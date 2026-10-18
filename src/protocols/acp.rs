@@ -2285,10 +2285,14 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     let projected = activity.drain_tool_projection().await;
                     let delivered = integration.flush_session_updates(&session_id).await;
                     let delivery = projected.and(delivered);
+                    // Run after actor/child settlement, even if client delivery failed.
+                    let durable = adapter
+                        .checkpoint_transcript()
+                        .map_err(AcpRuntimeError::Loop);
                     // A close acknowledgement means the actor-owned binding is
                     // already gone, so callers can immediately reuse the id.
                     drop(binding.take());
-                    let result = delivery.and_then(|()| {
+                    let result = delivery.and(durable).and_then(|()| {
                         if cleaned && closed {
                             Ok(())
                         } else {
