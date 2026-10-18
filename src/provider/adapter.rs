@@ -31,7 +31,6 @@ use super::{
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
-const MAX_SELECTOR_MODELS: usize = 2_000;
 const OPENROUTER_AUTH_REQUIRED: &str = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
 const SPEAKEASY_AUTH_REQUIRED: &str =
     "speakeasy_auth_required: run `kit auth login speakeasy` before using the Speakeasy provider";
@@ -317,6 +316,7 @@ impl SelectableAdapter {
             current,
             self.discovered_openai_models(),
             &self.credential_storage,
+            self.openrouter_api_key.as_ref(),
         )
         .await
     }
@@ -1480,17 +1480,59 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
                 current,
                 std::future::ready(DiscoveredModels::default()),
                 &Default::default(),
+                None,
             )
             .await
         }
     }
 }
 
+// Resolve credentials through the same stores and endpoint restrictions as inference.
+// Stored OAuth credentials count even when no API-key environment variable exists.
+fn available_catalog_providers(
+    storage: &crate::credentials::CredentialStorage,
+    openrouter_api_key: Option<&OpenRouterApiKey>,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Vec<ProviderKind> {
+    let mut providers = Vec::new();
+    if super::openai_auth::has_credentials(storage).unwrap_or(false) {
+        providers.push(ProviderKind::OpenAiSubscription);
+    }
+    if openrouter_config_from_env("openrouter/auto".into(), storage, openrouter_api_key, env)
+        .is_ok()
+    {
+        providers.push(ProviderKind::OpenRouter);
+    }
+    if speakeasy_auth::load(storage).ok().flatten().is_some() {
+        providers.push(ProviderKind::Speakeasy);
+    }
+    if super::anthropic_auth::credentials(storage)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        providers.push(ProviderKind::Anthropic);
+    }
+    providers
+}
+
 async fn model_catalog_with_openai(
     current: &ModelSelection,
     openai_catalog: impl std::future::Future<Output = DiscoveredModels>,
     storage: &crate::credentials::CredentialStorage,
+    openrouter_api_key: Option<&OpenRouterApiKey>,
 ) -> Vec<ModelGroup> {
+    let available =
+        available_catalog_providers(storage, openrouter_api_key, |name| std::env::var(name));
+    let openrouter_available = available.contains(&ProviderKind::OpenRouter);
+    let speakeasy_available = available.contains(&ProviderKind::Speakeasy);
+    let openai_catalog = async {
+        if available.contains(&ProviderKind::OpenAiSubscription) {
+            openai_catalog.await
+        } else {
+            DiscoveredModels::default()
+        }
+    };
     let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
         None => catalog_models_url(None),
         Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
@@ -1498,13 +1540,18 @@ async fn model_catalog_with_openai(
     let public_url = OPENROUTER_MODELS_URL.to_string();
     let same_catalog = openrouter_url.as_deref() == Some(public_url.as_str());
     let other_catalogs = async move {
-        if same_catalog {
+        if !openrouter_available && !speakeasy_available {
+            (DiscoveredModels::default(), DiscoveredModels::default())
+        } else if same_catalog {
             let models = fetch_model_ids(&public_url)
                 .await
                 .unwrap_or_else(|_| fallback_catalog());
             (models.clone(), models)
         } else {
             let openrouter_catalog = async {
+                if !openrouter_available {
+                    return DiscoveredModels::default();
+                }
                 match openrouter_url {
                     Some(url) => fetch_model_ids(&url)
                         .await
@@ -1513,6 +1560,9 @@ async fn model_catalog_with_openai(
                 }
             };
             let speakeasy_catalog = async {
+                if !speakeasy_available {
+                    return DiscoveredModels::default();
+                }
                 fetch_model_ids(&public_url)
                     .await
                     .unwrap_or_else(|_| fallback_catalog())
@@ -1546,28 +1596,8 @@ async fn model_catalog_with_openai(
     }
     openrouter.sort();
     openrouter.dedup();
-    openrouter.truncate(MAX_SELECTOR_MODELS);
-    if current_is_valid
-        && current.provider == ProviderKind::OpenRouter
-        && !openrouter.contains(&current.model)
-    {
-        if openrouter.len() == MAX_SELECTOR_MODELS {
-            openrouter.pop();
-        }
-        openrouter.push(current.model.clone());
-    }
     speakeasy.sort();
     speakeasy.dedup();
-    speakeasy.truncate(MAX_SELECTOR_MODELS);
-    if current_is_valid
-        && current.provider == ProviderKind::Speakeasy
-        && !speakeasy.contains(&current.model)
-    {
-        if speakeasy.len() == MAX_SELECTOR_MODELS {
-            speakeasy.pop();
-        }
-        speakeasy.push(current.model.clone());
-    }
     vec![
         ModelGroup {
             provider: ProviderKind::OpenAiSubscription,
@@ -1586,6 +1616,9 @@ async fn model_catalog_with_openai(
         },
         anthropic_model_group(current, anthropic),
     ]
+    .into_iter()
+    .filter(|group| available.contains(&group.provider))
+    .collect()
 }
 
 fn project_anthropic_reasoning(mut request: TurnRequest) -> TurnRequest {
@@ -1774,12 +1807,15 @@ fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
         .iter()
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .filter(|id| valid_model_id(id))
-        .take(MAX_SELECTOR_MODELS)
         .map(str::to_string)
         .collect();
-    let context_windows = models
+    let context_windows = entries
         .iter()
-        .filter_map(|id| parse_context_window(value, id).map(|window| (id.clone(), window)))
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?;
+            let window = entry.get("context_length")?.as_u64()?;
+            (valid_model_id(id) && window > 0).then(|| (id.to_string(), window))
+        })
         .collect();
     Ok(DiscoveredModels {
         models,
@@ -2825,6 +2861,120 @@ mod tests {
                 .is_err()
         );
         assert_eq!(adapter.selection().unwrap().model, "gpt-5.4");
+    }
+
+    #[test]
+    fn catalog_preserves_models_beyond_the_old_selector_limit() {
+        let entries: Vec<_> = (0..2_501)
+            .map(|i| json!({"id": format!("provider/model-{i}"), "context_length": 128_000}))
+            .collect();
+        let catalog = super::parse_discovered_models(&json!({"data": entries})).unwrap();
+        assert_eq!(catalog.models.len(), 2_501);
+        assert_eq!(catalog.models.last().unwrap(), "provider/model-2500");
+        assert_eq!(catalog.context_windows["provider/model-2500"], 128_000);
+    }
+
+    #[test]
+    fn catalog_availability_uses_stored_and_explicit_openrouter_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+        let unavailable = super::available_catalog_providers(&storage, None, |_| {
+            Err(std::env::VarError::NotPresent)
+        });
+        assert!(!unavailable.contains(&ProviderKind::OpenRouter));
+        assert!(!unavailable.contains(&ProviderKind::Speakeasy));
+        assert!(!unavailable.contains(&ProviderKind::OpenAiSubscription));
+        crate::provider::store_openrouter_test_credentials(&storage);
+        let stored = super::available_catalog_providers(&storage, None, |_| {
+            Err(std::env::VarError::NotPresent)
+        });
+        assert!(stored.contains(&ProviderKind::OpenRouter));
+        let custom_endpoint = |name: &str| {
+            if name == "OPENROUTER_BASE_URL" {
+                Ok("http://localhost:8080/chat/completions".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        assert!(
+            !super::available_catalog_providers(&storage, None, custom_endpoint)
+                .contains(&ProviderKind::OpenRouter)
+        );
+        let key = OpenRouterApiKey::new("explicit-key".to_string());
+        assert!(
+            super::available_catalog_providers(&storage, Some(&key), custom_endpoint)
+                .contains(&ProviderKind::OpenRouter)
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_advertises_stored_oauth_and_speakeasy_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+        let record = crate::provider::openai_auth::test_support::token_record(
+            "test-access",
+            "test-account",
+            "test-generation",
+        );
+        storage
+            .entry("openai-subscription", "subscription")
+            .save(&serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        storage.entry("speakeasy", "default").save(&serde_json::to_vec(&json!({"api_key": format!("gram_live_{}", "ab".repeat(32)), "project": "test-project", "email": null, "organization_id": null})).unwrap()).unwrap();
+        let current = ModelSelection::new(ProviderKind::Speakeasy, "private/custom-model");
+        let catalog = super::model_catalog_with_openai(
+            &current,
+            async {
+                super::DiscoveredModels {
+                    models: vec!["oauth-model".into()],
+                    ..Default::default()
+                }
+            },
+            &storage,
+            None,
+        )
+        .await;
+        let openai = catalog
+            .iter()
+            .find(|group| group.provider == ProviderKind::OpenAiSubscription)
+            .unwrap();
+        assert_eq!(openai.models, ["oauth-model"]);
+        let speakeasy = catalog
+            .iter()
+            .find(|group| group.provider == ProviderKind::Speakeasy)
+            .unwrap();
+        assert!(
+            speakeasy
+                .models
+                .contains(&"private/custom-model".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_does_not_poll_uncredentialed_openai_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+        let current = ModelSelection {
+            provider: ProviderKind::OpenAiSubscription,
+            model: "gpt-5.4".into(),
+        };
+        let catalog = super::model_catalog_with_openai(
+            &current,
+            async { panic!("uncredentialed discovery polled") },
+            &storage,
+            None,
+        )
+        .await;
+        assert!(
+            !catalog
+                .iter()
+                .any(|group| group.provider == ProviderKind::OpenAiSubscription)
+        );
+        assert!(
+            !catalog
+                .iter()
+                .any(|group| group.provider == ProviderKind::Speakeasy)
+        );
     }
 
     #[test]
