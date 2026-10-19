@@ -112,6 +112,7 @@ impl Subagents {
                     child: None,
                     recovery: None,
                     forking: None,
+                    startup_reservation: Weak::new(),
                     permit: Some(self.reserve().unwrap()),
                     cache_key: None,
                     finished: Default::default(),
@@ -409,6 +410,7 @@ fn manager_with_disconnected_session(
         child: Some(ChildSession::disconnected_for_test()),
         recovery: None,
         forking: None,
+        startup_reservation: Weak::new(),
         permit: Some(manager.acquire_permit().unwrap()),
         cache_key: None,
         finished: Default::default(),
@@ -1547,6 +1549,14 @@ async fn native_fork_releases_the_source_before_the_branch_prompt() {
         })
     );
 
+    // Source is fork-reserved and branch is starting: two active children,
+    // not three. An unrelated reservation must remain separately visible.
+    assert_eq!(scenario.manager.active_count().unwrap(), 2);
+    let unrelated = scenario.manager.acquire_permit().unwrap();
+    assert_eq!(scenario.manager.active_count().unwrap(), 3);
+    drop(unrelated);
+    assert_eq!(scenario.manager.active_count().unwrap(), 2);
+
     let prompt_error = scenario
         .manager
         .prompt(
@@ -2567,5 +2577,118 @@ async fn status_counts_startup_and_retained_reservations_without_waiting_on_chil
     state.lock().await.status = SubagentStatus::Removed;
     assert_eq!(manager.active_count().unwrap(), 1);
     state.lock().await.status = SubagentStatus::Idle;
+    assert_eq!(manager.active_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn status_keeps_orphaned_startup_and_unmatched_capacity_after_callback_panic() {
+    let mut scenario = MockAcpScenario::new(ScenarioOptions::default());
+    let source = scenario.create("source").await;
+    scenario.manager.event_sink = Arc::new(|event| {
+        if matches!(
+            event,
+            events::RuntimeEvent::SubagentStateChanged {
+                status: SubagentStatus::Starting,
+                ..
+            }
+        ) {
+            panic!("startup event sink failed");
+        }
+        Ok(())
+    });
+    assert!(
+        scenario
+            .spawn_fork(source.clone(), "branch")
+            .await
+            .unwrap()
+            .is_err()
+    );
+    // The real callback unwound the fork task after publication. The source's
+    // fork claim and orphaned Starting entry both remain nonsettled, but the
+    // orphan's expired identity must not consume unrelated capacity.
+    assert_eq!(
+        scenario.manager.capacity.available_permits(),
+        MAX_LIVE_SUBAGENTS - 1
+    );
+    assert_eq!(scenario.manager.active_count().unwrap(), 2);
+    let unrelated = scenario.manager.acquire_permit().unwrap();
+    assert_eq!(scenario.manager.active_count().unwrap(), 3);
+    drop(unrelated);
+    assert_eq!(scenario.manager.active_count().unwrap(), 2);
+    assert!(scenario.manager.shutdown().await.is_err());
+}
+
+#[tokio::test]
+async fn status_matches_external_reconnect_capacity_and_preserves_retired_work() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let open = |resume| {
+        session::open_in(
+            root.path(),
+            storage.path(),
+            "status-parent",
+            resume,
+            false,
+            Vec::new(),
+        )
+        .unwrap()
+    };
+    let opened = open(false);
+    let manager = manager_with_generic_harness(root.path(), vec!["--v2".into()])
+        .with_observer(opened.observer, opened.children)
+        .unwrap();
+    let prior = manager
+        .create(
+            "first".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(manager.active_count().unwrap(), 0);
+    drop(manager);
+    let opened = open(true);
+    let mut record = opened.children[0].clone();
+    record.acp_session_id = "replay-stall".into();
+    opened.observer.persist_child(&record).unwrap();
+    drop(opened);
+    let opened = open(true);
+    let manager = manager_with_generic_harness(root.path(), vec!["--v2".into()])
+        .with_observer(opened.observer, opened.children)
+        .unwrap();
+    let controller = agentkit_core::CancellationController::new();
+    let cancellation = controller.handle().checkpoint();
+    let task_manager = manager.clone();
+    let prompt = tokio::spawn(async move {
+        task_manager
+            .prompt(prior, "waiting".into(), cancellation, None)
+            .await
+    });
+    let marker = root.path().join("replay-stalled");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fixture must enter reconnect replay");
+    assert_eq!(manager.active_count().unwrap(), 1);
+    let unrelated = manager.acquire_permit().unwrap();
+    assert_eq!(manager.active_count().unwrap(), 2);
+    drop(unrelated);
+    // Retirement removes the visible entry but must not hide its startup owner.
+    assert!(manager.shutdown().await.is_err());
+    assert_eq!(manager.active_count().unwrap(), 1);
+    controller.interrupt();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    wait_for_available_permits(&manager, MAX_LIVE_SUBAGENTS).await;
     assert_eq!(manager.active_count().unwrap(), 0);
 }

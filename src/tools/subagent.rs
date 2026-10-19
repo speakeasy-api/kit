@@ -4,7 +4,7 @@ use crate::acp_child::transcript;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use agentkit_core::{ToolOutput, ToolResultPart, TurnCancellation};
@@ -37,6 +37,12 @@ pub(crate) fn prompt_cache_key(session_id: &str) -> String {
 
 #[derive(Debug)]
 pub(crate) struct Permit {
+    reservation: Arc<Reservation>,
+}
+
+/// A snapshot may retain this owner to keep a matched capacity slot live.
+#[derive(Debug)]
+struct Reservation {
     _local: OwnedSemaphorePermit,
     _slot: std::fs::File,
 }
@@ -249,6 +255,8 @@ struct State {
     recovery: Option<session::DurableChild>,
     forking: Option<String>,
     permit: Option<Permit>,
+    /// Non-owning identity of startup capacity held outside this state.
+    startup_reservation: Weak<Reservation>,
     /// Prompt cache key the child process runs under; `None` uses its own id.
     cache_key: Option<String>,
     /// Recent finished generations, newest last, for callers waiting on one.
@@ -633,6 +641,7 @@ impl Subagents {
                 child: None,
                 recovery: None,
                 forking: None,
+                startup_reservation: Weak::new(),
                 permit: Some(permit),
                 cache_key: cache_key.clone(),
                 finished: Default::default(),
@@ -1260,6 +1269,7 @@ impl Subagents {
                 child: None,
                 recovery: None,
                 forking: None,
+                startup_reservation: Arc::downgrade(&permit.reservation),
                 permit: None,
                 cache_key: cache_key.clone(),
                 finished: Default::default(),
@@ -1525,11 +1535,26 @@ impl Subagents {
         // failed-close owners retained until process exit. They are outstanding
         // work even after their visible child entry has been retired.
         let installed = guards.iter().filter(|state| state.permit.is_some()).count();
+        // Match only live startup owners, never an arbitrary number of slots.
+        // A callback panic can leave Starting behind after its permit unwinds.
+        // Upgrading keeps each matched slot alive through the capacity read;
+        // weak identity alone (or strong_count) would race owner destruction.
+        // Each fresh permit is bound to only its fork/reconnect destination.
+        // Installed permits are disjoint from these permit-less states; removed
+        // entries are not matched, so detached cleanup remains outstanding.
+        let matched: Vec<_> = guards
+            .iter()
+            .filter(|state| state.status == SubagentStatus::Starting && state.permit.is_none())
+            .filter_map(|state| state.startup_reservation.upgrade())
+            .collect();
         let uninstalled = MAX_LIVE_SUBAGENTS
             .saturating_sub(self.capacity.available_permits())
-            .saturating_sub(installed);
+            .saturating_sub(installed)
+            .saturating_sub(matched.len());
         drop(registry);
         drop(guards);
+        // Releasing a snapshot must not release capacity under registry/state locks.
+        drop(matched);
         Ok(count + uninstalled)
     }
 
@@ -1791,8 +1816,10 @@ impl Subagents {
                 ))
             })?;
         Ok(Permit {
-            _local: local,
-            _slot: tree_slot(tree_slot_directory(&self.tree_slots)?)?,
+            reservation: Arc::new(Reservation {
+                _local: local,
+                _slot: tree_slot(tree_slot_directory(&self.tree_slots)?)?,
+            }),
         })
     }
 
@@ -2929,6 +2956,7 @@ mod steer_tests {
             child: Some(ChildSession::disconnected_for_test()),
             recovery: None,
             forking: None,
+            startup_reservation: Weak::new(),
             permit: Some(manager.acquire_permit().unwrap()),
             cache_key: None,
             finished: Default::default(),
@@ -3039,7 +3067,13 @@ mod steer_tests {
                     locked.generation,
                     locked.handle_generation,
                     locked.output.clone(),
-                    locked.permit.as_ref().unwrap()._local.num_permits(),
+                    locked
+                        .permit
+                        .as_ref()
+                        .unwrap()
+                        .reservation
+                        ._local
+                        .num_permits(),
                 )
             };
             let capacity = manager.capacity.available_permits();
@@ -3079,7 +3113,13 @@ mod steer_tests {
                 assert_eq!(locked.handle_generation, before.1);
                 assert_eq!(locked.output, before.2);
                 assert_eq!(
-                    locked.permit.as_ref().unwrap()._local.num_permits(),
+                    locked
+                        .permit
+                        .as_ref()
+                        .unwrap()
+                        .reservation
+                        ._local
+                        .num_permits(),
                     before.3
                 );
                 assert_eq!(manager.capacity.available_permits(), capacity);
