@@ -606,7 +606,7 @@ enum Command {
         cancellation_generation: u64,
     },
     Close {
-        reply: oneshot::Sender<Result<(), AcpRuntimeError>>,
+        reply: oneshot::Sender<Result<super::SessionCloseReport, AcpRuntimeError>>,
     },
 }
 
@@ -1139,7 +1139,11 @@ impl Server {
                     .map_err(|_| AcpRuntimeError::ClientClosed)?
             })
                 as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<(), AcpRuntimeError>> + Send>,
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<super::SessionCloseReport, AcpRuntimeError>,
+                            > + Send,
+                    >,
                 >
         });
         // Registration, durable identity commit, and local publication are one
@@ -1347,7 +1351,7 @@ impl Server {
             session.integration.close();
             let result = close().await;
             drop(session);
-            result?;
+            result?.explicit_result()?;
             Ok(wire::CloseSessionResponse::new())
         })
         .await
@@ -1609,15 +1613,11 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         .checkpoint_transcript()
                         .map_err(AcpRuntimeError::Loop);
                     drop(binding.take());
-                    let result = delivery.and(durable).and_then(|()| {
-                        if cleaned && closed {
-                            Ok(())
-                        } else {
-                            Err(AcpRuntimeError::Loop(
-                                "session close cleanup did not complete".into(),
-                            ))
-                        }
-                    });
+                    let result = super::SessionCloseReport::from_outcomes(
+                        cleaned && closed,
+                        delivery,
+                        durable,
+                    );
                     let _ = reply.send(result);
                     break;
                 }
@@ -5344,7 +5344,13 @@ mod tests {
             PendingSessionPublication {
                 token,
                 interrupt: Arc::new(|| {}),
-                close: Arc::new(|| Box::pin(async { Ok(()) })),
+                close: Arc::new(|| {
+                    Box::pin(async {
+                        Ok(super::super::SessionCloseReport {
+                            checkpoint_error: None,
+                        })
+                    })
+                }),
                 actor: actor.abort_handle(),
                 completed: completion,
                 session_id,
@@ -5614,11 +5620,15 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_close_and_reset_join_acknowledgement_and_actor_exit() {
-        for outcome in ["ok", "error", "missing_ack"] {
+        for outcome in ["ok", "checkpoint", "error", "delivery", "missing_ack"] {
             for (cancel_request, reset_after_exit) in
                 [(false, false), (true, false), (false, true), (true, true)]
             {
                 let root = tempfile::tempdir().unwrap();
+                // Stand in for credential storage at the reset callback boundary.
+                let credentials = root.path().join("credentials");
+                std::fs::write(&credentials, "test credential").unwrap();
+                let cleanup_ok = matches!(outcome, "ok" | "checkpoint");
                 let registry = SessionRegistry::new();
                 let server = Arc::new(Server::new(
                     Runtime::new(root.path(), "gpt-5.4").unwrap(),
@@ -5648,14 +5658,24 @@ mod tests {
                     };
                     accepted.send(()).unwrap();
                     acknowledge_rx.await.unwrap();
-                    match outcome {
-                        "ok" => {
-                            let _ = reply.send(Ok(()));
-                        }
-                        "error" => {
-                            let _ = reply.send(Err(AcpRuntimeError::Loop("cleanup failed".into())));
-                        }
-                        _ => drop(reply),
+                    if outcome == "missing_ack" {
+                        drop(reply);
+                    } else {
+                        // Use the same outcome classification as the real actor.
+                        let report = super::super::SessionCloseReport::from_outcomes(
+                            outcome != "error",
+                            if outcome == "delivery" {
+                                Err(AcpRuntimeError::ClientClosed)
+                            } else {
+                                Ok(())
+                            },
+                            if outcome == "checkpoint" {
+                                Err(AcpRuntimeError::Loop("checkpoint failed".into()))
+                            } else {
+                                Ok(())
+                            },
+                        );
+                        let _ = reply.send(report);
                     }
                     acknowledged.send(()).unwrap();
                     exit_rx.await.unwrap();
@@ -5723,7 +5743,10 @@ mod tests {
                 if cancel_request {
                     request.abort();
                 }
-                let mut reset = Box::pin(registry.reset_authentication_with(async { "reset" }));
+                let mut reset = Box::pin(registry.reset_authentication_with(async {
+                    std::fs::remove_file(&credentials).unwrap();
+                    "reset"
+                }));
                 if !reset_after_exit {
                     assert!(futures_util::poll!(reset.as_mut()).is_pending());
                 }
@@ -5755,9 +5778,11 @@ mod tests {
                     drop(admission);
                 }
                 let (reopened, result) = timeout(Duration::from_secs(2), reset).await.unwrap();
-                assert_eq!(reopened, outcome == "ok");
-                assert_eq!(result, (outcome == "ok").then_some("reset"));
-                assert_eq!(registry.begin_attachment().is_ok(), outcome == "ok");
+                assert_eq!(reopened, cleanup_ok);
+                assert_eq!(result, cleanup_ok.then_some("reset"));
+                assert_eq!(credentials.exists(), !cleanup_ok);
+                assert_eq!(registry.inner.lock_state().permanently_closed, !cleanup_ok);
+                assert_eq!(registry.begin_attachment().is_ok(), cleanup_ok);
                 let response = match finished_request {
                     Some(response) => response,
                     None => request.await,
@@ -5765,7 +5790,16 @@ mod tests {
                 if cancel_request {
                     assert!(response.unwrap_err().is_cancelled());
                 } else {
-                    assert_eq!(response.unwrap().is_ok(), outcome == "ok");
+                    let response = response.unwrap();
+                    assert_eq!(response.is_ok(), outcome == "ok");
+                    if outcome == "checkpoint" {
+                        assert!(
+                            response
+                                .unwrap_err()
+                                .to_string()
+                                .contains("checkpoint failed")
+                        );
+                    }
                 }
             }
         }
@@ -5811,10 +5845,16 @@ mod tests {
             let close_release = Arc::clone(&close_release);
             Box::pin(async move {
                 close_release.notify_one();
-                Ok(())
+                Ok(super::super::SessionCloseReport {
+                    checkpoint_error: None,
+                })
             })
                 as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<(), AcpRuntimeError>> + Send>,
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<super::super::SessionCloseReport, AcpRuntimeError>,
+                            > + Send,
+                    >,
                 >
         });
         let mut admission = registry.begin_attachment().unwrap();
