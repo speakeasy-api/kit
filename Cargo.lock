@@ -4606,6 +4606,7 @@ dependencies = [
  "futures",
  "http",
  "indexmap 2.14.0",
+ "jsonwebtoken",
  "oauth2",
  "pin-project-lite",
  "process-wrap",
@@ -4619,6 +4620,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

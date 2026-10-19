@@ -1,5 +1,6 @@
 mod auth;
 mod credentials;
+mod machine;
 mod refresh;
 #[cfg(test)]
 #[allow(
@@ -348,6 +349,8 @@ struct PendingRecord {
 }
 
 struct OAuthSession {
+    machine: Option<(String, machine::Config)>,
+    machine_expires: AtomicU64,
     manager: Mutex<AuthorizationManager>,
     tokens: std::sync::Mutex<OAuthSessionTokens>,
     // Cleanup identity survives token poisoning. Only a new reservation advances it,
@@ -562,6 +565,8 @@ impl From<&str> for OAuthSessionError {
 impl OAuthSession {
     fn new(manager: AuthorizationManager, access_token: String) -> Self {
         Self {
+            machine: None,
+            machine_expires: AtomicU64::new(0),
             manager: Mutex::new(manager),
             tokens: std::sync::Mutex::new(OAuthSessionTokens {
                 applied: access_token,
@@ -652,6 +657,29 @@ impl OAuthSession {
         Ok(tokens)
     }
 
+    async fn refresh_backend(
+        &self,
+        manager: &mut AuthorizationManager,
+        storage: &CredentialStorage,
+        rejected: &str,
+    ) -> Result<String, String> {
+        if let Some((url, config)) = &self.machine {
+            // The existing manager mutex and operation gate serialize acquisition.
+            // Prepare completely before replacing; cancellation leaves the old pair
+            // untouched, and BackendLease isolates interrupted publication.
+            let started = machine::now();
+            let (token, replacement) = machine::authenticate(url, config).await?;
+            let expires = machine::expiry(&replacement, started).await?;
+            *manager = replacement;
+            self.machine_expires.store(expires, Ordering::Release);
+            Ok(token)
+        } else {
+            auth::refresh(manager, storage, rejected)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
     async fn refresh(
         self: &Arc<Self>,
         credential_storage: &CredentialStorage,
@@ -665,10 +693,10 @@ impl OAuthSession {
             armed: true,
         };
         let result = async {
-            let refreshed =
-                auth::refresh(&mut backend.manager, credential_storage, &rejected_token)
-                    .await
-                    .map_err(|error| error.to_string());
+            let refreshed = self
+                .refresh_backend(&mut backend.manager, credential_storage, &rejected_token)
+                .await
+                .map_err(|error| error.to_string());
             let mut tokens = self.lock_tokens()?;
             let token = refreshed?;
             tokens.applied = token.clone();
@@ -711,10 +739,10 @@ impl OAuthSession {
                     armed: true,
                 };
                 let result = async {
-                    let refreshed =
-                        auth::refresh(&mut backend.manager, &credential_storage, &observed_token)
-                            .await
-                            .map_err(|error| error.to_string());
+                    let refreshed = session
+                        .refresh_backend(&mut backend.manager, &credential_storage, &observed_token)
+                        .await
+                        .map_err(|error| error.to_string());
                     let mut tokens = session.lock_completion_tokens(generation)?;
                     let cancelled = match tokens.pending {
                         Some(PendingRefresh::Refreshing {
@@ -1196,6 +1224,10 @@ fn prepare_server(
                 return Err(format!(
                     "MCP server {id} cannot use both OAuth and static authorization"
                 ));
+            }
+            if let Some(config) = server.auth.as_ref().and_then(auth::Config::machine) {
+                config.validate()?;
+                machine::validate_transport_url(&server.url)?;
             }
             let mut transport = StreamableHttpTransportConfig::new(server.url.clone());
             let static_authorization = server.bearer_token.is_some() || authorization_header;
@@ -1838,11 +1870,60 @@ impl McpRuntime {
                 "MCP configuration changed while the tool was waiting; retry the call".into(),
             ));
         }
-        if let Some(record) = self.inner.servers.read().await.get(&server) {
-            record
-                .status
-                .check_available()
+        let authentication_required =
+            if let Some(record) = self.inner.servers.read().await.get(&server) {
+                record
+                    .status
+                    .check_available()
+                    .map_err(ToolError::Unavailable)?;
+                matches!(record.status, ServerStatus::AuthenticationRequired)
+            } else {
+                false
+            };
+        let session = self.inner.oauth_sessions.lock().await.get(&server).cloned();
+        if let Some(session) = session.filter(|session| session.machine.is_some())
+            && (authentication_required
+                || session.machine_expires.load(Ordering::Acquire) <= machine::now())
+        {
+            // Own publication before acquisition: cancellation between token
+            // commit and transport update must isolate, not leave a fresh
+            // deadline paired with the transport's previous token.
+            let mut publication = self
+                .begin_backend_publication()
+                .await
                 .map_err(ToolError::Unavailable)?;
+            let token = match session.refresh(&self.inner.credential_storage).await {
+                Ok(token) => token,
+                Err(error) => {
+                    publication.complete();
+                    return Err(ToolError::Unavailable(error.to_string()));
+                }
+            };
+            let mut credentials = MetadataMap::new();
+            credentials.insert("access_token".into(), Value::String(token));
+            publication
+                .backend()
+                .map_err(ToolError::Unavailable)?
+                .resolve_auth(AuthResolution::provided(
+                    connect_auth_request(&server),
+                    credentials,
+                ))
+                .await
+                .map_err(|_| {
+                    ToolError::Unavailable("could not apply machine MCP credentials".into())
+                })?;
+            publication.release_backend();
+            self.commit_auth_state(
+                &server,
+                &fingerprint,
+                Some(&session),
+                Some(None),
+                ServerStatus::Connected,
+                None,
+            )
+            .await
+            .map_err(ToolError::Unavailable)?;
+            publication.complete();
         }
         self.ensure_healthy().map_err(ToolError::Unavailable)?;
         Ok(McpInvocationLease {
@@ -2247,12 +2328,18 @@ impl McpRuntime {
             }
             owners
         };
+        let restore_started = machine::now();
         let restores = futures_util::future::join_all(records.iter().map(|(name, record)| {
             let credential_storage = self.inner.credential_storage.clone();
             async move {
                 let restore = match record.url.as_deref() {
                     Some(resource_url)
-                        if !record.static_authorization && credential_storage.is_persistent() =>
+                        if !record.static_authorization
+                            && (credential_storage.is_persistent()
+                                || record
+                                    .oauth
+                                    .as_ref()
+                                    .is_some_and(|config| config.machine().is_some())) =>
                     {
                         let oauth = record.oauth.clone().unwrap_or_default();
                         Some(auth::restore(resource_url, &oauth, &credential_storage).await)
@@ -2349,9 +2436,26 @@ impl McpRuntime {
         }
         for (name, record) in records {
             if let Some((status, challenge)) = outcomes.remove(&name) {
-                let replacement = restored
-                    .remove(&name)
-                    .map(|(token, manager)| Arc::new(OAuthSession::new(manager, token)));
+                let replacement = if let Some((token, manager)) = restored.remove(&name) {
+                    let mut session = OAuthSession::new(manager, token);
+                    session.machine = record
+                        .oauth
+                        .as_ref()
+                        .and_then(auth::Config::machine)
+                        .cloned()
+                        .zip(record.url.clone())
+                        .map(|(config, url)| (url, config));
+                    if session.machine.is_some() {
+                        let manager = session.manager.lock().await;
+                        session.machine_expires.store(
+                            machine::expiry(&manager, restore_started).await?,
+                            Ordering::Release,
+                        );
+                    }
+                    Some(Arc::new(session))
+                } else {
+                    None
+                };
                 let expected = expected_owners.get(&name).and_then(Option::as_ref);
                 self.commit_auth_state(
                     &name,
@@ -2501,6 +2605,9 @@ impl McpRuntime {
             )));
         }
         let oauth = record.oauth.clone().unwrap_or_default();
+        if oauth.machine().is_some() {
+            return Err(ToolError::InvalidInput("machine MCP authentication is managed by provisioned credential files, not interactive auth".into()));
+        }
 
         let challenge = { self.inner.challenges.lock().await.get(name).cloned() };
         let request = match challenge {
@@ -4910,6 +5017,160 @@ mod tests {
             .await
             .insert("remote".into(), Arc::clone(session));
         runtime
+    }
+
+    async fn expired_machine_session() -> Arc<OAuthSession> {
+        let store = InMemoryCredentialStore::new();
+        let token: OAuthTokenResponse = serde_json::from_value(json!({
+            "access_token": "old-machine-access",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+        .unwrap();
+        store
+            .save(StoredCredentials::new(
+                "machine-client".into(),
+                Some(token),
+                Vec::new(),
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut manager = AuthorizationManager::new("https://example.com/mcp")
+            .await
+            .unwrap();
+        manager.set_metadata(
+            serde_json::from_value(json!({
+                "issuer": "https://issuer.example",
+                "authorization_endpoint": "https://issuer.example/authorize",
+                "token_endpoint": "https://issuer.example/token"
+            }))
+            .unwrap(),
+        );
+        manager
+            .configure_client_credentials(
+                &rmcp::transport::auth::ClientCredentialsConfig::ClientSecret {
+                    client_id: "machine-client".into(),
+                    client_secret: "previous-secret".into(),
+                    scopes: Vec::new(),
+                    resource: Some("https://example.com/mcp".into()),
+                },
+            )
+            .unwrap();
+        manager.set_credential_store(store);
+        let mut session = OAuthSession::new(manager, "old-machine-access".into());
+        session.machine = Some((
+            "https://example.com/mcp".into(),
+            super::machine::Config {
+                // Reject before discovery or reading any credential file.
+                client_id: String::new(),
+                scopes: Vec::new(),
+                resource: "https://example.com/mcp".into(),
+                expected_issuer: "https://issuer.example".into(),
+                method: super::machine::Method::ClientSecret {
+                    client_secret_file: std::env::temp_dir().join("unused-machine-secret"),
+                },
+            },
+        ));
+        session.machine_expires.store(1, Ordering::Release);
+        Arc::new(session)
+    }
+
+    #[tokio::test]
+    async fn machine_acquisition_failure_preserves_previous_session_and_publication() {
+        let session = expired_machine_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let before = serde_json::to_value(
+            session
+                .manager
+                .lock()
+                .await
+                .get_credentials()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Repeat admission to prove the first failure released both ownership
+        // gates without publishing a new deadline or isolating a valid backend.
+        for _ in 0..2 {
+            let error = runtime
+                .acquire_invocation("mcp_remote_write")
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("machine MCP auth requires"));
+            assert!(runtime.ensure_healthy().is_ok());
+            assert!(session.check_usable().is_ok());
+            assert_eq!(session.lock_tokens().unwrap().applied, "old-machine-access");
+            assert!(session.lock_tokens().unwrap().pending.is_none());
+            assert_eq!(session.machine_expires.load(Ordering::Acquire), 1);
+            assert_eq!(
+                serde_json::to_value(
+                    session
+                        .manager
+                        .lock()
+                        .await
+                        .get_credentials()
+                        .await
+                        .unwrap()
+                )
+                .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_machine_acquisition_fences_owned_backend_publication() {
+        let session = expired_machine_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let manager = session.manager.lock().await;
+        let before = serde_json::to_value(manager.get_credentials().await.unwrap()).unwrap();
+        let mut invocation = Box::pin(runtime.acquire_invocation("mcp_remote_write"));
+        // Admission owns publication, then suspends at the real session-manager
+        // lock. Cancellation must fence even before acquisition can mutate it.
+        assert!(futures_util::poll!(invocation.as_mut()).is_pending());
+        assert!(runtime.inner.manager.try_lock().is_err());
+        drop(invocation);
+        assert_eq!(
+            serde_json::to_value(manager.get_credentials().await.unwrap()).unwrap(),
+            before
+        );
+        drop(manager);
+        assert_eq!(session.lock_tokens().unwrap().applied, "old-machine-access");
+        assert_eq!(session.machine_expires.load(Ordering::Acquire), 1);
+        assert!(runtime.ensure_healthy().is_err());
+        assert!(runtime.inner.manager.try_lock().is_ok());
+        let error = runtime
+            .acquire_invocation("mcp_remote_write")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_machine_admission_before_publication_preserves_backend_health() {
+        let session = expired_machine_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let backend = runtime.inner.manager.lock().await;
+        let mut invocation = Box::pin(runtime.acquire_invocation("mcp_remote_write"));
+        // No publication owner exists yet: cancelling a waiter must not fence
+        // the backend or strand its per-server operation gate.
+        assert!(futures_util::poll!(invocation.as_mut()).is_pending());
+        drop(invocation);
+        drop(backend);
+        assert!(runtime.ensure_healthy().is_ok());
+        assert_eq!(session.lock_tokens().unwrap().applied, "old-machine-access");
+        assert_eq!(session.machine_expires.load(Ordering::Acquire), 1);
+        let error = runtime
+            .acquire_invocation("mcp_remote_write")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("machine MCP auth requires"));
+        assert!(runtime.ensure_healthy().is_ok());
     }
 
     fn recorder_for(runtime: &super::McpRuntime) -> AuthRecorder {
