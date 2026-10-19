@@ -1,6 +1,8 @@
 # Configure and Use MCP Servers
 
-Kit merges Model Context Protocol (MCP) servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
+Add Model Context Protocol (MCP) servers to let the agent use external tools and resources. Use project `.mcp.json` for project-specific servers or the global MCP file for servers you need across projects.
+
+Kit merges servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
 
 Use `kit config set mcp_config ~/.kit/mcp.json` to select the global MCP file, `kit config get mcp_config` to inspect the saved path, or `kit config unset mcp_config` to remove the override. These commands edit `~/.kit/config.toml`, not the MCP JSON file or its server entries. See [configuration editing](getting-started-and-configuration.md#edit-configuration-from-the-command-line).
 
@@ -90,7 +92,7 @@ An HTTP server requires a non-empty `url`. Optional fields are `description`, `h
 
 ### Optional OAuth configuration fields
 
-OAuth is inferred reactively for every remote Streamable HTTP server. Kit first connects normally, records a `WWW-Authenticate` Bearer challenge, and uses that challenge for protected-resource discovery and dynamic client registration when `auth` is called. No `auth` block is required. Stdio servers never use this OAuth path.
+Unless machine authentication is configured explicitly, OAuth is inferred reactively for every remote Streamable HTTP server. Kit first connects normally, records a `WWW-Authenticate` Bearer challenge, and uses that challenge for protected-resource discovery and dynamic client registration when `auth` is called. No `auth` block is required. Stdio servers never use this OAuth path.
 
 An explicit `auth` block is an optional fallback or override. Set `auth.type` to the exact value `oauth`. `scopes` supplies fallback scopes in addition to challenge and server metadata. Use `clientId` to override dynamic registration with a pre-registered OAuth client. Optional `clientMetadataUrl` supplies a client metadata document during registration.
 
@@ -109,14 +111,16 @@ An explicit `auth` block is an optional fallback or override. Set `auth.type` to
 }
 ```
 
-
 ## Machine OAuth credentials
 
-For unattended services, provision a credential file **before Kit starts**, then use
-`auth.type: "client_credentials"`. Kit does not register a client, expose a bootstrap
-API, open a browser, or fall back to interactive OAuth when this mode fails.
-Existing `oauth`, `bearerToken`, and explicit header configurations remain supported;
-do not combine them with machine authentication on one server.
+Use machine OAuth to let an unattended Kit process access an HTTP MCP server without a browser login. This works with `kit prompt` as well as long-lived runtimes. Configure model-provider access separately before running these examples.
+
+Before starting Kit, have your identity administrator register a client for the `client_credentials` grant, authorize its scopes and resource, and provision its credential file through your control plane. Kit does not register machine clients or provide a credential-bootstrap API. Keep credential contents out of prompts, ACP messages, logs, and source control.
+
+### Connect with a provisioned client secret
+
+1. Provision the secret at an absolute path readable only by the Kit service account, such as `/run/secrets/mcp-client-secret`. The file must contain nonempty UTF-8 text; Kit removes trailing CR/LF. Credential files must be regular files of at most 64 KiB.
+2. Save this configuration as `/etc/kit/mcp-machine.json`, replacing the example URLs, client ID, scopes, and path with your administrator's values. If editing an existing MCP file instead, preserve unrelated server entries.
 
 ```json
 {
@@ -140,7 +144,21 @@ do not combine them with machine authentication on one server.
 }
 ```
 
-Alternatively, replace `method` with:
+3. Run Kit with that configuration:
+
+```sh
+kit prompt --mcp-config /etc/kit/mcp-machine.json \
+  'Use tool_search with query mcp and report the status of service.'
+```
+
+The `service` entry should report `authenticated` and its available tool count. No browser or `auth` call is needed. If it reports `error`, use the [machine-authentication recovery steps](#recover-from-machine-authentication-errors) below.
+
+The MCP URL, resource, and expected issuer must use HTTPS without embedded credentials or fragments. The discovered issuer must exactly match `expected_issuer`, and its token endpoint must share that issuer's HTTPS origin. Do not combine this `auth` block with `bearerToken` or an `Authorization` header.
+
+### Connect with a provisioned private key
+
+1. Have your administrator register the public key with the issuer and provision the matching RSA or EC private key at `/run/secrets/mcp-private-key.pem` (or another absolute path). Restrict access to the Kit service account. The same regular-file and 64 KiB limits apply; EC keys must use PKCS#8 PEM (`BEGIN PRIVATE KEY`).
+2. Use the complete server configuration above, but replace its `auth.method` object with the following. Select the algorithm that matches your key and the issuer's supported algorithms.
 
 ```json
 {
@@ -151,33 +169,44 @@ Alternatively, replace `method` with:
 }
 ```
 
-`client_id`, `resource`, `expected_issuer`, and `method` are required. `scopes`
-defaults to an empty array. `signing_algorithm` defaults to `RS256`; supported values
-are `RS256`, `RS384`, `RS512`, `ES256`, and `ES384`. Omit
-`token_endpoint_audience` to use the discovered issuer as the JWT audience.
-Credential paths must be absolute. Secret files contain UTF-8 text (trailing CR/LF
-is removed); private-key files contain an RSA or EC PEM key. EC keys must use PKCS#8 PEM
-(`BEGIN PRIVATE KEY`). Files must be regular,
-nonempty, and at most 64 KiB. Inline secrets and unknown configuration fields are
-rejected. Restrict file access to the service account; do not put credential
-contents in prompts, ACP requests, or logs.
+3. Check the connection with the private-key configuration:
 
-The MCP URL, resource, and expected issuer must use HTTPS without embedded
-credentials or fragments. Discovery must return the exact configured issuer;
-the token endpoint must share that issuer's HTTPS origin. Discovery uses rmcp's
-existing HTTP policy, and token exchanges do not follow redirects. These checks
-run before credential files are read or credentials are sent to the issuer.
+```sh
+kit prompt --mcp-config /etc/kit/mcp-machine.json \
+  'Use tool_search with query mcp and report the status of service.'
+```
 
-Machine tokens are cached only in their owning runtime session, separately from
-interactive OAuth's persisted credentials. Before a tool call, an expired or
-nearly expired token is reacquired with `client_credentials`; a bearer challenge
-on a tool call uses the same serialized renewal path and bounded replay handling.
-Kit never uses a refresh token in this mode. Each acquisition reopens the file,
-so atomically replacing its contents rotates credentials at the next acquisition
-without restarting Kit. A still-valid access token remains usable until renewal.
-Missing or invalid replacement credentials fail closed, without switching methods
-or starting interactive authorization.
+The `service` entry should report `authenticated`. Omit `token_endpoint_audience` unless your issuer requires an audience other than its issuer identifier. A signing failure does not fall back to a client secret or browser login; use the [recovery steps](#recover-from-machine-authentication-errors) if authentication fails.
 
+### Machine OAuth configuration reference
+
+Unknown fields and inline secrets are rejected. Use these exact field names, not interactive OAuth's `clientId`.
+
+| Field | Requirement or default |
+| --- | --- |
+| `auth.type` | Required: `client_credentials`. |
+| `auth.client_id` | Required, nonempty registered client ID. |
+| `auth.resource` | Required HTTPS resource identifier authorized for the client. |
+| `auth.expected_issuer` | Required HTTPS issuer identifier; exact discovery match. |
+| `auth.scopes` | Array of strings; defaults to `[]`. |
+| `auth.method.type` | Required: `client_secret` or `private_key_jwt`. |
+| `auth.method.client_secret_file` | Required only for `client_secret`; absolute file path. |
+| `auth.method.private_key_file` | Required only for `private_key_jwt`; absolute PEM file path. |
+| `auth.method.signing_algorithm` | JWT only; `RS256` (default), `RS384`, `RS512`, `ES256`, or `ES384`. |
+| `auth.method.token_endpoint_audience` | Optional JWT audience override; defaults to the discovered issuer. |
+
+### Rotate machine credentials without restarting Kit
+
+Atomically replace the provisioned file at the same path. Kit reopens it when acquiring a token, including renewal before an expired or nearly expired token is used for a tool call, or after a tool-call bearer challenge. A valid access token continues to work until renewal; replacing the file does not immediately revoke that token. Coordinate token revocation with your issuer if immediate revocation is required.
+
+Machine tokens are not persisted by `--credential-store`; each Kit process acquires its own tokens. You do not need `--credential-store file` or `--credential-dir` for these provisioned files. Machine authentication always uses the configured method, never a refresh-token grant or interactive fallback.
+
+### Recover from machine authentication errors
+
+- **`machine OAuth issuer does not match expected_issuer`** or a token-endpoint-origin error: check the issuer identifier and discovery configuration with your administrator. Do not change the expected issuer merely to bypass an unexpected discovery response.
+- **Credential-file read or validation error**: check the absolute path, service-account access, file type, nonempty contents, and size. For JWT, also check the key encoding and selected algorithm.
+- **`machine OAuth token exchange failed`**: check client registration, secret or public-key registration, allowed scopes/resource, signing algorithm, and any required audience override with the issuer. Kit omits issuer response details from this error to avoid exposing credentials; use the issuer's administrative diagnostics.
+- **`auth` reports that machine authentication is managed by provisioned credential files**: repair the configuration or provisioned file rather than starting a browser login. After an initialization failure, restart Kit with the corrected settings. After a renewal failure, repair the file and retry the tool call; inspect remote state first if the original operation might have had side effects.
 
 ## Discover, authenticate, and call MCP tools
 
@@ -188,12 +217,12 @@ Search and schema lookup use the last successfully published catalog while a ref
 MCP tools are model-visible through four meta-tools rather than as an unrestricted static list. The expected workflow is:
 
 1. Call `tool_search({ query: "issues" })`. The search reloads the configuration, waits for any servers that are still initializing, then ranks every connected server's tools globally with high precision: a tool must match the query in its name or match every query term. At most 5 tools are returned across all servers—often fewer—sorted by score and grouped by server with `available_tool_count`, `matched_tool_count`, `returned_tool_count`, and `truncated`, plus top-level `total_matched`, `total_returned`, and `truncated`. Responses are capped at 32 KiB by dropping lowest-ranked status-only server groups before lowest-ranked tools; the counts show when that happened. A server whose name strongly matches the query but which needs authentication or failed to connect is listed without tools. Use the exact query `tool_search({ query: "mcp" })` (case-insensitive) for a compact configured-server listing—name, bounded description, status, bounded optional error, and `available_tool_count` (`null` unless connected)—without any tool schemas. Compact listings drop tail servers when necessary and report `total_servers`, `returned_servers`, and `truncated`.
-2. If the selected server has status `authentication_required`, call `auth({ name: "projects" })` with its exact server name. Give the returned `url` to the user. While the flow is active, status is `pending`; the loopback browser callback expires after 10 minutes.
+2. For interactive OAuth, if the selected server has status `authentication_required`, call `auth({ name: "projects" })` with its exact server name. Give the returned `url` to the user. While the flow is active, status is `pending`; the loopback browser callback expires after 10 minutes.
 3. When the user completes OAuth, Kit stores the credentials, connects the server, and sends a notification to the originating ACP session. The agent resumes automatically and can search or call the newly available tools; no manual post-authentication search is required.
 4. If a tool has `schema_incomplete: true`, inspect its full input schema with `tool_schema` using the returned `schema_ref` before constructing arguments (see below).
 5. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema. Calls have a 60-second deadline by default. Set the optional `timeout_seconds` field from 1 through 3600 only when the tool is expected to return after that default; for example, `tool({ name: "returned_tool_name", args: { ... }, timeout_seconds: 300 })`.
 
-A connected server reports `authenticated`, including servers that do not need OAuth. If an already-connected OAuth server rejects a tool call with a Bearer challenge, Kit first refreshes the existing credentials and replays that tool call once. A missing or failed refresh, a request for additional scopes, or a rejected replay falls back to the explicit `auth` workflow. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
+A connected server reports `authenticated`, including servers that do not need OAuth. If an already-connected OAuth server rejects a tool call with a Bearer challenge, Kit first refreshes the existing credentials and replays that tool call once. For interactive OAuth, a missing or failed refresh, a request for additional scopes, or a rejected replay falls back to the explicit `auth` workflow. For machine authentication, follow [the machine-authentication recovery steps](#recover-from-machine-authentication-errors) instead. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
 
 ## Session-owned subscriptions
 
@@ -207,7 +236,7 @@ Subscribe before reading initial state. For example, if the server exposes `mess
 
 Inspect the returned `requested` and `acknowledged` filters, then call `read_resource` with the same server and URI. The other filters are `toolsListChanged`, `resourcesListChanged`, and `promptsListChanged`. A new `subscribe` replaces this session's filter for that server.
 
-Matching notifications wake an idle ACP session through its existing autonomous-turn route; busy sessions receive them after current work. The agent must read current resource or catalog state after waking. Updates are coalesced invalidations, not a durable event log; use a service's cursor-based read API when every event matters. Resource contents remain untrusted external data.
+Matching notifications wake an idle ACP session; busy sessions receive them after current work. The agent must read current resource or catalog state after waking. Updates are coalesced invalidations, not a durable event log; use a service's cursor-based read API when every event matters. Resource contents remain untrusted external data.
 
 `unsubscribe` removes this session's interest and invalidates queued subscription notifications. Shared resource URIs remain subscribed while another session needs them. Closing the session retires its interests; subscriptions do not persist across Kit restarts or completed one-shot prompts. Each session can watch at most 32 resource URIs per server, with a maximum URI length of 4096 bytes.
 
@@ -243,7 +272,7 @@ Nested built-in `acp.kit` children receive the configured and explicit MCP paths
 
 ## OAuth credential stores
 
-OpenAI and MCP use one shared backend. Choose it with `--credential-store` or `credential_store` in `~/.kit/config.toml`. The allowed values are `memory`, `keychain`, and `file`.
+OpenAI and interactive MCP OAuth use one shared backend. [Machine OAuth credential files](#machine-oauth-credentials) do not use this setting. Choose it with `--credential-store` or `credential_store` in `~/.kit/config.toml`. The allowed values are `memory`, `keychain`, and `file`.
 
 ### Memory store (default)
 
@@ -278,7 +307,7 @@ credential_store = "file"
 credential_dir = "/path/to/private/credentials"
 ```
 
-Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials during the background server initialization at startup—or when a later reload adds the server and the next `tool_search` or `auth` call initializes it; either path may refresh access tokens. This also works for the inferred default OAuth identity of a remote server with no `auth` block. Reuse the same backend, directory, and MCP server identity across commands. Kit serializes MCP token refreshes across processes that share a credential backend, reloads credentials after taking the lock, and reuses a token that another waiter already refreshed so rotating refresh tokens are not consumed twice.
+Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials during the background server initialization at startup—or when a later reload adds the server and the next `tool_search` or `auth` call initializes it; either path may refresh access tokens. This also works for the inferred default OAuth identity of a remote server with no `auth` block. Reuse the same backend, directory, and MCP server identity across commands. Processes sharing a credential backend coordinate token refreshes, so you can reuse the same store across Kit commands.
 
 ## Security guidance
 
@@ -292,7 +321,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 
 ### Configuration file errors
 
-- **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional, and its absence is tracked for live creation.
+- **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional; creating it takes effect on the next `tool_search` or `auth` call.
 - **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
 - **`MCP server ... is declared by both plugins ...`**: rename one plugin server or disable one of the colliding plugins. Explicit-file entries may override plugin servers, but plugin/plugin collisions are errors.
