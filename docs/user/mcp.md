@@ -252,7 +252,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 Use session-scoped MCP servers when an ACP client needs tools or credentials for
 one session without changing the host's MCP files. ACP v2 advertises
 `capabilities.session.mcp.stdio` and `.http`. Supply `mcpServers` with
-`session/new` or `session/resume`; for example, a Streamable HTTP entry is:
+`session/new` or cold `session/resume` restoration; for example, a Streamable HTTP entry is:
 
 ```json
 {
@@ -267,6 +267,10 @@ Replace the example URL and token with your server's values. These settings and
 credentials remain in memory, not in MCP files or transcripts. Supply them again
 when restoring a stopped session. Legacy SSE MCP transport is not supported.
 For gateway host execution and reattachment rules, see [the gateway guide](gateway.md#start-the-host).
+
+When reconnecting to a resident gateway session, omit `mcpServers` or send `[]`
+to retain its current overlay. A nonempty list is rejected with guidance to use
+`_kit/session/update_mcp`; reconnect does not replace or clear the overlay.
 
 ### Replace a live session's MCP servers
 

@@ -1605,16 +1605,10 @@ async fn cancelled_detach_reply_keeps_committed_generation_fence() {
 }
 
 #[test]
-fn resident_startup_applies_explicit_mcp_overlay_before_success() {
+fn resident_startup_omitted_or_empty_mcp_retains_overlay() {
     for via_attach in [false, true] {
         for method in ["session/new", "session/resume"] {
-            for servers in [
-                None,
-                Some(json!([])),
-                Some(
-                    json!([{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]),
-                ),
-            ] {
+            for servers in [None, Some(json!([]))] {
                 let mut actor = isolated_actor();
                 actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
                 actor.output(state_update("running"));
@@ -1651,20 +1645,8 @@ fn resident_startup_applies_explicit_mcp_overlay_before_success() {
                         )
                         .unwrap();
                 }
-                if let Some(servers) = servers {
-                    let attachment = actor.attachment.as_ref().unwrap();
-                    assert!(!attachment.live);
-                    assert!(attachment.events.is_empty());
-                    let update = receiver.try_recv().unwrap().message;
-                    assert_eq!(update["method"], "_kit/session/update_mcp");
-                    assert_eq!(
-                        update["params"],
-                        json!({"sessionId":"resident","mcpServers":servers})
-                    );
-                    // Detached work can continue while the extension waits on its gate.
-                    actor.output(state_update("idle"));
-                    actor.output(json!({"jsonrpc":"2.0","id":update["id"],"result":{}}));
-                }
+                // No child request means the resident overlay is left untouched.
+                assert!(actor.pending.is_empty());
                 assert!(receiver.try_recv().is_err());
                 let attachment = actor.attachment.as_ref().unwrap();
                 assert!(attachment.live);
@@ -1680,94 +1662,85 @@ fn resident_startup_applies_explicit_mcp_overlay_before_success() {
 }
 
 #[test]
-fn resident_mcp_update_failure_is_not_startup_success() {
-    let mut actor = isolated_actor();
-    actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
-    let (writes, mut receiver) = mpsc::channel(4);
-    let mut claim = resident_claim(&actor, false, 72);
-    if let Request::Attach {
-        startup: Some(startup),
-        ..
-    } = &mut claim
-    {
-        startup["params"]["mcpServers"] = json!([]);
-    }
-    actor.command(claim, &writes).unwrap();
-    let owner = actor.attachment.as_ref().unwrap().id.clone();
-    assert!(
-        actor
-            .command(resident_claim(&actor, false, 73), &writes)
-            .is_err()
-    );
-    assert_eq!(actor.attachment.as_ref().unwrap().id, owner);
-    let update = receiver.try_recv().unwrap().message;
-    actor.output(json!({"jsonrpc":"2.0","id":update["id"],"error":{"code":-32601,"message":"unsupported extension"}}));
-    let attachment = actor.attachment.as_ref().unwrap();
-    assert!(!attachment.live);
-    let response = &attachment.events.back().unwrap().1;
-    assert_eq!(response["id"], 72);
-    assert_eq!(response["error"]["code"], -32601);
-    assert!(response.get("result").is_none());
-}
-
-#[test]
 fn initial_startup_preserves_mcp_servers() {
-    let mut actor = isolated_actor();
-    let (writes, mut receiver) = mpsc::channel(4);
-    let attached = actor
-        .command(
-            Request::Attach {
-                session: actor.id.clone(),
-                replace: false,
-                replay: false,
-                startup: None,
-            },
-            &writes,
-        )
-        .unwrap();
-    let servers =
-        json!([{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]);
-    actor.command(Request::Send {
+    for restore in [false, true] {
+        let mut actor = isolated_actor();
+        actor.restore = restore;
+        let (writes, mut receiver) = mpsc::channel(4);
+        let attached = actor
+            .command(
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: false,
+                    replay: false,
+                    startup: None,
+                },
+                &writes,
+            )
+            .unwrap();
+        let servers =
+            json!([{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]);
+        actor.command(Request::Send {
         session: actor.id.clone(),
         attachment: attached["attachment"].as_str().unwrap().into(),
         message: json!({"jsonrpc":"2.0","id":74,"method":"session/new","params":{"mcpServers":servers}}),
         charge: None,
     }, &writes).unwrap();
-    let startup = receiver.try_recv().unwrap().message;
-    assert_eq!(startup["method"], "session/new");
-    assert_eq!(startup["params"]["mcpServers"], servers);
+        let startup = receiver.try_recv().unwrap().message;
+        assert_eq!(
+            startup["method"],
+            if restore {
+                "session/resume"
+            } else {
+                "session/new"
+            }
+        );
+        assert_eq!(startup["params"]["mcpServers"], servers);
+    }
 }
 
 #[test]
-fn resident_mcp_update_admission_failure_preserves_controller() {
-    for servers in [Value::Null, json!({}), json!([])] {
-        let mut actor = isolated_actor();
-        actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
-        let (writes, mut receiver) = mpsc::channel(1);
-        actor
-            .command(resident_claim(&actor, false, 75), &writes)
-            .unwrap();
-        let owner = actor.attachment.as_ref().unwrap().id.clone();
-        // A full child queue must not replace the previous controller either.
-        writes
-            .try_send(ChildWrite {
-                message: json!({}),
-                _charge: None,
-            })
-            .unwrap();
-        let mut claim = resident_claim(&actor, false, 76);
-        if let Request::Attach {
-            startup: Some(startup),
-            ..
-        } = &mut claim
-        {
-            startup["params"]["mcpServers"] = servers;
+fn resident_nonempty_mcp_rejected_without_replacing_controller() {
+    for via_attach in [false, true] {
+        for method in ["session/new", "session/resume"] {
+            let mut actor = isolated_actor();
+            actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+            let (writes, mut receiver) = mpsc::channel(4);
+            actor
+                .command(resident_claim(&actor, false, 75), &writes)
+                .unwrap();
+            let owner = actor.attachment.as_ref().unwrap().id.clone();
+            let events = actor.attachment.as_ref().unwrap().events.clone();
+            let startup = json!({"jsonrpc":"2.0","id":76,"method":method,"params":{
+                "sessionId":"resident",
+                "mcpServers":[{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]
+            }});
+            let request = if via_attach {
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: true,
+                    replay: false,
+                    startup: Some(startup),
+                }
+            } else {
+                Request::Send {
+                    session: actor.id.clone(),
+                    attachment: owner.clone(),
+                    message: startup,
+                    charge: None,
+                }
+            };
+            let error = actor.command(request, &writes).unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert!(error.1.contains("_kit/session/update_mcp"));
+            let attachment = actor.attachment.as_ref().unwrap();
+            assert_eq!(attachment.id, owner);
+            assert!(attachment.live);
+            assert_eq!(attachment.events, events);
+            assert_eq!(actor.committed_owner.as_ref().unwrap().id, owner);
+            assert!(actor.pending.is_empty());
+            assert!(receiver.try_recv().is_err());
         }
-        assert!(actor.command(claim, &writes).is_err());
-        assert_eq!(actor.attachment.as_ref().unwrap().id, owner);
-        assert!(actor.pending.is_empty());
-        assert_eq!(receiver.try_recv().unwrap().message, json!({}));
-        assert!(receiver.try_recv().is_err());
     }
 }
 
@@ -1797,6 +1770,7 @@ fn direct_mcp_update_keeps_owner_and_returns_extension_response() {
             result.unwrap();
             let update = receiver.try_recv().unwrap().message;
             assert_eq!(update["method"], "_kit/session/update_mcp");
+            assert_eq!(update["params"]["mcpServers"], json!([]));
             let response = if id == 83 {
                 json!({"jsonrpc":"2.0","id":update["id"],"error":{"code":-32602,"message":"invalid MCP configuration"}})
             } else {

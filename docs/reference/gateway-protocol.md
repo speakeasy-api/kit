@@ -93,7 +93,7 @@ The error above illustrates a session-routed revoke of an unknown pending messag
 
 ## Configure session MCP servers
 
-For native stdio and Streamable HTTP entries, replacement semantics, and the advertised `_kit/session/update_mcp` extension, see [ACP session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). Only the current controller can update a resident session. Legacy SSE MCP transport is not supported.
+For native stdio and Streamable HTTP entries, replacement semantics, and the advertised `_kit/session/update_mcp` extension, see [ACP session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). Resident `session/resume` retains the overlay when `mcpServers` is omitted or `[]`; a nonempty list is rejected with guidance to use `_kit/session/update_mcp`. The explicit update replaces the full overlay, and `[]` clears it. Initial creation and cold restoration accept HTTP entries. Only the current controller can update a resident session. Legacy SSE MCP transport is not supported.
 
 ## Transport limits
 
