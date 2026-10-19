@@ -1,11 +1,11 @@
-struct Model(bool);
-struct Session(bool);
-struct Turn(VecDeque<ModelTurnEvent>);
+struct Model(bool, bool);
+struct Session(bool, bool);
+struct Turn(VecDeque<ModelTurnEvent>, bool);
 #[async_trait]
 impl ModelAdapter for Model {
     type Session = Session;
     async fn start_session(&self, _: SessionConfig) -> Result<Session, LoopError> {
-        Ok(Session(self.0))
+        Ok(Session(self.0, self.1))
     }
 }
 #[async_trait]
@@ -59,7 +59,10 @@ impl ModelSession for Session {
             model: None,
             response_id: None,
         }));
-        Ok(Turn(events))
+        if self.1 {
+            events.pop_back();
+        }
+        Ok(Turn(events, self.1))
     }
 }
 #[async_trait]
@@ -68,13 +71,16 @@ impl ModelTurn for Turn {
         &mut self,
         _: Option<TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
-        Ok(self.0.pop_front())
+        match self.0.pop_front() {
+            None if self.1 => Err(LoopError::Cancelled),
+            event => Ok(event),
+        }
     }
 }
 
 #[tokio::test]
 async fn cold_restore_preserves_live_user_agent_and_separate_thought_ids() {
-    for replacement in [false, true] {
+    for (replacement, cancelled) in [(false, false), (true, false), (false, true), (true, true)] {
         let root = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let session_id = wire::SessionId::new("persisted-identity");
@@ -108,10 +114,11 @@ async fn cold_restore_preserves_live_user_agent_and_separate_thought_ids() {
             );
             let mut driver = Agent::builder()
                 .model(identity::Adapter {
-                    inner: Model(replacement),
+                    inner: Model(replacement, cancelled),
                     enabled: true,
                 })
                 .observer(observer)
+                .cancellation(_handle.cancellation_handle())
                 .transcript_observer(opened.observer)
                 .build()
                 .unwrap()
@@ -168,7 +175,10 @@ async fn cold_restore_preserves_live_user_agent_and_separate_thought_ids() {
             })
             .collect::<Vec<_>>();
         assert_eq!(live_ids.len(), 4);
-        assert_eq!(replay_ids, live_ids, "replacement={replacement}");
+        assert_eq!(
+            replay_ids, live_ids,
+            "replacement={replacement}, cancelled={cancelled}"
+        );
     }
 }
 
