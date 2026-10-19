@@ -1707,7 +1707,19 @@ fn resident_nonempty_mcp_rejected_without_replacing_controller() {
             actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
             let (writes, mut receiver) = mpsc::channel(4);
             actor
-                .command(resident_claim(&actor, false, 75), &writes)
+                .command(
+                    if via_attach {
+                        resident_claim(&actor, false, 75)
+                    } else {
+                        Request::Attach {
+                            session: actor.id.clone(),
+                            replace: true,
+                            replay: false,
+                            startup: None,
+                        }
+                    },
+                    &writes,
+                )
                 .unwrap();
             let owner = actor.attachment.as_ref().unwrap().id.clone();
             let events = actor.attachment.as_ref().unwrap().events.clone();
@@ -1735,7 +1747,7 @@ fn resident_nonempty_mcp_rejected_without_replacing_controller() {
             assert!(error.1.contains("_kit/session/update_mcp"));
             let attachment = actor.attachment.as_ref().unwrap();
             assert_eq!(attachment.id, owner);
-            assert!(attachment.live);
+            assert_eq!(attachment.live, via_attach);
             assert_eq!(attachment.events, events);
             assert_eq!(actor.committed_owner.as_ref().unwrap().id, owner);
             assert!(actor.pending.is_empty());
