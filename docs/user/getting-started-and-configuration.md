@@ -379,15 +379,17 @@ The main built-in defaults are:
 
 For example, with `model = "gpt-5.4"` in TOML, `kit prompt --model anthropic/claude-sonnet-4 ...` uses the CLI model. Omitting both CLI and TOML model selections uses `gpt-5.4`. The same CLI-over-TOML rule applies to `reasoning_effort` on `serve`, `acp`, `prompt`, and `tui`. Use `--reasoning-effort default` to override a configured value and leave effort unset. This preserves provider defaults, including `OPENROUTER_REASONING_EFFORT`. Environment variables used by a provider supply credentials or provider adapter settings; they do not change CLI-over-TOML precedence.
 
-## Global and project instructions from `AGENTS.md`
+## Project instructions from `AGENTS.md`
 
-Kit first loads `$HOME/.kit/AGENTS.md`, if present, as global assistant instructions. It then discovers `AGENTS.md` files at the project working directory and its ancestor directories and loads their content into the initial transcript as agent context. Put repository-wide guidance in a higher-level `AGENTS.md` and project-specific guidance nearer the selected root. The global file precedes the outermost-to-innermost project chain; each context item retains its source path. The native system prompt is unchanged. Choose `--root` deliberately because it controls both the working directory and which `AGENTS.md` instruction chain is loaded.
+To give Kit instructions for every project, create or edit `$HOME/.kit/AGENTS.md`. For repository-wide guidance, use an `AGENTS.md` in the repository; put subproject-specific guidance nearer the working directory you select with `--root`.
 
-Global and primary project instructions are snapshots taken when a new session starts. Editing the files does not change an active, resumed, or forked session's saved instructions; start a new session to apply changes. ACP additional-directory instructions still refresh on attachment, without reloading or duplicating global instructions. Missing files are skipped; other read errors fail loading. Like Kit configuration, the global path uses `HOME`; there is no separate Kit-home override.
+Kit reads the global file first, then project `AGENTS.md` files from the outermost ancestor down to the selected working directory. It does not discover descendant instruction files: select that subproject with `--root` when its guidance should apply. These instructions supplement Kit's built-in instructions rather than replace them.
 
-For managed deployments (including GKE), provision the global file in the runtime user's home before session startup. No REST bootstrap call is needed.
+Start a new session after editing global or primary project instructions. Active, resumed, and forked sessions keep their saved instructions. Attaching additional project directories through ACP refreshes those directories' instructions, but does not reload global instructions.
 
-If startup reports `could not load AGENTS.md context`, inspect the global file and the `AGENTS.md` files at the root and above it for read or loading problems. Changing `~/.kit/config.toml` does not replace project instructions; configuration selects runtime behavior, while `AGENTS.md` supplies instructions to the agent.
+For managed deployments, provision `$HOME/.kit/AGENTS.md` in the runtime user's home before starting sessions. Use the `HOME` of the Kit process; no REST setup call is needed.
+
+If startup reports `could not load AGENTS.md context`, check the named file's readability and permissions. Missing instruction files are optional; other read errors prevent loading. Changing `~/.kit/config.toml` does not replace instructions: use it for runtime settings and `AGENTS.md` for guidance to the agent.
 
 ## Agent Skills
 
