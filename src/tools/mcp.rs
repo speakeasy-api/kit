@@ -7832,6 +7832,10 @@ for line in sys.stdin:
                 else {
                     unreachable!();
                 };
+                if source != "configured" {
+                    // Plugin manifests require a bare executable or ./ path.
+                    configured.command = "python3".into();
+                }
                 // This server can have only one live owner, like a local MCP
                 // service holding a database lock. Competing startup fails at
                 // the real child-process boundary, not a runtime test hook.
