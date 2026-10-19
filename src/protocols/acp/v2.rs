@@ -1,3 +1,5 @@
+pub(crate) mod identity;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -166,7 +168,8 @@ impl AcpSessionUpdateSink for ConnectionSink {
 // All writers below manipulate only owned IDs and standard collections: no
 // user callbacks, backend calls, awaits, or fallible external commits under this
 // guard. Each ID is optional and each collection remains valid independently;
-// pending_thought is only a hint for the next notification. Clear/reset retire a
+// pending IDs are only hints for the next synchronous notification. The part
+// maps own presentation IDs, independent of durable file state. Clear/reset retire a
 // generation before sending best-effort clears outside the lock. Sink failure
 // does not resurrect it. Thus poison recovery preserves these local invariants,
 // not a promise of atomic delivery to the remote client.
@@ -176,6 +179,8 @@ struct CurrentReplacementMessages {
     thoughts: Vec<wire::MessageId>,
     thought_parts: HashMap<PartId, wire::MessageId>,
     pending_thought: Option<wire::MessageId>,
+    stable_parts: HashMap<PartId, wire::MessageId>,
+    pending_agent: Option<wire::MessageId>,
     replacement: Option<ReplacementGeneration>,
 }
 
@@ -235,6 +240,22 @@ impl<S> ResponseReplacementSink<S> {
             .current
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if let Delta::SetMetadata { part_id, metadata } = delta
+            && let Some(id) = metadata.get(identity::KEY).and_then(Value::as_str)
+        {
+            current
+                .stable_parts
+                .insert(part_id.clone(), wire::MessageId::new(id));
+        }
+        if let Delta::AppendText { part_id, .. } = delta
+            && let Some(id) = current.stable_parts.get(part_id).cloned()
+        {
+            if current.thought_parts.contains_key(part_id) {
+                current.thought_parts.insert(part_id.clone(), id);
+            } else {
+                current.pending_agent = Some(id);
+            }
+        }
         current.pending_thought = match delta {
             Delta::BeginPart {
                 part_id,
@@ -255,10 +276,12 @@ impl<S> ResponseReplacementSink<S> {
     }
 
     fn clear_pending_thought(&self) {
-        self.current
+        let mut current = self
+            .current
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pending_thought = None;
+            .unwrap_or_else(|error| error.into_inner());
+        current.pending_thought = None;
+        current.pending_agent = None;
     }
 
     fn rewrite_and_track(&self, notification: &mut wire::UpdateSessionNotification) {
@@ -268,7 +291,9 @@ impl<S> ResponseReplacementSink<S> {
             .unwrap_or_else(|error| error.into_inner());
         match &mut notification.update {
             wire::SessionUpdate::AgentMessageChunk(chunk) => {
-                if let Some(replacement) = current.replacement.as_mut() {
+                if let Some(id) = current.pending_agent.take() {
+                    chunk.message_id = id;
+                } else if let Some(replacement) = current.replacement.as_mut() {
                     chunk.message_id = replacement.message_id(ReplacementMessageKind::Agent);
                 }
                 current.agent = Some(chunk.message_id.clone());
@@ -305,6 +330,8 @@ impl<S: AcpSessionUpdateSink> ResponseReplacementSink<S> {
             let agent = current.agent.take();
             let thoughts = std::mem::take(&mut current.thoughts);
             current.thought_parts.clear();
+            current.stable_parts.clear();
+            current.pending_agent = None;
             current.pending_thought = None;
             current.replacement = Some(ReplacementGeneration::new());
             (agent, thoughts)
@@ -1658,7 +1685,8 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         }
     };
     background_jobs.begin_turn();
-    let prepared = integration.prompt_to_items(&request).and_then(|items| {
+    let prepared = integration.prompt_to_items(&request).and_then(|mut items| {
+        let message_id = identity::stamp_user(&mut items);
         skill_catalog
             .submit(&current.skills, items, |items| {
                 voice_monitor.submit(items, |items| driver.submit_input(items))
@@ -1669,7 +1697,8 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
                 }
                 skill_catalog::SubmitError::Submit(error) => map_loop_error(session_id, &error),
             })?;
-        integration.begin_prompt(session_id)
+        integration.begin_prompt(session_id)?;
+        Ok(message_id)
     });
     drop(current);
     let user_message_id = match prepared {
@@ -2226,35 +2255,59 @@ fn transcript_replay(
                     .collect::<Vec<_>>();
                 if !content.is_empty() {
                     replay.push(wire::SessionUpdate::UserMessage(
-                        wire::UserMessage::new(message_id("user")).content(content),
+                        wire::UserMessage::new(
+                            item.metadata
+                                .get(identity::KEY)
+                                .and_then(Value::as_str)
+                                .map(wire::MessageId::new)
+                                .unwrap_or_else(|| message_id("user")),
+                        )
+                        .content(content),
                     ));
                 }
             }
             ItemKind::Assistant => {
-                let content = item
-                    .parts
-                    .iter()
-                    .filter(|part| matches!(part, Part::Text(_)))
-                    .filter_map(replay_content)
-                    .collect::<Vec<_>>();
-                if !content.is_empty() {
-                    replay.push(wire::SessionUpdate::AgentMessage(
-                        wire::AgentMessage::new(message_id("agent")).content(content),
-                    ));
+                let mut messages: Vec<(wire::MessageId, bool, Vec<wire::ContentBlock>)> =
+                    Vec::new();
+                for part in &item.parts {
+                    let (metadata, thought, content) = match part {
+                        Part::Text(text) => (&text.metadata, false, replay_content(part)),
+                        Part::Reasoning(reasoning) => (
+                            &reasoning.metadata,
+                            true,
+                            reasoning.summary.as_ref().map(|summary| {
+                                wire::ContentBlock::Text(wire::TextContent::new(summary))
+                            }),
+                        ),
+                        _ => continue,
+                    };
+                    let Some(content) = content else {
+                        continue;
+                    };
+                    let id = metadata
+                        .get(identity::KEY)
+                        .and_then(Value::as_str)
+                        .map(wire::MessageId::new)
+                        .unwrap_or_else(|| message_id(if thought { "thought" } else { "agent" }));
+                    if let Some(existing) = messages
+                        .iter_mut()
+                        .find(|(existing, kind, _)| *existing == id && *kind == thought)
+                    {
+                        existing.2.push(content);
+                    } else {
+                        messages.push((id, thought, vec![content]));
+                    }
                 }
-                let thought = item
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        Part::Reasoning(reasoning) => reasoning.summary.as_ref(),
-                        _ => None,
-                    })
-                    .map(|summary| wire::ContentBlock::Text(wire::TextContent::new(summary)))
-                    .collect::<Vec<_>>();
-                if !thought.is_empty() {
-                    replay.push(wire::SessionUpdate::AgentThought(
-                        wire::AgentThought::new(message_id("thought")).content(thought),
-                    ));
+                for (id, thought, content) in messages {
+                    replay.push(if thought {
+                        wire::SessionUpdate::AgentThought(
+                            wire::AgentThought::new(id).content(content),
+                        )
+                    } else {
+                        wire::SessionUpdate::AgentMessage(
+                            wire::AgentMessage::new(id).content(content),
+                        )
+                    });
                 }
                 for part in &item.parts {
                     if let Part::ToolCall(call) = part {
@@ -2665,6 +2718,7 @@ pub(crate) fn component(
     clippy::disallowed_macros
 )]
 mod tests {
+    include!("v2/identity_tests.rs");
     #[test]
     fn compose_title_replay_preserves_identity_and_trims_intent() {
         let call = agentkit_core::ToolCallPart::new(

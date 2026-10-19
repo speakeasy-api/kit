@@ -1,0 +1,168 @@
+//! ACP identities travel with persisted parts, not process-local counters.
+use agentkit_core::{Delta, ItemKind, Part, PartId, PartKind, TurnCancellation};
+use agentkit_loop::{
+    LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, RetryObserver, SessionConfig,
+    TurnRequest,
+};
+use async_trait::async_trait;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
+pub(super) const KEY: &str = "dev.kit.acp.message_id";
+pub(super) fn stamp_user(items: &mut [agentkit_core::Item]) -> super::wire::MessageId {
+    let id = super::wire::MessageId::new(format!("kit-user-{}", crate::session::new_id()));
+    for item in items {
+        if item.kind == ItemKind::User {
+            item.metadata.insert(KEY.into(), id.to_string().into());
+        }
+    }
+    id
+}
+
+pub(crate) struct Adapter<A> {
+    pub(crate) inner: A,
+    pub(crate) enabled: bool,
+}
+pub(crate) struct Session<S> {
+    inner: S,
+    enabled: bool,
+}
+pub(crate) struct Turn<T> {
+    inner: T,
+    identity: Option<Identity>,
+    pending: VecDeque<ModelTurnEvent>,
+}
+struct Identity {
+    agent: String,
+    thoughts: Vec<String>,
+    parts: HashMap<PartId, String>,
+    committed_thoughts: usize,
+}
+impl Identity {
+    fn new() -> Self {
+        Self {
+            agent: format!("kit-agent-{}", crate::session::new_id()),
+            thoughts: Vec::new(),
+            parts: HashMap::new(),
+            committed_thoughts: 0,
+        }
+    }
+    fn thought(&mut self, index: usize) -> String {
+        while self.thoughts.len() <= index {
+            self.thoughts
+                .push(format!("kit-thought-{}", crate::session::new_id()));
+        }
+        self.thoughts[index].clone()
+    }
+    fn stamp(&mut self, part: &mut Part, thought: &mut usize) {
+        match part {
+            Part::Text(text) => {
+                text.metadata.insert(KEY.into(), self.agent.clone().into());
+            }
+            Part::Reasoning(reasoning) => {
+                reasoning
+                    .metadata
+                    .insert(KEY.into(), self.thought(*thought).into());
+                *thought += 1;
+            }
+            _ => {}
+        }
+    }
+}
+#[async_trait]
+impl<A: ModelAdapter> ModelAdapter for Adapter<A> {
+    type Session = Session<A::Session>;
+    async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
+        Ok(Session {
+            inner: self.inner.start_session(config).await?,
+            enabled: self.enabled,
+        })
+    }
+    fn provider_name(&self) -> Option<&str> {
+        self.inner.provider_name()
+    }
+}
+#[async_trait]
+impl<S: ModelSession> ModelSession for Session<S> {
+    type Turn = Turn<S::Turn>;
+    fn set_retry_observer(&mut self, observer: Option<Arc<dyn RetryObserver>>) {
+        self.inner.set_retry_observer(observer);
+    }
+    async fn begin_turn(
+        &mut self,
+        request: TurnRequest,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError> {
+        Ok(Turn {
+            inner: self.inner.begin_turn(request, cancellation).await?,
+            identity: self.enabled.then(Identity::new),
+            pending: VecDeque::new(),
+        })
+    }
+    fn model_name(&self) -> Option<&str> {
+        self.inner.model_name()
+    }
+    fn provider_name(&self) -> Option<&str> {
+        self.inner.provider_name()
+    }
+}
+#[async_trait]
+impl<T: ModelTurn> ModelTurn for Turn<T> {
+    fn on_cancelled(&mut self) {
+        self.pending.clear();
+        self.inner.on_cancelled();
+    }
+    async fn next_event(
+        &mut self,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
+        let mut event = self.inner.next_event(cancellation).await?;
+        let Some(identity) = &mut self.identity else {
+            return Ok(event);
+        };
+        match &mut event {
+            Some(ModelTurnEvent::ResponseAttemptSuperseded) => *identity = Identity::new(),
+            Some(ModelTurnEvent::Delta(Delta::BeginPart { part_id, kind })) => {
+                let id = match kind {
+                    PartKind::Text => Some(identity.agent.clone()),
+                    PartKind::Reasoning => Some(identity.thought(identity.thoughts.len())),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    identity.parts.insert(part_id.clone(), id.clone());
+                    self.pending
+                        .push_back(ModelTurnEvent::Delta(Delta::SetMetadata {
+                            part_id: part_id.clone(),
+                            metadata: [(KEY.into(), id.into())].into(),
+                        }));
+                }
+            }
+            Some(ModelTurnEvent::Delta(Delta::SetMetadata { part_id, metadata })) => {
+                if let Some(id) = identity.parts.get(part_id) {
+                    metadata.insert(KEY.into(), id.clone().into());
+                }
+            }
+            Some(ModelTurnEvent::Delta(Delta::CommitPart { part })) => {
+                let mut thought = identity.committed_thoughts;
+                identity.stamp(part, &mut thought);
+                identity.committed_thoughts = thought;
+            }
+            Some(ModelTurnEvent::Finished(result)) => {
+                let mut thought = 0;
+                for item in &mut result.output_items {
+                    if item.kind == ItemKind::Assistant {
+                        for part in &mut item.parts {
+                            identity.stamp(part, &mut thought);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(event)
+    }
+}
