@@ -5706,6 +5706,8 @@ mod tests {
                         tasks,
                     },
                 );
+                let admission_before_close =
+                    reset_after_exit.then(|| registry.begin_attachment().unwrap());
                 let closing_server = Arc::clone(&server);
                 let mut request = tokio::spawn(async move {
                     closing_server
@@ -5739,6 +5741,15 @@ mod tests {
                 } else {
                     None
                 };
+                if let Some(admission) = admission_before_close {
+                    // No reset has run yet: even failed explicit cleanup must
+                    // allow unrelated admission and preserve outstanding claims.
+                    let next_admission = registry.begin_attachment().unwrap();
+                    assert_eq!(next_admission.generation, admission.generation);
+                    assert!(!registry.inner.lock_state().permanently_closed);
+                    drop(next_admission);
+                    drop(admission);
+                }
                 let (reopened, result) = timeout(Duration::from_secs(2), reset).await.unwrap();
                 assert_eq!(reopened, outcome == "ok");
                 assert_eq!(result, (outcome == "ok").then_some("reset"));

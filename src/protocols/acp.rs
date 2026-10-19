@@ -620,9 +620,7 @@ fn shared_session_close(
         let result = result.and(completion);
         if let Some(registry) = registry.upgrade() {
             let mut state = registry.lock_state();
-            if result.is_err() {
-                state.close_gate(true);
-            }
+            state.cleanup_failed |= result.is_err();
             let close = state.closes.remove(&token);
             drop(state);
             drop(close);
@@ -657,6 +655,8 @@ struct RegisteredV2Session {
 struct RegistryState {
     accepting: bool,
     permanently_closed: bool,
+    // Retired explicit-close failures constrain teardown, not normal admission.
+    cleanup_failed: bool,
     generation: u64,
     pending_attachments: usize,
     sessions: HashMap<u64, RegisteredSession>,
@@ -694,7 +694,8 @@ impl SessionRegistryInner {
             // consumes a validated admission; insertion rejects existing tokens;
             // each insertion publishes its matching shared close without fallible
             // callbacks. Actor removal retains started closes until their shared
-            // result retires ownership (and seals the gate on failure). Other
+            // result records failure monotonically and retires ownership without
+            // changing admission. Only teardown consumes that failure. Other
             // removal extracts both owners; gate closure cannot wrap its generation.
             // Snapshots clone only concrete Arc/channel/handle types. Reopening
             // happens only after teardown and the external reset have succeeded;
@@ -751,6 +752,7 @@ impl SessionRegistry {
                 state: Mutex::new(RegistryState {
                     accepting: true,
                     permanently_closed: false,
+                    cleanup_failed: false,
                     generation: 0,
                     pending_attachments: 0,
                     sessions: HashMap::new(),
@@ -884,7 +886,7 @@ impl SessionRegistry {
         let v2_session = state.v2_sessions.remove(&token);
         // An actor can exit before the close waiter observes its result. Keep
         // started closes visible to reset until the shared operation records
-        // success or permanently seals the gate on failure.
+        // success or remembers failure for the next teardown.
         let retain = retain_started_close
             && state
                 .closes
@@ -1059,10 +1061,12 @@ impl SessionRegistry {
         // Actor completion proves residency ended, not that domain cleanup
         // succeeded. Never overwrite failed or unacknowledged cleanup with it.
         // A failed explicit close may have retired its result before this
-        // snapshot. Its permanent seal must still prevent credential reset.
-        let teardown_complete = teardown_complete
-            && !cleanup_failed
-            && (!reopen || !self.inner.lock_state().permanently_closed);
+        // snapshot. Remembered failure must still prevent credential reset,
+        // without having closed admission during ordinary explicit cleanup.
+        let teardown_complete = teardown_complete && !cleanup_failed && {
+            let state = self.inner.lock_state();
+            !state.cleanup_failed && (!reopen || !state.permanently_closed)
+        };
         if !teardown_complete {
             self.inner.lock_state().permanently_closed = true;
         }
@@ -4837,6 +4841,8 @@ pub(super) mod tests {
                         tasks,
                     },
                 );
+                let admission_before_close =
+                    reset_after_exit.then(|| registry.begin_attachment().unwrap());
                 let closing_server = Arc::clone(&server);
                 let mut request = tokio::spawn(async move {
                     closing_server.close(CloseSessionRequest::new(id)).await
@@ -4868,6 +4874,15 @@ pub(super) mod tests {
                 } else {
                     None
                 };
+                if let Some(admission) = admission_before_close {
+                    // No reset has run yet: even failed explicit cleanup must
+                    // allow unrelated admission and preserve outstanding claims.
+                    let next_admission = registry.begin_attachment().unwrap();
+                    assert_eq!(next_admission.generation, admission.generation);
+                    assert!(!registry.inner.lock_state().permanently_closed);
+                    drop(next_admission);
+                    drop(admission);
+                }
                 let (reopened, result) = timeout(Duration::from_secs(2), reset).await.unwrap();
                 assert_eq!(reopened, outcome == "ok");
                 assert_eq!(result, (outcome == "ok").then_some("reset"));
