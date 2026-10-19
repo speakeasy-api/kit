@@ -159,11 +159,16 @@ kit prompt --credential-store keychain \
 
 Login verifies your key and accessible projects with `ai.speakeasy.com` and saves
 the selected project with the credential. New and resumed Kit conversations stay
-together in AI Control Plane Agent Sessions. The model selector uses OpenRouter's
-catalog because Speakeasy does not provide a public model catalog; confirm that
-your selected model is allowed by your Speakeasy project if requests fail.
+together in AI Control Plane Agent Sessions. Select a model from the authenticated
+Speakeasy catalog. If the list is empty or requests are rejected, check your
+credential and project model eligibility with the control-plane operator; Kit
+does not substitute a public OpenRouter catalog when Speakeasy discovery fails.
 Logout removes only the local credential. Revoke the API key remotely in the
 Speakeasy dashboard.
+
+For an assistant launched with a provisioned runtime credential instead of an
+interactive login, follow [Run a Speakeasy assistant with a provisioned
+credential](speakeasy-assistant-runtime.md).
 
 ## Run common command workflows
 
