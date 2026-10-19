@@ -74,9 +74,15 @@ impl Fixture {
     }
 
     async fn gateway(&self) -> (Child, String) {
+        self.gateway_with_bind("127.0.0.1:0", &[]).await
+    }
+
+    async fn gateway_with_bind(&self, listen: &str, flags: &[&str]) -> (Child, String) {
         let mut child = self
             .command()
-            .args(["gateway", "--listen", "127.0.0.1:0", "--credential-file"])
+            .args(["gateway", "--listen", listen])
+            .args(flags)
+            .arg("--credential-file")
             .arg(&self.credential)
             .arg("--project")
             .arg(&self.root)
@@ -828,6 +834,93 @@ async fn exited_sessions_release_capacity_and_preserve_history_without_restart()
     catalog.detach().await;
     stop_gateway(&mut gateway).await;
     provider.abort();
+}
+
+#[tokio::test]
+async fn wildcard_bind_is_opt_in_and_not_public_address_permission() {
+    let fixture = Fixture::new();
+    for (address, flags) in [
+        ("0.0.0.0:0", vec![]),
+        ("[::]:0", vec![]),
+        ("0.0.0.0:0", vec!["--allow-private-network"]),
+        ("[::]:0", vec!["--allow-private-network"]),
+        ("8.8.8.8:0", vec!["--allow-wildcard-bind"]),
+        ("[2606:4700:4700::1111]:0", vec!["--allow-wildcard-bind"]),
+        ("10.1.2.3:0", vec!["--allow-wildcard-bind"]),
+    ] {
+        let output = timeout(
+            WAIT,
+            fixture
+                .command()
+                .args(["gateway", "--listen", address])
+                .args(flags)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("gateway must bind loopback"),
+            "{address}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wildcard_bind_still_requires_valid_credentials() {
+    let fixture = Fixture::new();
+    for address in ["0.0.0.0:0", "[::]:0"] {
+        for (token, mode, expected) in [
+            (None, 0o600, "--credential-file is required"),
+            (Some(""), 0o600, "one non-empty ASCII bearer token"),
+            (
+                Some("two tokens"),
+                0o600,
+                "one non-empty ASCII bearer token",
+            ),
+            (Some(TOKEN), 0o644, "chmod 600"),
+        ] {
+            let mut command = fixture.command();
+            command.args(["gateway", "--listen", address, "--allow-wildcard-bind"]);
+            if let Some(token) = token {
+                fs::write(&fixture.credential, token).unwrap();
+                fs::set_permissions(&fixture.credential, fs::Permissions::from_mode(mode)).unwrap();
+                command.arg("--credential-file").arg(&fixture.credential);
+            }
+            let output = timeout(WAIT, command.output()).await.unwrap().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{stderr}");
+            assert!(stderr.contains(expected), "{address}: {stderr}");
+            assert!(!stderr.contains("Kit gateway listening"), "{stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn wildcard_bind_authenticates_http_requests() {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture
+        .gateway_with_bind("0.0.0.0:0", &["--allow-wildcard-bind"])
+        .await;
+    let url = url.replace("0.0.0.0", "127.0.0.1");
+    for path in ["/acp/v2", "/v1"] {
+        for token in [None, Some("wrong-token")] {
+            let request = fixture.client.post(format!("{url}{path}")).json(&json!({}));
+            let request = if let Some(token) = token {
+                request.bearer_auth(token)
+            } else {
+                request
+            };
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+    assert_eq!(fixture.catalog(&url).await["sessions"], json!([]));
+    stop_gateway(&mut gateway).await;
 }
 
 #[tokio::test]

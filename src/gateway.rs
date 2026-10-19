@@ -50,6 +50,7 @@ pub struct Args {
     credential_file: Option<PathBuf>,
     project: Vec<PathBuf>,
     allow_private_network: bool,
+    allow_wildcard_bind: bool,
     command: Option<InternalCommand>,
 }
 #[derive(Debug)]
@@ -105,6 +106,14 @@ impl Args {
                     .action(ArgAction::SetTrue)
                     .help("Allow binding an explicit private-network IP (never a wildcard)"),
             )
+            .arg(
+                Arg::new("allow_wildcard_bind")
+                    .long("allow-wildcard-bind")
+                    .action(ArgAction::SetTrue)
+                    .help(
+                        "Allow binding 0.0.0.0 or :: (all interfaces; requires network isolation)",
+                    ),
+            )
             .subcommand(
                 client("list").about("List resident and restorable sessions in approved projects"),
             )
@@ -155,6 +164,7 @@ impl Args {
                 .map(|roots| roots.cloned().collect())
                 .unwrap_or_default(),
             allow_private_network: required_arg(matches, "allow_private_network")?,
+            allow_wildcard_bind: required_arg(matches, "allow_wildcard_bind")?,
             command,
         })
     }
@@ -360,8 +370,9 @@ fn credential(path: &Path) -> io::Result<String> {
     }
     Ok(token.to_owned())
 }
-fn permitted_address(address: SocketAddr, private: bool) -> bool {
+fn permitted_address(address: SocketAddr, private: bool, wildcard: bool) -> bool {
     address.ip().is_loopback()
+        || wildcard && address.ip().is_unspecified()
         || private
             && match address.ip() {
                 std::net::IpAddr::V4(ip) => ip.is_private(),
@@ -403,8 +414,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
     }
-    if !permitted_address(args.listen, args.allow_private_network) {
-        return Err("gateway must bind loopback or an explicitly enabled private-network IP (not a wildcard)".into());
+    if !permitted_address(
+        args.listen,
+        args.allow_private_network,
+        args.allow_wildcard_bind,
+    ) {
+        return Err("gateway must bind loopback, a private-network IP with --allow-private-network, or 0.0.0.0 / :: with --allow-wildcard-bind".into());
     }
     let path = args
         .credential_file
