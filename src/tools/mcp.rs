@@ -7865,9 +7865,13 @@ for line in sys.stdin:
                     )
                     .unwrap();
                 } else {
+                    // Keep immutable plugin sources separate from runtime cache,
+                    // data, and the MCP process marker/lock files.
+                    let package = cwd.join("plugin");
+                    std::fs::create_dir_all(&package).unwrap();
                     let resolved = plugin(
                         "singleton",
-                        &cwd,
+                        &package,
                         vec![PluginMcpServer {
                             name: "local".into(),
                             transport: PluginMcpTransport::Stdio {
@@ -7879,9 +7883,9 @@ for line in sys.stdin:
                         }],
                     );
                     if source == "dynamic-plugin" {
-                        std::fs::write(cwd.join("plugin.json"),
+                        std::fs::write(package.join("plugin.json"),
                             r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"singleton-manifest"}"#).unwrap();
-                        std::fs::write(&path, serde_json::to_vec(&json!({
+                        std::fs::write(package.join("mcp.json"), serde_json::to_vec(&json!({
                             "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
                             "mcpServers": {"local": server}
                         })).unwrap()).unwrap();
@@ -7890,7 +7894,7 @@ for line in sys.stdin:
                             &config,
                             format!(
                                 "[plugins.singleton]\nsource = 'path'\npath = '{}'\n",
-                                cwd.display()
+                                package.display()
                             ),
                         )
                         .unwrap();
