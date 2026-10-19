@@ -287,6 +287,7 @@ async fn serve(
         }
         "tools/call" => json!({"content":[{"type":"text","text":"ordinary RPC works"}],
             "structuredContent":{"called":request["params"]["name"]},"isError":false}),
+        "prompts/list" => json!({"resultType":"complete","prompts":[]}),
         "ping" => json!({}),
         other => panic!("unexpected MCP request: {other}"),
     };
