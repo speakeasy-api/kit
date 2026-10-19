@@ -1536,11 +1536,10 @@ impl Runtime {
                 })
                 .cancellation(controller.handle())
                 .observer(crate::fatal::RetryLog)
-                .model(HookedAdapter::new(
-                    adapter.clone(),
-                    self.hooks.clone(),
-                    trigger,
-                ))
+                .model(
+                    HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
+                        .with_child(self.base_depth > 0),
+                )
                 .telemetry(self.agentkit_telemetry())
                 .add_tool_source(self.compose_with_jobs(
                     0,
@@ -1716,11 +1715,14 @@ impl Runtime {
                     crate::request_budget::RequestBudget::current().seconds(),
                 ),
             })
-            .model(HookedAdapter::new(
-                self.adapter.clone(),
-                self.hooks.clone(),
-                SessionStartInputTrigger::Startup,
-            ))
+            .model(
+                HookedAdapter::new(
+                    self.adapter.clone(),
+                    self.hooks.clone(),
+                    SessionStartInputTrigger::Startup,
+                )
+                .with_child(depth > 0 || self.base_depth > 0),
+            )
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs(
                 depth,
@@ -1846,6 +1848,10 @@ impl Runtime {
             ),
             None => (None, None, None),
         };
+        // Resident-process child forks share Hooks with their parent. Only the
+        // internal subagent parent context marks them as children; a user fork
+        // remains a top-level session.
+        let hook_child = self.base_depth > 0 || parent_context.is_some();
         let is_fork = forked_transcript.is_some();
         let initial = if let Some(mut transcript) = forked_transcript {
             if request.resume {
@@ -1950,7 +1956,8 @@ impl Runtime {
             })
             .model(crate::protocols::acp::v2::identity::Adapter {
                 enabled: context.response_attempt_replacement,
-                inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger),
+                inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
+                    .with_child(hook_child),
             })
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs_and_mcp(

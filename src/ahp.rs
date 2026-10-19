@@ -96,6 +96,9 @@ impl Hooks {
     /// Snapshot immutable workspace context; session identity always comes from the caller.
     fn session(&self, id: &str) -> Box<Session> {
         let mut session = Session::new(id);
+        if self.injections.is_child(id) {
+            session.agent = Presence::Present(agenthooksprotocol::SessionAgent::new(id));
+        }
         if let Some(root) = &self.root {
             let root = root.to_string_lossy().into_owned();
             session.cwd = Presence::Present(root.clone());
@@ -120,8 +123,9 @@ impl Hooks {
         session: &str,
         trigger: SessionStartInputTrigger,
         model: Option<&str>,
+        child: bool,
     ) -> Result<injection::SessionLease, String> {
-        let lease = self.injections.open(session)?;
+        let lease = self.injections.open(session, child)?;
         let producer = self.injections.producer(session);
         let mut input = SessionStartInput::new(
             Vec::new(),
