@@ -157,7 +157,7 @@ kit prompt --credential-store keychain \
   --root /path/to/project "Reply with a short project summary"
 ```
 
-Login verifies your key and accessible projects with `app.getgram.ai` and saves
+Login verifies your key and accessible projects with `ai.speakeasy.com` and saves
 the selected project with the credential. New and resumed Kit conversations stay
 together in AI Control Plane Agent Sessions. The model selector uses OpenRouter's
 catalog because Speakeasy does not provide a public model catalog; confirm that
