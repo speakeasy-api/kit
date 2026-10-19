@@ -2299,6 +2299,27 @@ fn transcript_replay(
                     }
                 }
                 for (id, thought, content) in messages {
+                    // One streamed message can span multiple assistant items. Replay
+                    // emits a full replacement, so accumulate rather than overwrite it.
+                    let existing = replay.iter_mut().find_map(|update| match update {
+                        wire::SessionUpdate::AgentMessage(message)
+                            if !thought && message.message_id == id =>
+                        {
+                            Some(&mut message.content)
+                        }
+                        wire::SessionUpdate::AgentThought(message)
+                            if thought && message.message_id == id =>
+                        {
+                            Some(&mut message.content)
+                        }
+                        _ => None,
+                    });
+                    if let Some(agent_client_protocol::schema::MaybeUndefined::Value(existing)) =
+                        existing
+                    {
+                        existing.extend(content);
+                        continue;
+                    }
                     replay.push(if thought {
                         wire::SessionUpdate::AgentThought(
                             wire::AgentThought::new(id).content(content),
