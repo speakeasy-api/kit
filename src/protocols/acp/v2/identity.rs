@@ -90,7 +90,8 @@ impl Identity {
                                             ("id".into(), section.id.clone().into()),
                                             ("text".into(), section.text.clone().into()),
                                         ]
-                                        .into(),
+                                        .into_iter()
+                                        .collect(),
                                     )
                                 })
                                 .collect(),
