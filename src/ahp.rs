@@ -48,6 +48,12 @@ pub struct Hooks {
 }
 
 impl Hooks {
+    /// Compaction hooks have observable effects and cannot run speculatively.
+    pub(crate) fn intercepts_compaction(&self) -> bool {
+        self.sdk.subscribes(EventType::ContextCompactBefore)
+            || self.sdk.subscribes(EventType::ContextCompactAfter)
+    }
+
     /// Loads `~/.agents/hooks.json`, then `<root>/.agents/hooks.json`. Project
     /// hooks replace global hooks with the same id. Invalid files are skipped.
     pub(crate) fn load(root: &Path) -> Option<Arc<Self>> {

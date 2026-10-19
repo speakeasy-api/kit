@@ -523,6 +523,7 @@ pub struct Runtime {
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
     hooks: Option<Arc<crate::ahp::Hooks>>,
+    compaction: crate::compaction::policy::CompactionConfig,
 }
 
 impl Runtime {
@@ -639,6 +640,7 @@ impl Runtime {
             skill_package_roots: Vec::new(),
             skill_directories: Vec::new(),
             hooks: None,
+            compaction: Default::default(),
         }))
     }
 
@@ -738,6 +740,67 @@ impl Runtime {
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
         runtime.base_depth = depth;
         Ok(Arc::new(runtime))
+    }
+
+    /// Configures compaction before publishing the runtime to any sessions.
+    pub fn with_compaction(
+        runtime: Arc<Self>,
+        policy: crate::compaction::policy::CompactionConfig,
+    ) -> Result<Arc<Self>, String> {
+        policy.validate()?;
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure compaction after runtime was shared".to_string())?;
+        runtime.compaction = policy;
+        Ok(Arc::new(runtime))
+    }
+
+    fn compactor(
+        &self,
+        adapter: SelectableAdapter,
+        persistence: Option<crate::session::SessionObserver>,
+        owner_session: String,
+    ) -> Result<crate::compaction::AutomaticCompactor, String> {
+        let prepare = self.base_depth == 0
+            && persistence.is_some()
+            && !self
+                .hooks
+                .as_ref()
+                .is_some_and(|hooks| hooks.intercepts_compaction());
+        let compactor_session = if persistence.is_some() {
+            format!("compaction-{}", crate::session::new_id())
+        } else {
+            format!("compaction-{owner_session}")
+        };
+        let compactor = crate::compaction::automatic_with_policy(
+            adapter.clone(),
+            self.agentkit_telemetry(),
+            persistence,
+            compactor_session,
+            owner_session.clone(),
+            self.hooks.clone(),
+            self.compaction,
+        )?;
+        if !prepare {
+            return Ok(compactor);
+        }
+        let live = adapter.clone();
+        let telemetry = self.agentkit_telemetry();
+        let policy = self.compaction;
+        Ok(compactor.with_preparation(
+            move || {
+                let (frozen, revision) = adapter.compaction_snapshot()?;
+                let strategy = crate::compaction::strategy(
+                    frozen,
+                    telemetry,
+                    format!("precompaction-{}", crate::session::new_id()),
+                    owner_session.clone(),
+                    None,
+                    policy,
+                );
+                Ok((strategy, revision))
+            },
+            move || live.selection_revision(),
+        ))
     }
 
     /// Loads agent hook registrations from the global and project `.agents` directories.
@@ -1377,22 +1440,20 @@ impl Runtime {
             .with_session_observer(opened.observer.clone(), !request.resume)?;
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
-            let compactor = crate::compaction::automatic(
-                adapter.clone(),
-                self.agentkit_telemetry(),
-                Some(opened.observer.clone()),
-                format!("compaction-{}", crate::session::new_id()),
-                session_id.clone(),
-                self.hooks.clone(),
-            )
-            .map_err(|error| {
-                record_runtime_failure(
-                    &session_id,
-                    crate::fatal::Surface::Prompt,
-                    "compactor_build",
-                    error,
+            let compactor = self
+                .compactor(
+                    adapter.clone(),
+                    Some(opened.observer.clone()),
+                    session_id.clone(),
                 )
-            })?;
+                .map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "compactor_build",
+                        error,
+                    )
+                })?;
             let subagents = self
                 .subagents
                 .fresh()
@@ -1578,16 +1639,10 @@ impl Runtime {
             .map_err(LoopError::InvalidState)?;
         let skills = self.fresh_skills();
         let recorded = crate::session::TransientTranscript::new(transcript.clone());
-        let compactor = crate::compaction::automatic(
-            self.adapter.clone(),
-            self.agentkit_telemetry(),
-            None,
-            format!("compaction-{session}"),
-            session.clone(),
-            self.hooks.clone(),
-        )
-        .map_err(LoopError::InvalidState)?
-        .mirroring(recorded.clone());
+        let compactor = self
+            .compactor(self.adapter.clone(), None, session.clone())
+            .map_err(LoopError::InvalidState)?
+            .mirroring(recorded.clone());
         let subagents = self
             .subagents
             .fresh()
@@ -1789,15 +1844,13 @@ impl Runtime {
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
         let skill_catalog = current_skills.skills;
-        let compactor = crate::compaction::automatic(
-            adapter.clone(),
-            self.agentkit_telemetry(),
-            Some(opened.observer.clone()),
-            format!("compaction-{}", crate::session::new_id()),
-            session_id.clone(),
-            self.hooks.clone(),
-        )
-        .map_err(AcpRuntimeError::Loop)?;
+        let compactor = self
+            .compactor(
+                adapter.clone(),
+                Some(opened.observer.clone()),
+                session_id.clone(),
+            )
+            .map_err(AcpRuntimeError::Loop)?;
         let prompt_cache_key = crate::tools::subagent::prompt_cache_key(&session_id);
         let subagents = self
             .subagents

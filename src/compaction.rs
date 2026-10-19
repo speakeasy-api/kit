@@ -20,7 +20,10 @@ use crate::{
     session::SessionObserver,
 };
 
-const COMPACTION_PERCENT: u64 = 80;
+mod background;
+pub mod policy;
+
+use policy::CompactionConfig;
 // Defaults adapted from OpenCode's checkpoint compactor. Keeping recent tool
 // rounds avoids making every continuation depend on summary fidelity.
 const RECENT_TOKENS: usize = 8_000;
@@ -379,6 +382,59 @@ pub fn automatic<M>(
 where
     M: ModelAdapter + Clone + 'static,
 {
+    automatic_with_policy(
+        adapter,
+        telemetry,
+        persistence,
+        session_id,
+        owner_session_id,
+        hooks,
+        CompactionConfig::default(),
+    )
+}
+
+/// Builds the standard compactor with configured trigger thresholds.
+pub fn automatic_with_policy<M>(
+    adapter: M,
+    telemetry: TelemetryConfig,
+    persistence: Option<SessionObserver>,
+    session_id: impl Into<SessionId>,
+    owner_session_id: impl Into<SessionId>,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
+    policy: CompactionConfig,
+) -> Result<AutomaticCompactor, String>
+where
+    M: ModelAdapter + Clone + 'static,
+{
+    policy.validate()?;
+    Ok(AutomaticCompactor {
+        inner: strategy(
+            adapter,
+            telemetry,
+            session_id,
+            owner_session_id,
+            hooks,
+            policy,
+        ),
+        persistence,
+        mirror: None,
+        policy,
+        preparation: None,
+    })
+}
+
+/// Builds the same pipeline for a frozen, observer-free preparation adapter.
+pub(crate) fn strategy<M>(
+    adapter: M,
+    telemetry: TelemetryConfig,
+    session_id: impl Into<SessionId>,
+    owner_session_id: impl Into<SessionId>,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
+    policy: CompactionConfig,
+) -> StrategyCompactor
+where
+    M: ModelAdapter + Clone + 'static,
+{
     let backend = KitCompactionBackend {
         adapter,
         telemetry,
@@ -386,24 +442,19 @@ where
         owner_session_id: owner_session_id.into(),
         hooks,
     };
-    let inner = StrategyCompactor::new(
-        |transcript: &[Item], _point: MutationPoint| {
+    StrategyCompactor::new(
+        move |transcript: &[Item], _point: MutationPoint| {
             transcript
                 .last()
                 .and_then(manual_message)
                 .map(|_| CompactionReason::Manual)
-                .or_else(|| compaction_reason(transcript))
+                .or_else(|| configured_reason(transcript, &policy))
         },
         CompactionPipeline::new()
             .with_strategy(DropReasoningStrategy::new())
             .with_strategy(SummarizeForContinuation::default()),
     )
-    .with_backend(backend);
-    Ok(AutomaticCompactor {
-        inner,
-        persistence,
-        mirror: None,
-    })
+    .with_backend(backend)
 }
 
 struct KitCompactionBackend<M> {
@@ -736,9 +787,22 @@ pub struct AutomaticCompactor {
     inner: StrategyCompactor,
     persistence: Option<SessionObserver>,
     mirror: Option<crate::session::TransientTranscript>,
+    policy: CompactionConfig,
+    preparation: Option<background::Preparation>,
 }
 
 impl AutomaticCompactor {
+    /// Enables single-flight preparation using a fresh immutable model snapshot.
+    /// The factory must not attach persistence, session observers, or hooks.
+    pub(crate) fn with_preparation(
+        mut self,
+        factory: impl Fn() -> Result<(StrategyCompactor, u64), String> + Send + Sync + 'static,
+        revision: impl Fn() -> Result<u64, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.preparation = Some(background::Preparation::new(factory, revision));
+        self
+    }
+
     /// Applies each replacement to an in-memory transcript as well.
     pub(crate) fn mirroring(mut self, transcript: crate::session::TransientTranscript) -> Self {
         self.mirror = Some(transcript);
@@ -753,7 +817,18 @@ impl LoopMutator for AutomaticCompactor {
         cursor: &mut TranscriptCursor<'_>,
         ctx: LoopCtx<'_>,
     ) -> Result<(), LoopError> {
+        // Cancellation can race the loop's pre-mutator check. Avoid starting
+        // preparation or emitting a compaction lifecycle after that race.
+        if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+            if let Some(preparation) = &self.preparation {
+                preparation.cancel(false);
+            }
+            return Err(LoopError::Cancelled);
+        }
         let Some(reason) = self.inner.should_compact(cursor.as_slice(), ctx.point) else {
+            if let Some(preparation) = &self.preparation {
+                preparation.arm(cursor.as_slice(), &self.policy, ctx.cancellation.clone());
+            }
             return Ok(());
         };
         ctx.emitter.emit(AgentEvent::MutationStarted {
@@ -783,12 +858,44 @@ impl LoopMutator for AutomaticCompactor {
         };
 
         let before = cursor.len();
-        let result = self
-            .inner
-            .compact(cursor.as_slice(), reason.clone(), ctx.cancellation.clone())
-            .await;
+        let preparation_wait_started = Instant::now();
+        let prepared = if let Some(preparation) = &self.preparation {
+            if matches!(reason, CompactionReason::Manual) {
+                preparation.cancel(false);
+                None
+            } else {
+                preparation
+                    .take(cursor.as_slice(), ctx.cancellation.clone())
+                    .await
+            }
+        } else {
+            None
+        };
+        let preparation_wait_millis =
+            u64::try_from(preparation_wait_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let used_prepared = prepared.is_some();
+        let result = if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+            Err(CompactionError::Cancelled)
+        } else if let Some(prepared) = prepared {
+            Ok(prepared)
+        } else {
+            self.inner
+                .compact(cursor.as_slice(), reason.clone(), ctx.cancellation.clone())
+                .await
+        };
+        if let Some(preparation) = &self.preparation {
+            preparation.cancel(result.is_ok());
+        }
         let mut metadata = MetadataMap::new();
         metadata.insert("reason".into(), format!("{reason:?}").into());
+        metadata.insert(
+            "prepared_reused".into(),
+            (used_prepared && result.is_ok()).into(),
+        );
+        metadata.insert(
+            "preparation_wait_millis".into(),
+            preparation_wait_millis.into(),
+        );
 
         match result {
             Ok(compacted) => {
@@ -877,21 +984,33 @@ pub(crate) fn latest_context_tokens(transcript: &[Item]) -> Option<u64> {
         })
 }
 
+#[cfg(test)]
 fn compaction_reason(transcript: &[Item]) -> Option<CompactionReason> {
-    let used = latest_context_tokens(transcript)?;
-    let usage = transcript
+    configured_reason(transcript, &CompactionConfig::default())
+}
+
+fn context_window(transcript: &[Item]) -> Option<u64> {
+    transcript
         .iter()
         .rev()
-        .find_map(|item| item.usage.as_ref())?;
-    let window = usage
+        .find_map(|item| item.usage.as_ref())?
         .metadata
-        .get("context_window")
-        .and_then(serde_json::Value::as_u64)?;
-    if window == 0 || u128::from(used) * 100 < u128::from(window) * u128::from(COMPACTION_PERCENT) {
+        .get("context_window")?
+        .as_u64()
+        .filter(|window| *window > 0)
+}
+
+fn configured_reason(transcript: &[Item], policy: &CompactionConfig) -> Option<CompactionReason> {
+    // The configured headroom accommodates growth between provider reports.
+    // Local serialization sizes are not token usage and must not move the trigger.
+    let used = latest_context_tokens(transcript)?;
+    let window = context_window(transcript)?;
+    let threshold = policy.resolve(window).apply_tokens;
+    if used < threshold {
         return None;
     }
     Some(CompactionReason::Custom(format!(
-        "context_used={used} reached {COMPACTION_PERCENT}% of context_window={window}"
+        "context_used={used} reached threshold={threshold} of context_window={window}"
     )))
 }
 
@@ -1204,6 +1323,8 @@ mod tests {
             .with_backend(FixedBackend),
             persistence: Some(opened.observer),
             mirror: None,
+            policy: CompactionConfig::default(),
+            preparation: None,
         };
         let mut transcript = opened.transcript;
         let marker = transcript.pop().unwrap();
@@ -1263,6 +1384,8 @@ mod tests {
             ),
             persistence: None,
             mirror: None,
+            policy: CompactionConfig::default(),
+            preparation: None,
         };
         let agent = Agent::builder()
             .model(NoModelTurn)
@@ -1923,5 +2046,69 @@ mod tests {
     #[test]
     fn latest_reported_usage_is_authoritative() {
         assert!(compaction_reason(&[measured(90, Some(100)), measured(10, Some(100)),]).is_none());
+    }
+
+    #[test]
+    fn large_unreported_tail_does_not_move_the_configured_threshold() {
+        let policy = CompactionConfig {
+            threshold_percent: 55,
+            max_context_tokens: Some(200_000),
+            ..CompactionConfig::default()
+        };
+        let mut transcript = vec![
+            measured(60_000, Some(200_000)),
+            Item::text(ItemKind::User, "x".repeat(120_000)),
+        ];
+        assert!(configured_reason(&transcript, &policy).is_none());
+        transcript.push(Item::new(
+            ItemKind::User,
+            vec![
+                Part::text("y".repeat(300_000)),
+                Part::media(
+                    agentkit_core::Modality::Image,
+                    "image/png",
+                    DataRef::Uri("https://x/i".into()),
+                ),
+            ],
+        ));
+        assert!(configured_reason(&transcript, &policy).is_none());
+        transcript.push(measured(110_000, Some(200_000)));
+        assert!(configured_reason(&transcript, &policy).is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_direct_policy() {
+        let policy = CompactionConfig {
+            threshold_percent: 100,
+            ..CompactionConfig::default()
+        };
+        assert!(
+            automatic_with_policy(
+                NoModelTurn,
+                TelemetryConfig::default(),
+                None,
+                "summary",
+                "owner",
+                None,
+                policy
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn low_reported_occupancy_with_new_image_does_not_force_compaction() {
+        let transcript = [
+            measured(10_000, Some(200_000)),
+            Item::new(
+                ItemKind::User,
+                vec![Part::media(
+                    agentkit_core::Modality::Image,
+                    "image/png",
+                    DataRef::Uri("https://x/i".into()),
+                )],
+            ),
+        ];
+        assert!(configured_reason(&transcript, &CompactionConfig::default()).is_none());
     }
 }
