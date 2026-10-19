@@ -20,7 +20,7 @@ Have your deployment's secret manager supply a JSON file with these fields:
 {
   "version": 1,
   "bearer_token": "<durable credential issued by AICP>",
-  "origin": "https://your-gram-origin.example"
+  "origin": "https://ai.speakeasy.com"
 }
 ```
 
@@ -50,7 +50,7 @@ Replace the project path and model with an existing directory and a model your
 Speakeasy server offers:
 
 ```sh
-export SPEAKEASY_ORIGIN='https://your-gram-origin.example'
+export SPEAKEASY_ORIGIN='https://ai.speakeasy.com'
 kit acp --protocol-version 2 \
   --provider speakeasy --model provider/eligible-model \
   --root /absolute/project \
@@ -104,6 +104,15 @@ when implementing these operations.
 The control plane must validate chat ownership and suppress inference transcript
 capture. AICP's ACP projection is the sole transcript writer; enabling both
 capture paths can duplicate conversation history.
+
+## Change the production server safely
+
+For production, configure `https://ai.speakeasy.com`. A runtime credential issued
+for another origin cannot be reused by changing only `SPEAKEASY_ORIGIN`. Have the
+control plane provision a credential for the intended origin, install its complete
+record, then restart Kit. Do not edit the stored origin to relabel a credential.
+Local deployments retain their explicitly configured matching origins and HTTP
+opt-in; they are not redirected to production.
 
 ## Resolve startup and inference failures
 

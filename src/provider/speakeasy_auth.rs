@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 use crate::credentials::CredentialStorage;
 
+pub(super) const PRODUCTION_ORIGIN: &str = "https://ai.speakeasy.com";
 const DASHBOARD_URL: &str = "https://ai.speakeasy.com/";
 const VERIFY_URL: &str = "https://ai.speakeasy.com/rpc/keys.verify";
 const NAMESPACE: &str = "speakeasy";
@@ -31,6 +32,7 @@ pub(crate) enum AuthCommand {
 #[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Credentials {
+    pub(crate) origin: String,
     pub(crate) api_key: String,
     pub(crate) project: String,
     pub(crate) email: Option<String>,
@@ -122,6 +124,17 @@ pub(crate) fn load(storage: &CredentialStorage) -> Result<Option<Credentials>, S
     if bytes.len() > MAX_RECORD_BYTES {
         return Err("stored Speakeasy credentials exceed 16 KiB".into());
     }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "stored Speakeasy credentials are invalid".to_string())?;
+    // An unbound historical key cannot be safely assigned to a different host.
+    // Do not rewrite it or infer authority from the new default.
+    if value
+        .as_object()
+        .is_some_and(|object| !object.contains_key("origin"))
+    {
+        return Err("stored Speakeasy credentials lack an origin binding; run `kit auth login speakeasy` with the same credential store to authenticate again".into());
+    }
+    // Deserialize the original bytes strictly so duplicate fields stay invalid.
     let record: Credentials = serde_json::from_slice(&bytes)
         .map_err(|_| "stored Speakeasy credentials are invalid".to_string())?;
     validate(&record)?;
@@ -145,6 +158,7 @@ fn save(storage: &CredentialStorage, record: &Credentials) -> Result<(), String>
 }
 
 fn validate(record: &Credentials) -> Result<(), String> {
+    super::speakeasy_runtime::trusted_origin(&record.origin, true)?;
     if !valid_api_key(&record.api_key) {
         return Err("Speakeasy returned an invalid Gram API key".into());
     }
@@ -265,6 +279,10 @@ fn verify_credentials_at(
             .ok_or_else(|| "Speakeasy API key has no accessible projects".to_string())?,
     };
     let record = Credentials {
+        origin: url::Url::parse(verify_url)
+            .map_err(|_| "invalid Speakeasy verification URL".to_string())?
+            .origin()
+            .ascii_serialization(),
         api_key: callback.api_key.clone(),
         project,
         email: callback.email.clone(),
@@ -611,6 +629,7 @@ mod tests {
 
     fn test_record() -> Credentials {
         Credentials {
+            origin: PRODUCTION_ORIGIN.into(),
             api_key: format!("gram_live_{}", "ab".repeat(32)),
             project: "kit-test".into(),
             email: Some("person@example.com".into()),
@@ -619,11 +638,51 @@ mod tests {
     }
 
     #[test]
+    fn unbound_historical_credentials_require_login_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let entry = storage.entry(NAMESPACE, IDENTITY);
+        let mut historical = serde_json::to_value(test_record()).unwrap();
+        historical.as_object_mut().unwrap().remove("origin");
+        let bytes = serde_json::to_vec(&historical).unwrap();
+        entry.save(&bytes).unwrap();
+        for _ in 0..2 {
+            let error = load(&storage).unwrap_err();
+            assert!(error.contains("lack an origin binding"));
+            assert!(error.contains("kit auth login speakeasy"));
+            assert!(!error.contains("gram_live_"));
+            assert_eq!(entry.load().unwrap().unwrap().as_slice(), bytes.as_slice());
+        }
+        for origin in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!("https://host.example/path"),
+        ] {
+            historical["origin"] = origin;
+            entry
+                .save(&serde_json::to_vec(&historical).unwrap())
+                .unwrap();
+            assert!(load(&storage).is_err());
+        }
+        let mut duplicate = serde_json::to_string(&test_record()).unwrap();
+        duplicate.pop();
+        duplicate.push_str(",\"origin\":\"https://other.example\"}");
+        entry.save(duplicate.as_bytes()).unwrap();
+        assert!(load(&storage).is_err());
+        save(&storage, &test_record()).unwrap();
+        let current: serde_json::Value =
+            serde_json::from_slice(&entry.load().unwrap().unwrap()).unwrap();
+        assert_eq!(current["origin"], PRODUCTION_ORIGIN);
+        assert_eq!(load(&storage).unwrap().unwrap().origin, PRODUCTION_ORIGIN);
+    }
+
+    #[test]
     fn credentials_round_trip_without_exposing_the_key() {
         let storage = CredentialStorage::Memory;
         save(&storage, &test_record()).unwrap();
         let loaded = load(&storage).unwrap().unwrap();
         assert_eq!(loaded.project, "kit-test");
+        assert_eq!(loaded.origin, PRODUCTION_ORIGIN);
         assert!(!format!("{loaded:?}").contains("gram_live_"));
         storage.entry(NAMESPACE, IDENTITY).delete().unwrap();
     }
@@ -631,6 +690,8 @@ mod tests {
     #[test]
     fn sign_in_url_uses_the_dashboard_cli_contract() {
         let url = sign_in_url("http://127.0.0.1:1234/callback?state=abc").unwrap();
+        assert_eq!(url.origin().ascii_serialization(), PRODUCTION_ORIGIN);
+        assert_eq!(VERIFY_URL, format!("{PRODUCTION_ORIGIN}/rpc/keys.verify"));
         let pairs = url
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
@@ -703,6 +764,7 @@ mod tests {
         let request = verify_server.join().unwrap().to_ascii_lowercase();
         assert!(request.contains(&format!("gram-key: {key}")));
         assert_eq!(record.project, "default-project");
+        assert_eq!(record.origin, format!("http://{verify_address}"));
 
         let directory = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());

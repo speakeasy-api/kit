@@ -2661,6 +2661,7 @@ mod tests {
             openrouter: OpenRouterProvider::from(config),
             auth: super::speakeasy_runtime::Authentication::Legacy(
                 crate::provider::speakeasy_auth::Credentials {
+                    origin: crate::provider::speakeasy_auth::PRODUCTION_ORIGIN.into(),
                     api_key: format!("gram_live_{}", "ab".repeat(32)),
                     project: "kit-test".into(),
                     email: None,

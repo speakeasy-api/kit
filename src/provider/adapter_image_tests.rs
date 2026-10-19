@@ -211,6 +211,7 @@ async fn completions_and_openrouter_encode_parallel_mixed_replay_as_user_images(
         openrouter: OpenRouterProvider::from(OpenRouterConfig::new("test", "test/model")),
         auth: crate::provider::speakeasy_runtime::Authentication::Legacy(
             crate::provider::speakeasy_auth::Credentials {
+                origin: crate::provider::speakeasy_auth::PRODUCTION_ORIGIN.into(),
                 api_key: "test".into(),
                 project: "test".into(),
                 email: None,

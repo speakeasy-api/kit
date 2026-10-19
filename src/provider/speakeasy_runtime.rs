@@ -17,6 +17,79 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn production_defaults_never_retarget_stored_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let entry = storage.entry("speakeasy", "default");
+        let store = |origin: &str| {
+            entry
+                .save(
+                    &serde_json::to_vec(&json!({
+                        "origin": origin, "api_key": format!("gram_live_{}", "ab".repeat(32)),
+                        "project": "test", "email": null, "organization_id": null
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        };
+        store(speakeasy_auth::PRODUCTION_ORIGIN);
+        let config = Configuration::load_with_env(&storage, |_| None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.origin, "https://ai.speakeasy.com");
+        assert!(!config.auth.is_runtime());
+        assert_eq!(
+            format!("{}/chat/models", config.origin),
+            "https://ai.speakeasy.com/chat/models"
+        );
+        assert_eq!(
+            format!("{}/chat/completions", config.origin),
+            "https://ai.speakeasy.com/chat/completions"
+        );
+
+        store("https://previous.example");
+        let before = entry.load().unwrap().unwrap();
+        assert!(Configuration::load_with_env(&storage, |_| None).is_err());
+        assert_eq!(entry.load().unwrap().unwrap(), before);
+        let explicit_previous = Configuration::load_with_env(&storage, |name| {
+            (name == "SPEAKEASY_ORIGIN").then(|| "https://previous.example".into())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(explicit_previous.origin, "https://previous.example");
+
+        store("http://aicp:8080");
+        let local = |name: &str| match name {
+            "SPEAKEASY_ORIGIN" => Some("http://aicp:8080".into()),
+            "SPEAKEASY_ALLOW_INSECURE_HTTP" => Some("1".into()),
+            _ => None,
+        };
+        assert_eq!(
+            Configuration::load_with_env(&storage, local)
+                .unwrap()
+                .unwrap()
+                .origin,
+            "http://aicp:8080"
+        );
+
+        let runtime = storage.entry("speakeasy", "assistant-runtime");
+        let bytes = serde_json::to_vec(
+            &json!({"version":1,"bearer_token":"sai_test","origin":"https://previous.example"}),
+        )
+        .unwrap();
+        runtime.save(&bytes).unwrap();
+        assert!(
+            Configuration::load_with_env(&storage, |name| (name == "SPEAKEASY_ORIGIN")
+                .then(|| speakeasy_auth::PRODUCTION_ORIGIN.into()))
+            .is_err()
+        );
+        assert_eq!(
+            runtime.load().unwrap().unwrap().as_slice(),
+            bytes.as_slice()
+        );
+    }
+
+    #[test]
     fn runtime_record_is_versioned_origin_bound_and_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(dir.path().to_path_buf());
@@ -158,9 +231,12 @@ impl Configuration {
             return Ok(None);
         };
         let origin = trusted_origin(
-            &env("SPEAKEASY_ORIGIN").unwrap_or_else(|| "https://ai.speakeasy.com".into()),
+            &env("SPEAKEASY_ORIGIN").unwrap_or_else(|| speakeasy_auth::PRODUCTION_ORIGIN.into()),
             insecure,
         )?;
+        if origin != trusted_origin(&legacy.origin, insecure)? {
+            return Err("Speakeasy API-key credential origin does not match the configured origin; authenticate for the intended server instead of moving credentials between hosts".into());
+        }
         Ok(Some(Self {
             origin,
             auth: Authentication::Legacy(legacy),
@@ -168,7 +244,7 @@ impl Configuration {
     }
 }
 
-fn trusted_origin(value: &str, insecure: bool) -> Result<String, String> {
+pub(super) fn trusted_origin(value: &str, insecure: bool) -> Result<String, String> {
     let invalid = || {
         "invalid Speakeasy origin: use an HTTPS origin, or explicitly allow HTTP for development"
             .to_string()

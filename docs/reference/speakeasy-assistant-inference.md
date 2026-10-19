@@ -26,7 +26,11 @@ The bearer is assistant/runtime-wide, not tied to one ACP session. Issue it
 before startup, enforce admission and revocation server-side, and do not require
 Kit to call a bootstrap or per-turn credential API. Runtime requests omit the
 legacy `Gram-Key` and `Gram-Project` headers. Dashboard API-key authentication
-remains supported separately.
+remains supported separately. Its default production origin is
+`https://ai.speakeasy.com`; saved API keys must carry the origin that verified them,
+and configuration must match it. Historical API-key records without an origin
+require a fresh login rather than automatic migration. Runtime records are never
+rewritten or retargeted when the production origin changes.
 
 ## Discover eligible models
 

@@ -166,6 +166,12 @@ does not substitute a public OpenRouter catalog when Speakeasy discovery fails.
 Logout removes only the local credential. Revoke the API key remotely in the
 Speakeasy dashboard.
 
+Saved API keys are bound to the origin that verified them. If Kit reports that a
+stored credential lacks an origin binding, sign in again using the same credential
+store shown above. Kit leaves the old record unchanged until successful login and
+does not send an unbound key to the production server. Do not add or change the
+stored origin by hand to move a key between servers.
+
 For an assistant launched with a provisioned runtime credential instead of an
 interactive login, follow [Run a Speakeasy assistant with a provisioned
 credential](speakeasy-assistant-runtime.md).
