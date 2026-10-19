@@ -281,7 +281,7 @@ separate resource settings per session, or a shared HTTP MCP service designed
 for concurrent clients. The gateway runs one child per session, but multiple
 children can still compete for the same host-wide lock or port.
 
-For singleton stdio servers, prefer `kit acp --protocol-version v2` (including
+For singleton stdio servers, prefer `kit acp --protocol-version 2` (including
 the gateway child path), which defers unused base connections. Mixed-protocol
 `kit serve` retains eager base initialization for its other protocols; its ACP
 v2 session can compete with that base connection. Use a concurrent HTTP service
