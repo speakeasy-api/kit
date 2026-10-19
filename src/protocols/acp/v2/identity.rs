@@ -11,7 +11,7 @@ use std::{
 };
 pub(super) const KEY: &str = "dev.kit.acp.message_id";
 pub(super) const SECTIONS_KEY: &str = "dev.kit.acp.thought_sections";
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 pub(super) struct ThoughtSection {
     pub(super) id: String,
     pub(super) text: String,
@@ -79,9 +79,23 @@ impl Identity {
                     // reasoning part. Preserve their presentation independently of
                     // the provider summary, encrypted data and continuation metadata.
                     let sections = &self.sections[(*thought).min(self.sections.len())..];
-                    reasoning
-                        .metadata
-                        .insert(SECTIONS_KEY.into(), serde_json::json!(sections));
+                    reasoning.metadata.insert(
+                        SECTIONS_KEY.into(),
+                        serde_json::Value::Array(
+                            sections
+                                .iter()
+                                .map(|section| {
+                                    serde_json::Value::Object(
+                                        [
+                                            ("id".into(), section.id.clone().into()),
+                                            ("text".into(), section.text.clone().into()),
+                                        ]
+                                        .into(),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    );
                     *thought = self.sections.len();
                 }
             }
