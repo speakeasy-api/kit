@@ -36,7 +36,8 @@ Disable with `kit config set experimental.eval false` and restart Kit.
 
 ## Ask several questions in one call
 
-`eval` is a hidden Compose tool, not a separate Runlet expression:
+Call `eval` inside a `compose` program. Give each question a name so you can
+use its answer independently:
 
 ```text
 return eval({

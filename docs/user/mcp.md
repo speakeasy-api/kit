@@ -1,6 +1,8 @@
 # Configure and Use MCP Servers
 
-Kit merges Model Context Protocol (MCP) servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
+Add Model Context Protocol (MCP) servers to let the agent use external tools and resources. Use project `.mcp.json` for project-specific servers or the global MCP file for servers you need across projects.
+
+Kit merges servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
 
 Use `kit config set mcp_config ~/.kit/mcp.json` to select the global MCP file, `kit config get mcp_config` to inspect the saved path, or `kit config unset mcp_config` to remove the override. These commands edit `~/.kit/config.toml`, not the MCP JSON file or its server entries. See [configuration editing](getting-started-and-configuration.md#edit-configuration-from-the-command-line).
 
@@ -137,7 +139,7 @@ Subscribe before reading initial state. For example, if the server exposes `mess
 
 Inspect the returned `requested` and `acknowledged` filters, then call `read_resource` with the same server and URI. The other filters are `toolsListChanged`, `resourcesListChanged`, and `promptsListChanged`. A new `subscribe` replaces this session's filter for that server.
 
-Matching notifications wake an idle ACP session through its existing autonomous-turn route; busy sessions receive them after current work. The agent must read current resource or catalog state after waking. Updates are coalesced invalidations, not a durable event log; use a service's cursor-based read API when every event matters. Resource contents remain untrusted external data.
+Matching notifications wake an idle ACP session; busy sessions receive them after current work. The agent must read current resource or catalog state after waking. Updates are coalesced invalidations, not a durable event log; use a service's cursor-based read API when every event matters. Resource contents remain untrusted external data.
 
 `unsubscribe` removes this session's interest and invalidates queued subscription notifications. Shared resource URIs remain subscribed while another session needs them. Closing the session retires its interests; subscriptions do not persist across Kit restarts or completed one-shot prompts. Each session can watch at most 32 resource URIs per server, with a maximum URI length of 4096 bytes.
 
@@ -208,7 +210,7 @@ credential_store = "file"
 credential_dir = "/path/to/private/credentials"
 ```
 
-Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials during the background server initialization at startup—or when a later reload adds the server and the next `tool_search` or `auth` call initializes it; either path may refresh access tokens. This also works for the inferred default OAuth identity of a remote server with no `auth` block. Reuse the same backend, directory, and MCP server identity across commands. Kit serializes MCP token refreshes across processes that share a credential backend, reloads credentials after taking the lock, and reuses a token that another waiter already refreshed so rotating refresh tokens are not consumed twice.
+Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials during the background server initialization at startup—or when a later reload adds the server and the next `tool_search` or `auth` call initializes it; either path may refresh access tokens. This also works for the inferred default OAuth identity of a remote server with no `auth` block. Reuse the same backend, directory, and MCP server identity across commands. Processes sharing a credential backend coordinate token refreshes, so you can reuse the same store across Kit commands.
 
 ## Security guidance
 
@@ -222,7 +224,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 
 ### Configuration file errors
 
-- **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional, and its absence is tracked for live creation.
+- **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional; creating it takes effect on the next `tool_search` or `auth` call.
 - **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
 - **`MCP server ... is declared by both plugins ...`**: rename one plugin server or disable one of the colliding plugins. Explicit-file entries may override plugin servers, but plugin/plugin collisions are errors.

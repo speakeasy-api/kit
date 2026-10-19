@@ -1,12 +1,12 @@
 # Reusable subagents and ACP harnesses
 
-Kit can start parent-owned nested agents through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/get-started/introduction). ACP is an open interface between an agent client and an agent runtime. That separation lets Kit orchestrate Kit, Claude Code, Codex, Cursor, and other compatible harnesses through one lifecycle instead of maintaining a custom integration for each one.
+Delegate independent tasks to subagents while keeping the main conversation focused on coordination and results. Kit supports Kit, Claude Code, Codex, Cursor, and other compatible harnesses through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/get-started/introduction).
 
 A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, branch its completed context with `fork`, list retained handles with `subagents({})`, or terminate one with `close`.
 
 ## Prompt content and file context
 
-The `prompt` argument to `subagent`, `prompt`, and `fork` accepts either a string (the existing text-only form) or an ordered array of ACP content blocks:
+The `prompt` argument to `subagent`, `prompt`, and `fork` accepts either a string or an ordered array of ACP content blocks:
 
 ```text
 child = subagent({
@@ -23,7 +23,7 @@ return child.output
 - Embedded `resource` blocks contain a `resource` object with `uri`, optional `mimeType`, and either `text` or base64 `blob`. They require the child's `promptCapabilities.embeddedContext` capability.
 - `image` blocks contain base64 `data`, `mimeType`, and an optional `uri`. They require the child's `promptCapabilities.image` capability. These are ACP blocks, not Kit managed File references; the parent's session-authorized File references are not transferred to the child.
 
-Kit rejects unsupported content rather than silently converting it to text or dropping it. The array must be nonempty. Block order and metadata are preserved. When `output_schema` is set, Kit appends the JSON-output instructions as a separate text block after the supplied blocks. Roster task summaries use only text blocks, not embedded files or image data.
+Kit rejects unsupported content rather than silently converting it to text or dropping it. The array must be nonempty. Block order and metadata are preserved.
 
 ## Why use another harness from Kit?
 
@@ -115,17 +115,17 @@ The prompt accepts text or ACP content blocks. Unknown and retired IDs fail. Can
 
 ## Inspect display names
 
-The calling model should give each new `subagent` and `fork` a concise role-oriented display name based on its task, such as `Round 2 Implementer` or `Reviewer`. This uses the model already making the tool call; Kit does not make a separate naming request. The name is display metadata and never changes the prompt sent to the child. Omitting `name`, or supplying an invalid name, uses the lowest available `Agent N` label.
+The calling model should give each new `subagent` and `fork` a concise role-oriented display name based on its task, such as `Round 2 Implementer` or `Reviewer`. The name is display metadata and never changes the prompt sent to the child. Omitting `name`, or supplying an invalid name, uses the lowest available `Agent N` label.
 
 Kit trims preferred names and accepts 1–32 bytes of printable ASCII. Names compare case-insensitively among one parent's direct live children; clashes receive the lowest available numeric suffix, with the base shortened as needed to stay within 32 bytes. The immutable `s-…` ID remains authoritative; names never select handles.
 
-A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Nested Kit processes allocate independently, so separate descendant branches can generate duplicate visible names in the agent roster even though each parent keeps its direct-child names unique.
+Names remain assigned while a child is reusable. Separate descendant branches can have duplicate display names, so use the session ID to select a child.
 
 Use `subagents({})` to inspect live direct children. Each row contains `id`, `name`, `status`, `generation`, and the bounded current task summary. Closed and terminally retired children are omitted.
 
 ## Read the agent roster
 
-The terminal client's agent roster lists every live subagent with its status, current activity, and elapsed time. The activity excerpt uses a running tool's title, otherwise an in-progress plan entry, otherwise the latest session title, otherwise the original prompt. These updates depend on what the harness reports over ACP. When a turn finishes, tool and plan activity clears and the excerpt returns to the session title or prompt. Kit publishes compose `intent` as an ACP tool-title update, which also supplies the main TUI's tool summary.
+The terminal client's agent roster shows subagent status, current activity, and elapsed time. Activity may describe a running tool, plan, or task, depending on what the harness reports. Use it to monitor progress; an idle child can be continued with `prompt`. For navigation and inspection, see [Monitor subagents in the agent roster](tui-and-sessions.md#monitor-subagents-in-the-agent-roster).
 
 When a harness reports context usage over ACP, the row shows the same `percent used/size` readout as the header on a separate line below the activity excerpt. Kit's own ACP server always reports it, so nested Kit subagents show usage without configuration.
 
@@ -182,17 +182,38 @@ command = "kit"
 args = ["acp"]
 ```
 
-Kit appends its required runtime, resolved reasoning-effort, persistent-session, resume, MCP, credential, and inherited-depth arguments after those base arguments. Use installed-binary commands such as `kit --help` and `kit acp --help` to inspect the current command interface rather than relying on an exhaustive flag list here.
+Kit supplies the child’s runtime settings automatically. Use `kit --help` and `kit acp --help` to check the installed command interface when configuring an executable override.
 
 Kit's ACP server also advertises a separate reasoning-effort session selector with `Default`, `Low`, `Medium`, and `High` values. Changes take effect on the next turn without changing the selected model. `Default` leaves the effort unset, preserving provider defaults and `OPENROUTER_REASONING_EFFORT` when OpenRouter supplies one. Set the startup default with top-level `reasoning_effort` or `--reasoning-effort`; the bundled TUI exposes the same selector through `/effort`. Built-in `acp.kit` children inherit the startup value resolved from CLI and TOML, while generic ACP harnesses keep their own behavior.
 
-Persistent parent sessions record their direct children’s ACP session IDs, harness references, working directories, names, and completed handle generations in the parent transcript. Loading the same parent restores completed handles without immediately starting child processes. Child lifecycle checkpoints must reach disk before a mutable prompt or explicit deletion proceeds; unavailable storage can therefore block these operations. `prompt` and native `fork` reconnect on demand using the current harness configuration. Closing the parent still releases its child processes; it does not delete their history. Nonpersistent parents retain process-lifetime handles only.
+## Resume delegated work after restarting Kit
 
-Recovery reattaches the same mutable child session, not a snapshot or a new branch. It is not the generic immutable fork fallback discussed in #12. Interrupted turns are not automatically retried, and explicitly closed children are never restored—even if remote history deletion failed. Existing transcripts without child records remain readable but cannot reconstruct their old child handles. New child-state records require a reader that understands the newer transcript schema.
+Reopen the **same parent session** to recover its completed child handles:
 
-For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Its stop reason uses the same success, cancellation, refusal, and request-limit handling as v1. Delivering a `prompt` into a working turn requires ACP v2 with advertised `steer` support; otherwise the message waits for the next turn. An omitted reason permits normal completion; an unknown reason reports an error rather than success. Whole-message updates replace text by message ID; omitted content preserves text, empty or null content clears it, and later chunks append.
+```sh
+kit tui --root /path/to/project --resume <parent-session-id>
+```
 
-For generic v2 children, recovery uses `session/resume` with `replayFrom: {"type": "start"}`; v1 children must advertise `loadSession` and are reattached with `session/load`. Built-in Kit children use their persistent-session launch path. Replay completes before the next prompt and never replaces the handle’s last-turn output. Kit uses only IDs recorded by the owning parent; it does not scan and adopt unrelated child sessions. If the harness was removed, cannot load sessions, or lost its history, reconnect fails without creating a replacement session. Restore the harness configuration or explicitly close the obsolete handle. Close during an in-progress reconnect reports an error without retiring the handle; retry after startup completes or is cancelled.
+Ask the parent to list its children with `subagents({})`, then continue the selected child by ID:
+
+```text
+return prompt({
+  subagent: { id: "s-…" },
+  prompt: "Check the current project state, then continue the review."
+})
+```
+
+Kit reconnects when you prompt or natively fork a restored child, using the current harness configuration. Recovery continues the same mutable child session; it does not create a snapshot or a replacement branch. Closing the parent releases child processes without deleting their history.
+
+Recovery has these limits:
+
+- Only persistent parents can recover completed child handles after restart. Older transcripts without saved child handles cannot reconstruct them, and a parent never adopts unrelated sessions.
+- Interrupted turns are not automatically retried. Inspect project state before repeating work because edits or other side effects may already have occurred.
+- Explicitly closed children are not restored, even if deleting their remote history failed.
+- Child recovery requires retained history and a harness that supports session loading or resuming. If the harness was removed, cannot restore sessions, or lost its history, reconnect fails instead of silently creating a replacement. Restore the harness configuration or explicitly close the obsolete handle.
+- Storage must be available before mutable child prompts or explicit deletion can proceed. If storage is full, follow [storage recovery](tui-and-sessions.md#recovering-from-full-storage).
+- If closing a child reports that reconnect is still starting, retry after startup completes or is cancelled.
+- Use a Kit version that understands the saved transcript schema; older readers may reject child-state records.
 
 ## Configure a generic ACP harness
 
