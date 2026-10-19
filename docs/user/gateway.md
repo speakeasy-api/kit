@@ -6,7 +6,11 @@ This is an experimental, single-user, private-network facility, not a public ser
 
 ## Start the host
 
-Configure the host's provider credentials, model, tools, and MCP servers as for a local Kit session. Children inherit the gateway host's environment and load its configuration; the remote terminal does not supply provider credentials. For session-specific MCP tools supplied by an ACP client, see [Configure host-side MCP servers](gateway-protocol.md#configure-host-side-mcp-servers).
+Configure the host's provider credentials, model, tools, and MCP servers as for a local Kit session. Children inherit the gateway host's environment and load its configuration; the remote terminal does not supply provider credentials.
+
+ACP clients may supply session-scoped stdio or Streamable HTTP `mcpServers` when creating or restoring a session. Stdio commands and HTTP requests run on the gateway host, not on the client. Each ACP v2 stdio entry needs `"type":"stdio"` and an absolute host executable path.
+
+On resident reattach, omit `mcpServers` or send `[]` to retain the current client-supplied servers. A nonempty list is rejected; use `_kit/session/update_mcp` to add or update client-owned servers explicitly. Omitted servers remain registered and `[]` is a no-op. Client entries cannot overwrite host or plugin names. Session-scoped MCP configuration is not persisted in the transcript, so supply it again when restoring a stopped session. See [ACP session MCP configuration](mcp.md#acp-session-mcp-configuration) for HTTP entries and live add/update requests.
 
 Create a high-entropy bearer credential without putting it in command-line arguments:
 
@@ -75,13 +79,13 @@ kit tui --remote http://127.0.0.1:7766 \
   --remote-no-replay
 ```
 
-This option requires an existing session ID. The TUI marks **History unavailable**; an empty historical pane is not a claim that the session has no history. The attachment still requires the authoritative current configuration and active/idle state before enabling control. The durable transcript stays on the host, and in-flight work is not restarted. For direct ACP clients, see the [resume and replay contract](gateway-protocol.md#connect-over-httpsse).
+This option requires an existing session ID. The TUI marks **History unavailable**; an empty historical pane is not a claim that the session has no history. The attachment still requires the authoritative current configuration and active/idle state before enabling control. The durable transcript stays on the host, and in-flight work is not restarted. For direct ACP clients, see the [resume and replay contract](../reference/gateway-protocol.md#connect-over-httpsse).
 
 To start another session, exit and omit `--remote-session` on the next invocation. To switch sessions, exit, list them, and supply the desired ID. In-place `/new`, session listing/resume/rename commands, local provider login/usage, and voice are disabled in a remote attachment. The remote TUI has no session deletion or close command. To end resident work through an ACP client, see [Close a session](#close-a-session).
 
 ## Close a session
 
-Use standard ACP [`session/close`](gateway-protocol.md#close-a-resident-session) from the current controller to end a resident session and its outstanding work, including detached jobs and subagents. Closing a terminal or HTTP connection only detaches; it is not a substitute for closing the session. Interrupting a turn with `session/cancel` also leaves ordinary top-level detached jobs running.
+Use standard ACP [`session/close`](../reference/gateway-protocol.md#close-a-resident-session) from the current controller to end a resident session and its outstanding work, including detached jobs and subagents. Closing a terminal or HTTP connection only detaches; it is not a substitute for closing the session. Interrupting a turn with `session/cancel` also leaves ordinary top-level detached jobs running.
 
 A successful close response follows session cleanup and child exit. Cleanup failure returns an error rather than reopening a partially closed child. Closing uses Kit's existing synchronous transcript persistence; it does not strengthen disk-failure durability guarantees. The transcript remains available for explicit resume, which restores history rather than restarting the closed work. If the response is lost, do not assume either success or that the old child is still usable; list sessions and explicitly resume when ready to continue.
 
@@ -89,17 +93,17 @@ An idle turn does not mean detached background jobs or subagents have finished. 
 
 ## Standard ACP HTTP clients
 
-Use an ACP v2 HTTP/SSE client with the exact endpoint `http://HOST:7766/acp/v2`, a bearer credential on every request, and matching Kit versions. There is no separate Kit session REST API. See the [gateway protocol reference](gateway-protocol.md) for connection setup, supported operations, close requests, and transport limits.
+Use an ACP v2 HTTP/SSE client with the exact endpoint `http://HOST:7766/acp/v2`, a bearer credential on every request, and matching Kit versions. There is no separate Kit session REST API. See the [gateway protocol reference](../reference/gateway-protocol.md) for connection setup, supported operations, close requests, and transport limits.
 
 ### Supported operations
 
-See [Supported operations](gateway-protocol.md#supported-operations) for the adapter contract.
+See [Supported operations](../reference/gateway-protocol.md#supported-operations) for the adapter contract.
 
 <a id="pinned-wire-fixture"></a>
 
 ### Implement an ACP HTTP client
 
-See [Implement an ACP HTTP client](gateway-protocol.md#implement-an-acp-http-client) for request and response examples.
+See [Implement an ACP HTTP client](../reference/gateway-protocol.md#implement-an-acp-http-client) for request and response examples.
 
 ## Failure and security boundaries
 
@@ -110,7 +114,7 @@ See [Implement an ACP HTTP client](gateway-protocol.md#implement-an-acp-http-cli
 - Live reattachment replays the resident child's notifications and current configuration, not old request responses. Replies are scoped to the attachment that submitted the request, so a stale response cannot resolve a new terminal's request ID. ACP v2 state-update notifications carry active/idle state across reconnects.
 - Replay is an in-memory convenience, not a second durable session format. It is limited to 8 MiB and approximately 4,096 events per session/attachment, including room for a current snapshot. Overflow rejects a full live reattach rather than falsely claiming complete replay. Use explicit `--remote-no-replay` only when historical omission is acceptable. Current configuration and actual ACP turn state follow historical events before resume completes; durable assistant text alone is never used as evidence that a turn is idle. Restarting the gateway does not guarantee oversized full replay will fit, and burst replay can exhaust transport budgets even below the history limit.
 - There is no fixed resident-session count ceiling. Provision memory and process capacity for your workload. Detaching does not stop a session, even when it is idle; use `session/close` to end resident work. Listing or creating sessions reclaims completed entries without deleting durable transcripts.
-- Transport saturation can disconnect a client without canceling accepted work. HTTP frames are limited to 1 MiB; child output frames to 8 MiB. Oversized or malformed child output stops that child. There is no idle connection expiration or body-read deadline: abandoned transports can retain connection slots, and exhaustion may require restarting the gateway. See [Transport limits](gateway-protocol.md#transport-limits) before sizing an integration. These bounds are not a hard process-memory ceiling or denial-of-service protection.
+- Transport saturation can disconnect a client without canceling accepted work. HTTP frames are limited to 1 MiB; child output frames to 8 MiB. Oversized or malformed child output stops that child. There is no idle connection expiration or body-read deadline: abandoned transports can retain connection slots, and exhaustion may require restarting the gateway. See [Transport limits](../reference/gateway-protocol.md#transport-limits) before sizing an integration. These bounds are not a hard process-memory ceiling or denial-of-service protection.
 - Use `Ctrl+C` on the gateway host for graceful shutdown. Kit waits for child cleanup and exit, then forcibly stops a child if it exceeds the 10-second timeout. That fallback can leave a stale transcript lock requiring operator intervention. Hard process termination has operating-system-dependent cleanup behavior; arbitrary tool descendants are not a managed process group.
 - Client-side ACP services, arbitrary extra directories, session-scoped HTTP/SSE MCP servers, browser callbacks, and arbitrary ACP methods are not supported. Files, tool execution, and provider authentication belong to the gateway host.
 
