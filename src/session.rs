@@ -112,6 +112,8 @@ struct Writer {
     workspace_root: PathBuf,
     // None permanently disables this writer; there is no session retry queue.
     file: Option<File>,
+    // Sticky: an observer rejection means the in-memory history may be ahead.
+    persistence_error: Option<String>,
     lock: SessionLock,
     // Ephemeral resume cannot seal legacy histories, and buffered redirects
     // can be lost. Keep source authority until this writer closes.
@@ -511,6 +513,7 @@ fn open_with_initial_timestamps_in(
             path,
             workspace_root,
             file: None,
+            persistence_error: None,
             lock,
             legacy_locks,
             created: (!resume).then(|| CreatedTranscript::new(None, filesystem, None)),
@@ -654,6 +657,7 @@ fn open_with_initial_timestamps_in(
         path,
         workspace_root,
         file,
+        persistence_error: None,
         lock,
         legacy_locks: migration_locks,
         created,
@@ -716,6 +720,28 @@ fn finish_open(
 }
 
 impl SessionObserver {
+    /// Require all accepted transcript records to reach disk before close succeeds.
+    /// The writer lock excludes append/replace and lease transitions during this
+    /// barrier. Poison isolates the writer; no guard crosses an await or callback.
+    pub(crate) fn checkpoint(&self) -> Result<(), String> {
+        let mut writer = self
+            .0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?;
+        if let Some(error) = &writer.persistence_error {
+            return Err(format!("session transcript is not durable: {error}"));
+        }
+        writer.ensure_lock()?;
+        if writer.file.is_none() {
+            return Err("session transcript persistence was disabled".into());
+        }
+        writer
+            .lock
+            .filesystem()?
+            .require_disk(&writer.path)
+            .map_err(|error| format!("session transcript is not durable: {error}"))
+    }
+
     /// Best-effort records reasoning effort without changing transcript items.
     /// Storage buffering or loss follows ordinary transcript persistence semantics.
     pub(crate) fn set_reasoning_effort(
@@ -834,8 +860,10 @@ impl TranscriptObserver for SessionObserver {
         // Persistence must not prevent the loop from committing its in-memory
         // transcript. Poison still isolates the writer: never recover a guard
         // whose file or lease transition may have been interrupted.
-        if let Ok(mut writer) = self.0.lock() {
-            let _ = writer.append(event.item);
+        if let Ok(mut writer) = self.0.lock()
+            && let Err(error) = writer.append(event.item)
+        {
+            writer.persistence_error.get_or_insert(error);
         }
     }
 }
@@ -6080,7 +6108,7 @@ mod tests {
 
     struct TranscriptOpenFaults {
         deny_transcript_read: bool,
-        // 0: healthy, 1: bufferable device I/O, 2: nonbufferable rejection.
+        // 0: healthy, 1: bufferable device I/O, 2: rejection, 3: directory sync.
         write_failure: Arc<AtomicU64>,
     }
 
@@ -6150,6 +6178,12 @@ mod tests {
             fs::DiskBackend.set_permissions(path, permissions)
         }
         fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            if self.write_failure.load(Ordering::SeqCst) == 3 {
+                #[cfg(unix)]
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+                #[cfg(not(unix))]
+                return Err(io::Error::other("injected directory sync failure"));
+            }
             fs::DiskBackend.sync_directory(path)
         }
         fn acquire_lease(
@@ -6165,6 +6199,91 @@ mod tests {
         ) -> io::Result<Box<dyn fs::BackendFile>> {
             fs::DiskBackend.open_beneath(root, relative)
         }
+    }
+
+    fn checkpoint_fault_case(mode: u64, recoverable: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let failure = Arc::new(AtomicU64::new(0));
+        assert!(
+            fs::initialize_global(Fs::new(Arc::new(TranscriptOpenFaults {
+                deny_transcript_read: false,
+                write_failure: failure.clone(),
+            })))
+            .is_ok()
+        );
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        opened.observer.checkpoint().unwrap();
+        failure.store(mode, Ordering::SeqCst);
+        // Ordinary observer delivery remains best effort, including rejection.
+        write(
+            &opened.observer,
+            &Item::text(ItemKind::User, "must survive close"),
+        );
+        assert!(opened.observer.checkpoint().is_err());
+        failure.store(0, Ordering::SeqCst);
+        if recoverable {
+            opened.observer.checkpoint().unwrap();
+            assert_eq!(stored(root.path()).last().unwrap().kind, ItemKind::User);
+        } else {
+            // Restoring storage cannot repair records already discarded.
+            assert!(opened.observer.checkpoint().is_err());
+        }
+    }
+
+    #[test]
+    fn strict_checkpoint_rejects_prior_suppressed_write_failure() {
+        if isolated_process("strict_checkpoint_rejects_prior_suppressed_write_failure") {
+            return;
+        }
+        checkpoint_fault_case(2, false);
+    }
+
+    #[test]
+    fn strict_checkpoint_rejects_buffered_writes_until_recovered() {
+        if isolated_process("strict_checkpoint_rejects_buffered_writes_until_recovered") {
+            return;
+        }
+        checkpoint_fault_case(1, true);
+    }
+
+    #[test]
+    fn strict_checkpoint_rejects_sync_failure_until_recovered() {
+        if isolated_process("strict_checkpoint_rejects_sync_failure_until_recovered") {
+            return;
+        }
+        checkpoint_fault_case(3, true);
+    }
+
+    #[test]
+    fn strict_checkpoint_rejects_previously_suppressed_observer_error() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let unstamped = Item::text(ItemKind::User, "not persisted");
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("abc"),
+            item: &unstamped,
+        });
+        assert!(
+            opened
+                .observer
+                .checkpoint()
+                .unwrap_err()
+                .contains("missing created_at")
+        );
     }
 
     #[test]

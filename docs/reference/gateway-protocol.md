@@ -101,7 +101,9 @@ Send `session/close` as the current controller, not HTTP DELETE:
 {"jsonrpc":"2.0","id":5,"method":"session/close","params":{"sessionId":"SESSION_ID"}}
 ```
 
-The close response follows child cleanup. A cleanup failure returns an error and does not reopen a partially closed child. A successful close uses existing transcript persistence, not a stronger disk-failure durability guarantee. See [Close a session](../user/gateway.md#close-a-session) for the distinction between closing, canceling, and detaching.
+The close response follows child cleanup. A cleanup failure returns an error and does not reopen a partially closed child. A successful close also confirms transcript durability after cleanup. Unflushed buffered writes, disabled persistence, or an earlier rejected transcript record cause an error; later storage recovery cannot erase evidence of a lost record. This strict close check applies to ACP v1 and v2 sessions, but the gateway transport accepts only ACP v2. Ordinary transcript delivery remains best effort. See [Close a session](../user/gateway.md#close-a-session) for the distinction between closing, canceling, and detaching.
+
+A persistence failure returns a JSON-RPC `error` with code `-32603`, message `"Internal error"`, and diagnostic string `data` beginning with `"loop error: "`; the response has no `result`. Treat this as a failed close acknowledgement, not proof that cleanup was rolled back. The diagnostic explains the failure for operators; do not match its wording in client logic or use the generic internal-error code alone to identify a storage failure.
 
 Close-response history is retained for at most one 15-second lease after child cleanup, or until the controller detaches. This is not durable response replay. Resume explicitly to restore the transcript; do not automatically resend an uncertain prompt.
 

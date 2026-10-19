@@ -274,6 +274,13 @@ impl SelectableAdapter {
         Ok(self)
     }
 
+    /// Strict close barrier; adapters without durable sessions have nothing to flush.
+    pub(crate) fn checkpoint_transcript(&self) -> Result<(), String> {
+        self.session_observer
+            .as_ref()
+            .map_or(Ok(()), |observer| observer.checkpoint())
+    }
+
     pub fn selection(&self) -> Result<ModelSelection, String> {
         self.selection
             .lock()
