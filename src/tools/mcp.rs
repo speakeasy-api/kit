@@ -7834,7 +7834,7 @@ for line in sys.stdin:
                 };
                 if source != "configured" {
                     // Plugin manifests require a bare executable or ./ path.
-                    configured.command = "python3".into();
+                    configured.command = "env".into();
                 }
                 // This server can have only one live owner, like a local MCP
                 // service holding a database lock. Competing startup fails at
