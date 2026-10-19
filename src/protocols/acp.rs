@@ -596,7 +596,7 @@ struct RegisteredSession {
 /// Registry teardown consumes that proof plus actor exit; explicit close also
 /// requires the checkpoint below. Keep checkpoint errors out of cleanup_failed.
 #[derive(Clone, Debug)]
-struct SessionCloseReport {
+pub(super) struct SessionCloseReport {
     checkpoint_error: Option<String>,
 }
 
