@@ -18,9 +18,14 @@ The supported wire protocol is ACP v2, using the pinned ACP Rust SDK 2.0.0. The 
 Start with `initialize`, then use standard `session/new`, `session/list`, and
 `session/resume` requests. `session/new.cwd` must be an exact canonical root
 approved with `--project`. Listing returns standard `sessions` entries with
-`sessionId`, `cwd`, and `title`; Kit's `_meta["kit.gateway.state"]` distinguishes `resident` from
-`restorable` entries. Resident means the gateway still owns the session, including brief close-response retention; it does not guarantee prompt admission or completed work;
-restorable means a durable transcript is available.
+`sessionId`, `cwd`, and `title`; Kit's `_meta["kit.gateway.state"]` identifies `resident`,
+`restorable`, or `exited` entries. Resident means the gateway still owns the session,
+including brief close-response retention; it does not guarantee prompt admission or
+completed work. Restorable means a durable transcript is available. An `exited`
+entry has no catalog row to restore and can appear transiently when its actor exits
+during listing. Listing or creating sessions reclaims completed actor entries;
+durable transcripts remain listed as restorable. Reclamation does not repair stale
+transcript locks left by abrupt child termination.
 
 Request `"replayFrom": {"type": "start"}` in `session/resume` to receive history as ACP
 session notifications. Resuming without requesting history is not a full replay.

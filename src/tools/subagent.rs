@@ -1506,26 +1506,55 @@ impl Subagents {
             let event = if locked.status == SubagentStatus::Removed {
                 None
             } else {
+                // Removal is not a new generation result. Only an unfinished
+                // turn is failed; idle success/failure and its time stay intact.
+                if locked.outcome.is_none() {
+                    locked.outcome = Some(GenerationOutcome::Failed);
+                    locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                    locked.record_finished();
+                }
                 locked.status = SubagentStatus::Removed;
                 locked.forking = None;
-                locked.outcome = Some(GenerationOutcome::Failed);
-                locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 Some(locked.runtime_event(id.clone()))
             };
-            let child = locked.child.clone();
+            // Move, rather than clone: a harness without session/close can
+            // release its process only when this is the sole command sender.
+            let child = locked.child.take();
+            let permit = if child.is_some() {
+                locked.permit.take()
+            } else {
+                None
+            };
             drop(locked);
             self.remove_if_same(&id, &state);
+            // The cleanup task owns child and capacity before callbacks or the
+            // next await. Cancelling shutdown cannot abandon either mid-close.
+            let cleanup = child.map(|child| {
+                tokio::spawn(async move {
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), child.close())
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(ChildError::Failed("subagent close timed out".into()))
+                            });
+                    if let Err(error) = &result
+                        && !child_error_is_terminal(error, &child)
+                    {
+                        Self::watch_permit_until_process_exit(permit, &child);
+                    }
+                    result
+                })
+            });
             if let Some(event) = event {
                 self.emit_event(event);
             }
-            if let Some(child) = child {
-                let result = tokio::time::timeout(std::time::Duration::from_secs(5), child.close())
-                    .await
-                    .unwrap_or_else(|_| Err(ChildError::Failed("subagent close timed out".into())));
+            if let Some(cleanup) = cleanup {
+                let result = cleanup.await.unwrap_or_else(|error| {
+                    Err(ChildError::Failed(format!(
+                        "subagent shutdown cleanup task failed: {error}"
+                    )))
+                });
                 if let Err(error) = result {
-                    if !child_error_is_terminal(&error, &child) {
-                        self.retain_permit_until_process_exit(&state, &child).await;
-                    }
                     failure.get_or_insert(error);
                 }
             }

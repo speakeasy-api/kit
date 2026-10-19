@@ -654,7 +654,7 @@ impl Drop for ActorGuard {
         if let Some(server) = self.server.upgrade() {
             server.remove_session(&self.session_id, self.token);
         }
-        self.registry.remove(self.token);
+        self.registry.actor_finished(self.token);
         self.completed.send_replace(true);
     }
 }
@@ -1331,32 +1331,24 @@ impl Server {
         &self,
         request: wire::CloseSessionRequest,
     ) -> Result<wire::CloseSessionResponse, AcpRuntimeError> {
-        let session = self
-            .sessions
-            .lock()
-            .map_err(|_| AcpRuntimeError::ClientClosed)?
-            .remove(&request.session_id)
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        let registry = self.registry.clone();
-        // Once removed, cleanup belongs to this task rather than the request.
+        let (session, close) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+            let session = sessions
+                .remove(&request.session_id)
+                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+            let close = self.registry.session_close(session.token)?;
+            (session, close)
+        };
+        // Both explicit close and reset join the registration's one operation.
         tokio::spawn(async move {
-            let result = async {
-                super::cancel_background_jobs(&session.tasks, &session.background_jobs).await;
-                session.integration.close();
-                let (reply, acknowledged) = oneshot::channel();
-                session
-                    .commands
-                    .send(Command::Close { reply })
-                    .await
-                    .map_err(|_| AcpRuntimeError::ClientClosed)?;
-                acknowledged
-                    .await
-                    .map_err(|_| AcpRuntimeError::ClientClosed)??;
-                Ok(wire::CloseSessionResponse::new())
-            }
-            .await;
-            registry.remove(session.token);
-            result
+            session.integration.close();
+            let result = close().await;
+            drop(session);
+            result?;
+            Ok(wire::CloseSessionResponse::new())
         })
         .await
         .map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -5614,6 +5606,154 @@ mod tests {
         assert!(claim_prompt(&busy).is_ok());
         actor.abort();
         let _ = actor.await;
+    }
+
+    #[tokio::test]
+    async fn explicit_close_and_reset_join_acknowledgement_and_actor_exit() {
+        for outcome in ["ok", "error", "missing_ack"] {
+            for (cancel_request, reset_after_exit) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let root = tempfile::tempdir().unwrap();
+                let registry = SessionRegistry::new();
+                let server = Arc::new(Server::new(
+                    Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                    registry.clone(),
+                ));
+                let id = wire::SessionId::new("overlapping-close");
+                let token = registry.next_token().unwrap();
+                let (commands, mut received) = mpsc::channel(1);
+                let (completed, completion) = watch::channel(false);
+                let (accepted, accepted_rx) = oneshot::channel();
+                let (acknowledge, acknowledge_rx) = oneshot::channel();
+                let (acknowledged, acknowledged_rx) = oneshot::channel();
+                let (exit, exit_rx) = oneshot::channel();
+                let guard = ActorGuard {
+                    server: Arc::downgrade(&server),
+                    registry: registry.clone(),
+                    session_id: id.clone(),
+                    token,
+                    completed,
+                };
+                // Fake only the actor command boundary. Exercise the real server
+                // removal, detached cleanup, registration and reset paths.
+                let actor = tokio::spawn(async move {
+                    let _guard = guard;
+                    let Some(Command::Close { reply }) = received.recv().await else {
+                        panic!("expected close");
+                    };
+                    accepted.send(()).unwrap();
+                    acknowledge_rx.await.unwrap();
+                    match outcome {
+                        "ok" => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        "error" => {
+                            let _ = reply.send(Err(AcpRuntimeError::Loop("cleanup failed".into())));
+                        }
+                        _ => drop(reply),
+                    }
+                    acknowledged.send(()).unwrap();
+                    exit_rx.await.unwrap();
+                });
+                let background_jobs = BackgroundJobs::default();
+                let tasks = AsyncTaskManager::new().handle();
+                let weak = commands.downgrade();
+                let close: super::super::CloseV2Session = Arc::new(move || {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        let commands = weak.upgrade().ok_or(AcpRuntimeError::ClientClosed)?;
+                        let (reply, acknowledged) = oneshot::channel();
+                        commands
+                            .send(Command::Close { reply })
+                            .await
+                            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+                        acknowledged
+                            .await
+                            .map_err(|_| AcpRuntimeError::ClientClosed)?
+                    })
+                });
+                registry
+                    .register_v2(
+                        &mut registry.begin_attachment().unwrap(),
+                        token,
+                        Arc::new(|| {}),
+                        close,
+                        actor.abort_handle(),
+                        completion,
+                    )
+                    .unwrap();
+                let integration = server
+                    .integration
+                    .bind_session(AcpSessionBinding::new(
+                        id.clone(),
+                        SessionId::new("overlapping-close"),
+                        RecordingSink::default(),
+                    ))
+                    .unwrap();
+                server.sessions.lock().unwrap().insert(
+                    id.clone(),
+                    SessionHandle {
+                        mcp: server.runtime.mcp_for_test().clone(),
+                        integration,
+                        busy: Arc::new(AtomicBool::new(false)),
+                        subagents: None,
+                        voice_state: Default::default(),
+                        token,
+                        commands,
+                        background_jobs,
+                        structured_completion: false,
+                        tasks,
+                    },
+                );
+                let closing_server = Arc::clone(&server);
+                let mut request = tokio::spawn(async move {
+                    closing_server
+                        .close(wire::CloseSessionRequest::new(id))
+                        .await
+                });
+                accepted_rx.await.unwrap();
+                assert!(server.sessions.lock().unwrap().is_empty());
+                if cancel_request {
+                    request.abort();
+                }
+                let mut reset = Box::pin(registry.reset_authentication_with(async { "reset" }));
+                if !reset_after_exit {
+                    assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                }
+                acknowledge.send(()).unwrap();
+                acknowledged_rx.await.unwrap();
+                // An acknowledgement (including failure) is not actor exit.
+                if !reset_after_exit {
+                    assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                }
+                if !cancel_request {
+                    assert!(!request.is_finished());
+                }
+                exit.send(()).unwrap();
+                actor.await.unwrap();
+                // Non-cancelled late resets also observe an already-retired
+                // explicit result, not just an actor whose task has exited.
+                let finished_request = if reset_after_exit {
+                    Some((&mut request).await)
+                } else {
+                    None
+                };
+                let (reopened, result) = timeout(Duration::from_secs(2), reset).await.unwrap();
+                assert_eq!(reopened, outcome == "ok");
+                assert_eq!(result, (outcome == "ok").then_some("reset"));
+                assert_eq!(registry.begin_attachment().is_ok(), outcome == "ok");
+                let response = match finished_request {
+                    Some(response) => response,
+                    None => request.await,
+                };
+                if cancel_request {
+                    assert!(response.unwrap_err().is_cancelled());
+                } else {
+                    assert_eq!(response.unwrap().is_ok(), outcome == "ok");
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2394,3 +2394,153 @@ async fn shutdown_propagates_child_close_failure() {
         matches!(request, LoggedRequest::Close { session_id } if session_id == "branch-1")
     }));
 }
+
+#[tokio::test]
+async fn shutdown_without_optional_close_releases_the_sole_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = manager_with_generic_harness(root.path(), Vec::new()).child_config();
+    // A real ACP subprocess that advertises no optional session capabilities.
+    let script = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if 'id' not in request:
+        continue
+    if method == 'initialize':
+        result = {'protocolVersion': 1, 'agentCapabilities': {}}
+    elif method == 'session/new':
+        result = {'sessionId': 'sole-owner'}
+    elif method == 'session/prompt':
+        result = {'stopReason': 'end_turn'}
+    else:
+        raise RuntimeError('unexpected method: ' + method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+    config.harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+        "generic".into(),
+        crate::acp_child::AcpHarnessProfile {
+            command: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            permissions: Default::default(),
+        },
+    )]))
+    .unwrap();
+    let manager = Subagents::new(config);
+    let handle = manager
+        .create(
+            "finish".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = manager.lookup(&handle).unwrap();
+    let mut closed = state.lock().await.child.as_ref().unwrap().closed_signal();
+    manager.shutdown().await.unwrap();
+    assert!(state.lock().await.child.is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !*closed.borrow() {
+            closed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("sole-owner subprocess did not exit");
+    wait_for_available_permits(&manager, MAX_LIVE_SUBAGENTS).await;
+}
+
+#[tokio::test]
+async fn shutdown_preserves_completed_generation_results() {
+    for failed in [false, true] {
+        let scenario = MockAcpScenario::new(ScenarioOptions::default());
+        let handle = scenario.create("completed").await;
+        if failed {
+            assert!(
+                scenario
+                    .manager
+                    .prompt(
+                        handle.clone(),
+                        "MOCK_REFUSAL".into(),
+                        TurnCancellation::default(),
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let state = scenario.manager.lookup(&handle).unwrap();
+        let before = {
+            let locked = state.lock().await;
+            (
+                locked.outcome,
+                locked.generation_finished_at_unix_ms,
+                locked.finished.len(),
+            )
+        };
+        scenario.manager.shutdown().await.unwrap();
+        let locked = state.lock().await;
+        assert_eq!(locked.status, SubagentStatus::Removed);
+        assert_eq!(
+            (
+                locked.outcome,
+                locked.generation_finished_at_unix_ms,
+                locked.finished.len()
+            ),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_shutdown_keeps_cleanup_owned_and_settles_running_generation() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_close: true,
+        gate_prompt: Some("running"),
+        ..Default::default()
+    });
+    let handle = scenario.create("completed").await;
+    let state = scenario.manager.lookup(&handle).unwrap();
+    let manager = scenario.manager.clone();
+    let prompt = tokio::spawn(async move {
+        manager
+            .prompt(handle, "running".into(), TurnCancellation::default(), None)
+            .await
+    });
+    scenario
+        .wait_for(
+            |request| matches!(request, LoggedRequest::Prompt { text, .. } if text == "running"),
+        )
+        .await;
+    let manager = scenario.manager.clone();
+    let shutdown = tokio::spawn(async move { manager.shutdown().await });
+    scenario
+        .wait_for(|request| matches!(request, LoggedRequest::Close { .. }))
+        .await;
+    shutdown.abort();
+    assert!(shutdown.await.unwrap_err().is_cancelled());
+    {
+        let locked = state.lock().await;
+        assert_eq!(locked.status, SubagentStatus::Removed);
+        assert_eq!(locked.outcome, Some(GenerationOutcome::Failed));
+        assert!(locked.generation_finished_at_unix_ms.is_some());
+        assert_eq!(
+            locked.finished.back().unwrap().generation,
+            locked.generation
+        );
+        assert_eq!(
+            locked.finished.back().unwrap().outcome,
+            GenerationOutcome::Failed
+        );
+        assert!(locked.child.is_none());
+    }
+    assert_eq!(
+        scenario.manager.capacity.available_permits(),
+        MAX_LIVE_SUBAGENTS - 1
+    );
+    MockAcpScenario::release(&scenario.prompt_release);
+    MockAcpScenario::release(&scenario.close_release);
+    assert!(prompt.await.unwrap().is_err());
+    wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+}
