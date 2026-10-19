@@ -5199,6 +5199,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             id.clone(),
             SessionHandle {
+                mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
                 subagents: None,
                 voice_state: Default::default(),
