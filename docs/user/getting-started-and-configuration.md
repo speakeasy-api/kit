@@ -231,7 +231,7 @@ ACP clients can supply additional stdio MCP servers per session: use `mcpServers
 
 ## Configure `~/.kit/config.toml`
 
-At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.
+At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown top-level keys are ignored so configurations remain compatible across Kit versions. The `[compaction]` table rejects unknown keys to catch policy typos. Invalid values, an unreadable file, and invalid TOML syntax are errors.
 
 ### Edit configuration from the command line
 
@@ -317,6 +317,36 @@ subdir = "agent-plugins/example"
 `a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP export of AgentKit's GenAI trace spans. `otel_protocol` accepts exactly `grpc`, `http/protobuf`, or `http/json`; gRPC is the default. For either HTTP protocol, Kit appends `/v1/traces` to a base endpoint unless it already ends with that path. `credential_store` selects one backend for model providers and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone provider login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 Agent hooks are configured in `~/.agents/hooks.json` and `<root>/.agents/hooks.json`. See [Agent Hooks Protocol](agent-hooks-protocol.md).
+
+### Configure automatic compaction
+
+To compact at 200,000 tokens or 55% of the provider's context window, whichever comes first, add:
+
+```toml
+[compaction]
+threshold_percent = 55
+max_context_tokens = 200000
+precompute_margin_percent = 10
+precompute_margin_tokens = 20000
+```
+
+Or save the trigger settings with:
+
+```sh
+kit config set compaction.threshold_percent 55
+kit config set compaction.max_context_tokens 200000
+```
+
+| Setting | Default | Valid values |
+| --- | --- | --- |
+| `threshold_percent` | `80` | Integer from 1 through 99 |
+| `max_context_tokens` | Unset (no token ceiling) | Positive integer |
+| `precompute_margin_percent` | `10` | Integer from 0 through 100; percentage points of the full context window |
+| `precompute_margin_tokens` | `20000` | Nonnegative integer |
+
+Omitting the table keeps these defaults. Partial tables inherit omitted defaults. Use `kit config unset compaction.max_context_tokens` to remove the token ceiling. Invalid values and unknown keys in this table prevent runtime startup; the config editor saves TOML without validating the policy. Reading configuration never rewrites the file.
+
+The token ceiling is a compaction trigger, not a strict limit on context size: provider usage arrives after work, and retained instructions and recent history may exceed a small ceiling. If the provider's context window is unknown or zero, automatic compaction remains disabled even with a token ceiling. See [Automatic context compaction](tui-and-sessions.md#automatic-context-compaction) for preparation timing, hooks, and limitations. The model-switch safety warning uses its separate safety margin; these settings do not change it.
 
 ### Configuration precedence and built-in defaults
 

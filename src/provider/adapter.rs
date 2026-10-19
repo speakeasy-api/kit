@@ -282,6 +282,35 @@ impl SelectableAdapter {
             .map_err(|_| "session selection lock is poisoned".into())
     }
 
+    /// Captures a fixed model and effort for a background summary. The selection
+    /// and its revision are read under one lock; the detached adapter cannot
+    /// follow a later foreground switch or retain the transcript writer.
+    pub(crate) fn compaction_snapshot(&self) -> Result<(Self, u64), String> {
+        let selected = self
+            .selection
+            .lock()
+            .map_err(|_| "session selection lock is poisoned".to_string())?
+            .clone();
+        let revision = selected.revision;
+        Ok((
+            Self {
+                session_observer: None,
+                selection: Arc::new(Mutex::new(selected)),
+                credential_storage: self.credential_storage.clone(),
+                openrouter_api_key: self.openrouter_api_key.clone(),
+                openai_model_catalog: self.openai_model_catalog.clone(),
+            },
+            revision,
+        ))
+    }
+
+    pub(crate) fn selection_revision(&self) -> Result<u64, String> {
+        self.selection
+            .lock()
+            .map(|selection| selection.revision)
+            .map_err(|_| "session selection lock is poisoned".to_string())
+    }
+
     pub fn reasoning_effort(&self) -> Result<Option<ReasoningEffort>, String> {
         self.selection
             .lock()
@@ -2058,6 +2087,67 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn compaction_snapshot_keeps_model_and_effort_across_switches() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = crate::session::open(
+            root.path(),
+            "snapshot-isolation",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "first/model",
+            CredentialStorage::Memory,
+            Some(ReasoningEffort::High),
+            Some(OpenRouterApiKey::new("test-key")),
+        )
+        .unwrap();
+        let adapter = adapter
+            .with_session_observer(opened.observer, false)
+            .unwrap();
+        let (snapshot, revision) = adapter.compaction_snapshot().unwrap();
+        assert_eq!(revision, adapter.selection_revision().unwrap());
+        adapter
+            .select(ModelSelection::new(
+                ProviderKind::OpenRouter,
+                "second/model",
+            ))
+            .unwrap();
+        adapter.select_reasoning_effort(None).unwrap();
+        assert_ne!(revision, adapter.selection_revision().unwrap());
+        assert_eq!(snapshot.selection().unwrap().model, "first/model");
+        assert_eq!(
+            snapshot.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(snapshot.selection_revision().unwrap(), revision);
+        assert!(snapshot.session_observer.is_none());
+    }
+
+    #[test]
+    fn compaction_snapshot_rejects_poisoned_selection() {
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "first/model",
+            CredentialStorage::Memory,
+            None,
+            Some(OpenRouterApiKey::new("test-key")),
+        )
+        .unwrap();
+        let selection = adapter.selection.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = selection.lock().unwrap();
+            panic!("poison selection");
+        })
+        .join();
+        assert!(adapter.compaction_snapshot().is_err());
+        assert!(adapter.selection_revision().is_err());
     }
 
     #[test]
