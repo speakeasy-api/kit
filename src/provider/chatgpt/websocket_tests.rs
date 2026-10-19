@@ -536,6 +536,53 @@ async fn subscription_retries_correlated_transient_response_failure() {
 }
 
 #[tokio::test]
+async fn subscription_retries_uncorrelated_overload_on_fresh_socket() {
+    for wrapped in [false, true] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut failed = tungstenite::accept(accept(&listener)).unwrap();
+            receive(&mut failed, false);
+            success(&mut failed, "first-response", "first answer");
+            // Fail a reused connection after acceptance, without a response ID.
+            let incremental = receive_wire(&mut failed);
+            assert_eq!(incremental["previous_response_id"], "first-response");
+            failed
+                .send(Message::Text(response("failed", "")[0].to_string().into()))
+                .unwrap();
+            let error = json!({
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "The server is overloaded. Please try again later.",
+                "status": 503
+            });
+            let failure = if wrapped {
+                json!({"type": "error", "status": 503, "error": error})
+            } else {
+                json!({
+                    "type": "response.failed",
+                    "sequence_number": 2,
+                    "response": {"status_code": 503, "error": error}
+                })
+            };
+            failed
+                .send(Message::Text(failure.to_string().into()))
+                .unwrap();
+            // Leave the failed socket open. Recovery must replace it and send
+            // the complete transcript, not reuse its continuation checkpoint.
+            let mut fresh = tungstenite::accept(accept(&listener)).unwrap();
+            receive(&mut fresh, true);
+            success(&mut fresh, "retried", "second answer");
+        });
+        let mut session = session_with_retries(&endpoint, 1).await;
+        let mut first = begin(&mut session, false).await;
+        finished(&mut first, "first-response", "first answer").await;
+        drop(first);
+        let mut turn = begin(&mut session, true).await;
+        finished(&mut turn, "retried", "second answer").await;
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn subscription_auto_426_fallback_stays_http_for_future_turns() {
     let (endpoint, peer) = server(|listener| {
         let (headers, _) = http(&listener, "426 Upgrade Required", "");
