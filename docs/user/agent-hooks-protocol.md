@@ -1,12 +1,15 @@
 # Agent Hooks Protocol
 
-Kit delivers [Agent Hooks Protocol](https://github.com/agenthooksprotocol/rust-sdk)
+Use hooks to enforce tool policies, inspect model requests, or add session context.
+Kit delivers [Agent Hooks Protocol](https://agenthooksprotocol.com/)
 events to hook backends registered in `~/.agents/hooks.json` (global) and
 `<root>/.agents/hooks.json` (project). When neither file exists, hooks are off.
 
 ## Configure hooks
 
-Each file holds an AHP registration:
+Install a trusted hook backend, then create either registration file. This
+example intercepts tool calls; replace `command` with your backend executable.
+The backend must implement the [Agent Hooks Protocol](https://agenthooksprotocol.com/).
 
 ```json
 {
@@ -129,16 +132,16 @@ These are host settings and observations, not a copy of the provider's wire
 request. Credentials, environment contents, arbitrary request metadata, and
 opaque continuation state are not added to payloads. Provider-only generation
 settings, exact compaction token deltas, and generic tool MCP/batch/file-change
-metadata are omitted when the runtime seam does not expose them. Unknown
+metadata are omitted when unavailable. Unknown
 required model identities are explicitly identified in `gaps`.
 
 Tool calls, model retries and model continuations stay within the same logical
 turn; they do not emit extra turn boundaries. Kit delivers turn observations
 in order, before the session's next hook event and whenever the session goes
-idle. An abrupt process exit can drop a terminal observation. The start event has no transcript snapshot;
-its trigger is reported as external because the loop does not expose a cause.
-The continuation count is zero because Kit does not initiate AHP hook
-continuations.
+idle. An abrupt process exit can drop a terminal observation. Do not rely on
+terminal observations as a durable audit log. The start event has no transcript
+snapshot and reports an external trigger. Kit does not initiate AHP hook
+continuations; the continuation count is zero.
 
 Kit does not emit `turn.finish.before`, `model.switch.*`, `config.change.*`, `file.changed`
-or the tool permission and progress events yet.
+or the tool permission and progress events.
