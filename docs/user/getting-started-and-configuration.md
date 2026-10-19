@@ -231,7 +231,7 @@ ACP clients can supply additional stdio MCP servers per session: use `mcpServers
 
 ## Configure `~/.kit/config.toml`
 
-At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown top-level keys are ignored so configurations remain compatible across Kit versions. The `[compaction]` table rejects unknown keys to catch policy typos. Invalid values, an unreadable file, and invalid TOML syntax are errors.
+At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown top-level keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.
 
 ### Edit configuration from the command line
 
@@ -344,7 +344,7 @@ kit config set compaction.max_context_tokens 200000
 | `precompute_margin_percent` | `10` | Integer from 0 through 100; percentage points of the full context window |
 | `precompute_margin_tokens` | `20000` | Nonnegative integer |
 
-Omitting the table keeps these defaults. Partial tables inherit omitted defaults. Use `kit config unset compaction.max_context_tokens` to remove the token ceiling. Invalid values and unknown keys in this table prevent runtime startup; the config editor saves TOML without validating the policy. Reading configuration never rewrites the file.
+Omitting the table keeps these defaults. Partial tables inherit omitted defaults. Use `kit config unset compaction.max_context_tokens` to remove the token ceiling. Unknown keys in this table are ignored for compatibility across Kit versions. Invalid values for known settings prevent runtime startup; the config editor saves TOML without validating the policy. Reading configuration never rewrites the file.
 
 The token ceiling is a compaction trigger, not a strict limit on context size: provider usage arrives after work, and retained instructions and recent history may exceed a small ceiling. If the provider's context window is unknown or zero, automatic compaction remains disabled even with a token ceiling. See [Automatic context compaction](tui-and-sessions.md#automatic-context-compaction) for preparation timing, hooks, and limitations. The model-switch safety warning uses its separate safety margin; these settings do not change it.
 

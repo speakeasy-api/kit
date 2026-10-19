@@ -2858,6 +2858,34 @@ mod tests {
     }
 
     #[test]
+    fn config_compaction_ignores_and_preserves_unknown_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let text = "[compaction]\nthreshold_percent = 55\nfuture = { enabled = true }\n";
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().compaction.threshold_percent,
+            55
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        kit::config_editor::set(&path, "compaction.threshold_percent", "60").unwrap();
+        let edited = fs::read_to_string(&path).unwrap();
+        let document: toml::Value = toml::from_str(&edited).unwrap();
+        assert_eq!(
+            document["compaction"]["future"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            Config::load(&path).unwrap().compaction.threshold_percent,
+            60
+        );
+        let invalid = text.replace("55", "0");
+        fs::write(&path, &invalid).unwrap();
+        assert!(Config::load(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+    }
+
+    #[test]
     fn config_compaction_rejects_invalid_policy_without_rewriting() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -2869,7 +2897,6 @@ mod tests {
             "[compaction]\nmax_context_tokens = 0",
             "[compaction]\nprecompute_margin_percent = 101",
             "[compaction]\nprecompute_margin_tokens = -1",
-            "[compaction]\nunknown = true",
         ] {
             fs::write(&path, text).unwrap();
             assert!(toml::from_str::<Config>(text).is_err(), "{text}");

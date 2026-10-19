@@ -24,7 +24,7 @@ impl Default for CompactionConfig {
 }
 
 #[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct RawCompactionConfig {
     threshold_percent: u64,
     max_context_tokens: Option<u64>,
@@ -202,7 +202,6 @@ mod tests {
             "precompute_margin_percent = 101",
             "precompute_margin_percent = -1",
             "precompute_margin_tokens = -1",
-            "unknown = 1",
         ] {
             assert!(
                 toml::from_str::<CompactionConfig>(invalid).is_err(),
@@ -214,6 +213,8 @@ mod tests {
             "threshold_percent = 99",
             "precompute_margin_percent = 100",
             "precompute_margin_tokens = 0",
+            "future = true",
+            "threshold_percent = 55\nfuture = { enabled = true }",
         ] {
             assert!(toml::from_str::<CompactionConfig>(valid).is_ok(), "{valid}");
         }
