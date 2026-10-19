@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -39,7 +39,10 @@ use agentkit_loop::{
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use futures_util::future::{Either, select};
+use futures_util::{
+    FutureExt as _,
+    future::{Either, select},
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
@@ -563,7 +566,7 @@ enum Command {
         reply: oneshot::Sender<Result<AcpForkState, AcpRuntimeError>>,
     },
     Close {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), AcpRuntimeError>>,
     },
 }
 
@@ -589,14 +592,62 @@ struct RegisteredSession {
     completed: watch::Receiver<bool>,
 }
 
-type CloseV2Session =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync + 'static>;
+type CloseV2Session = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), AcpRuntimeError>> + Send + 'static>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+// Each registration owns one lazy close operation. Clones join the same
+// acknowledgement AND actor completion; dropping a waiter cannot restart it.
+fn shared_session_close(
+    close: impl Future<Output = Result<(), AcpRuntimeError>> + Send + 'static,
+    mut completed: watch::Receiver<bool>,
+    registry: Weak<SessionRegistryInner>,
+    token: u64,
+) -> SharedSessionClose {
+    let started = Arc::new(AtomicBool::new(false));
+    let closing = Arc::clone(&started);
+    let close = async move {
+        closing.store(true, Ordering::Release);
+        let result = close.await.map_err(|error| error.to_string());
+        let completion = completed
+            .wait_for(|done| *done)
+            .await
+            .map(|_| ())
+            .map_err(|_| AcpRuntimeError::ClientClosed.to_string());
+        let result = result.and(completion);
+        if let Some(registry) = registry.upgrade() {
+            let mut state = registry.lock_state();
+            state.cleanup_failed |= result.is_err();
+            let close = state.closes.remove(&token);
+            drop(state);
+            drop(close);
+        }
+        result
+    }
+    .boxed()
+    .shared();
+    SharedSessionClose {
+        started,
+        operation: Arc::new(move || {
+            let close = close.clone();
+            Box::pin(async move { close.await.map_err(AcpRuntimeError::Loop) })
+        }),
+    }
+}
+
+#[derive(Clone)]
+struct SharedSessionClose {
+    started: Arc<AtomicBool>,
+    operation: CloseV2Session,
+}
 
 #[derive(Clone)]
 struct RegisteredV2Session {
     token: u64,
     interrupt: Arc<dyn Fn() + Send + Sync>,
-    close: CloseV2Session,
     actor: AbortHandle,
     completed: watch::Receiver<bool>,
 }
@@ -604,10 +655,13 @@ struct RegisteredV2Session {
 struct RegistryState {
     accepting: bool,
     permanently_closed: bool,
+    // Retired explicit-close failures constrain teardown, not normal admission.
+    cleanup_failed: bool,
     generation: u64,
     pending_attachments: usize,
     sessions: HashMap<u64, RegisteredSession>,
     v2_sessions: HashMap<u64, RegisteredV2Session>,
+    closes: HashMap<u64, SharedSessionClose>,
 }
 
 impl RegistryState {
@@ -638,7 +692,11 @@ impl SessionRegistryInner {
             // in-memory transitions without callbacks, wakeups, arbitrary drops, or
             // awaits: admission counts are checked before incrementing; completion
             // consumes a validated admission; insertion rejects existing tokens;
-            // removal extracts ownership; gate closure cannot wrap its generation.
+            // each insertion publishes its matching shared close without fallible
+            // callbacks. Actor removal retains started closes until their shared
+            // result records failure monotonically and retires ownership without
+            // changing admission. Only teardown consumes that failure. Other
+            // removal extracts both owners; gate closure cannot wrap its generation.
             // Snapshots clone only concrete Arc/channel/handle types. Reopening
             // happens only after teardown and the external reset have succeeded;
             // cancellation or panic before then leaves admission closed. Thus unwind
@@ -694,10 +752,12 @@ impl SessionRegistry {
                 state: Mutex::new(RegistryState {
                     accepting: true,
                     permanently_closed: false,
+                    cleanup_failed: false,
                     generation: 0,
                     pending_attachments: 0,
                     sessions: HashMap::new(),
                     v2_sessions: HashMap::new(),
+                    closes: HashMap::new(),
                 }),
             }),
         }
@@ -730,6 +790,27 @@ impl SessionRegistry {
         admission: &mut SessionAdmission,
         session: RegisteredSession,
     ) -> Result<(), ()> {
+        let closing = session.clone();
+        let close = shared_session_close(
+            async move {
+                cancel_background_jobs(&closing.tasks, &closing.background_jobs).await;
+                let commands = closing
+                    .commands
+                    .upgrade()
+                    .ok_or(AcpRuntimeError::ClientClosed)?;
+                let (reply, acknowledged) = oneshot::channel();
+                commands
+                    .send(Command::Close { reply })
+                    .await
+                    .map_err(|_| AcpRuntimeError::ClientClosed)?;
+                acknowledged
+                    .await
+                    .map_err(|_| AcpRuntimeError::ClientClosed)?
+            },
+            session.completed.clone(),
+            Arc::downgrade(&self.inner),
+            session.token,
+        );
         let mut state = self.inner.lock_state();
         if !admission.active
             || !Arc::ptr_eq(&self.inner, &admission.registry)
@@ -737,9 +818,11 @@ impl SessionRegistry {
             || state.generation != admission.generation
             || state.sessions.contains_key(&session.token)
             || state.v2_sessions.contains_key(&session.token)
+            || state.closes.contains_key(&session.token)
         {
             return Err(());
         }
+        state.closes.insert(session.token, close);
         state.sessions.insert(session.token, session);
         admission.complete(&mut state);
         drop(state);
@@ -756,6 +839,12 @@ impl SessionRegistry {
         actor: AbortHandle,
         completed: watch::Receiver<bool>,
     ) -> Result<(), ()> {
+        let close = shared_session_close(
+            async move { close().await },
+            completed.clone(),
+            Arc::downgrade(&self.inner),
+            token,
+        );
         let mut state = self.inner.lock_state();
         if !admission.active
             || !Arc::ptr_eq(&self.inner, &admission.registry)
@@ -763,15 +852,16 @@ impl SessionRegistry {
             || state.generation != admission.generation
             || state.sessions.contains_key(&token)
             || state.v2_sessions.contains_key(&token)
+            || state.closes.contains_key(&token)
         {
             return Err(());
         }
+        state.closes.insert(token, close);
         state.v2_sessions.insert(
             token,
             RegisteredV2Session {
                 token,
                 interrupt,
-                close,
                 actor,
                 completed,
             },
@@ -783,24 +873,69 @@ impl SessionRegistry {
     }
 
     pub(super) fn remove(&self, token: u64) {
+        self.remove_registration(token, false);
+    }
+
+    fn actor_finished(&self, token: u64) {
+        self.remove_registration(token, true);
+    }
+
+    fn remove_registration(&self, token: u64, retain_started_close: bool) {
         let mut state = self.inner.lock_state();
         let session = state.sessions.remove(&token);
         let v2_session = state.v2_sessions.remove(&token);
+        // An actor can exit before the close waiter observes its result. Keep
+        // started closes visible to reset until the shared operation records
+        // success or remembers failure for the next teardown.
+        let retain = retain_started_close
+            && state
+                .closes
+                .get(&token)
+                .is_some_and(|close| close.started.load(Ordering::Acquire));
+        let close = if retain {
+            None
+        } else {
+            state.closes.remove(&token)
+        };
         drop(state);
         // Captured callback state can reenter the registry or panic on final drop.
         drop(session);
         drop(v2_session);
+        drop(close);
+    }
+
+    fn session_close(&self, token: u64) -> Result<CloseV2Session, AcpRuntimeError> {
+        self.inner
+            .lock_state()
+            .closes
+            .get(&token)
+            .map(|close| {
+                // Claim under registry exclusion, before the detached task can
+                // be scheduled or the actor can retire its registration.
+                close.started.store(true, Ordering::Release);
+                Arc::clone(&close.operation)
+            })
+            .ok_or(AcpRuntimeError::ClientClosed)
     }
 
     fn close_gate_and_snapshot(
         &self,
         permanently: bool,
-    ) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
+    ) -> (
+        Vec<RegisteredSession>,
+        Vec<RegisteredV2Session>,
+        Vec<CloseV2Session>,
+    ) {
         let mut state = self.inner.lock_state();
         state.close_gate(permanently);
         (
             state.sessions.values().cloned().collect(),
             state.v2_sessions.values().cloned().collect(),
+            state
+                .closes
+                .values()
+                .map(|close| Arc::clone(&close.operation))
+                .collect(),
         )
     }
 
@@ -847,7 +982,7 @@ impl SessionRegistry {
                 return (false, None);
             }
         };
-        let (sessions, v2_sessions) = self.close_gate_and_snapshot(!reopen);
+        let (sessions, v2_sessions, closes) = self.close_gate_and_snapshot(!reopen);
         for session in &sessions {
             session.background_jobs.cancel_all();
             let _ = session.integration.interrupt_session(&session.session_id);
@@ -856,32 +991,21 @@ impl SessionRegistry {
             (session.interrupt)();
         }
 
-        let mut closing = JoinSet::new();
-        for mut session in sessions.iter().cloned() {
+        let mut closing = JoinSet::<Result<bool, ()>>::new();
+        for close in closes {
             closing.spawn(async move {
-                cancel_background_jobs(&session.tasks, &session.background_jobs).await;
-                if let Some(commands) = session.commands.upgrade() {
-                    let (reply, acknowledged) = oneshot::channel();
-                    if commands.send(Command::Close { reply }).await.is_ok() {
-                        let _ = acknowledged.await;
-                    }
-                }
-                session.completed.wait_for(|done| *done).await.is_ok()
+                close().await.map_err(|_| ())?;
+                Ok(true)
             });
         }
 
-        for mut session in v2_sessions.iter().cloned() {
-            closing.spawn(async move {
-                (session.close)().await;
-                session.completed.wait_for(|done| *done).await.is_ok()
-            });
-        }
-
+        let mut cleanup_failed = false;
         let graceful = matches!(
             timeout(limit, async {
                 let mut completed = true;
                 while let Some(result) = closing.join_next().await {
-                    completed &= matches!(result, Ok(true));
+                    cleanup_failed |= !matches!(result, Ok(Ok(true)));
+                    completed &= matches!(result, Ok(Ok(true)));
                 }
                 self.wait_for_pending_attachments().await;
                 completed
@@ -890,9 +1014,9 @@ impl SessionRegistry {
             Ok(true)
         );
         let teardown_complete = if !graceful {
-            // A panicking close callback is not successful teardown. Abort any
-            // unfinished actor and require its positive completion signal before
-            // resetting external credentials or reopening admission.
+            // Aborting an actor establishes termination, not successful domain
+            // cleanup. Retain every failed/cancelled close outcome separately
+            // while waiting for positive actor completion.
             closing.abort_all();
             for session in &sessions {
                 if !*session.completed.borrow() {
@@ -904,7 +1028,9 @@ impl SessionRegistry {
                     session.actor.abort();
                 }
             }
-            while closing.join_next().await.is_some() {}
+            while let Some(result) = closing.join_next().await {
+                cleanup_failed |= !matches!(result, Ok(Ok(true)));
+            }
             matches!(
                 timeout(limit, async {
                     for mut session in sessions.iter().cloned() {
@@ -932,6 +1058,15 @@ impl SessionRegistry {
         for session in &v2_sessions {
             self.remove(session.token);
         }
+        // Actor completion proves residency ended, not that domain cleanup
+        // succeeded. Never overwrite failed or unacknowledged cleanup with it.
+        // A failed explicit close may have retired its result before this
+        // snapshot. Remembered failure must still prevent credential reset,
+        // without having closed admission during ordinary explicit cleanup.
+        let teardown_complete = teardown_complete && !cleanup_failed && {
+            let state = self.inner.lock_state();
+            !state.cleanup_failed && (!reopen || !state.permanently_closed)
+        };
         if !teardown_complete {
             self.inner.lock_state().permanently_closed = true;
         }
@@ -1221,7 +1356,7 @@ impl Drop for SessionActorGuard {
         if let Some(server) = self.server.upgrade() {
             server.remove_session(&self.session_id, self.token);
         }
-        self.registry.remove(self.token);
+        self.registry.actor_finished(self.token);
         self.completed.send_replace(true);
     }
 }
@@ -1659,6 +1794,7 @@ impl Server {
         let (tx, rx) = mpsc::channel(8);
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
+            subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
@@ -1813,23 +1949,30 @@ impl Server {
     ) -> Result<CloseSessionResponse, AcpRuntimeError> {
         // Closing uses the same out-of-band interrupt, then waits for the
         // actor to reach and acknowledge the serialized close boundary.
-        let session = self
-            .sessions
-            .lock()
-            .map_err(|_| AcpRuntimeError::ClientClosed)?
-            .remove(&request.session_id)
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        cancel_background_jobs(&session.tasks, &session.background_jobs).await;
-        self.integration.interrupt_session(&request.session_id)?;
-        let (tx, rx) = oneshot::channel();
-        session
-            .commands
-            .send(Command::Close { reply: tx })
-            .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?;
-        self.registry.remove(session.token);
-        Ok(CloseSessionResponse::new())
+        let (session, close) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+            let session = sessions
+                .remove(&request.session_id)
+                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+            // Actor removal takes the local map first, so registration remains
+            // available until we have captured its shared close operation.
+            let close = self.registry.session_close(session.token)?;
+            (session, close)
+        };
+        let integration = Arc::clone(&self.integration);
+        // Request cancellation must not abandon cleanup after local removal.
+        tokio::spawn(async move {
+            let _ = integration.interrupt_session(&request.session_id);
+            let result = close().await;
+            drop(session); // Keep the command sender alive through close.
+            result?;
+            Ok(CloseSessionResponse::new())
+        })
+        .await
+        .map_err(|_| AcpRuntimeError::ClientClosed)?
     }
 
     async fn sender(
@@ -1946,6 +2089,7 @@ pub(super) async fn detach_compose_call(
 }
 
 struct SessionActor<S: ModelSession> {
+    subagents: Option<crate::tools::subagent::Subagents>,
     voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: agentkit_acp::SessionId,
     runtime: Arc<Runtime>,
@@ -1965,6 +2109,7 @@ struct SessionActor<S: ModelSession> {
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
+        subagents,
         mut voice_monitor,
         session_id,
         runtime,
@@ -2126,17 +2271,39 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
-                    clean_up_session(&runtime, &session_id, &mut driver, &tasks, &background_jobs)
-                        .await;
+                    let cleaned = clean_up_session(
+                        &runtime,
+                        &session_id,
+                        &mut driver,
+                        &tasks,
+                        &background_jobs,
+                    )
+                    .await;
+                    let closed = close_subagents(subagents.as_ref()).await;
+                    // Cleanup can enqueue terminal lifecycle updates. Drain their
+                    // projection before the transport barrier, while still bound.
+                    let projected = activity.drain_tool_projection().await;
+                    let delivered = integration.flush_session_updates(&session_id).await;
+                    let delivery = projected.and(delivered);
                     // A close acknowledgement means the actor-owned binding is
                     // already gone, so callers can immediately reuse the id.
                     drop(binding.take());
-                    let _ = reply.send(());
+                    let result = delivery.and_then(|()| {
+                        if cleaned && closed {
+                            Ok(())
+                        } else {
+                            Err(AcpRuntimeError::Loop(
+                                "session close cleanup did not complete".into(),
+                            ))
+                        }
+                    });
+                    let _ = reply.send(result);
                     break;
                 }
                 None => {
                     clean_up_session(&runtime, &session_id, &mut driver, &tasks, &background_jobs)
                         .await;
+                    close_subagents(subagents.as_ref()).await;
                     break;
                 }
             },
@@ -2362,25 +2529,43 @@ pub(super) async fn cancel_background_jobs(
     }
 }
 
+pub(super) async fn close_subagents(subagents: Option<&crate::tools::subagent::Subagents>) -> bool {
+    if let Some(subagents) = subagents
+        && let Err(error) = subagents.shutdown().await
+    {
+        eprintln!("failed to close ACP subagents: {error}");
+        return false;
+    }
+    true
+}
+
 pub(super) async fn clean_up_session<S: ModelSession>(
     runtime: &Runtime,
     session_id: &agentkit_acp::SessionId,
     driver: &mut LoopDriver<S>,
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
-) {
+) -> bool {
+    let mut cleaned = true;
     cancel_background_jobs(tasks, background_jobs).await;
     for task in tasks.list_running().await {
         if let Err(error) = tasks.cancel(task.id).await {
+            cleaned = false;
             eprintln!("failed to cancel ACP task for {session_id}: {error}");
         }
     }
-    let _ = tokio::time::timeout(
+    if tokio::time::timeout(
         Duration::from_secs(1),
         background_jobs.wait_for_quiescence(),
     )
-    .await;
+    .await
+    .is_err()
+    {
+        cleaned = false;
+        eprintln!("ACP background cleanup timed out for {session_id}");
+    }
     if let Err(error) = driver.cancel_pending_approvals().await {
+        cleaned = false;
         eprintln!("failed to cancel ACP approvals for {session_id}: {error}");
     }
     if let Some(hooks) = runtime.hooks() {
@@ -2388,6 +2573,7 @@ pub(super) async fn clean_up_session<S: ModelSession>(
             .session_end(&session_id.to_string(), SessionEndInputOutcome::Completed)
             .await;
     }
+    cleaned
 }
 
 fn record_acp_runtime_failure(
@@ -3919,7 +4105,7 @@ pub(super) mod tests {
             let _completion = CompletionOnDrop(completed);
             if let Some(Command::Close { reply }) = received.recv().await {
                 actor_closed.store(true, Ordering::SeqCst);
-                let _ = reply.send(());
+                let _ = reply.send(Ok(()));
             }
         });
         registry
@@ -3984,7 +4170,7 @@ pub(super) mod tests {
             let _completion = CompletionOnDrop(completed);
             if let Some(Command::Close { reply }) = received.recv().await {
                 actor_closed.store(true, Ordering::SeqCst);
-                let _ = reply.send(());
+                let _ = reply.send(Ok(()));
             }
         });
         registry
@@ -4067,7 +4253,7 @@ pub(super) mod tests {
             admission,
             token,
             interrupt,
-            Arc::new(|| Box::pin(async {})),
+            Arc::new(|| Box::pin(async { Ok(()) })),
             actor.abort_handle(),
             completion,
         )
@@ -4579,7 +4765,240 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn registry_close_panic_requires_positive_actor_completion_before_reset() {
+    async fn explicit_close_and_reset_join_acknowledgement_and_actor_exit() {
+        for outcome in ["ok", "error", "missing_ack"] {
+            for (cancel_request, reset_after_exit) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let root = tempfile::tempdir().unwrap();
+                let registry = SessionRegistry::new();
+                let server = logout_test_server(
+                    Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                    registry.clone(),
+                );
+                let id = agentkit_acp::SessionId::new("overlapping-close");
+                let token = registry.next_token().unwrap();
+                let (commands, mut received) = mpsc::channel(1);
+                let (completed, completion) = watch::channel(false);
+                let (accepted, accepted_rx) = oneshot::channel();
+                let (acknowledge, acknowledge_rx) = oneshot::channel();
+                let (acknowledged, acknowledged_rx) = oneshot::channel();
+                let (exit, exit_rx) = oneshot::channel();
+                let guard = SessionActorGuard {
+                    server: Arc::downgrade(&server),
+                    registry: registry.clone(),
+                    session_id: id.clone(),
+                    token,
+                    completed,
+                };
+                // Fake only the actor command boundary. Exercise the real server
+                // removal, detached cleanup, registration and reset paths.
+                let actor = tokio::spawn(async move {
+                    let _guard = guard;
+                    let Some(Command::Close { reply }) = received.recv().await else {
+                        panic!("expected close");
+                    };
+                    accepted.send(()).unwrap();
+                    acknowledge_rx.await.unwrap();
+                    match outcome {
+                        "ok" => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        "error" => {
+                            let _ = reply.send(Err(AcpRuntimeError::Loop("cleanup failed".into())));
+                        }
+                        _ => drop(reply),
+                    }
+                    acknowledged.send(()).unwrap();
+                    exit_rx.await.unwrap();
+                });
+                let background_jobs = BackgroundJobs::default();
+                let tasks = AsyncTaskManager::new().handle();
+                registry
+                    .register(
+                        &mut registry.begin_attachment().unwrap(),
+                        RegisteredSession {
+                            token,
+                            session_id: id.clone(),
+                            integration: Arc::clone(&server.integration),
+                            background_jobs: background_jobs.clone(),
+                            tasks: tasks.clone(),
+                            commands: commands.downgrade(),
+                            actor: actor.abort_handle(),
+                            completed: completion,
+                        },
+                    )
+                    .unwrap();
+                server.sessions.lock().unwrap().insert(
+                    id.clone(),
+                    SessionHandle {
+                        subagents: None,
+                        voice_state: Default::default(),
+                        token,
+                        commands,
+                        background_jobs,
+                        structured_completion: false,
+                        tasks,
+                    },
+                );
+                let admission_before_close =
+                    reset_after_exit.then(|| registry.begin_attachment().unwrap());
+                let closing_server = Arc::clone(&server);
+                let mut request = tokio::spawn(async move {
+                    closing_server.close(CloseSessionRequest::new(id)).await
+                });
+                accepted_rx.await.unwrap();
+                assert!(server.sessions.lock().unwrap().is_empty());
+                if cancel_request {
+                    request.abort();
+                }
+                let mut reset = Box::pin(registry.reset_authentication_with(async { "reset" }));
+                if !reset_after_exit {
+                    assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                }
+                acknowledge.send(()).unwrap();
+                acknowledged_rx.await.unwrap();
+                // An acknowledgement (including failure) is not actor exit.
+                if !reset_after_exit {
+                    assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                }
+                if !cancel_request {
+                    assert!(!request.is_finished());
+                }
+                exit.send(()).unwrap();
+                actor.await.unwrap();
+                // Non-cancelled late resets also observe an already-retired
+                // explicit result, not just an actor whose task has exited.
+                let finished_request = if reset_after_exit {
+                    Some((&mut request).await)
+                } else {
+                    None
+                };
+                if let Some(admission) = admission_before_close {
+                    // No reset has run yet: even failed explicit cleanup must
+                    // allow unrelated admission and preserve outstanding claims.
+                    let next_admission = registry.begin_attachment().unwrap();
+                    assert_eq!(next_admission.generation, admission.generation);
+                    assert!(!registry.inner.lock_state().permanently_closed);
+                    drop(next_admission);
+                    drop(admission);
+                }
+                let (reopened, result) = timeout(Duration::from_secs(2), reset).await.unwrap();
+                assert_eq!(reopened, outcome == "ok");
+                assert_eq!(result, (outcome == "ok").then_some("reset"));
+                assert_eq!(registry.begin_attachment().is_ok(), outcome == "ok");
+                let response = match finished_request {
+                    Some(response) => response,
+                    None => request.await,
+                };
+                if cancel_request {
+                    assert!(response.unwrap_err().is_cancelled());
+                } else {
+                    assert_eq!(response.unwrap().is_ok(), outcome == "ok");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_unsuccessful_cleanup_prevents_reset_even_after_actor_completion() {
+        for failure in ["error", "cancelled", "missing_ack", "send_rejected"] {
+            for v2 in [false, true] {
+                let registry = SessionRegistry::new();
+                let token = registry.next_token().unwrap();
+                let (completed, completion) = watch::channel(false);
+                let (commands, mut received) = mpsc::channel(1);
+                struct Completion(watch::Sender<bool>);
+                impl Drop for Completion {
+                    fn drop(&mut self) {
+                        self.0.send_replace(true);
+                    }
+                }
+                let actor = tokio::spawn(async move {
+                    let _completion = Completion(completed);
+                    if failure == "send_rejected" {
+                        return;
+                    }
+                    if let Some(Command::Close { reply }) = received.recv().await {
+                        match failure {
+                            "cancelled" => {
+                                // Retain the accepted reply until cancellation drops
+                                // this actor and publishes its residency completion.
+                                std::future::pending::<()>().await;
+                                drop(reply);
+                            }
+                            "missing_ack" => drop(reply),
+                            _ => {
+                                let _ =
+                                    reply.send(Err(AcpRuntimeError::Loop("cleanup failed".into())));
+                            }
+                        }
+                    }
+                });
+                let mut admission = registry.begin_attachment().unwrap();
+                if v2 {
+                    let sender = commands.clone();
+                    let close: CloseV2Session = Arc::new(move || {
+                        let sender = sender.clone();
+                        Box::pin(async move {
+                            let (reply, response) = oneshot::channel();
+                            sender
+                                .send(Command::Close { reply })
+                                .await
+                                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+                            response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+                        })
+                    });
+                    registry
+                        .register_v2(
+                            &mut admission,
+                            token,
+                            Arc::new(|| {}),
+                            close,
+                            actor.abort_handle(),
+                            completion,
+                        )
+                        .unwrap();
+                } else {
+                    registry
+                        .register(
+                            &mut admission,
+                            RegisteredSession {
+                                token,
+                                session_id: agentkit_acp::SessionId::new("cleanup-error"),
+                                integration: shutdown_test_integration(),
+                                background_jobs: BackgroundJobs::default(),
+                                tasks: AsyncTaskManager::new().handle(),
+                                commands: commands.downgrade(),
+                                actor: actor.abort_handle(),
+                                completed: completion,
+                            },
+                        )
+                        .unwrap();
+                }
+                drop(admission);
+                let reset_ran = AtomicBool::new(false);
+                let (reopened, output) = registry
+                    .close_sessions_with_timeout(Duration::from_millis(100), true, || async {
+                        reset_ran.store(true, Ordering::SeqCst);
+                    })
+                    .await;
+                assert!(!reopened);
+                assert!(output.is_none());
+                assert!(!reset_ran.load(Ordering::SeqCst));
+                assert!(registry.begin_attachment().is_err());
+                let joined = actor.await;
+                if failure == "cancelled" {
+                    assert!(joined.unwrap_err().is_cancelled());
+                } else {
+                    joined.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_close_panic_prevents_reset_even_with_actor_completion() {
         struct Completion {
             alive: Arc<AtomicBool>,
             completed: watch::Sender<bool>,
@@ -4623,9 +5042,9 @@ pub(super) mod tests {
                     reset_ran.store(true, Ordering::SeqCst);
                 })
                 .await;
-            assert_eq!(reopened, acknowledge);
-            assert_eq!(reset_ran.load(Ordering::SeqCst), acknowledge);
-            assert_eq!(registry.begin_attachment().is_ok(), acknowledge);
+            assert!(!reopened);
+            assert!(!reset_ran.load(Ordering::SeqCst));
+            assert!(registry.begin_attachment().is_err());
             assert!(actor.await.unwrap_err().is_cancelled());
         }
     }
@@ -4643,7 +5062,8 @@ pub(super) mod tests {
             Box::pin(async move {
                 close_flag.store(true, Ordering::SeqCst);
                 completed.send_replace(true);
-            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                Ok(())
+            }) as Pin<Box<dyn Future<Output = Result<(), AcpRuntimeError>> + Send>>
         });
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
@@ -6325,6 +6745,7 @@ pub(super) mod tests {
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let skills = runtime.current_skills().await.unwrap();
         let actor = tokio::spawn(session_actor(SessionActor {
+            subagents: None,
             voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(&[]),
             session_id: acp_session_id.clone(),
             runtime,
@@ -6432,6 +6853,7 @@ pub(super) mod tests {
             .unwrap();
         timeout(Duration::from_secs(1), close_rx)
             .await
+            .unwrap()
             .unwrap()
             .unwrap();
         let (client, _messages) = AcpClientHandle::channel();

@@ -33,7 +33,6 @@ const LEASE: Duration = Duration::from_secs(15);
 const MAX_REPLAY: usize = 8 * 1024 * 1024;
 const MAX_HTTP_FRAME: usize = 1024 * 1024;
 const MAX_QUEUE: usize = 4096;
-const MAX_SESSIONS: usize = 64;
 
 fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
     Value::Object(
@@ -626,11 +625,6 @@ async fn handle(
                     return Err(Failure::root("session belongs to another project"));
                 }
             } else {
-                if entries.len() >= MAX_SESSIONS && !entries.contains_key(&id) {
-                    return Err(Failure::unavailable(
-                        "gateway session capacity reached; all slots are occupied by active or stopping actors",
-                    ));
-                }
                 let entry = spawn(&root, &id, restore, force)
                     .map_err(|error| Failure::unavailable(error.to_string()))?;
                 let replaced = entries.insert(id.clone(), entry);
@@ -713,6 +707,9 @@ struct Actor {
     id: String,
     root: PathBuf,
     restore: bool,
+    // Terminal after any standard session/close response: an error may mean
+    // cleanup partially completed, so never reopen a half-closed child.
+    closed: bool,
     attachment: Option<Attachment>,
     // Survives detach, expiry and replay overflow; only a committed claim replaces it.
     committed_owner: Option<CommittedOwner>,
@@ -749,6 +746,7 @@ fn spawn(root: &Path, id: &str, restore: bool, force: bool) -> io::Result<Entry>
         id: id.to_owned(),
         root: root.to_owned(),
         restore,
+        closed: false,
         attachment: None,
         committed_owner: None,
         serial: 0,
@@ -853,23 +851,76 @@ impl Actor {
                 },
                 Either::Right(None) => break,
             }
+            if self.closed {
+                break;
+            }
         }
         // EOF permits ACP's normal session cleanup to release transcript locks.
         // Abort the writer (including a stalled write) to close stdin, then drain
         // stdout concurrently with waiting: final notifications must not fill a
         // pipe and prevent the child from exiting. Hard kill is a bounded fallback.
-        drop(writes);
         writer.shutdown().await;
-        let cleanup = async {
-            let drain = async { while matches!(lines.next_line().await, Ok(Some(_))) {} };
-            let _ = futures_util::future::join(child.wait(), drain).await;
+        let mut stopping = false;
+        let cleaned = {
+            let cleanup = tokio::time::timeout(Duration::from_secs(10), async {
+                let drain = async { while matches!(lines.next_line().await, Ok(Some(_))) {} };
+                let _ = futures_util::future::join(child.wait(), drain).await;
+            });
+            let mut cleanup = std::pin::pin!(cleanup);
+            loop {
+                // Do not let process teardown consume the HTTP output deadline
+                // or block unrelated multiplexed controllers. Terminal output
+                // stays private until teardown has finished.
+                match select(cleanup.as_mut(), std::pin::pin!(commands.recv())).await {
+                    Either::Left((result, _)) => break result.is_ok(),
+                    Either::Right((Some(command), _)) => {
+                        if matches!(command.request, Request::Shutdown) {
+                            stopping = true;
+                            let _ = command.reply.send(Ok(object([])));
+                            continue;
+                        }
+                        let poll = matches!(command.request, Request::Poll { .. });
+                        let result = if self.closed {
+                            self.command(command.request, &writes)
+                        } else {
+                            Err(Failure::unavailable("child exited; restore its transcript"))
+                        }
+                        .map(|result| {
+                            if poll {
+                                object([
+                                    ("events", Value::Array(Vec::new())),
+                                    ("closed", false.into()),
+                                ])
+                            } else {
+                                result
+                            }
+                        });
+                        let _ = command.reply.send(result);
+                    }
+                    Either::Right((None, _)) => break cleanup.await.is_ok(),
+                }
+            }
         };
-        if tokio::time::timeout(Duration::from_secs(10), cleanup)
-            .await
-            .is_err()
-        {
+        if !cleaned {
             let _ = child.kill().await;
             let _ = child.wait().await;
+        }
+        if self.closed && !stopping && self.attachment.is_some() {
+            // Child cleanup precedes delivery of the close response. Keep only
+            // bounded response history for one lease, even if the client vanished.
+            let drain = async {
+                while let Some(command) = commands.recv().await {
+                    if matches!(command.request, Request::Shutdown) {
+                        break;
+                    }
+                    let result = self.command(command.request, &writes);
+                    let _ = command.reply.send(result);
+                    if self.attachment.is_none() {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(LEASE, drain).await;
         }
     }
     fn emit(&mut self, message: Value) {
@@ -922,11 +973,14 @@ impl Actor {
         } else if let Some(id) = message["id"].as_u64()
             && let Some(pending) = self.pending.remove(&id)
         {
+            if pending.method == "session/close" {
+                self.closed = true;
+            }
             if pending.method == "initialize"
                 && let Some(capabilities) =
                     message["result"]["capabilities"]["session"].as_object_mut()
             {
-                for name in ["close", "delete", "fork", "list"] {
+                for name in ["delete", "fork", "list"] {
                     capabilities.remove(name);
                 }
             }
@@ -1077,6 +1131,13 @@ impl Actor {
         Ok(messages)
     }
     fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
+        if (self.closed || self.pending.values().any(|p| p.method == "session/close"))
+            && !matches!(request, Request::Poll { .. } | Request::Detach { .. })
+        {
+            return Err(Failure::conflict(
+                "session is closing or closed; restore after cleanup",
+            ));
+        }
         if let Request::Attach {
             replace,
             replay,
@@ -1263,7 +1324,13 @@ impl Actor {
                         object([("cursor", (*sequence).into()), ("message", message.clone())])
                     })
                     .collect();
-                Ok(object([("events", events.into())]))
+                Ok(object([
+                    (
+                        "closed",
+                        (self.closed && attachment.events.len() <= 128).into(),
+                    ),
+                    ("events", events.into()),
+                ]))
             }
             Request::Send {
                 attachment,
@@ -1310,6 +1377,7 @@ impl Actor {
                         | "session/revoke_inject"
                         | "session/replace_inject"
                         | "session/cancel"
+                        | "session/close"
                         | "kit/background/cancel"
                         | "session/set_config_option"
                         | "_kit/session/update_mcp"
@@ -1317,6 +1385,9 @@ impl Actor {
                     return Err(Failure::bad(
                         "ACP method is not supported by the gateway; disconnect to detach",
                     ));
+                }
+                if method == "session/close" && original.is_none() {
+                    return Err(Failure::bad("session close requires a request id"));
                 }
                 let startup = matches!(method.as_str(), "session/new" | "session/resume");
                 if startup {

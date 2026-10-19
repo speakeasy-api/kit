@@ -2845,3 +2845,53 @@ async fn bridge_replays_160_short_history_records() {
 async fn bridge_replays_1000_short_history_records() {
     assert_bridge_replays_ready_history(1000).await;
 }
+
+#[tokio::test]
+async fn standard_close_releases_residency_and_preserves_explicit_resume() {
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut client = SdkClient::connect(&url).await;
+    let created = client
+        .request(
+            2,
+            "session/new",
+            json!({"cwd":fixture.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(created.get("error").is_none(), "{created}");
+    let id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    client.start_prompt(10, &id, "Persist before closing").await;
+    let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    release.send("Durable answer before close.").unwrap();
+    client.wait_idle().await;
+    client.updates.clear();
+    let closed = client
+        .request(3, "session/close", json!({"sessionId":id}))
+        .await;
+    assert!(closed.get("error").is_none(), "{closed}");
+    timeout(WAIT, async {
+        loop {
+            let catalog = client.request(4, "session/list", json!({})).await;
+            if catalog["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| {
+                    row["sessionId"] == id && row["_meta"]["kit.gateway.state"] == "restorable"
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let resumed = client.request(5, "session/resume", json!({"sessionId":id,"cwd":fixture.root,"mcpServers":[],"replayFrom":{"type":"start"}})).await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    assert_eq!(resumed["result"]["sessionId"], id);
+    assert_replayed_answer(&client.updates, "Durable answer before close.");
+    client.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
