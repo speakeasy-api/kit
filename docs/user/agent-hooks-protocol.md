@@ -1,7 +1,7 @@
 # Agent Hooks Protocol
 
 Use hooks to enforce tool policies, inspect model requests, or add session context.
-Kit delivers [Agent Hooks Protocol](https://github.com/agenthooksprotocol/rust-sdk)
+Kit delivers [Agent Hooks Protocol](https://agenthooksprotocol.com/)
 events to hook backends registered in `~/.agents/hooks.json` (global) and
 `<root>/.agents/hooks.json` (project). When neither file exists, hooks are off.
 
@@ -9,7 +9,7 @@ events to hook backends registered in `~/.agents/hooks.json` (global) and
 
 Install a trusted hook backend, then create either registration file. This
 example intercepts tool calls; replace `command` with your backend executable.
-The backend must implement the [Agent Hooks Protocol](https://github.com/agenthooksprotocol/rust-sdk).
+The backend must implement the [Agent Hooks Protocol](https://agenthooksprotocol.com/).
 
 ```json
 {
