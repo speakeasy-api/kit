@@ -85,17 +85,17 @@ To start another session, exit and omit `--remote-session` on the next invocatio
 
 ## Standard ACP HTTP clients
 
-Use an ACP v2 HTTP/SSE client with the exact endpoint `http://HOST:7766/acp/v2`, a bearer credential on every request, and matching Kit versions. There is no separate Kit session REST API. See the [gateway protocol reference](gateway-protocol.md) for connection setup, supported operations, wire examples, and transport limits.
+Use an ACP v2 HTTP/SSE client with the exact endpoint `http://HOST:7766/acp/v2`, a bearer credential on every request, and matching Kit versions. There is no separate Kit session REST API. See the [gateway protocol reference](../reference/gateway-protocol.md) for connection setup, supported operations, wire examples, and transport limits.
 
 ### Supported operations
 
-See [Supported operations](gateway-protocol.md#supported-operations) for the adapter contract.
+See [Supported operations](../reference/gateway-protocol.md#supported-operations) for the adapter contract.
 
 <a id="pinned-wire-fixture"></a>
 
 ### Implement an ACP HTTP client
 
-See [Implement an ACP HTTP client](gateway-protocol.md#implement-an-acp-http-client) for request and response examples.
+See [Implement an ACP HTTP client](../reference/gateway-protocol.md#implement-an-acp-http-client) for request and response examples.
 
 ## Failure and security boundaries
 
@@ -106,7 +106,7 @@ See [Implement an ACP HTTP client](gateway-protocol.md#implement-an-acp-http-cli
 - Live reattachment replays the resident child's notifications and current configuration, not old request responses. Replies are scoped to the attachment that submitted the request, so a stale response cannot resolve a new terminal's request ID. ACP v2 state-update notifications carry active/idle state across reconnects.
 - Replay is an in-memory convenience, not a second durable session format. It is limited to 8 MiB and approximately 4,096 events per session/attachment, including room for a current snapshot. Overflow rejects a full live reattach rather than falsely claiming complete replay. Use explicit `--remote-no-replay` only when historical omission is acceptable. Current configuration and actual ACP turn state follow historical events before resume completes; durable assistant text alone is never used as evidence that a turn is idle. Restarting the gateway does not guarantee oversized full replay will fit, and burst replay can exhaust transport budgets even below the history limit.
 - At most 64 active or stopping sessions can be resident. List sessions to reclaim completed session slots without restarting the gateway or deleting durable transcripts. Creating a session also reclaims completed slots. Detaching does not stop a session, even when it is idle.
-- Transport saturation can disconnect a client without canceling accepted work. HTTP frames are limited to 1 MiB; child output frames to 8 MiB. Oversized or malformed child output stops that child. There is no idle connection expiration or body-read deadline: abandoned transports can retain connection slots, and exhaustion may require restarting the gateway. See [Transport limits](gateway-protocol.md#transport-limits) before sizing an integration. These bounds are not a hard process-memory ceiling or denial-of-service protection.
+- Transport saturation can disconnect a client without canceling accepted work. HTTP frames are limited to 1 MiB; child output frames to 8 MiB. Oversized or malformed child output stops that child. There is no idle connection expiration or body-read deadline: abandoned transports can retain connection slots, and exhaustion may require restarting the gateway. See [Transport limits](../reference/gateway-protocol.md#transport-limits) before sizing an integration. These bounds are not a hard process-memory ceiling or denial-of-service protection.
 - Use `Ctrl+C` on the gateway host for graceful shutdown. Kit waits for child cleanup and exit, then forcibly stops a child if it exceeds the 10-second timeout. That fallback can leave a stale transcript lock requiring operator intervention. Hard process termination has operating-system-dependent cleanup behavior; arbitrary tool descendants are not a managed process group.
 - Client-side ACP services, arbitrary extra directories, legacy SSE MCP servers, browser callbacks, and arbitrary ACP methods are not supported. Files, tool execution, and provider authentication belong to the gateway host.
 

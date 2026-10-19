@@ -1,6 +1,6 @@
 # Gateway ACP HTTP protocol reference
 
-Use this reference to implement an ACP HTTP client for Kit. For host setup, terminal use, and recovery, see the [gateway task guide](gateway.md).
+Use this reference to implement an ACP HTTP client for Kit. For host setup, terminal use, and recovery, see the [gateway task guide](../user/gateway.md).
 
 ## Connect over HTTP/SSE
 
@@ -45,7 +45,7 @@ that controller's pending requests with errors without detaching its other sessi
 | `session/inject`, `session/replace_inject`, `session/revoke_inject` | Enqueue, replace, or revoke pending steering using the host-advertised ACP capability. |
 | `session/cancel` | Interrupt the current response; ordinary top-level sessions retain detached background jobs. This is distinct from closing a connection. |
 | `kit/background/cancel` | Request cancellation of one detached call using the existing Kit extension. |
-| `_kit/session/update_mcp` | Replace the current controller's session-scoped MCP servers; see [session MCP configuration](mcp.md#acp-session-mcp-configuration). |
+| `_kit/session/update_mcp` | Replace the current controller's session-scoped MCP servers; see [session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). |
 | `session/set_config_option` | Select configuration advertised by the child, without changing client-local defaults. |
 
 Unsupported requests fail explicitly. Client-to-agent request cancellation (`$/cancel_request`) does not interrupt accepted session work. Integrations must use `session/cancel` for that purpose, and cancel detached jobs separately. Do not automatically resend a prompt after a transport failure.
@@ -93,7 +93,7 @@ The error above illustrates a session-routed revoke of an unknown pending messag
 
 ## Configure session MCP servers
 
-For native stdio and Streamable HTTP entries, replacement semantics, and the advertised `_kit/session/update_mcp` extension, see [ACP session MCP configuration](mcp.md#acp-session-mcp-configuration). Only the current controller can update a resident session. Legacy SSE MCP transport is not supported.
+For native stdio and Streamable HTTP entries, replacement semantics, and the advertised `_kit/session/update_mcp` extension, see [ACP session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). Only the current controller can update a resident session. Legacy SSE MCP transport is not supported.
 
 ## Transport limits
 
