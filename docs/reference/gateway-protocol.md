@@ -45,7 +45,7 @@ that controller's pending requests with errors without detaching its other sessi
 | `session/inject`, `session/replace_inject`, `session/revoke_inject` | Enqueue, replace, or revoke pending steering using the host-advertised ACP capability. |
 | `session/cancel` | Interrupt the current response; ordinary top-level sessions retain detached background jobs. This is distinct from closing a connection. |
 | `kit/background/cancel` | Request cancellation of one detached call using the existing Kit extension. |
-| `_kit/session/update_mcp` | Replace the current controller's session-scoped MCP servers; see [session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). |
+| `_kit/session/update_mcp` | Add or update the current controller's client-owned MCP servers; see [session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). |
 | `session/set_config_option` | Select configuration advertised by the child, without changing client-local defaults. |
 
 Unsupported requests fail explicitly. Client-to-agent request cancellation (`$/cancel_request`) does not interrupt accepted session work. Integrations must use `session/cancel` for that purpose, and cancel detached jobs separately. Do not automatically resend a prompt after a transport failure.
@@ -73,7 +73,7 @@ Initialize POST body (send `Authorization: Bearer TOKEN` and `Content-Type: appl
 The response is HTTP 200 JSON with `Acp-Connection-Id`. Its `result` contains `protocolVersion: 2`, `info.name: "kit-gateway"`, the running Kit version, and these capabilities:
 
 ```json
-{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","replacement":true}}}}}
+{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}}
 ```
 
 Its `result._meta` explicitly identifies the experimental limits:
@@ -93,7 +93,7 @@ The error above illustrates a session-routed revoke of an unknown pending messag
 
 ## Configure session MCP servers
 
-For native stdio and Streamable HTTP entries, replacement semantics, and the advertised `_kit/session/update_mcp` extension, see [ACP session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). Resident `session/resume` retains the overlay when `mcpServers` is omitted or `[]`; a nonempty list is rejected with guidance to use `_kit/session/update_mcp`. The explicit update replaces the full overlay, and `[]` clears it. Initial creation and cold restoration accept HTTP entries. Only the current controller can update a resident session. Legacy SSE MCP transport is not supported.
+For native stdio and Streamable HTTP entries, additive update semantics, and the advertised `_kit/session/update_mcp` extension, see [ACP session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). Resident `session/resume` retains the overlay when `mcpServers` is omitted or `[]`; a nonempty list is rejected with guidance to use `_kit/session/update_mcp`. The explicit update adds new client names or updates submitted client-owned names; omitted names remain and `[]` is a no-op. Host/plugin collisions and duplicate submitted names reject the whole batch. No removal operation is provided. Initial creation and cold restoration accept HTTP entries. Only the current controller can update a resident session. Legacy SSE MCP transport is not supported.
 
 ## Transport limits
 

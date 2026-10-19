@@ -272,25 +272,28 @@ When reconnecting to a resident gateway session, omit `mcpServers` or send `[]`
 to retain its current overlay. A nonempty list is rejected with guidance to use
 `_kit/session/update_mcp`; reconnect does not replace or clear the overlay.
 
-### Replace a live session's MCP servers
+### Add or update a live session's MCP servers
 
-To change servers or rotate credentials without restarting the model session,
+To add client tools or rotate credentials without restarting the model session,
 check `capabilities.session.mcp._meta["kit/updateMcp"]` for Kit's extension:
 
 ```json
-{ "method": "_kit/session/update_mcp", "replacement": true }
+{ "method": "_kit/session/update_mcp", "upsert": true }
 ```
 
 Send that JSON-RPC method with `params` containing `sessionId` and `mcpServers`.
-Both fields are required. The list replaces all client-supplied servers for that
-session; `[]` removes them, without removing configured host or plugin servers.
-The response is `{}` after the replacement succeeds. Duplicate names, invalid
-transports or configuration, and collisions with host or plugin names return an
-error without replacing the current client configuration. Correct the list and
-retry. Do not send credentials with each prompt.
+Both fields are required. New client-owned names are added. An existing
+client-owned name updates only that server's configuration and credentials.
+Omitted servers remain registered; `[]` is a no-op. There is no removal operation.
+Host and plugin servers and built-in tools are not replaced by client entries.
 
-Changes wait for in-flight operations on affected servers before replacing their
-connections and credentials. Await the response before starting work that
-requires the replacement credentials. A client disconnect or request cancellation
-after reconciliation begins does not roll the update back; retry the same full
-list to establish the desired configuration.
+The response is `{}` after the batch succeeds. Duplicate names within the batch,
+invalid transports or configuration, and collisions with host or plugin names
+reject the whole batch without changing the client configuration. Correct the
+batch and retry. Do not send credentials with each prompt.
+
+Changes wait for in-flight operations on affected servers before updating their
+connections and credentials. Unrelated registrations and background tasks remain.
+Await the response before starting work that requires the updated credentials.
+A client disconnect or request cancellation after reconciliation begins does not
+roll the update back; retry the same batch to establish the desired configuration.

@@ -44,7 +44,7 @@ use super::{
     SessionRegistry, skill_catalog, terminal_auth_method_specs,
 };
 
-/// Replaces the complete client-owned overlay without recreating the session.
+/// Adds or updates client-owned servers without removing omitted registrations.
 #[derive(
     Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcRequest,
 )]
@@ -858,7 +858,7 @@ impl Server {
                             "method".into(),
                             Value::String("_kit/session/update_mcp".into()),
                         ),
-                        ("replacement".into(), Value::Bool(true)),
+                        ("upsert".into(), Value::Bool(true)),
                     ])),
                 )])),
         );
@@ -6059,7 +6059,7 @@ mod tests {
                     })
                     .block_task()
                     .await
-                    .expect_err("invalid replacement must be rejected");
+                    .expect_err("invalid upsert must be rejected");
                 let listed = connection
                     .send_request(wire::ListSessionsRequest::new())
                     .block_task()
@@ -6113,7 +6113,7 @@ mod tests {
     }
 
     #[test]
-    fn update_mcp_requires_explicit_replacement_and_preserves_http_headers() {
+    fn update_mcp_requires_explicit_batch_and_preserves_http_headers() {
         assert!(
             serde_json::from_value::<UpdateMcpRequest>(serde_json::json!({"sessionId":"s"}))
                 .is_err()
@@ -6212,10 +6212,11 @@ mod tests {
         let mcp = session.mcp.expect("session MCP capabilities");
         assert!(mcp.stdio.is_some());
         assert!(mcp.http.is_some());
-        assert_eq!(
-            mcp.meta.unwrap()["kit/updateMcp"]["method"],
-            "_kit/session/update_mcp"
-        );
+        let metadata = mcp.meta.unwrap();
+        let update = &metadata["kit/updateMcp"];
+        assert_eq!(update["method"], "_kit/session/update_mcp");
+        assert_eq!(update["upsert"], true);
+        assert!(update.get("replacement").is_none());
         assert!(session.inject.is_some());
         assert!(session.delete.is_none());
         assert!(session.fork.is_none());

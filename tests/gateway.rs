@@ -175,7 +175,7 @@ impl SdkClient {
         assert_eq!(response["result"]["protocolVersion"], 2, "{response}");
         assert_eq!(
             response["result"]["capabilities"]["session"]["mcp"],
-            json!({"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","replacement":true}}})
+            json!({"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}})
         );
         assert_eq!(
             response["result"]["_meta"]["kit/gateway"]["transport"],
@@ -489,7 +489,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
     .await
     .expect("native HTTP MCP discovery was not observed");
 
-    // Invalid replacement must preserve the current controller and its overlay.
+    // Invalid upsert must preserve the current controller and its overlay.
     let rejected = sdk
         .request(
             4,
@@ -519,22 +519,22 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
     sdk.wait_idle().await;
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
 
-    // Direct replacement returns the extension's empty result, not a resume result.
-    let cleared = sdk
+    // An empty upsert is a no-op and returns the extension's empty result, not a resume result.
+    let unchanged = sdk
         .request(
             4,
             "_kit/session/update_mcp",
             json!({"sessionId":id,"mcpServers":[]}),
         )
         .await;
-    assert_eq!(cleared["result"], json!({}), "{cleared}");
-    sdk.start_prompt(5, &id, "Discover after clearing the overlay")
+    assert_eq!(unchanged["result"], json!({}), "{unchanged}");
+    sdk.start_prompt(5, &id, "Discover after the empty upsert")
         .await;
     sdk.wait_idle().await;
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
     sdk.detach().await;
 
-    // Nonempty resident resume rejects; only the explicit update replaces the overlay.
+    // Nonempty resident resume rejects; use the explicit update to upsert servers.
     let mut sdk = SdkClient::connect(&url).await;
     let resumed = sdk
         .request(
@@ -559,18 +559,18 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         )
         .await;
     assert_eq!(resumed["result"]["sessionId"], id, "{resumed}");
-    let replaced = sdk
+    let updated = sdk
         .request(
             4,
             "_kit/session/update_mcp",
             json!({"sessionId":id,"mcpServers":servers}),
         )
         .await;
-    assert_eq!(replaced["result"], json!({}), "{replaced}");
-    sdk.start_prompt(3, &id, "Discover the replaced session MCP fixture")
+    assert_eq!(updated["result"], json!({}), "{updated}");
+    sdk.start_prompt(3, &id, "Discover the unchanged session MCP fixture")
         .await;
     sdk.wait_idle().await;
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
     sdk.detach().await;
 
     // Empty resident resume retains the overlay and its existing connections.
@@ -586,7 +586,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
     sdk.start_prompt(3, &id, "Discover after resident retention")
         .await;
     sdk.wait_idle().await;
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
     sdk.detach().await;
     stop_gateway(&mut gateway).await;
 
@@ -604,7 +604,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
     sdk.start_prompt(3, &id, "Discover the restored session MCP fixture")
         .await;
     sdk.wait_idle().await;
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 3);
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
     sdk.detach().await;
     stop_gateway(&mut gateway).await;
     mcp_http.abort();
@@ -1575,8 +1575,8 @@ async fn sdk_revoke_injection_requires_current_controller() {
         .await;
     // The pinned capability also advertises pending.replace; exercise its
     // companion route rather than advertising an unsupported operation.
-    let replaced = current.request(6, "session/replace_inject", json!({"sessionId":id,"messageId":message_id,"content":[{"type":"text","text":"Replacement must also be revoked"}]})).await;
-    assert!(replaced.get("error").is_none(), "{replaced}");
+    let updated = current.request(6, "session/replace_inject", json!({"sessionId":id,"messageId":message_id,"content":[{"type":"text","text":"Replacement must also be revoked"}]})).await;
+    assert!(replaced.get("error").is_none(), "{updated}");
     let revoked = current.request(3, "session/revoke_inject", revoke).await;
     assert_eq!(revoked["result"], json!({}), "{revoked}");
     release.send("Answer without revoked steer").unwrap();
@@ -1710,7 +1710,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         initialized,
         json!({"jsonrpc":"2.0","id":1,"result":{
             "protocolVersion":2,"info":{"name":"kit-gateway","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","replacement":true}}}}},
+            "capabilities":{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}},
             "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4093}}
         }})
     );

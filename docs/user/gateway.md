@@ -10,7 +10,7 @@ Configure the host's provider credentials, model, tools, and MCP servers as for 
 
 ACP clients may supply session-scoped stdio or Streamable HTTP `mcpServers` when creating or restoring a session. Stdio commands and HTTP requests run on the gateway host, not on the client. Each ACP v2 stdio entry needs `"type":"stdio"` and an absolute host executable path.
 
-On resident reattach, omit `mcpServers` or send `[]` to retain the current client-supplied servers. A nonempty list is rejected; use `_kit/session/update_mcp` to replace the overlay explicitly. Only that explicit update treats `[]` as clearing the client-supplied servers, without removing host or plugin servers. Session-scoped MCP configuration is not persisted in the transcript, so supply it again when restoring a stopped session. See [ACP session MCP configuration](mcp.md#acp-session-mcp-configuration) for HTTP entries and live replacement requests.
+On resident reattach, omit `mcpServers` or send `[]` to retain the current client-supplied servers. A nonempty list is rejected; use `_kit/session/update_mcp` to add or update client-owned servers explicitly. Omitted servers remain registered and `[]` is a no-op. Client entries cannot overwrite host or plugin names. Session-scoped MCP configuration is not persisted in the transcript, so supply it again when restoring a stopped session. See [ACP session MCP configuration](mcp.md#acp-session-mcp-configuration) for HTTP entries and live add/update requests.
 
 Create a high-entropy bearer credential without putting it in command-line arguments:
 

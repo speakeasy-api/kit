@@ -1082,7 +1082,7 @@ impl Actor {
                 })
             {
                 return Err(Failure::conflict(
-                    "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to replace them",
+                    "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to add or update client servers",
                 ));
             }
             let metadata = startup
@@ -1343,7 +1343,7 @@ impl Actor {
                             !servers.is_null() && servers != &Value::Array(Vec::new())
                         }) {
                             return Err(Failure::conflict(
-                                "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to replace them",
+                                "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to add or update client servers",
                             ));
                         }
                         let Some(id) = original else {

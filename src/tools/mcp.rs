@@ -2019,7 +2019,8 @@ impl McpRuntime {
         self.reload_config().await
     }
 
-    /// Replace the complete request-scoped overlay through normal reload reconciliation.
+    /// Add or update submitted request-scoped servers, retaining omitted servers.
+    /// An empty batch is a no-op; host and plugin names cannot be updated.
     /// Invalid configuration leaves the published generation unchanged. Affected
     /// operations finish before replacement; cancellation after admission does not
     /// cancel the coordinator-owned publication.
@@ -2028,6 +2029,9 @@ impl McpRuntime {
         servers: Vec<agentkit_acp::McpServer>,
         cwd: &Path,
     ) -> Result<(), String> {
+        if servers.is_empty() {
+            return Ok(());
+        }
         let source = session_config_source(servers, cwd)?;
         self.reload_config_with_session(Some(source)).await
     }
@@ -2104,15 +2108,42 @@ impl McpRuntime {
                 }
                 None => (current_plugins, current_plugin_entries),
             };
-            let mut next_sources = Vec::with_capacity(current_sources.len());
-            for current in &current_sources {
-                if session_source.is_some() && current.source.session_bytes.is_some() {
-                    continue;
+            // The reload-flight permit covers this snapshot/merge through publication.
+            // Never merge at admission: concurrent disjoint batches must see the
+            // preceding publication. Keep retained source cwd values unchanged.
+            let submitted = match &session_source {
+                Some(source) => {
+                    let raw = read_source(source)
+                        .await?
+                        .ok_or("missing session MCP config")?;
+                    let (prepared, _) =
+                        prepare_config(&raw, &source.path, source.default_stdio_cwd.as_deref())?;
+                    validate_server_names(prepared.keys())?;
+                    prepared.keys().cloned().collect::<BTreeSet<_>>()
                 }
-                next_sources.push(SourceState {
-                    source: current.source.clone(),
-                    raw: read_source(&current.source).await?,
-                });
+                None => BTreeSet::new(),
+            };
+            let mut next_sources = Vec::with_capacity(current_sources.len() + 1);
+            for current in &current_sources {
+                let mut source = current.source.clone();
+                let mut raw = read_source(&source).await?;
+                if !submitted.is_empty() && source.session_bytes.is_some() {
+                    let mut config: BTreeMap<String, BTreeMap<String, Value>> =
+                        serde_json::from_slice(raw.as_deref().ok_or("missing session MCP config")?)
+                            .map_err(|error| format!("invalid session MCP config: {error}"))?;
+                    let servers = config
+                        .get_mut("mcpServers")
+                        .ok_or("missing session MCP servers")?;
+                    servers.retain(|name, _| !submitted.contains(name));
+                    if servers.is_empty() {
+                        continue;
+                    }
+                    let bytes = serde_json::to_vec(&config)
+                        .map_err(|error| format!("could not encode session MCP config: {error}"))?;
+                    source.session_bytes = Some(Arc::from(bytes.clone()));
+                    raw = Some(bytes);
+                }
+                next_sources.push(SourceState { source, raw });
             }
 
             if let Some(source) = &session_source {
@@ -7124,7 +7155,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_overlay_http_updates_replace_only_session_sources() {
+    async fn session_updates_preserve_omitted_servers_and_reject_whole_invalid_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let original = r#"{"mcpServers":{"host":{"command":"kit-test-missing-command"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let plugins = [plugin(
+            "owner",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "plugin".into(),
+                transport: PluginMcpTransport::StreamableHttp {
+                    url: "https://example.invalid/mcp".into(),
+                    headers: Default::default(),
+                },
+            }],
+        )];
+        let base = super::connect(Some(&path), &plugins, false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let runtime = base
+            .with_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        for name in ["first", "second"] {
+            runtime
+                .update_session_servers(vec![session_server(name)], directory.path())
+                .await
+                .unwrap();
+        }
+        let before = runtime.inner.reload.lock().await.entries.clone();
+        assert_eq!(
+            before.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["first", "host", "plugin", "second"]
+        );
+        for batch in [
+            vec![session_server("new"), session_server("host")],
+            vec![session_server("new"), session_server("plugin")],
+            vec![
+                session_server("new"),
+                session_server("duplicate"),
+                session_server("duplicate"),
+            ],
+            vec![session_server("new"), session_server("")],
+        ] {
+            assert!(
+                runtime
+                    .update_session_servers(batch, directory.path())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(runtime.inner.reload.lock().await.entries, before);
+            runtime.reload_config().await.unwrap();
+            assert_eq!(runtime.inner.reload.lock().await.entries, before);
+            assert!(!runtime.inner.servers.read().await.contains_key("new"));
+        }
+        // An empty update must not even reload a changed host file or advance the epoch.
+        let epoch = runtime.inner.reload_epoch.load(Ordering::Acquire);
+        std::fs::write(&path, "invalid JSON").unwrap();
+        runtime
+            .update_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        assert_eq!(runtime.inner.reload_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(runtime.inner.reload.lock().await.entries, before);
+        std::fs::write(&path, original).unwrap();
+        let (left, right) = tokio::join!(
+            runtime.update_session_servers(vec![session_server("left")], directory.path()),
+            runtime.update_session_servers(vec![session_server("right")], directory.path()),
+        );
+        left.unwrap();
+        right.unwrap();
+        runtime.reload_config().await.unwrap();
+        let state = runtime.inner.reload.lock().await;
+        for (name, fingerprint) in before {
+            assert_eq!(state.entries[&name], fingerprint);
+        }
+        assert!(state.entries.contains_key("left"));
+        assert!(state.entries.contains_key("right"));
+    }
+
+    #[tokio::test]
+    async fn session_overlay_http_updates_only_submitted_session_servers() {
         let directory = tempfile::tempdir().unwrap();
         let base = super::connect(None::<&Path>, &[], false, CredentialStorage::Memory)
             .await
@@ -7137,6 +7249,18 @@ mod tests {
             .update_session_servers(vec![session_http_server("Bearer first")], directory.path())
             .await
             .unwrap();
+        let other_credentials = serde_json::from_value(json!({
+            "type": "http", "name": "retained", "url": "https://example.invalid/other",
+            "headers": [{"name": "Authorization", "value": "Bearer retained"}]
+        }))
+        .unwrap();
+        runtime
+            .update_session_servers(vec![other_credentials], directory.path())
+            .await
+            .unwrap();
+        let retained = runtime.inner.servers.read().await["retained"]
+            .fingerprint
+            .clone();
         let first = runtime.inner.servers.read().await["remote"]
             .fingerprint
             .clone();
@@ -7158,6 +7282,19 @@ mod tests {
             panic!("expected native HTTP transport");
         };
         assert_eq!(http.headers[0].1.to_str().unwrap(), "Bearer second");
+        let McpTransportBinding::StreamableHttp(other) = &prepared["retained"].config.transport
+        else {
+            panic!("expected retained HTTP transport");
+        };
+        assert_eq!(other.headers[0].1.to_str().unwrap(), "Bearer retained");
+        assert_eq!(
+            retained,
+            runtime.inner.servers.read().await["retained"].fingerprint
+        );
+        assert!(matches!(
+            runtime.inner.credential_storage,
+            CredentialStorage::Memory
+        ));
         let second = runtime.inner.servers.read().await["remote"]
             .fingerprint
             .clone();
@@ -7181,7 +7318,10 @@ mod tests {
             .update_session_servers(vec![], directory.path())
             .await
             .unwrap();
-        assert!(runtime.inner.servers.read().await.is_empty());
+        assert_eq!(
+            second,
+            runtime.inner.servers.read().await["remote"].fingerprint
+        );
         let attached = base
             .with_session_servers(
                 vec![session_http_server("Bearer attached")],
