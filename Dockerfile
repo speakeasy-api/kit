@@ -29,6 +29,7 @@ ARG CARGO_ARGS
 COPY Cargo.toml Cargo.lock build.rs install.sh ./
 COPY src ./src
 COPY docs/user ./docs/user
+COPY docs/reference ./docs/reference
 
 RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=kit-gnu-target-${TARGETARCH},sharing=locked,target=/src/target \
@@ -58,6 +59,7 @@ ARG CARGO_ARGS
 COPY Cargo.toml Cargo.lock build.rs install.sh ./
 COPY src ./src
 COPY docs/user ./docs/user
+COPY docs/reference ./docs/reference
 
 RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=kit-musl-target-${TARGETARCH},sharing=locked,target=/src/target \

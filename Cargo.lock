@@ -108,9 +108,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.12"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "394478ee8cb0e8916531ae4f450b953e4adfc0f700bbd4a1a85ebb265bfb18ce"
+checksum = "fdfeb02858b4c7defc804c6fda75854ae6682919f3bac7fd25de832517f903ea"
 dependencies = [
  "agentkit-acp-sdk",
  "agentkit-core",
@@ -186,9 +186,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-adapter-completions"
-version = "0.10.9"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f99b81132ad4c4a62575ce4f39f133245607769923072df88de4865e7efa782"
+checksum = "7e947b67ac0506e914b75a9d1edecd73c63a774227a138be60707a73981878d0"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -218,9 +218,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-compaction"
-version = "0.10.5"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "483b8de89e4d2de33370151c398c4d81bfd3267899cdc2caee4361c9dab052f2"
+checksum = "2d7fc0457d6517319cd2fccfbf1080f6150b6dff73ef6850090a4376c0ca8891"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -276,14 +276,15 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.13"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e581d59925462f08c1145ee85e4c937db76fb6d1690b4b9ed49d44ca8c560141"
+checksum = "e5e048d2be22aa27bf635b65b073cb2a396efca232200a4ba79b4f75d1513dcd"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
  "agentkit-tools-core",
  "async-trait",
+ "futures-timer",
  "opentelemetry",
  "serde",
  "serde_json",
@@ -294,9 +295,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1d32cd5a62fa73f8389acdb917b60582ea8ec35e7b9cdca15b146bde8adfbef"
+checksum = "c4903fbc06478d9c07af1b06b6582f3c757b5820eee506be806a19c9183287c7"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -330,9 +331,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-anthropic"
-version = "0.10.11"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa41fff5bbb3dbda6925b67fc40a005b6c4627e7a2b37d6c8a864ba4ffff02c6"
+checksum = "5146d35ed83d9cdd16e421ca5328aa52bfe5473a5f36ce3668ebe0b11d2aca38"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -348,9 +349,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.14"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd48c34c461074b8f8afda9d19b32ff33f0b880277beb4559865084abeb56944"
+checksum = "8b784def208ab1ae4eba747efc397adeb8c2a9e69f2ad820de60e7bfab255792"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -369,9 +370,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openrouter"
-version = "0.10.8"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "211948f3127537bcdb4dfc77c59a6bee447ec3eca9f75a21697dbea5d038276d"
+checksum = "28b6f3f308612f8be3db1c631f78f6cc671582708b25e17b9623064c5b80826d"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -4606,6 +4607,7 @@ dependencies = [
  "futures",
  "http",
  "indexmap 2.14.0",
+ "jsonwebtoken",
  "oauth2",
  "pin-project-lite",
  "process-wrap",
@@ -4619,6 +4621,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

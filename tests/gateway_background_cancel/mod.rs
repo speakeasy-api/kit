@@ -75,6 +75,12 @@ async fn sdk_cancels_detached_background_call_after_controller_replacement() {
     assert!(malformed.get("error").is_some(), "{malformed}");
     client.start_prompt(5, id, "Start a background task.").await;
     client.wait_idle().await;
+    let status = client
+        .request(20, "kit/session/status", json!({"sessionId":id}))
+        .await;
+    assert_eq!(status["result"]["settled"], false, "{status}");
+    assert_eq!(status["result"]["backgroundActive"], true, "{status}");
+    assert_eq!(status["result"]["foregroundActive"], false, "{status}");
     let pid = timeout(WAIT, async {
         loop {
             if let Ok(pid) = fs::read_to_string(fixture.root.join("background.pid"))
@@ -111,6 +117,11 @@ async fn sdk_cancels_detached_background_call_after_controller_replacement() {
         )
         .await;
     assert!(resumed.get("error").is_none(), "{resumed}");
+    let status = replacement
+        .request(20, "kit/session/status", json!({"sessionId":id}))
+        .await;
+    assert_eq!(status["result"]["settled"], false, "{status}");
+    assert_eq!(status["result"]["backgroundActive"], true, "{status}");
     client
         .assert_rejected_or_closed(
             7,
@@ -166,6 +177,21 @@ async fn sdk_cancels_detached_background_call_after_controller_replacement() {
     })
     .await
     .expect("background cancellation did not reap the shell");
+    timeout(WAIT, async {
+        loop {
+            let status = replacement
+                .request(21, "kit/session/status", json!({"sessionId":id}))
+                .await;
+            if status["result"]["settled"] == true {
+                assert_eq!(status["result"]["backgroundActive"], false);
+                assert_eq!(status["result"]["pendingBackgroundTerminals"], false);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled background work never became settled");
     replacement.detach().await;
     // A replaced transport may already have been closed by the server.
     client.transport.abort();

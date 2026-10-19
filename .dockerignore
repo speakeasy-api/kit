@@ -14,5 +14,7 @@
 !docs/
 !docs/user/
 !docs/user/**
+!docs/reference/
+!docs/reference/**
 !Dockerfile
 !.dockerignore

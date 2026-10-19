@@ -1310,7 +1310,18 @@ const CONFIG_MIGRATIONS: &[ConfigMigration] = &[
     ConfigMigration {
         apply: migrate_experimental_voice,
     },
+    ConfigMigration {
+        apply: migrate_compaction_policy,
+    },
 ];
+
+// Additive policy: preserve explicit values and malformed shapes for validation.
+// This migration only changes the in-memory document, never the user's file.
+fn migrate_compaction_policy(config: &mut toml::Table) {
+    config
+        .entry("compaction")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+}
 
 fn migrate_experimental_voice(config: &mut toml::Table) {
     let experimental = config
@@ -1353,6 +1364,8 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
+    #[serde(default)]
+    compaction: kit::compaction::policy::CompactionConfig,
     #[serde(default, deserialize_with = "deserialize_experimental_config")]
     experimental: ExperimentalConfig,
     request_budget_seconds: Option<kit::request_budget::RequestBudget>,
@@ -2282,6 +2295,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
@@ -2381,6 +2395,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
@@ -2392,6 +2407,11 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
+            let runtime = if matches!(protocol_version, AcpProtocolVersion::V2) {
+                kit::Runtime::with_lazy_mcp_initialization(runtime)?
+            } else {
+                runtime
+            };
             let runtime = if mcp.legacy_mcp_config {
                 kit::Runtime::with_mcp_config(
                     runtime,
@@ -2450,6 +2470,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?;
+            let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
@@ -2787,6 +2808,107 @@ mod tests {
             .to_string();
         assert!(help.contains("--resume [<RESUME>]"));
         assert!(help.contains("session picker without an ID"));
+    }
+
+    #[test]
+    fn config_compaction_defaults_migration_and_writer() {
+        use kit::compaction::policy::CompactionConfig;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        assert_eq!(Config::default().compaction, CompactionConfig::default());
+        assert_eq!(
+            Config::load(&path).unwrap().compaction,
+            CompactionConfig::default()
+        );
+        for text in [
+            "",
+            "model = 'gpt-5.4'",
+            "[compaction]",
+            "mcp_credential_store = 'file'\ncredential_store = 'memory'\n[compaction]\nthreshold_percent = 55\nmax_context_tokens = 200000",
+        ] {
+            fs::write(&path, text).unwrap();
+            let config = Config::load(&path).unwrap();
+            let expected = if text.contains("55") { 55 } else { 80 };
+            assert_eq!(config.compaction.threshold_percent, expected);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            let migrated = super::migrate_config(toml::from_str(text).unwrap());
+            assert_eq!(super::migrate_config(migrated.clone()), migrated);
+            if expected == 55 {
+                assert_eq!(config.compaction.max_context_tokens, Some(200_000));
+                assert!(matches!(
+                    config.credential_store,
+                    Some(CredentialStoreKind::Memory)
+                ));
+            }
+        }
+        kit::config_editor::set(&path, "compaction.threshold_percent", "60").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.compaction.threshold_percent, 60);
+        assert_eq!(config.compaction.max_context_tokens, Some(200_000));
+        kit::config_editor::unset(&path, "compaction.threshold_percent").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().compaction.threshold_percent,
+            80
+        );
+        kit::config_editor::unset(&path, "compaction").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().compaction,
+            CompactionConfig::default()
+        );
+        fs::write(&path, super::initial_config(directory.path())).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().compaction,
+            CompactionConfig::default()
+        );
+    }
+
+    #[test]
+    fn config_compaction_ignores_and_preserves_unknown_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let text = "[compaction]\nthreshold_percent = 55\nfuture = { enabled = true }\n";
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().compaction.threshold_percent,
+            55
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        kit::config_editor::set(&path, "compaction.threshold_percent", "60").unwrap();
+        let edited = fs::read_to_string(&path).unwrap();
+        let document: toml::Value = toml::from_str(&edited).unwrap();
+        assert_eq!(
+            document["compaction"]["future"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            Config::load(&path).unwrap().compaction.threshold_percent,
+            60
+        );
+        let invalid = text.replace("55", "0");
+        fs::write(&path, &invalid).unwrap();
+        assert!(Config::load(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn config_compaction_rejects_invalid_policy_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for text in [
+            "compaction = 1",
+            "compaction = []",
+            "[compaction]\nthreshold_percent = 0",
+            "[compaction]\nthreshold_percent = 100",
+            "[compaction]\nmax_context_tokens = 0",
+            "[compaction]\nprecompute_margin_percent = 101",
+            "[compaction]\nprecompute_margin_tokens = -1",
+        ] {
+            fs::write(&path, text).unwrap();
+            assert!(toml::from_str::<Config>(text).is_err(), "{text}");
+            let error = Config::load(&path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
     }
 
     #[test]

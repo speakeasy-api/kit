@@ -74,9 +74,15 @@ impl Fixture {
     }
 
     async fn gateway(&self) -> (Child, String) {
+        self.gateway_with_bind("127.0.0.1:0", &[]).await
+    }
+
+    async fn gateway_with_bind(&self, listen: &str, flags: &[&str]) -> (Child, String) {
         let mut child = self
             .command()
-            .args(["gateway", "--listen", "127.0.0.1:0", "--credential-file"])
+            .args(["gateway", "--listen", listen])
+            .args(flags)
+            .arg("--credential-file")
             .arg(&self.credential)
             .arg("--project")
             .arg(&self.root)
@@ -175,7 +181,7 @@ impl SdkClient {
         assert_eq!(response["result"]["protocolVersion"], 2, "{response}");
         assert_eq!(
             response["result"]["capabilities"]["session"]["mcp"],
-            json!({"stdio":{}})
+            json!({"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}})
         );
         assert_eq!(
             response["result"]["_meta"]["kit/gateway"]["transport"],
@@ -363,8 +369,8 @@ async fn sdk_session_mcp_validation_preserves_directory_boundaries() {
             "invalid mcpServers",
         ),
         (
-            json!({"cwd":fixture.root,"mcpServers":[{"type":"http","name":"unsupported","url":"http://127.0.0.1:1/mcp","headers":[]}]}),
-            "stdio transport",
+            json!({"cwd":fixture.root,"mcpServers":[{"type":"sse","name":"unsupported","url":"http://127.0.0.1:1/mcp","headers":[]}]}),
+            "stdio and HTTP",
         ),
         (
             json!({"cwd":fixture.root,"mcpServers":[stdio.clone(),stdio.clone()]}),
@@ -398,7 +404,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         let delta = if finished {
             json!({"role":"assistant","content":"MCP discovery complete"})
         } else {
-            json!({"role":"assistant","tool_calls":[{"index":0,"id":"discover-mcp","type":"function","function":{"name":"compose","arguments":json!({"script":"return tool_search({ query: \"session-fixture echo\" })"}).to_string()}}]})
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":"discover-mcp","type":"function","function":{"name":"compose","arguments":json!({"script":"stdio = tool_search({ query: \"session-fixture echo\" })\nhttp = tool_search({ query: \"session-http echo\" })\nreturn {stdio, http}"}).to_string()}}]})
         };
         let chunk = json!({"id":"local-mcp-test","choices":[{"index":0,"delta":delta,"finish_reason":if finished {"stop"} else {"tool_calls"}}]});
         (
@@ -417,13 +423,53 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         .await
         .unwrap();
     });
+    async fn http_mcp(
+        axum::extract::State(seen): axum::extract::State<
+            tokio::sync::mpsc::UnboundedSender<String>,
+        >,
+        headers: axum::http::HeaderMap,
+        axum::Json(message): axum::Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        assert_eq!(headers["x-mcp-fixture"], "local-fixture");
+        let Some(id) = message.get("id") else {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        };
+        let method = message["method"].as_str().unwrap();
+        seen.send(method.to_owned()).unwrap();
+        let result = match method {
+            "initialize" => {
+                json!({"protocolVersion":message["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"http-fixture","version":"1"}})
+            }
+            "tools/list" => {
+                json!({"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{}}}]})
+            }
+            // The fixture implements the initialized MCP lifecycle. Reject newer
+            // discovery probes correctly so the real client can negotiate it.
+            _ => return axum::Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}})).into_response(),
+        };
+        axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+    }
+    let (http_seen, mut http_requests) = tokio::sync::mpsc::unbounded_channel();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mcp_http = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/mcp", axum::routing::post(http_mcp))
+                .with_state(http_seen),
+        )
+        .await
+        .unwrap();
+    });
     let marker = fixture.home.path().join("mcp-started");
     let script = fixture.home.path().join("mcp.py");
     fs::write(&script, format!(
         "import os, runpy\nwith open(os.environ['MCP_MARKER'], 'a') as f: f.write(os.getcwd() + '\\n')\nrunpy.run_path({:?}, run_name='__main__')\n",
         format!("{}/fixtures/mock-mcp.py", env!("CARGO_MANIFEST_DIR"))
     )).unwrap();
-    let servers = json!([{"type":"stdio","name":"session-fixture","command":"/usr/bin/python3","args":[script],"env":[{"name":"MCP_MARKER","value":marker}]}]);
+    let servers = json!([{"type":"stdio","name":"session-fixture","command":"/usr/bin/python3","args":[script],"env":[{"name":"MCP_MARKER","value":marker}]},{"type":"http","name":"session-http","url":http_url,"headers":[{"name":"x-mcp-fixture","value":"local-fixture"}]}]);
     let (mut gateway, url) = fixture.gateway().await;
     let mut sdk = SdkClient::connect(&url).await;
     let created = sdk
@@ -443,10 +489,60 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         format!("{}\n", fixture.root.display())
     );
 
-    // Nonempty MCP on a resident resume must not silently replace or ignore it,
-    // and rejection must preserve the current controller.
-    let mut other = SdkClient::connect(&url).await;
-    let rejected = other
+    timeout(WAIT, async {
+        while http_requests.recv().await.as_deref() != Some("tools/list") {}
+    })
+    .await
+    .expect("native HTTP MCP discovery was not observed");
+
+    // Invalid upsert must preserve the current controller and its overlay.
+    let rejected = sdk
+        .request(
+            4,
+            "_kit/session/update_mcp",
+            json!({"sessionId":id,"mcpServers":[servers[0].clone(),servers[0].clone()]}),
+        )
+        .await;
+    assert!(rejected.get("error").is_some(), "{rejected}");
+    sdk.start_prompt(5, &id, "Confirm the original overlay remains available")
+        .await;
+    sdk.wait_idle().await;
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    sdk.detach().await;
+
+    // Omission retains the resident overlay and its existing connection.
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root}),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    sdk.start_prompt(3, &id, "Discover the retained session MCP fixture")
+        .await;
+    sdk.wait_idle().await;
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+
+    // An empty upsert is a no-op and returns the extension's empty result, not a resume result.
+    let unchanged = sdk
+        .request(
+            4,
+            "_kit/session/update_mcp",
+            json!({"sessionId":id,"mcpServers":[]}),
+        )
+        .await;
+    assert_eq!(unchanged["result"], json!({}), "{unchanged}");
+    sdk.start_prompt(5, &id, "Discover after the empty upsert")
+        .await;
+    sdk.wait_idle().await;
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    sdk.detach().await;
+
+    // Nonempty resident resume rejects; use the explicit update to upsert servers.
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
         .request(
             2,
             "session/resume",
@@ -454,14 +550,36 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         )
         .await;
     assert!(
-        rejected["error"].to_string().contains("resident"),
-        "{rejected}"
+        resumed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("_kit/session/update_mcp")
     );
-    other.detach().await;
-    sdk.start_prompt(4, &id, "Confirm the original controller remains attached")
+    sdk.detach().await;
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root}),
+        )
+        .await;
+    assert_eq!(resumed["result"]["sessionId"], id, "{resumed}");
+    let updated = sdk
+        .request(
+            4,
+            "_kit/session/update_mcp",
+            json!({"sessionId":id,"mcpServers":servers}),
+        )
+        .await;
+    assert_eq!(updated["result"], json!({}), "{updated}");
+    sdk.start_prompt(3, &id, "Discover the unchanged session MCP fixture")
         .await;
     sdk.wait_idle().await;
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
     sdk.detach().await;
+
+    // Empty resident resume retains the overlay and its existing connections.
     let mut sdk = SdkClient::connect(&url).await;
     let resumed = sdk
         .request(
@@ -471,7 +589,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         )
         .await;
     assert!(resumed.get("error").is_none(), "{resumed}");
-    sdk.start_prompt(3, &id, "Discover the retained session MCP fixture")
+    sdk.start_prompt(3, &id, "Discover after resident retention")
         .await;
     sdk.wait_idle().await;
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
@@ -495,6 +613,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
     sdk.detach().await;
     stop_gateway(&mut gateway).await;
+    mcp_http.abort();
     provider.abort();
 }
 
@@ -715,6 +834,93 @@ async fn exited_sessions_release_capacity_and_preserve_history_without_restart()
     catalog.detach().await;
     stop_gateway(&mut gateway).await;
     provider.abort();
+}
+
+#[tokio::test]
+async fn wildcard_bind_is_opt_in_and_not_public_address_permission() {
+    let fixture = Fixture::new();
+    for (address, flags) in [
+        ("0.0.0.0:0", vec![]),
+        ("[::]:0", vec![]),
+        ("0.0.0.0:0", vec!["--allow-private-network"]),
+        ("[::]:0", vec!["--allow-private-network"]),
+        ("8.8.8.8:0", vec!["--allow-wildcard-bind"]),
+        ("[2606:4700:4700::1111]:0", vec!["--allow-wildcard-bind"]),
+        ("10.1.2.3:0", vec!["--allow-wildcard-bind"]),
+    ] {
+        let output = timeout(
+            WAIT,
+            fixture
+                .command()
+                .args(["gateway", "--listen", address])
+                .args(flags)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("gateway must bind loopback"),
+            "{address}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wildcard_bind_still_requires_valid_credentials() {
+    let fixture = Fixture::new();
+    for address in ["0.0.0.0:0", "[::]:0"] {
+        for (token, mode, expected) in [
+            (None, 0o600, "--credential-file is required"),
+            (Some(""), 0o600, "one non-empty ASCII bearer token"),
+            (
+                Some("two tokens"),
+                0o600,
+                "one non-empty ASCII bearer token",
+            ),
+            (Some(TOKEN), 0o644, "chmod 600"),
+        ] {
+            let mut command = fixture.command();
+            command.args(["gateway", "--listen", address, "--allow-wildcard-bind"]);
+            if let Some(token) = token {
+                fs::write(&fixture.credential, token).unwrap();
+                fs::set_permissions(&fixture.credential, fs::Permissions::from_mode(mode)).unwrap();
+                command.arg("--credential-file").arg(&fixture.credential);
+            }
+            let output = timeout(WAIT, command.output()).await.unwrap().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{stderr}");
+            assert!(stderr.contains(expected), "{address}: {stderr}");
+            assert!(!stderr.contains("Kit gateway listening"), "{stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn wildcard_bind_authenticates_http_requests() {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture
+        .gateway_with_bind("0.0.0.0:0", &["--allow-wildcard-bind"])
+        .await;
+    let url = url.replace("0.0.0.0", "127.0.0.1");
+    for path in ["/acp/v2", "/v1"] {
+        for token in [None, Some("wrong-token")] {
+            let request = fixture.client.post(format!("{url}{path}")).json(&json!({}));
+            let request = if let Some(token) = token {
+                request.bearer_auth(token)
+            } else {
+                request
+            };
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+    assert_eq!(fixture.catalog(&url).await["sessions"], json!([]));
+    stop_gateway(&mut gateway).await;
 }
 
 #[tokio::test]
@@ -1597,7 +1803,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         initialized,
         json!({"jsonrpc":"2.0","id":1,"result":{
             "protocolVersion":2,"info":{"name":"kit-gateway","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{}}}},
+            "capabilities":{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}},
             "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4093}}
         }})
     );
@@ -2638,4 +2844,54 @@ async fn bridge_replays_160_short_history_records() {
 #[tokio::test]
 async fn bridge_replays_1000_short_history_records() {
     assert_bridge_replays_ready_history(1000).await;
+}
+
+#[tokio::test]
+async fn standard_close_releases_residency_and_preserves_explicit_resume() {
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut client = SdkClient::connect(&url).await;
+    let created = client
+        .request(
+            2,
+            "session/new",
+            json!({"cwd":fixture.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(created.get("error").is_none(), "{created}");
+    let id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    client.start_prompt(10, &id, "Persist before closing").await;
+    let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    release.send("Durable answer before close.").unwrap();
+    client.wait_idle().await;
+    client.updates.clear();
+    let closed = client
+        .request(3, "session/close", json!({"sessionId":id}))
+        .await;
+    assert!(closed.get("error").is_none(), "{closed}");
+    timeout(WAIT, async {
+        loop {
+            let catalog = client.request(4, "session/list", json!({})).await;
+            if catalog["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| {
+                    row["sessionId"] == id && row["_meta"]["kit.gateway.state"] == "restorable"
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let resumed = client.request(5, "session/resume", json!({"sessionId":id,"cwd":fixture.root,"mcpServers":[],"replayFrom":{"type":"start"}})).await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    assert_eq!(resumed["result"]["sessionId"], id);
+    assert_replayed_answer(&client.updates, "Durable answer before close.");
+    client.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
 }

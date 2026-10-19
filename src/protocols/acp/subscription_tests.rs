@@ -185,6 +185,7 @@ async fn resource_subscription_wakes_idle_session_reads_and_unsubscribes() {
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let skills = runtime.current_skills().await.unwrap();
     let actor = tokio::spawn(session_actor(SessionActor {
+        subagents: None,
         voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(&[]),
         session_id: session_id.clone(),
         runtime,
@@ -258,6 +259,7 @@ async fn resource_subscription_wakes_idle_session_reads_and_unsubscribes() {
     commands.send(Command::Close { reply }).await.unwrap();
     timeout(Duration::from_secs(10), response)
         .await
+        .unwrap()
         .unwrap()
         .unwrap();
     actor.await.unwrap();

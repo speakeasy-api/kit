@@ -20,6 +20,7 @@ struct Control {
     attachment: String,
     entry: Entry,
     cursor: u64,
+    closed: bool,
     pending: HashMap<String, Value>,
 }
 
@@ -87,6 +88,7 @@ impl Control {
                 cursor: self.cursor,
             })
             .await?;
+        self.closed = result["closed"] == true;
         let mut messages = Vec::new();
         if let Some(events) = result["events"].as_array() {
             for event in events {
@@ -138,12 +140,29 @@ impl Connection {
             // Use the same pinned ACP v2 schema/capabilities as the local agent.
             let mut capabilities = serde_json::to_value(agentkit_acp::v2::agent_capabilities())
                 .map_err(|e| Failure::unavailable(e.to_string()))?;
+            capabilities["_meta"] = object([("kit/session/status", object([]))]);
             if let Some(session) = capabilities["session"].as_object_mut() {
-                for name in ["close", "delete", "fork"] {
+                for name in ["delete", "fork"] {
                     session.remove(name);
                 }
                 session.insert("list".into(), object([]));
-                session.insert("mcp".into(), object([("stdio", object([]))]));
+                session.insert(
+                    "mcp".into(),
+                    object([
+                        ("stdio", object([])),
+                        ("http", object([])),
+                        (
+                            "_meta",
+                            object([(
+                                "kit/updateMcp",
+                                object([
+                                    ("method", "_kit/session/update_mcp".into()),
+                                    ("upsert", true.into()),
+                                ]),
+                            )]),
+                        ),
+                    ]),
+                );
             }
             self.initialize = Some((message.clone(), Arc::clone(charge)));
             return Ok(Some(object([
@@ -319,6 +338,7 @@ impl Connection {
                 attachment,
                 entry,
                 cursor: 0,
+                closed: false,
                 pending: HashMap::new(),
             };
             if attached["started"] == true {
@@ -414,10 +434,34 @@ impl Connection {
                     for message in messages {
                         send(channel, message, deadline).await?;
                     }
+                    if control.closed {
+                        for (_, request_id) in control.pending.drain() {
+                            send(
+                                channel,
+                                object([
+                                    ("jsonrpc", "2.0".into()),
+                                    ("id", request_id),
+                                    (
+                                        "error",
+                                        object([
+                                            ("code", (-32000).into()),
+                                            (
+                                                "message",
+                                                "session closed before request completed".into(),
+                                            ),
+                                        ]),
+                                    ),
+                                ]),
+                                deadline,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 Err(error) => failed.push((id.clone(), error)),
             }
         }
+        self.controls.retain(|_, control| !control.closed);
         // A replacement affects one session, not the multiplexed connection.
         // Settle that controller's pending calls explicitly before forgetting it.
         for (id, error) in failed {
@@ -748,6 +792,7 @@ mod tests {
                         stopped,
                     },
                     cursor: 0,
+                    closed: false,
                     pending: HashMap::new(),
                 },
             );
@@ -876,6 +921,7 @@ mod tests {
                     stopped,
                 },
                 cursor: 0,
+                closed: false,
                 pending: HashMap::new(),
             },
         );
@@ -923,6 +969,7 @@ mod tests {
                 stopped,
             },
             cursor: 0,
+            closed: false,
             pending: (0..ChannelLimits::default().max_pending_requests)
                 .map(|id| (id.to_string(), json!(id)))
                 .collect(),

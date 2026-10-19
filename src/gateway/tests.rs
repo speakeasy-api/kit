@@ -106,6 +106,7 @@ for line in sys.stdin:
             id: id.to_owned(),
             root: self.gateway.roots[0].clone(),
             restore: false,
+            closed: false,
             attachment: None,
             committed_owner: None,
             serial: 0,
@@ -309,22 +310,12 @@ async fn disconnect_replay_single_controller_and_stale_response_isolation() {
             .iter()
             .any(|event| event["params"]["update"]["state"] == "running")
     );
-    // A second startup on the same attachment must not duplicate replay or
-    // create another child session; a close must not be falsely acknowledged.
-    for method in ["session/new", "session/close"] {
-        let (status, _) = harness
-            .raw(json!({"op":"send","session":"resident","attachment":second,
-            "message":{"jsonrpc":"2.0","id":90,"method":method,"params":{"sessionId":"resident"}}}))
-            .await;
-        assert_eq!(
-            status,
-            if method == "session/new" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            }
-        );
-    }
+    // A second startup on the same attachment must not duplicate replay.
+    let (status, _) = harness
+        .raw(json!({"op":"send","session":"resident","attachment":second,
+        "message":{"jsonrpc":"2.0","id":90,"method":"session/new","params":{"sessionId":"resident"}}}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(harness.raw(json!({"op":"send","session":"resident","attachment":first,"message":{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}})).await.0,StatusCode::CONFLICT);
     harness
         .send(
@@ -384,12 +375,34 @@ async fn disconnect_replay_single_controller_and_stale_response_isolation() {
         .await;
 }
 #[test]
-fn private_bind_requires_explicit_opt_in() {
-    assert!(permitted_address("127.0.0.1:0".parse().unwrap(), false));
-    assert!(!permitted_address("10.1.2.3:80".parse().unwrap(), false));
-    assert!(permitted_address("10.1.2.3:80".parse().unwrap(), true));
-    for address in ["0.0.0.0:80", "8.8.8.8:80", "[::]:80"] {
-        assert!(!permitted_address(address.parse().unwrap(), true));
+fn bind_policy_requires_separate_explicit_opt_ins() {
+    for private in [false, true] {
+        for wildcard in [false, true] {
+            for (address, expected) in [
+                ("127.0.0.1:0", true),
+                ("[::1]:0", true),
+                ("10.1.2.3:80", private),
+                ("172.16.0.1:80", private),
+                ("192.168.1.1:80", private),
+                ("[fd00::1]:80", private),
+                ("0.0.0.0:80", wildcard),
+                ("[::]:80", wildcard),
+                ("8.8.8.8:80", false),
+                ("[2606:4700:4700::1111]:80", false),
+                ("169.254.1.1:80", false),
+                ("[fe80::1]:80", false),
+                ("224.0.0.1:80", false),
+                ("[ff02::1]:80", false),
+                ("255.255.255.255:80", false),
+                ("[::ffff:8.8.8.8]:80", false),
+            ] {
+                assert_eq!(
+                    permitted_address(address.parse().unwrap(), private, wildcard),
+                    expected,
+                    "{address}: private={private}, wildcard={wildcard}"
+                );
+            }
+        }
     }
 }
 
@@ -398,6 +411,7 @@ fn isolated_actor() -> Actor {
         id: "resident".into(),
         root: PathBuf::from("/approved"),
         restore: false,
+        closed: false,
         attachment: None,
         committed_owner: None,
         serial: 0,
@@ -1601,5 +1615,374 @@ async fn cancelled_detach_reply_keeps_committed_generation_fence() {
             "startup":{"jsonrpc":"2.0","id":205,"method":"session/resume","params":{"sessionId":"resident","_meta":{"kit/gateway":{"previousAttachment":previous,"recoveryId":"cancelled-detach","recoveryAttempt":1}}}}
         })).await;
         assert_eq!(status, expected);
+    }
+}
+
+#[test]
+fn resident_startup_omitted_or_empty_mcp_retains_overlay() {
+    for via_attach in [false, true] {
+        for method in ["session/new", "session/resume"] {
+            for servers in [None, Some(json!([]))] {
+                let mut actor = isolated_actor();
+                actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+                actor.output(state_update("running"));
+                let (writes, mut receiver) = mpsc::channel(4);
+                let mut startup = json!({"jsonrpc":"2.0","id":71,"method":method,"params":{"sessionId":"resident"}});
+                if let Some(servers) = &servers {
+                    startup["params"]["mcpServers"] = servers.clone();
+                }
+                let attached = actor
+                    .command(
+                        Request::Attach {
+                            session: actor.id.clone(),
+                            replace: true,
+                            replay: false,
+                            startup: if via_attach {
+                                Some(startup.clone())
+                            } else {
+                                None
+                            },
+                        },
+                        &writes,
+                    )
+                    .unwrap();
+                if !via_attach {
+                    actor
+                        .command(
+                            Request::Send {
+                                session: actor.id.clone(),
+                                attachment: attached["attachment"].as_str().unwrap().into(),
+                                message: startup,
+                                charge: None,
+                            },
+                            &writes,
+                        )
+                        .unwrap();
+                }
+                // No child request means the resident overlay is left untouched.
+                assert!(actor.pending.is_empty());
+                assert!(receiver.try_recv().is_err());
+                let attachment = actor.attachment.as_ref().unwrap();
+                assert!(attachment.live);
+                let response = &attachment.events.back().unwrap().1;
+                assert_eq!(response["id"], 71);
+                assert_eq!(response["result"]["sessionId"], "resident");
+                assert!(attachment.events.iter().any(
+                    |(_, message)| message["params"]["update"]["state"] == actor.state["state"]
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_startup_preserves_mcp_servers() {
+    for restore in [false, true] {
+        let mut actor = isolated_actor();
+        actor.restore = restore;
+        let (writes, mut receiver) = mpsc::channel(4);
+        let attached = actor
+            .command(
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: false,
+                    replay: false,
+                    startup: None,
+                },
+                &writes,
+            )
+            .unwrap();
+        let servers =
+            json!([{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]);
+        actor.command(Request::Send {
+        session: actor.id.clone(),
+        attachment: attached["attachment"].as_str().unwrap().into(),
+        message: json!({"jsonrpc":"2.0","id":74,"method":"session/new","params":{"mcpServers":servers}}),
+        charge: None,
+    }, &writes).unwrap();
+        let startup = receiver.try_recv().unwrap().message;
+        assert_eq!(
+            startup["method"],
+            if restore {
+                "session/resume"
+            } else {
+                "session/new"
+            }
+        );
+        assert_eq!(startup["params"]["mcpServers"], servers);
+    }
+}
+
+#[test]
+fn resident_nonempty_mcp_rejected_without_replacing_controller() {
+    for via_attach in [false, true] {
+        for method in ["session/new", "session/resume"] {
+            let mut actor = isolated_actor();
+            actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+            let (writes, mut receiver) = mpsc::channel(4);
+            actor
+                .command(
+                    if via_attach {
+                        resident_claim(&actor, false, 75)
+                    } else {
+                        Request::Attach {
+                            session: actor.id.clone(),
+                            replace: true,
+                            replay: false,
+                            startup: None,
+                        }
+                    },
+                    &writes,
+                )
+                .unwrap();
+            let owner = actor.attachment.as_ref().unwrap().id.clone();
+            let events = actor.attachment.as_ref().unwrap().events.clone();
+            let startup = json!({"jsonrpc":"2.0","id":76,"method":method,"params":{
+                "sessionId":"resident",
+                "mcpServers":[{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]
+            }});
+            let request = if via_attach {
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: true,
+                    replay: false,
+                    startup: Some(startup),
+                }
+            } else {
+                Request::Send {
+                    session: actor.id.clone(),
+                    attachment: owner.clone(),
+                    message: startup,
+                    charge: None,
+                }
+            };
+            let error = actor.command(request, &writes).unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert!(error.1.contains("_kit/session/update_mcp"));
+            let attachment = actor.attachment.as_ref().unwrap();
+            assert_eq!(attachment.id, owner);
+            assert_eq!(attachment.live, via_attach);
+            assert_eq!(attachment.events, events);
+            assert_eq!(actor.committed_owner.as_ref().unwrap().id, owner);
+            assert!(actor.pending.is_empty());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+}
+
+#[test]
+fn direct_mcp_update_keeps_owner_and_returns_extension_response() {
+    let mut actor = isolated_actor();
+    actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+    let (writes, mut receiver) = mpsc::channel(4);
+    let attached = actor
+        .command(resident_claim(&actor, false, 80), &writes)
+        .unwrap();
+    let owner = attached["attachment"].as_str().unwrap().to_owned();
+    for (id, session) in [
+        (81, Value::Null),
+        (82, json!("wrong")),
+        (83, json!("resident")),
+        (84, json!("resident")),
+    ] {
+        let result = actor.command(Request::Send {
+            session: actor.id.clone(), attachment: owner.clone(), charge: None,
+            message: json!({"jsonrpc":"2.0","id":id,"method":"_kit/session/update_mcp","params":{"sessionId":session,"mcpServers":[]}}),
+        }, &writes);
+        if id < 83 {
+            assert!(result.is_err());
+            assert!(receiver.try_recv().is_err());
+        } else {
+            result.unwrap();
+            let update = receiver.try_recv().unwrap().message;
+            assert_eq!(update["method"], "_kit/session/update_mcp");
+            assert_eq!(update["params"]["mcpServers"], json!([]));
+            let response = if id == 83 {
+                json!({"jsonrpc":"2.0","id":update["id"],"error":{"code":-32602,"message":"invalid MCP configuration"}})
+            } else {
+                json!({"jsonrpc":"2.0","id":update["id"],"result":{}})
+            };
+            actor.output(response);
+            let attachment = actor.attachment.as_ref().unwrap();
+            assert_eq!(attachment.id, owner);
+            assert!(attachment.live);
+            let response = &attachment.events.back().unwrap().1;
+            assert_eq!(response["id"], id);
+            if id == 83 {
+                assert_eq!(response["error"]["code"], -32602);
+            } else {
+                assert_eq!(response["result"], json!({}));
+            }
+            assert_eq!(
+                actor.session_result.as_ref().unwrap()["sessionId"],
+                "resident"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn close_cleans_child_before_response_and_reclaims_actor() {
+    let harness = Harness::new().await;
+    let cleaned = harness._directory.path().join("cleaned");
+    let source = r#"
+import sys,json
+pending=None
+for line in sys.stdin:
+ req=json.loads(line)
+ if req['method']=='session/prompt':
+  pending=req
+  continue
+ if req['method']=='session/close' and pending:
+  print(json.dumps({'jsonrpc':'2.0','id':pending['id'],'result':{'stopReason':'cancelled'}}),flush=True)
+ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{}}),flush=True)
+open(sys.argv[1],'w').write('cleaned')
+"#;
+    harness
+        .child_source(
+            "resident",
+            source,
+            &[cleaned.to_string_lossy().into_owned()],
+        )
+        .await;
+    let attachment = harness.attach().await;
+    harness.handshake(&attachment).await;
+    harness.send(&attachment, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"resident"}})).await;
+    harness.send(&attachment, json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":"resident"}})).await;
+    let events = harness
+        .events(&attachment, |events| events.iter().any(|e| e["id"] == 4))
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["id"] == 3 && e["result"]["stopReason"] == "cancelled")
+    );
+    assert_eq!(std::fs::read_to_string(cleaned).unwrap(), "cleaned");
+    let (status, _) = harness.raw(json!({"op":"send","session":"resident","attachment":attachment,"message":{"id":5,"method":"session/prompt","params":{}}})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let mut entry = harness.gateway.sessions.lock().await["resident"].clone();
+    harness
+        .call(json!({"op":"detach","session":"resident","attachment":attachment}))
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), entry.stopped.changed())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    harness.gateway.reclaim_exited().await;
+    assert!(
+        !harness
+            .gateway
+            .sessions
+            .lock()
+            .await
+            .contains_key("resident")
+    );
+}
+
+#[tokio::test]
+async fn failed_close_reports_error_without_reopening_partially_closed_child() {
+    let harness = Harness::new().await;
+    let source = r#"
+import sys,json
+for line in sys.stdin:
+ req=json.loads(line)
+ response={'jsonrpc':'2.0','id':req['id']}
+ if req['method']=='session/close': response['error']={'code':-32603,'message':'close failed'}
+ else: response['result']={}
+ print(json.dumps(response),flush=True)
+"#;
+    harness.child_source("resident", source, &[]).await;
+    let attachment = harness.attach().await;
+    harness.handshake(&attachment).await;
+    harness.send(&attachment, json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":"resident"}})).await;
+    let events = harness
+        .events(&attachment, |events| events.iter().any(|e| e["id"] == 3))
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["id"] == 3 && e.get("error").is_some())
+    );
+    let (status, _) = harness.raw(json!({"op":"send","session":"resident","attachment":attachment,"message":{"id":4,"method":"session/prompt","params":{}}})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    harness
+        .call(json!({"op":"detach","session":"resident","attachment":attachment}))
+        .await;
+}
+
+#[tokio::test]
+async fn closing_child_keeps_polling_responsive_until_cleanup_finishes() {
+    for shutdown in [false, true] {
+        let harness = Harness::new().await;
+        let ready = harness._directory.path().join("ready");
+        let release = harness._directory.path().join("release");
+        let source = r#"
+import sys,json,os,time
+for line in sys.stdin:
+ req=json.loads(line)
+ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{}}),flush=True)
+open(sys.argv[1],'w').close()
+while not os.path.exists(sys.argv[2]): time.sleep(.01)
+"#;
+        harness
+            .child_source(
+                "resident",
+                source,
+                &[
+                    ready.to_string_lossy().into_owned(),
+                    release.to_string_lossy().into_owned(),
+                ],
+            )
+            .await;
+        let attachment = harness.attach().await;
+        harness.handshake(&attachment).await;
+        harness.send(&attachment, json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":"resident"}})).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let polled = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness
+                .call(json!({"op":"poll","session":"resident","attachment":attachment,"cursor":0})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["events"], json!([]));
+        assert_eq!(polled["closed"], false);
+        let mut entry = harness.gateway.sessions.lock().await["resident"].clone();
+        if shutdown {
+            let (reply, acknowledged) = oneshot::channel();
+            entry
+                .sender
+                .send(Envelope {
+                    request: Request::Shutdown,
+                    reply,
+                })
+                .await
+                .unwrap();
+            acknowledged.await.unwrap().unwrap();
+        }
+        std::fs::write(release, "release").unwrap();
+        if shutdown {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), entry.stopped.changed())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            harness
+                .events(&attachment, |events| events.iter().any(|e| e["id"] == 3))
+                .await;
+            harness
+                .call(json!({"op":"detach","session":"resident","attachment":attachment}))
+                .await;
+        }
     }
 }

@@ -406,30 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn bundled_corpus_contains_every_user_guide() {
-        let paths = BUNDLED_DOCUMENTS
-            .iter()
-            .map(|(path, _)| *path)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            paths,
-            vec![
-                "docs/user/agent-hooks-protocol.md",
-                "docs/user/agent-plugins.md",
-                "docs/user/compose-and-local-tools.md",
-                "docs/user/evaluations.md",
-                "docs/user/gateway.md",
-                "docs/user/getting-started-and-configuration.md",
-                "docs/user/mcp.md",
-                "docs/user/migrating-from-claude-code-and-codex.md",
-                "docs/user/native-voice.md",
-                "docs/user/provider-usage.md",
-                "docs/user/reporting-kit-issues.md",
-                "docs/user/security-limits-and-troubleshooting.md",
-                "docs/user/subagents-and-acp-harnesses.md",
-                "docs/user/tui-and-sessions.md",
-            ]
-        );
+    fn bundled_corpus_searches_task_guides_and_protocol_references() {
+        let reference = bundled_search("Acp-Connection-Id").unwrap();
+        assert!(reference.matches.iter().any(|item| {
+            item.path == "docs/reference/gateway-protocol.md"
+                && item.content.contains("Acp-Connection-Id")
+        }));
         let result = bundled_search("MCP OAuth credential store").unwrap();
         assert_eq!(result.version, env!("CARGO_PKG_VERSION"));
         assert!(
