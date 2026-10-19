@@ -489,22 +489,15 @@ fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionEr
     let mut conversation =
         String::from("Here is the conversation to checkpoint:\n\n<conversation>\n");
     let mut first = true;
-    let latest_user = request
+    for item in request
         .items
         .iter()
-        .rposition(|item| item.kind == ItemKind::User);
-    for (index, item) in request
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| !is_compaction_summary(item))
+        .filter(|item| !is_compaction_summary(item))
     {
         if !first {
             conversation.push_str("\n\n");
         }
-        let rendered = if Some(index) == latest_user
-            || matches!(item.kind, ItemKind::System | ItemKind::Context)
-        {
+        let rendered = if matches!(item.kind, ItemKind::System | ItemKind::Context) {
             render_protected_summary_item(item)?
         } else {
             render_summary_item(item)?
@@ -547,28 +540,22 @@ fn smaller_summary_prompt(
 }
 
 /// This projects only summary input, never the canonical tool-call history.
-/// Preserve the last user message in this prefix conservatively: it need not
-/// be the current directive, which may be in the retained suffix. Never label
-/// it as overriding that suffix, or silently truncate its text to fit.
+/// User messages here are historical, including the last user in the prefix.
+/// System/context messages and the prior checkpoint remain irreducible. The
+/// strategy retains the current directive separately during forced recovery.
 fn bounded_summary_prompt(
     request: &SummaryRequest,
     budget: usize,
     marker: &str,
 ) -> Result<String, CompactionError> {
-    let latest_user = request
-        .items
-        .iter()
-        .rposition(|item| item.kind == ItemKind::User);
     let mut protected = String::new();
     let mut history = String::new();
-    for (index, item) in request
+    for item in request
         .items
         .iter()
-        .enumerate()
-        .filter(|(_, item)| !is_compaction_summary(item))
+        .filter(|item| !is_compaction_summary(item))
     {
-        let is_protected =
-            Some(index) == latest_user || matches!(item.kind, ItemKind::System | ItemKind::Context);
+        let is_protected = matches!(item.kind, ItemKind::System | ItemKind::Context);
         let rendered = if is_protected {
             render_protected_summary_item(item)?
         } else {
@@ -942,6 +929,11 @@ impl CompactionStrategy for SummarizeForContinuation {
             SUMMARY_PROMPT_BUDGET_METADATA_KEY.into(),
             serde_json::Value::from(summary_prompt_budget(&request.transcript) as u64),
         );
+        // Every user message in this prefix may be projected as history.
+        // During forced recovery, the current directive is in `recent`, or
+        // copied into `retained_directive`. Ordinary/manual compaction may
+        // summarize completed requests. Inferring protection from the prefix's
+        // last user would make large old requests fatal.
         let mut summary = backend
             .summarize(
                 SummaryRequest::new(summarized, request.reason).with_metadata(summary_metadata),
@@ -1388,7 +1380,7 @@ mod tests {
                     ItemKind::Assistant,
                     format!("{}{}", "H".repeat(12_000), "T".repeat(12_000)),
                 ),
-                Item::text(ItemKind::User, "protected latest directive"),
+                Item::text(ItemKind::User, "latest historical request"),
             ],
             CompactionReason::TranscriptTooLong,
         )
@@ -1429,7 +1421,7 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0], original);
         assert!(sent[1].len() <= sent[0].len() / 2);
-        assert!(sent[1].contains("protected latest directive"));
+        assert!(sent[1].contains("latest historical request"));
         assert!(sent[1].contains("omitted after provider context rejection"));
         assert!(sent[1].matches('H').count() > sent[1].matches('T').count() * 4);
     }
@@ -2023,6 +2015,107 @@ mod tests {
                 "summary",
             )]))
         }
+    }
+
+    #[tokio::test]
+    async fn historical_prefix_projects_with_checkpoint_and_current_directive_in_suffix() {
+        for reason in [
+            CompactionReason::Manual,
+            CompactionReason::Custom("context-length-rejected:1".into()),
+        ] {
+            for accept_below in [usize::MAX, 8_000] {
+                let checkpoint = "prior checkpoint ".repeat(180);
+                let mut previous = Item::text(ItemKind::Developer, checkpoint.clone());
+                previous
+                    .metadata
+                    .insert(COMPACTION_SUMMARY_METADATA_KEY.into(), true.into());
+                let mut current =
+                    Item::text(ItemKind::User, "current directive in retained suffix");
+                current.usage = measured(28_000, Some(32_000)).usage;
+                let mut transcript = vec![
+                    previous,
+                    Item::text(ItemKind::User, "historical request ".repeat(730)),
+                    current.clone(),
+                ];
+                if reason == CompactionReason::Manual {
+                    transcript.push(Item::text(ItemKind::User, "/compact"));
+                }
+                let (backend, requests) = rejecting_backend(true, accept_below);
+                let mut context = CompactionContext::new().with_backend(&backend);
+                let result = test_strategy()
+                    .apply(
+                        CompactionRequest::new(transcript, reason.clone()),
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                // Compaction strips obsolete provider usage from retained items.
+                current.usage = None;
+                assert!(result.transcript.contains(&current));
+                let sent = requests.try_iter().collect::<Vec<_>>();
+                assert_eq!(sent.len(), if accept_below == usize::MAX { 1 } else { 2 });
+                assert!(sent[0].contains("omitted for compaction prompt budget"));
+                for prompt in &sent {
+                    assert!(prompt.len() <= 16_000);
+                    assert!(prompt.contains(&checkpoint));
+                    assert!(prompt.contains(SUMMARY_UPDATE));
+                    assert!(!prompt.contains("current directive in retained suffix"));
+                }
+                if sent.len() == 2 {
+                    assert!(sent[1].len() <= sent[0].len() / 2);
+                    assert!(sent[1].contains("omitted after provider context rejection"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_submits_oversized_historical_user_to_summary_adapter() {
+        let transcript = vec![
+            Item::text(ItemKind::User, "older content ".repeat(20_000)),
+            Item::text(ItemKind::Assistant, "recent answer"),
+            Item::text(ItemKind::User, "/compact"),
+        ];
+        let (backend, requests) = rejecting_backend(false, usize::MAX);
+        let mut context = CompactionContext::new().with_backend(&backend);
+        test_strategy()
+            .apply(
+                CompactionRequest::new(transcript, CompactionReason::Manual),
+                &mut context,
+            )
+            .await
+            .unwrap();
+        let sent = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].len() <= SUMMARY_PROMPT_FALLBACK_BYTES);
+        assert!(sent[0].contains("item truncated for compaction budget"));
+    }
+
+    #[tokio::test]
+    async fn forced_recovery_projects_large_directive_but_retains_its_canonical_text() {
+        let current = Item::text(ItemKind::User, "current directive ".repeat(3_000));
+        let transcript = vec![
+            Item::text(ItemKind::Assistant, "older work"),
+            current.clone(),
+            measured(28_000, Some(32_000)),
+        ];
+        let (backend, requests) = rejecting_backend(false, usize::MAX);
+        let mut context = CompactionContext::new().with_backend(&backend);
+        let result = test_strategy()
+            .apply(
+                CompactionRequest::new(
+                    transcript,
+                    CompactionReason::Custom("context-length-rejected:1".into()),
+                ),
+                &mut context,
+            )
+            .await
+            .unwrap();
+        assert!(result.transcript.contains(&current));
+        let sent = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].len() <= 16_000);
+        assert!(!sent[0].contains(item_text(&current).unwrap()));
     }
 
     #[tokio::test]
@@ -2675,7 +2768,7 @@ mod tests {
     #[test]
     fn protected_summary_messages_project_attachments_without_truncating_text() {
         let directive = "preserve this directive ".repeat(1_000);
-        for kind in [ItemKind::User, ItemKind::System, ItemKind::Context] {
+        for kind in [ItemKind::System, ItemKind::Context] {
             let request = SummaryRequest::new(
                 vec![Item::new(
                     kind,
@@ -2761,12 +2854,12 @@ mod tests {
         let prompt = build_summary_prompt(&request).unwrap();
         assert!(prompt.len() <= 5_000);
         assert!(prompt.contains("omitted for compaction prompt budget"));
-        assert!(prompt.contains("protected latest directive"));
+        assert!(prompt.contains("latest historical request"));
     }
 
     #[test]
     fn summary_prompt_refuses_to_truncate_oversized_protected_text() {
-        for kind in [ItemKind::User, ItemKind::Developer] {
+        for kind in [ItemKind::System, ItemKind::Context, ItemKind::Developer] {
             let mut protected = Item::text(kind, "protected text ".repeat(10_000));
             if kind == ItemKind::Developer {
                 protected
@@ -2792,7 +2885,7 @@ mod tests {
             let expected = build_summary_prompt(&request).unwrap();
             assert!(expected.len() <= 4_000);
             assert!(expected.contains("omitted for compaction prompt budget"));
-            assert!(expected.contains("protected latest directive"));
+            assert!(expected.contains("latest historical request"));
             let result = backend.summarize(request, None).await;
             assert_eq!(result.is_ok(), accept_below != 0);
             assert_eq!(requests.try_iter().collect::<Vec<_>>(), [expected]);
