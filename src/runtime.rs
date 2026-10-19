@@ -517,6 +517,7 @@ pub struct Runtime {
     /// Later ACP sessions receive their own persisted ids.
     session: Mutex<SessionSelection>,
     mcp: crate::tools::mcp::McpRuntime,
+    eager_mcp_initialization: bool,
     plugin_runtime: Option<crate::plugins::PluginRuntime>,
     dynamic_skill_tool: Option<Arc<dyn Tool>>,
     skills: Arc<SkillRegistry>,
@@ -633,6 +634,7 @@ impl Runtime {
             subagents,
             session: Mutex::new(SessionSelection::default()),
             mcp: crate::tools::mcp::empty(),
+            eager_mcp_initialization: true,
             plugin_runtime: None,
             dynamic_skill_tool: None,
             skills,
@@ -910,6 +912,16 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
+    /// Defer base MCP connections until discovery or invocation. Call before
+    /// installing MCP sources for ACP v2, whose sessions own isolated runtimes.
+    /// Other entrypoints retain eager initialization by default.
+    pub fn with_lazy_mcp_initialization(runtime: Arc<Self>) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
+        runtime.eager_mcp_initialization = false;
+        Ok(Arc::new(runtime))
+    }
+
     /// Preserves the original single-file behavior. `path` is the explicit MCP
     /// source and project-local configuration is not discovered.
     pub async fn with_mcp_config(
@@ -1019,8 +1031,11 @@ impl Runtime {
         interactive_oauth_enabled: bool,
         credential_storage: crate::tools::mcp::CredentialStorage,
     ) -> Result<Arc<Self>, String> {
-        let mcp = match runtime.plugin_runtime.clone() {
-            Some(plugins) => {
+        let mcp = match (
+            runtime.plugin_runtime.clone(),
+            runtime.eager_mcp_initialization,
+        ) {
+            (Some(plugins), true) => {
                 crate::tools::mcp::connect_dynamic(
                     install.sources,
                     plugins,
@@ -1029,12 +1044,32 @@ impl Runtime {
                 )
                 .await?
             }
-            None => {
+            (None, true) => {
                 crate::tools::mcp::connect(
                     install.sources,
                     &plugin_mcps,
                     interactive_oauth_enabled,
                     credential_storage.clone(),
+                )
+                .await?
+            }
+            (Some(plugins), false) => {
+                crate::tools::mcp::connect_dynamic_with_initialization(
+                    install.sources,
+                    plugins,
+                    interactive_oauth_enabled,
+                    credential_storage.clone(),
+                    false,
+                )
+                .await?
+            }
+            (None, false) => {
+                crate::tools::mcp::connect_with_initialization(
+                    install.sources,
+                    &plugin_mcps,
+                    interactive_oauth_enabled,
+                    credential_storage.clone(),
+                    false,
                 )
                 .await?
             }

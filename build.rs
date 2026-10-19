@@ -20,26 +20,30 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
-    let docs_root = Path::new("docs/user");
-    println!("cargo:rerun-if-changed={}", docs_root.display());
-
     let mut paths = Vec::new();
-    collect_markdown(docs_root, &mut paths).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not collect {}: {error}", docs_root.display()),
-        )
-    })?;
-    paths.sort();
-    if paths.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} must contain bundled Markdown documentation",
-                docs_root.display()
-            ),
-        ));
+    // Bundle task guides and implementation references without conflating their
+    // organization or maintaining a hand-written per-document inventory.
+    for root in ["docs/user", "docs/reference"] {
+        let docs_root = Path::new(root);
+        println!("cargo:rerun-if-changed={}", docs_root.display());
+        let previous_count = paths.len();
+        collect_markdown(docs_root, &mut paths).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not collect {}: {error}", docs_root.display()),
+            )
+        })?;
+        if paths.len() == previous_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} must contain bundled Markdown documentation",
+                    docs_root.display()
+                ),
+            ));
+        }
     }
+    paths.sort();
 
     let mut generated = String::from("&[\n");
     for path in paths {

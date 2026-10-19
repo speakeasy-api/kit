@@ -2392,6 +2392,11 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
+            let runtime = if matches!(protocol_version, AcpProtocolVersion::V2) {
+                kit::Runtime::with_lazy_mcp_initialization(runtime)?
+            } else {
+                runtime
+            };
             let runtime = if mcp.legacy_mcp_config {
                 kit::Runtime::with_mcp_config(
                     runtime,

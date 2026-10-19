@@ -53,6 +53,8 @@ use super::{
 struct UpdateMcpRequest {
     session_id: wire::SessionId,
     mcp_servers: Vec<wire::McpServer>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(
@@ -6042,6 +6044,7 @@ mod tests {
                     .send_request(UpdateMcpRequest {
                         session_id: source.session_id.clone(),
                         mcp_servers: stdio.clone(),
+                        meta: None,
                     })
                     .block_task()
                     .await?;
@@ -6049,6 +6052,7 @@ mod tests {
                     .send_request(UpdateMcpRequest {
                         session_id: source.session_id.clone(),
                         mcp_servers: vec![],
+                        meta: Some(serde_json::Map::new()),
                     })
                     .block_task()
                     .await?;
@@ -6056,6 +6060,7 @@ mod tests {
                     .send_request(UpdateMcpRequest {
                         session_id: source.session_id.clone(),
                         mcp_servers: unsupported.clone(),
+                        meta: None,
                     })
                     .block_task()
                     .await
@@ -6114,6 +6119,25 @@ mod tests {
 
     #[test]
     fn update_mcp_requires_explicit_batch_and_preserves_http_headers() {
+        for servers in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "type": "http", "name": "remote", "url": "https://example.invalid/mcp", "headers": []
+            }]),
+        ] {
+            let request: UpdateMcpRequest = serde_json::from_value(serde_json::json!({
+                "sessionId": "s", "mcpServers": servers,
+                "_meta": {"example.com/trace": "123"}
+            }))
+            .unwrap();
+            assert_eq!(request.meta.unwrap()["example.com/trace"], "123");
+        }
+        assert!(
+            serde_json::from_value::<UpdateMcpRequest>(serde_json::json!({
+                "sessionId":"s", "mcpServers":[], "_meta": "invalid"
+            }))
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<UpdateMcpRequest>(serde_json::json!({"sessionId":"s"}))
                 .is_err()

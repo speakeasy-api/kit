@@ -272,6 +272,21 @@ When reconnecting to a resident gateway session, omit `mcpServers` or send `[]`
 to retain its current overlay. A nonempty list is rejected with guidance to use
 `_kit/session/update_mcp`; reconnect does not replace or clear the overlay.
 
+### Use MCP servers that require exclusive resources
+
+ACP v2 sessions have separate MCP connections, including connections to host and
+plugin servers. If a stdio server requires an exclusive lock or fixed port, do
+not use it concurrently from multiple sessions in one raw ACP v2 process. Use
+separate resource settings per session, or a shared HTTP MCP service designed
+for concurrent clients. The gateway runs one child per session, but multiple
+children can still compete for the same host-wide lock or port.
+
+For singleton stdio servers, prefer `kit acp --protocol-version v2` (including
+the gateway child path), which defers unused base connections. Mixed-protocol
+`kit serve` retains eager base initialization for its other protocols; its ACP
+v2 session can compete with that base connection. Use a concurrent HTTP service
+in that deployment instead.
+
 ### Add or update a live session's MCP servers
 
 To add client tools or rotate credentials without restarting the model session,
@@ -282,7 +297,7 @@ check `capabilities.session.mcp._meta["kit/updateMcp"]` for Kit's extension:
 ```
 
 Send that JSON-RPC method with `params` containing `sessionId` and `mcpServers`.
-Both fields are required. New client-owned names are added. An existing
+Both fields are required. An optional ACP `_meta` object is accepted. New client-owned names are added. An existing
 client-owned name updates only that server's configuration and credentials.
 Omitted servers remain registered; `[]` is a no-op. There is no removal operation.
 Host and plugin servers and built-in tools are not replaced by client entries.

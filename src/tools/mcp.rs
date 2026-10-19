@@ -1513,12 +1513,30 @@ pub(crate) async fn connect(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
+    connect_with_initialization(
+        sources,
+        plugins,
+        interactive_oauth_enabled,
+        credential_storage,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn connect_with_initialization(
+    sources: impl IntoConfigSources,
+    plugins: &[crate::plugins::ResolvedPluginMcp],
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+    eager_initialization: bool,
+) -> Result<McpRuntime, String> {
     connect_inner(
         sources.into_config_sources(),
         plugins,
         None,
         interactive_oauth_enabled,
         credential_storage,
+        eager_initialization,
     )
     .await
 }
@@ -1529,6 +1547,23 @@ pub(crate) async fn connect_dynamic(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
+    connect_dynamic_with_initialization(
+        sources,
+        plugins,
+        interactive_oauth_enabled,
+        credential_storage,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn connect_dynamic_with_initialization(
+    sources: impl IntoConfigSources,
+    plugins: crate::plugins::PluginRuntime,
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+    eager_initialization: bool,
+) -> Result<McpRuntime, String> {
     let snapshot = plugins.snapshot();
     connect_inner(
         sources.into_config_sources(),
@@ -1536,6 +1571,7 @@ pub(crate) async fn connect_dynamic(
         Some(plugins),
         interactive_oauth_enabled,
         credential_storage,
+        eager_initialization,
     )
     .await
 }
@@ -1546,6 +1582,7 @@ async fn connect_inner(
     plugin_source: Option<crate::plugins::PluginRuntime>,
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
+    eager_initialization: bool,
 ) -> Result<McpRuntime, String> {
     let plugins = plugins.to_vec();
     let (plugin_prepared, plugin_entries) =
@@ -1565,7 +1602,9 @@ async fn connect_inner(
         interactive_oauth_enabled,
         credential_storage,
     )?;
-    runtime.spawn_eager_initialization();
+    if eager_initialization {
+        runtime.spawn_eager_initialization();
+    }
     Ok(runtime)
 }
 
@@ -7778,6 +7817,142 @@ for line in sys.stdin:
             panic!("expected structured MCP response");
         };
         value
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazy_acp_base_leaves_singleton_servers_for_session_discovery() {
+        for source in ["configured", "plugin", "dynamic-plugin"] {
+            for legacy in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let cwd = directory.path().canonicalize().unwrap();
+                let path = cwd.join("mcp.json");
+                let agentkit_acp::McpServer::Stdio(mut configured) =
+                    session_stdio_fixture(&cwd, "singleton")
+                else {
+                    unreachable!();
+                };
+                // This server can have only one live owner, like a local MCP
+                // service holding a database lock. Competing startup fails at
+                // the real child-process boundary, not a runtime test hook.
+                let script = configured.args.last_mut().unwrap();
+                *script = script.replace(
+                    "import json, os, sys",
+                    "import json, os, sys, fcntl\nsingleton = open(os.environ['MARKER'] + '.lock', 'w')\nfcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                );
+                let env = configured
+                    .env
+                    .into_iter()
+                    .map(|variable| (variable.name, variable.value))
+                    .collect::<BTreeMap<_, _>>();
+                let server = json!({
+                    "type": "stdio", "command": configured.command,
+                    "args": configured.args, "env": env
+                });
+                let mut runtime = crate::Runtime::new(&cwd, "test-model").unwrap();
+                let mut plugin_mcps = Vec::new();
+                if source == "configured" {
+                    std::fs::write(
+                        &path,
+                        serde_json::to_vec(&json!({
+                            "mcpServers": {"local": server}
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                } else {
+                    let resolved = plugin(
+                        "singleton",
+                        &cwd,
+                        vec![PluginMcpServer {
+                            name: "local".into(),
+                            transport: PluginMcpTransport::Stdio {
+                                command: configured.command.to_string_lossy().into_owned(),
+                                args: configured.args,
+                                env,
+                                cwd: Some(cwd.to_string_lossy().into_owned()),
+                            },
+                        }],
+                    );
+                    if source == "dynamic-plugin" {
+                        std::fs::write(cwd.join("plugin.json"),
+                            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"singleton-manifest"}"#).unwrap();
+                        std::fs::write(&path, serde_json::to_vec(&json!({
+                            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                            "mcpServers": {"local": server}
+                        })).unwrap()).unwrap();
+                        let config = cwd.join("config.toml");
+                        std::fs::write(
+                            &config,
+                            format!(
+                                "[plugins.singleton]\nsource = 'path'\npath = '{}'\n",
+                                cwd.display()
+                            ),
+                        )
+                        .unwrap();
+                        let plugins = PluginRuntime::new(
+                            config,
+                            cwd.clone(),
+                            cwd.join("cache"),
+                            cwd.join("data"),
+                            ResolvedPlugins {
+                                mcp_plugins: vec![resolved],
+                                ..Default::default()
+                            },
+                        );
+                        runtime =
+                            crate::Runtime::with_plugin_runtime(runtime, Some(plugins)).unwrap();
+                    } else {
+                        plugin_mcps.push(resolved);
+                    }
+                }
+                runtime = crate::Runtime::with_lazy_mcp_initialization(runtime).unwrap();
+                let configured_path = (source == "configured").then_some(path.as_path());
+                runtime = if legacy {
+                    crate::Runtime::with_mcp_config(
+                        runtime,
+                        configured_path,
+                        plugin_mcps,
+                        false,
+                        CredentialStorage::Memory,
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    crate::Runtime::with_mcp_sources(
+                        runtime,
+                        configured_path,
+                        None,
+                        plugin_mcps,
+                        false,
+                        CredentialStorage::Memory,
+                    )
+                    .await
+                    .unwrap()
+                };
+                let base = runtime.mcp_for_test();
+                // No detached initializer owns the otherwise unused base.
+                assert_eq!(Arc::strong_count(&base.inner), 1);
+                assert!(!cwd.join("singleton.started").exists());
+                let weak_base = Arc::downgrade(&base.inner);
+                let session = runtime.isolated_session_mcp(vec![], &cwd).await.unwrap();
+                assert!(!cwd.join("singleton.started").exists());
+                let found = session.search("inspect").await.unwrap();
+                assert_eq!(
+                    found["servers"][0]["status"], "authenticated",
+                    "{source}: {found}"
+                );
+                assert!(cwd.join("singleton.started").exists());
+                assert_eq!(call_session_stdio(&session).await["value"], "singleton");
+                assert!(matches!(
+                    runtime.mcp_for_test().inner.servers.read().await["local"].status,
+                    ServerStatus::Uninitialized
+                ));
+                drop(runtime);
+                assert!(weak_base.upgrade().is_none());
+                assert_eq!(call_session_stdio(&session).await["value"], "singleton");
+            }
+        }
     }
 
     #[cfg(unix)]
