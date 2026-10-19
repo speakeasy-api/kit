@@ -69,7 +69,7 @@ Initialize POST body (send `Authorization: Bearer TOKEN` and `Content-Type: appl
 The response is HTTP 200 JSON with `Acp-Connection-Id`. Its `result` contains `protocolVersion: 2`, `info.name: "kit-gateway"`, the running Kit version, and these capabilities:
 
 ```json
-{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{}}}
+{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{}}}}
 ```
 
 Its `result._meta` explicitly identifies the experimental limits:
