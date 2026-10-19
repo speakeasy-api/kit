@@ -5856,6 +5856,7 @@ mod tests {
                 server.sessions.lock().unwrap().insert(
                     id.clone(),
                     SessionHandle {
+                        activity: SessionActivity::new(|_| Ok(())),
                         mcp: server.runtime.mcp_for_test().clone(),
                         integration,
                         busy: Arc::new(AtomicBool::new(false)),
