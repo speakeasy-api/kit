@@ -794,13 +794,24 @@ impl TransientTranscript {
     }
 
     pub(crate) fn replace(&self, transcript: &[Item]) {
-        if let Ok(mut items) = self.0.lock() {
-            transcript.clone_into(&mut items);
-        }
+        // Prepare before locking; publish one complete snapshot and drop the
+        // displaced items only after releasing the guard. Poison isolates the
+        // mirror, just as it does for append and snapshot operations.
+        let replacement = transcript.to_vec();
+        let previous = if let Ok(mut items) = self.0.lock() {
+            Some(std::mem::replace(&mut *items, replacement))
+        } else {
+            None
+        };
+        drop(previous);
     }
 }
 
 impl TranscriptObserver for TransientTranscript {
+    fn on_transcript_replaced(&self, _session_id: &agentkit_core::SessionId, items: &[Item]) {
+        self.replace(items);
+    }
+
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
         if let Ok(mut items) = self.0.lock() {
             items.push(event.item.clone());
@@ -809,6 +820,16 @@ impl TranscriptObserver for TransientTranscript {
 }
 
 impl TranscriptObserver for SessionObserver {
+    fn on_transcript_replaced(&self, session_id: &agentkit_core::SessionId, items: &[Item]) {
+        // The driver calls this only after committing its staged transcript.
+        // As with appends, storage is best-effort and cannot roll back that
+        // commit. Keep the existing loss-domain semantics; report rejected
+        // writes rather than claiming that the replacement reached disk.
+        if let Err(error) = self.replace(items) {
+            tracing::warn!(%session_id, %error, "could not persist committed transcript replacement");
+        }
+    }
+
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
         // Persistence must not prevent the loop from committing its in-memory
         // transcript. Poison still isolates the writer: never recover a guard
@@ -2792,6 +2813,142 @@ mod tests {
     use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
     use serde_json::json;
 
+    mod context_recovery {
+        use super::*;
+        use agentkit_core::{FinishReason, SessionId, TurnCancellation};
+        use agentkit_loop::*;
+        use async_trait::async_trait;
+        use std::time::Duration;
+
+        struct RejectOnce;
+        struct Model(bool);
+        struct Turn(Option<ModelTurnEvent>);
+
+        #[async_trait]
+        impl ModelAdapter for RejectOnce {
+            type Session = Model;
+            async fn start_session(&self, _: SessionConfig) -> Result<Model, LoopError> {
+                Ok(Model(false))
+            }
+        }
+
+        #[async_trait]
+        impl ModelSession for Model {
+            type Turn = Turn;
+            async fn begin_turn(
+                &mut self,
+                _: TurnRequest,
+                _: Option<TurnCancellation>,
+            ) -> Result<Turn, LoopError> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(LoopError::ProviderFailure(Box::new(ProviderFailure {
+                        route: ProviderRoute::Unknown,
+                        reason: ProviderFailureReason::InvalidRequest,
+                        last_attempt_reason: None,
+                        upstream: ProviderClassification {
+                            code: UpstreamErrorKind::ContextLengthExceeded,
+                            ..Default::default()
+                        },
+                        accounting: RetryAccounting::default(),
+                    })));
+                }
+                Ok(Turn(Some(ModelTurnEvent::Finished(ModelTurnResult {
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item::text(ItemKind::Assistant, "recovered")],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                    model: None,
+                    response_id: None,
+                }))))
+            }
+        }
+
+        #[async_trait]
+        impl ModelTurn for Turn {
+            async fn next_event(
+                &mut self,
+                _: Option<TurnCancellation>,
+            ) -> Result<Option<ModelTurnEvent>, LoopError> {
+                Ok(self.0.take())
+            }
+        }
+
+        struct StagedReplacement {
+            mirror: TransientTranscript,
+            path: PathBuf,
+            fail: bool,
+        }
+
+        #[async_trait]
+        impl LoopMutator for StagedReplacement {
+            async fn mutate(
+                &self,
+                cursor: &mut TranscriptCursor<'_>,
+                ctx: LoopCtx<'_>,
+            ) -> Result<(), LoopError> {
+                if ctx.point != MutationPoint::ContextLengthRejected {
+                    return Ok(());
+                }
+                let mirrored = self.mirror.snapshot();
+                let persisted = fs::read_to_string(&self.path).unwrap();
+                cursor.insert(1, Item::text(ItemKind::Context, "replacement summary"));
+                assert_eq!(self.mirror.snapshot(), mirrored);
+                assert_eq!(fs::read_to_string(&self.path).unwrap(), persisted);
+                if self.fail {
+                    return Err(LoopError::Mutator("reject staged replacement".into()));
+                }
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn committed_recovery_replaces_persistence_and_mirror_but_failed_staging_does_not() {
+            for fail in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let opened = open(
+                    root.path(),
+                    "recovery",
+                    false,
+                    false,
+                    vec![Item::text(ItemKind::System, "system")],
+                )
+                .unwrap();
+                let mirror = TransientTranscript::new(opened.transcript.clone());
+                let mut driver = Agent::builder()
+                    .model(RejectOnce)
+                    .transcript(opened.transcript)
+                    .input(vec![Item::text(ItemKind::User, "question")])
+                    .context_recovery(ContextRecoveryPolicy {
+                        max_attempts: 3,
+                        budget: Duration::from_secs(10),
+                    })
+                    .mutator(StagedReplacement {
+                        mirror: mirror.clone(),
+                        path: transcript_path(root.path(), "recovery"),
+                        fail,
+                    })
+                    .transcript_observer(opened.observer)
+                    .transcript_observer(mirror.clone())
+                    .build()
+                    .unwrap()
+                    .start(SessionConfig::new(SessionId::new("recovery")))
+                    .await
+                    .unwrap();
+                let result = driver.next().await;
+                assert_eq!(result.is_err(), fail);
+                let canonical = driver.snapshot().transcript;
+                assert_eq!(mirror.snapshot(), canonical);
+                assert_eq!(
+                    canonical.iter().any(|item| item.kind == ItemKind::Context),
+                    !fail
+                );
+                drop(driver);
+                let resumed = open(root.path(), "recovery", true, false, Vec::new()).unwrap();
+                assert_eq!(resumed.transcript, canonical);
+            }
+        }
+    }
     #[test]
     fn transient_transcripts_follow_the_conversation_and_can_be_forked() {
         let root = tempfile::tempdir().unwrap();
@@ -6384,6 +6541,90 @@ mod tests {
         drop(opened);
         assert!(!transcript_path(root.path(), "ephemeral").exists());
         assert!(!fs::shutdown_token().is_cancelled());
+    }
+
+    #[test]
+    fn replacement_callback_isolates_poisoned_writer_without_blocking_healthy_mirror() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let mirror = TransientTranscript::new(opened.transcript.clone());
+        let path = transcript_path(root.path(), "abc");
+        let original = fs::read(&path).unwrap();
+        let generation = opened.observer.0.lock().unwrap().generation;
+        let observer = opened.observer.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _writer = observer.0.lock().unwrap();
+                panic!("writer interrupted");
+            })
+            .join()
+            .is_err()
+        );
+        let canonical = vec![
+            opened.transcript[0].clone(),
+            Item::text(ItemKind::Context, "committed replacement"),
+        ];
+        let session = agentkit_core::SessionId::new("abc");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                opened.observer.on_transcript_replaced(&session, &canonical);
+                mirror.on_transcript_replaced(&session, &canonical);
+            }))
+            .is_ok()
+        );
+        assert_eq!(mirror.snapshot(), canonical);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(opened.observer.0.is_poisoned());
+        // Test-only inspection of isolated state; never clear or repair poison.
+        assert_eq!(
+            opened
+                .observer
+                .0
+                .lock()
+                .err()
+                .unwrap()
+                .into_inner()
+                .generation,
+            generation
+        );
+        assert!(opened.observer.0.is_poisoned());
+    }
+
+    #[test]
+    fn replacement_callback_does_not_adopt_into_poisoned_transient_mirror() {
+        let original = vec![Item::text(ItemKind::System, "original")];
+        let mirror = TransientTranscript::new(original.clone());
+        let poisoned = mirror.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _items = poisoned.0.lock().unwrap();
+                panic!("mirror interrupted");
+            })
+            .join()
+            .is_err()
+        );
+        let replacement = vec![Item::text(ItemKind::User, "replacement")];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mirror.on_transcript_replaced(&agentkit_core::SessionId::new("abc"), &replacement);
+            }))
+            .is_ok()
+        );
+        assert!(mirror.0.is_poisoned());
+        assert!(
+            mirror.snapshot().is_empty(),
+            "poisoned snapshots stay isolated"
+        );
+        // Test-only inspection proves replacement did not enter isolated state.
+        assert_eq!(*mirror.0.lock().err().unwrap().into_inner(), original);
+        assert!(mirror.0.is_poisoned());
     }
 
     #[test]
