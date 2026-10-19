@@ -387,8 +387,6 @@ Kit reads the global file first, then project `AGENTS.md` files from the outermo
 
 Start a new session after editing global or primary project instructions. Active, resumed, and forked sessions keep their saved instructions. Attaching additional project directories through ACP refreshes those directories' instructions, but does not reload global instructions.
 
-For managed deployments, provision `$HOME/.kit/AGENTS.md` in the runtime user's home before starting sessions. Use the `HOME` of the Kit process; no REST setup call is needed.
-
 If startup reports `could not load AGENTS.md context`, check the named file's readability and permissions. Missing instruction files are optional; other read errors prevent loading. Changing `~/.kit/config.toml` does not replace instructions: use it for runtime settings and `AGENTS.md` for guidance to the agent.
 
 ## Agent Skills
