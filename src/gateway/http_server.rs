@@ -154,7 +154,7 @@ impl Connection {
                                 "kit/updateMcp",
                                 object([
                                     ("method", "_kit/session/update_mcp".into()),
-                                    ("replacement", true.into()),
+                                    ("upsert", true.into()),
                                 ]),
                             )]),
                         ),
