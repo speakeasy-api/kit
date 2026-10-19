@@ -1575,8 +1575,8 @@ async fn sdk_revoke_injection_requires_current_controller() {
         .await;
     // The pinned capability also advertises pending.replace; exercise its
     // companion route rather than advertising an unsupported operation.
-    let updated = current.request(6, "session/replace_inject", json!({"sessionId":id,"messageId":message_id,"content":[{"type":"text","text":"Replacement must also be revoked"}]})).await;
-    assert!(replaced.get("error").is_none(), "{updated}");
+    let replaced = current.request(6, "session/replace_inject", json!({"sessionId":id,"messageId":message_id,"content":[{"type":"text","text":"Replacement must also be revoked"}]})).await;
+    assert!(replaced.get("error").is_none(), "{replaced}");
     let revoked = current.request(3, "session/revoke_inject", revoke).await;
     assert_eq!(revoked["result"], json!({}), "{revoked}");
     release.send("Answer without revoked steer").unwrap();
