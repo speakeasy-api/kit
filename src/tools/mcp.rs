@@ -7870,7 +7870,7 @@ for line in sys.stdin:
                                 command: configured.command.to_string_lossy().into_owned(),
                                 args: configured.args,
                                 env,
-                                cwd: Some(cwd.to_string_lossy().into_owned()),
+                                cwd: Some("${PLUGIN_ROOT}".into()),
                             },
                         }],
                     );
