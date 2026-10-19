@@ -259,12 +259,7 @@ fn summary_part(part: Part) -> Part {
 }
 
 fn render_summary_item(item: &Item) -> Result<String, CompactionError> {
-    let mut projected = item.clone();
-    projected.parts = projected.parts.into_iter().map(summary_part).collect();
-    projected.usage = None;
-    let rendered = serde_json::to_string(&projected)
-        .map_err(|error| CompactionError::Failed(error.to_string()))?;
-    let rendered = format!("[{:?}] {rendered}", item.kind);
+    let rendered = render_protected_summary_item(item)?;
     Ok(truncate_middle_bytes(
         &rendered,
         SUMMARY_ITEM_MAX_BYTES,
@@ -273,7 +268,11 @@ fn render_summary_item(item: &Item) -> Result<String, CompactionError> {
 }
 
 fn render_protected_summary_item(item: &Item) -> Result<String, CompactionError> {
-    serde_json::to_string(item)
+    // Protect directive text, not inline attachment payloads or usage metadata.
+    let mut projected = item.clone();
+    projected.parts = projected.parts.into_iter().map(summary_part).collect();
+    projected.usage = None;
+    serde_json::to_string(&projected)
         .map(|rendered| format!("[{:?}] {rendered}", item.kind))
         .map_err(|error| CompactionError::Failed(error.to_string()))
 }
@@ -471,13 +470,22 @@ struct KitCompactionBackend<M> {
     hooks: Option<Arc<crate::ahp::Hooks>>,
 }
 
-fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionError> {
-    let previous = request
+fn prior_checkpoint_section(request: &SummaryRequest) -> String {
+    request
         .items
         .iter()
         .rev()
         .find(|item| is_compaction_summary(item))
-        .and_then(item_text);
+        .and_then(item_text)
+        .map(|previous| {
+            format!(
+                "\n\nHere is the prior checkpoint:\n\n<prior-checkpoint>\n{previous}\n</prior-checkpoint>\n\n{SUMMARY_UPDATE}"
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionError> {
     let mut conversation =
         String::from("Here is the conversation to checkpoint:\n\n<conversation>\n");
     let mut first = true;
@@ -506,21 +514,46 @@ fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionEr
     }
     conversation.push_str("\n</conversation>");
 
-    let previous_section = previous
-        .map(|previous| {
-            format!(
-                "\n\nHere is the prior checkpoint:\n\n<prior-checkpoint>\n{previous}\n</prior-checkpoint>\n\n{SUMMARY_UPDATE}"
-            )
-        })
-        .unwrap_or_default();
-    Ok(format!("{conversation}{previous_section}"))
+    let previous_section = prior_checkpoint_section(request);
+    let prompt = format!("{conversation}{previous_section}");
+    let budget = request
+        .metadata
+        .get(SUMMARY_PROMPT_BUDGET_METADATA_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|budget| usize::try_from(budget).ok())
+        .unwrap_or_else(|| summary_prompt_budget(&request.items));
+    if prompt.len() <= budget {
+        Ok(prompt)
+    } else {
+        bounded_summary_prompt(
+            request,
+            budget,
+            "\n[intermediate history omitted for compaction prompt budget]\n",
+        )
+    }
 }
 
-/// Only called after a typed provider rejection. Never truncate a checkpoint
-/// or the newest directive; losing either silently is worse than stopping.
+/// Only called after a typed provider rejection. The initial proposal already
+/// observes the configured budget; recovery reduces it further.
 fn smaller_summary_prompt(
     request: &SummaryRequest,
     budget: usize,
+) -> Result<String, CompactionError> {
+    bounded_summary_prompt(
+        request,
+        budget,
+        "\n[intermediate history omitted after provider context rejection]\n",
+    )
+}
+
+/// This projects only summary input, never the canonical tool-call history.
+/// Preserve the last user message in this prefix conservatively: it need not
+/// be the current directive, which may be in the retained suffix. Never label
+/// it as overriding that suffix, or silently truncate its text to fit.
+fn bounded_summary_prompt(
+    request: &SummaryRequest,
+    budget: usize,
+    marker: &str,
 ) -> Result<String, CompactionError> {
     let latest_user = request
         .items
@@ -528,10 +561,14 @@ fn smaller_summary_prompt(
         .rposition(|item| item.kind == ItemKind::User);
     let mut protected = String::new();
     let mut history = String::new();
-    for (index, item) in request.items.iter().enumerate() {
-        let is_protected = is_compaction_summary(item)
-            || Some(index) == latest_user
-            || matches!(item.kind, ItemKind::System | ItemKind::Context);
+    for (index, item) in request
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !is_compaction_summary(item))
+    {
+        let is_protected =
+            Some(index) == latest_user || matches!(item.kind, ItemKind::System | ItemKind::Context);
         let rendered = if is_protected {
             render_protected_summary_item(item)?
         } else {
@@ -545,15 +582,22 @@ fn smaller_summary_prompt(
         target.push_str(&rendered);
         target.push_str("\n\n");
     }
-    let marker = "\n[intermediate history omitted after provider context rejection]\n";
-    let framing =
-        "Conversation (oldest history first; protected checkpoint and latest directive follow):\n";
+    let previous_section = prior_checkpoint_section(request);
+    let framing = "Here is the conversation to checkpoint (oldest history first; protected messages from this prefix follow):\n\n<conversation>\n";
+    let closing = "\n</conversation>";
     let remaining = budget
-        .checked_sub(protected.len() + framing.len() + marker.len() + 1)
+        .checked_sub(
+            protected.len()
+                + framing.len()
+                + closing.len()
+                + previous_section.len()
+                + marker.len()
+                + 1,
+        )
         .filter(|remaining| *remaining > 0)
         .ok_or_else(|| {
             CompactionError::Failed(
-                "protected checkpoint and latest directive exceed recovery budget".into(),
+                "protected checkpoint and messages exceed summary prompt budget".into(),
             )
         })?;
     let history = if history.len() > remaining {
@@ -569,7 +613,9 @@ fn smaller_summary_prompt(
     } else {
         history
     };
-    Ok(format!("{framing}{history}\n{protected}"))
+    Ok(format!(
+        "{framing}{history}\n{protected}{closing}{previous_section}"
+    ))
 }
 
 fn recovery_attempt(reason: &CompactionReason) -> u32 {
@@ -2627,32 +2673,130 @@ mod tests {
     }
 
     #[test]
-    fn summary_prompt_first_sends_protected_content_without_preflight_truncation() {
-        let mut metadata = MetadataMap::new();
-        metadata.insert(SUMMARY_PROMPT_BUDGET_METADATA_KEY.into(), json!(4_000));
-        let mut previous = Item::text(ItemKind::Developer, "prior checkpoint ".repeat(10_000));
+    fn protected_summary_messages_project_attachments_without_truncating_text() {
+        let directive = "preserve this directive ".repeat(1_000);
+        for kind in [ItemKind::User, ItemKind::System, ItemKind::Context] {
+            let request = SummaryRequest::new(
+                vec![Item::new(
+                    kind,
+                    vec![
+                        Part::text(directive.clone()),
+                        Part::media(
+                            agentkit_core::Modality::Image,
+                            "image/png",
+                            DataRef::inline_text("protected-base64".repeat(100_000)),
+                        ),
+                        Part::file(DataRef::inline_bytes(vec![42; 1_000_000])),
+                        Part::file(DataRef::uri("file:///tmp/reference.txt")),
+                    ],
+                )],
+                CompactionReason::TranscriptTooLong,
+            );
+            let original = serde_json::to_string(&request.items).unwrap();
+            for prompt in [
+                build_summary_prompt(&request).unwrap(),
+                smaller_summary_prompt(&request, 30_000).unwrap(),
+            ] {
+                assert!(prompt.len() <= 30_000);
+                assert!(prompt.contains(&directive));
+                assert!(!prompt.contains("protected-base64"));
+                assert!(prompt.contains("inline payload omitted"));
+                assert!(prompt.contains("file:///tmp/reference.txt"));
+            }
+            assert_eq!(serde_json::to_string(&request.items).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn bounded_summary_prompts_preserve_checkpoint_and_merge_precedence() {
+        let mut previous = Item::text(ItemKind::Developer, "old objective: use red");
         previous
             .metadata
             .insert(COMPACTION_SUMMARY_METADATA_KEY.into(), true.into());
+        let mut metadata = MetadataMap::new();
+        metadata.insert(SUMMARY_PROMPT_BUDGET_METADATA_KEY.into(), json!(4_000));
         let request = SummaryRequest::new(
             vec![
                 previous,
-                Item::text(ItemKind::User, "first objective"),
-                Item::text(ItemKind::Assistant, "x".repeat(100_000)),
-                Item::text(ItemKind::User, "latest state"),
+                Item::text(ItemKind::Assistant, "history 🦀 ".repeat(10_000)),
+                Item::text(ItemKind::User, "new objective: use blue"),
             ],
             CompactionReason::TranscriptTooLong,
         )
         .with_metadata(metadata);
 
-        let prompt = build_summary_prompt(&request).unwrap();
+        for (prompt, budget, marker) in [
+            (
+                build_summary_prompt(&request).unwrap(),
+                4_000,
+                "omitted for compaction prompt budget",
+            ),
+            (
+                smaller_summary_prompt(&request, 2_000).unwrap(),
+                2_000,
+                "omitted after provider context rejection",
+            ),
+        ] {
+            assert!(prompt.len() <= budget);
+            assert!(prompt.contains(marker));
+            assert!(prompt.contains("new objective: use blue"));
+            assert!(
+                prompt.contains("<prior-checkpoint>\nold objective: use red\n</prior-checkpoint>")
+            );
+            assert!(prompt.contains(SUMMARY_UPDATE));
+            assert!(
+                prompt.find("</conversation>").unwrap()
+                    < prompt.find("<prior-checkpoint>").unwrap()
+            );
+        }
+        // The text alone fits, but the checkpoint framing and merge instruction
+        // do not. Fail rather than silently remove those semantics.
+        assert!(smaller_summary_prompt(&request, SUMMARY_UPDATE.len()).is_err());
+    }
 
-        assert!(prompt.len() > 4_000);
-        assert!(prompt.contains("first objective"));
-        assert!(prompt.contains("latest state"));
-        assert!(prompt.contains("prior checkpoint"));
-        assert!(prompt.contains(&"prior checkpoint ".repeat(10_000)));
-        assert!(smaller_summary_prompt(&request, 4_000).is_err());
+    #[test]
+    fn initial_summary_uses_window_budget_without_metadata_override() {
+        let mut request = recovery_summary_request();
+        request.items.push(measured(8_000, Some(10_000)));
+        let prompt = build_summary_prompt(&request).unwrap();
+        assert!(prompt.len() <= 5_000);
+        assert!(prompt.contains("omitted for compaction prompt budget"));
+        assert!(prompt.contains("protected latest directive"));
+    }
+
+    #[test]
+    fn summary_prompt_refuses_to_truncate_oversized_protected_text() {
+        for kind in [ItemKind::User, ItemKind::Developer] {
+            let mut protected = Item::text(kind, "protected text ".repeat(10_000));
+            if kind == ItemKind::Developer {
+                protected
+                    .metadata
+                    .insert(COMPACTION_SUMMARY_METADATA_KEY.into(), true.into());
+            }
+            let mut metadata = MetadataMap::new();
+            metadata.insert(SUMMARY_PROMPT_BUDGET_METADATA_KEY.into(), json!(4_000));
+            let request = SummaryRequest::new(vec![protected], CompactionReason::TranscriptTooLong)
+                .with_metadata(metadata);
+            assert!(build_summary_prompt(&request).is_err());
+            assert!(smaller_summary_prompt(&request, 4_000).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_summary_observes_budget_without_retrying_generic_provider_errors() {
+        for accept_below in [usize::MAX, 0] {
+            let (backend, requests) = rejecting_backend(false, accept_below);
+            let mut metadata = MetadataMap::new();
+            metadata.insert(SUMMARY_PROMPT_BUDGET_METADATA_KEY.into(), json!(4_000));
+            let request = recovery_summary_request().with_metadata(metadata);
+            let expected = build_summary_prompt(&request).unwrap();
+            assert!(expected.len() <= 4_000);
+            assert!(expected.contains("omitted for compaction prompt budget"));
+            assert!(expected.contains("protected latest directive"));
+            let result = backend.summarize(request, None).await;
+            assert_eq!(result.is_ok(), accept_below != 0);
+            assert_eq!(requests.try_iter().collect::<Vec<_>>(), [expected]);
+        }
     }
 
     #[test]
