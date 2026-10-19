@@ -97,6 +97,16 @@ If close reports a persistence error, fix the host storage problem and inspect t
 
 An idle turn does not mean detached background jobs or subagents have finished. Inspect their task and tool updates before deciding whether to close. Likewise, a `resident` listing can briefly include a closed session whose response is still available; it is not a readiness or completion guarantee.
 
+<a id="read-only-settlement-and-snapshot-admission"></a>
+
+## Check whether all session work has finished
+
+A turn becoming idle does not mean detached jobs or delegated work have finished. If you are building a client that needs to show whether the whole session is busy, use the advertised [`kit/session/status` request](../reference/gateway-protocol.md#read-session-settlement) after reconnecting and while work remains.
+
+Create or resume the session before querying gateway status. Treat a failed status read as unknown, not as completion. Retry transient observation errors; for authentication, missing-session, or replaced-controller errors, follow [recovery guidance](#automatic-recovery-and-uncertain-requests). Do not automatically take control back from a newer attachment or resend a prompt to discover its outcome. Settlement does not prove successful execution or durable storage; inspect results for errors or cancellation. A settled response describes only the instant observed: another submission or autonomous event can start work afterward.
+
+The gateway does not expose `session/fork`. When using native Kit transcript forks, stop concurrent submissions and wait for outstanding work to finish. If the fork reports `session must be settled before snapshot`, wait for background and delegated work to finish, or cancel it explicitly and wait for completion. If it reports `session changed during snapshot admission; retry`, wait for activity to settle before retrying the fork. A saved transcript is history, not a checkpoint that restarts interrupted tools.
+
 ## Standard ACP HTTP clients
 
 Use an ACP v2 HTTP/SSE client with the exact endpoint `http://HOST:7766/acp/v2`, a bearer credential on every request, and matching Kit versions. There is no separate Kit session REST API. See the [gateway protocol reference](../reference/gateway-protocol.md) for connection setup, supported operations, close requests, and transport limits.

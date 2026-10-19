@@ -612,6 +612,7 @@ enum Command {
 
 struct SessionHandle {
     mcp: crate::tools::mcp::McpRuntime,
+    activity: SessionActivity,
     subagents: Option<crate::tools::Subagents>,
     voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
@@ -846,6 +847,10 @@ impl Server {
         // version even when the requested version is unsupported; the client
         // then disconnects if it cannot speak v2. It does not switch wire schemas.
         let mut capabilities = agentkit_acp::v2::agent_capabilities();
+        capabilities
+            .meta
+            .get_or_insert_with(Map::new)
+            .insert("kit/session/status".into(), serde_json::json!({}));
         capabilities
             .session
             .get_or_insert_with(wire::SessionCapabilities::new)
@@ -1086,7 +1091,7 @@ impl Server {
             handle: handle.clone(),
             busy: Arc::clone(&busy),
             binding,
-            activity,
+            activity: activity.clone(),
             sink,
             driver: driver.driver,
             tasks: driver.tasks,
@@ -1159,6 +1164,7 @@ impl Server {
                 session_id: session_id.clone(),
                 session: SessionHandle {
                     mcp,
+                    activity,
                     subagents: Some(driver.subagents),
                     voice_state,
                     token,
@@ -1416,6 +1422,76 @@ impl Server {
         })
     }
 
+    async fn session_status(
+        &self,
+        request: super::SessionStatusRequest,
+    ) -> Result<super::SessionStatusResponse, AcpRuntimeError> {
+        let id = wire::SessionId::new(request.session_id.clone());
+        let (activity, busy, jobs, subagents, tasks, commands, token) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+            let session = sessions
+                .get(&id)
+                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.clone()))?;
+            (
+                session.activity.clone(),
+                session.busy.clone(),
+                session.background_jobs.clone(),
+                session.subagents.clone(),
+                session.tasks.clone(),
+                session.commands.clone(),
+                session.token,
+            )
+        };
+        let before = activity.snapshot()?;
+        let background = jobs.activity();
+        let running_tasks = tasks
+            .list_running()
+            .await
+            .iter()
+            .any(|task| task.kind != agentkit_task_manager::TaskKind::Background);
+        let active_subagents = subagents
+            .as_ref()
+            .map(|s| s.active_count())
+            .transpose()
+            .map_err(|e| AcpRuntimeError::Loop(e.to_string()))?
+            .unwrap_or(0);
+        let foreground_active = before.1
+            || busy.load(Ordering::Acquire)
+            || commands.capacity() != commands.max_capacity()
+            || running_tasks;
+        let after = activity.snapshot()?;
+        if before != after || background != jobs.activity() || commands.is_closed() {
+            return Err(AcpRuntimeError::Loop(
+                "session changed during status read; retry".into(),
+            ));
+        }
+        if !self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
+            .get(&id)
+            .is_some_and(|session| session.token == token)
+        {
+            return Err(AcpRuntimeError::SessionNotFound(request.session_id));
+        }
+        // The observation precedes any later request; it neither reserves the
+        // session nor prevents future autonomous work. No work is started here.
+        Ok(super::SessionStatusResponse {
+            session_id: request.session_id,
+            settled: !foreground_active
+                && !background.active
+                && !background.unacknowledged_terminals
+                && active_subagents == 0,
+            foreground_active,
+            background_active: background.active,
+            pending_background_terminals: background.unacknowledged_terminals,
+            active_subagents,
+        })
+    }
+
     fn cancel_background(
         &self,
         request: CancelBackgroundRequest,
@@ -1661,7 +1737,6 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             }
             Either::Right(Either::Right(event)) => match event {
                 Some(TaskEvent::Completed(snapshot, _)) => {
-                    background_jobs.acknowledge_terminal(&snapshot.call_id);
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background
                         && let Err(error) = drive_autonomous(
                             &session_id,
@@ -1677,6 +1752,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                     }
+                    // Keep terminal debt authoritative until any autonomous
+                    // continuation has settled, not merely until dequeue.
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
                 }
                 Some(TaskEvent::Cancelled(snapshot) | TaskEvent::Failed(snapshot, _)) => {
                     background_jobs.acknowledge_terminal(&snapshot.call_id);
@@ -2688,6 +2766,21 @@ pub(crate) fn component(
                     cx.spawn(async move {
                         responder.respond_with_result(
                             state.steer_subagent(request).await.map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: super::SessionStatusRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.session_status(request).await.map_err(sdk_error),
                         )
                     })?;
                     Ok(())
@@ -5087,6 +5180,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_requires_foreground_background_and_terminal_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            SessionRegistry::new(),
+        );
+        let id = wire::SessionId::new("status-session");
+        let sink = RecordingSink::default();
+        let integration = server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                id.clone(),
+                SessionId::new("status-session"),
+                sink.clone(),
+            ))
+            .unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let jobs = BackgroundJobs::default();
+        server.sessions.lock().unwrap().insert(
+            id.clone(),
+            SessionHandle {
+                mcp: server.runtime.mcp_for_test().clone(),
+                activity: SessionActivity::new(|_| Ok(())),
+                subagents: None,
+                voice_state: Default::default(),
+                token: 1,
+                commands,
+                integration,
+                busy: busy.clone(),
+                background_jobs: jobs.clone(),
+                structured_completion: false,
+                tasks: AsyncTaskManager::new().handle(),
+            },
+        );
+        let request = || super::super::SessionStatusRequest {
+            session_id: id.to_string(),
+        };
+        assert!(server.session_status(request()).await.unwrap().settled);
+        busy.store(true, Ordering::Release);
+        let status = server.session_status(request()).await.unwrap();
+        assert!(status.foreground_active && !status.settled);
+        busy.store(false, Ordering::Release);
+        jobs.register_foreground_for_test("background");
+        jobs.detach("background").unwrap();
+        let status = server.session_status(request()).await.unwrap();
+        assert!(status.background_active && !status.foreground_active && !status.settled);
+        jobs.finish_for_test("background");
+        let status = server.session_status(request()).await.unwrap();
+        assert!(
+            !status.background_active && status.pending_background_terminals && !status.settled
+        );
+        jobs.acknowledge_terminal(&agentkit_core::ToolCallId::new("background"));
+        assert!(server.session_status(request()).await.unwrap().settled);
+        sink.fail_flush.store(true, Ordering::Release);
+        // Status is observational, not a transport drain/flush request.
+        assert!(server.session_status(request()).await.unwrap().settled);
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        server.sessions.lock().unwrap().remove(&id);
+        assert!(server.session_status(request()).await.is_err());
+    }
+
     #[test]
     fn concurrent_prompt_admission_is_rejected_until_the_turn_finishes() {
         let busy = AtomicBool::new(false);
@@ -5137,6 +5296,7 @@ mod tests {
             id.clone(),
             SessionHandle {
                 mcp: server.runtime.mcp_for_test().clone(),
+                activity: SessionActivity::new(|_| Ok(())),
                 subagents: None,
                 voice_state: state,
                 token: 1,
@@ -5206,6 +5366,7 @@ mod tests {
             session_id.clone(),
             SessionHandle {
                 mcp: server.runtime.mcp_for_test().clone(),
+                activity: SessionActivity::new(|_| Ok(())),
                 subagents: None,
                 voice_state: Default::default(),
                 token: 1,
@@ -5356,6 +5517,7 @@ mod tests {
                 session_id,
                 session: SessionHandle {
                     mcp: server.runtime.mcp_for_test().clone(),
+                    activity: SessionActivity::new(|_| Ok(())),
                     subagents: None,
                     voice_state: Default::default(),
                     token,
@@ -5718,6 +5880,7 @@ mod tests {
                 server.sessions.lock().unwrap().insert(
                     id.clone(),
                     SessionHandle {
+                        activity: SessionActivity::new(|_| Ok(())),
                         mcp: server.runtime.mcp_for_test().clone(),
                         integration,
                         busy: Arc::new(AtomicBool::new(false)),
@@ -5876,6 +6039,7 @@ mod tests {
                     session_id: published_session_id,
                     session: SessionHandle {
                         mcp: publisher_server.runtime.mcp_for_test().clone(),
+                        activity: SessionActivity::new(|_| Ok(())),
                         subagents: None,
                         voice_state: Default::default(),
                         token,
@@ -6467,6 +6631,10 @@ mod tests {
                 "v2 handler must advertise its supported version for request {requested_version}"
             );
         }
+        assert_eq!(
+            response.capabilities.meta.as_ref().unwrap()["kit/session/status"],
+            json!({})
+        );
         let session = response.capabilities.session.expect("session capabilities");
         let mcp = session.mcp.expect("session MCP capabilities");
         assert!(mcp.stdio.is_some());

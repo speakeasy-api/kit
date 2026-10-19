@@ -1379,6 +1379,7 @@ impl Actor {
                         | "session/cancel"
                         | "session/close"
                         | "kit/background/cancel"
+                        | "kit/session/status"
                         | "session/set_config_option"
                         | "_kit/session/update_mcp"
                 ) {

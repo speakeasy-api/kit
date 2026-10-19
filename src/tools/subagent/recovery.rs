@@ -51,6 +51,7 @@ impl Subagents {
                 recovery: Some(record.clone()),
                 forking: None,
                 permit: None,
+                startup_reservation: Weak::new(),
                 cache_key: None,
                 finished: Default::default(),
             };
@@ -163,6 +164,7 @@ impl Subagents {
             .map_err(ChildError::Failed)?;
         // Capacity is private to this attempt until the child is installed.
         let permit = self.acquire_permit()?;
+        locked.startup_reservation = Arc::downgrade(&permit.reservation);
         locked.status = SubagentStatus::Starting;
         let config = self
             .config
