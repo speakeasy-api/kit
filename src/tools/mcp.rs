@@ -1545,12 +1545,30 @@ pub(crate) async fn connect(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
+    connect_with_initialization(
+        sources,
+        plugins,
+        interactive_oauth_enabled,
+        credential_storage,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn connect_with_initialization(
+    sources: impl IntoConfigSources,
+    plugins: &[crate::plugins::ResolvedPluginMcp],
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+    eager_initialization: bool,
+) -> Result<McpRuntime, String> {
     connect_inner(
         sources.into_config_sources(),
         plugins,
         None,
         interactive_oauth_enabled,
         credential_storage,
+        eager_initialization,
     )
     .await
 }
@@ -1561,6 +1579,23 @@ pub(crate) async fn connect_dynamic(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
+    connect_dynamic_with_initialization(
+        sources,
+        plugins,
+        interactive_oauth_enabled,
+        credential_storage,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn connect_dynamic_with_initialization(
+    sources: impl IntoConfigSources,
+    plugins: crate::plugins::PluginRuntime,
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+    eager_initialization: bool,
+) -> Result<McpRuntime, String> {
     let snapshot = plugins.snapshot();
     connect_inner(
         sources.into_config_sources(),
@@ -1568,6 +1603,7 @@ pub(crate) async fn connect_dynamic(
         Some(plugins),
         interactive_oauth_enabled,
         credential_storage,
+        eager_initialization,
     )
     .await
 }
@@ -1578,6 +1614,7 @@ async fn connect_inner(
     plugin_source: Option<crate::plugins::PluginRuntime>,
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
+    eager_initialization: bool,
 ) -> Result<McpRuntime, String> {
     let plugins = plugins.to_vec();
     let (plugin_prepared, plugin_entries) =
@@ -1597,7 +1634,9 @@ async fn connect_inner(
         interactive_oauth_enabled,
         credential_storage,
     )?;
-    runtime.spawn_eager_initialization();
+    if eager_initialization {
+        runtime.spawn_eager_initialization();
+    }
     Ok(runtime)
 }
 
@@ -1656,8 +1695,102 @@ fn build_runtime(
     Ok(runtime)
 }
 
+fn session_config_source(
+    servers: Vec<agentkit_acp::McpServer>,
+    cwd: &Path,
+) -> Result<ConfigSource, String> {
+    let mut entries = BTreeMap::new();
+    for server in servers {
+        let server = match server {
+            agentkit_acp::McpServer::Http(server) => {
+                if entries.contains_key(&server.name) {
+                    return Err(format!("duplicate session MCP server {:?}", server.name));
+                }
+                let mut headers = BTreeMap::new();
+                for header in server.headers {
+                    if headers
+                        .insert(header.name.to_ascii_lowercase(), header.value)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "duplicate header for session MCP server {:?}",
+                            server.name
+                        ));
+                    }
+                }
+                entries.insert(
+                    server.name,
+                    Value::Object(serde_json::Map::from_iter([
+                        ("type".into(), Value::String("http".into())),
+                        ("url".into(), Value::String(server.url)),
+                        (
+                            "headers".into(),
+                            Value::Object(
+                                headers
+                                    .into_iter()
+                                    .map(|(name, value)| (name, Value::String(value)))
+                                    .collect(),
+                            ),
+                        ),
+                    ])),
+                );
+                continue;
+            }
+            agentkit_acp::McpServer::Stdio(server) => server,
+            _ => return Err("session MCP servers do not support SSE transport".into()),
+        };
+        if entries.contains_key(&server.name) {
+            return Err(format!("duplicate session MCP server {:?}", server.name));
+        }
+        let mut env = BTreeMap::new();
+        for variable in server.env {
+            if env.insert(variable.name, variable.value).is_some() {
+                return Err(format!(
+                    "duplicate environment variable for session MCP server {:?}",
+                    server.name
+                ));
+            }
+        }
+        let command = server
+            .command
+            .to_str()
+            .ok_or_else(|| format!("session MCP server {:?} command is not UTF-8", server.name))?;
+        entries.insert(
+            server.name,
+            Value::Object(serde_json::Map::from_iter([
+                ("type".into(), Value::String("stdio".into())),
+                ("command".into(), Value::String(command.into())),
+                (
+                    "args".into(),
+                    Value::Array(server.args.into_iter().map(Value::String).collect()),
+                ),
+                (
+                    "env".into(),
+                    Value::Object(
+                        env.into_iter()
+                            .map(|(name, value)| (name, Value::String(value)))
+                            .collect(),
+                    ),
+                ),
+            ])),
+        );
+    }
+    let config = Value::Object(serde_json::Map::from_iter([(
+        "mcpServers".into(),
+        Value::Object(entries.into_iter().collect()),
+    )]));
+    let bytes = serde_json::to_vec(&config)
+        .map_err(|error| format!("could not encode session MCP config: {error}"))?;
+    Ok(ConfigSource {
+        path: PathBuf::from("<session MCP servers>"),
+        required: true,
+        default_stdio_cwd: Some(cwd.to_path_buf()),
+        session_bytes: Some(Arc::from(bytes)),
+    })
+}
+
 impl McpRuntime {
-    /// Build an isolated runtime with request-scoped stdio servers. Credentials
+    /// Build an isolated runtime with request-scoped MCP servers. Credentials
     /// supplied in the request remain in an immutable in-memory config source.
     /// Initialization is lazy: rejected or cancelled attachment must not leave
     /// a detached initializer owning this runtime or starting its processes.
@@ -1667,52 +1800,7 @@ impl McpRuntime {
         cwd: &Path,
     ) -> Result<McpRuntime, String> {
         self.ensure_healthy()?;
-        let mut entries = BTreeMap::new();
-        for server in servers {
-            let agentkit_acp::McpServer::Stdio(server) = server else {
-                return Err("session MCP servers support only stdio transport".into());
-            };
-            if entries.contains_key(&server.name) {
-                return Err(format!("duplicate session MCP server {:?}", server.name));
-            }
-            let mut env = BTreeMap::new();
-            for variable in server.env {
-                if env.insert(variable.name, variable.value).is_some() {
-                    return Err(format!(
-                        "duplicate environment variable for session MCP server {:?}",
-                        server.name
-                    ));
-                }
-            }
-            let command = server.command.to_str().ok_or_else(|| {
-                format!("session MCP server {:?} command is not UTF-8", server.name)
-            })?;
-            entries.insert(
-                server.name,
-                Value::Object(serde_json::Map::from_iter([
-                    ("type".into(), Value::String("stdio".into())),
-                    ("command".into(), Value::String(command.into())),
-                    (
-                        "args".into(),
-                        Value::Array(server.args.into_iter().map(Value::String).collect()),
-                    ),
-                    (
-                        "env".into(),
-                        Value::Object(
-                            env.into_iter()
-                                .map(|(name, value)| (name, Value::String(value)))
-                                .collect(),
-                        ),
-                    ),
-                ])),
-            );
-        }
-        let config = Value::Object(serde_json::Map::from_iter([(
-            "mcpServers".into(),
-            Value::Object(entries.into_iter().collect()),
-        )]));
-        let bytes = serde_json::to_vec(&config)
-            .map_err(|error| format!("could not encode session MCP config: {error}"))?;
+        let session_source = session_config_source(servers, cwd)?;
         // Clone a consistent source/plugin generation. Release the reload lock
         // before reads, validation, backend work, or initialization.
         let (sources, plugins, plugin_entries, plugin_source) = {
@@ -1735,13 +1823,8 @@ impl McpRuntime {
             source_states.push(SourceState { source, raw });
         }
         source_states.push(SourceState {
-            source: ConfigSource {
-                path: PathBuf::from("<session MCP servers>"),
-                required: true,
-                default_stdio_cwd: Some(cwd.to_path_buf()),
-                session_bytes: Some(Arc::from(bytes.clone())),
-            },
-            raw: Some(bytes),
+            raw: read_source(&session_source).await?,
+            source: session_source,
         });
         build_runtime(
             source_states,
@@ -2056,7 +2139,31 @@ impl McpRuntime {
         self.reload_config().await
     }
 
+    /// Add or update submitted request-scoped servers, retaining omitted servers.
+    /// An empty batch is a no-op; host and plugin names cannot be updated.
+    /// Invalid configuration leaves the published generation unchanged. Affected
+    /// operations finish before replacement; cancellation after admission does not
+    /// cancel the coordinator-owned publication.
+    pub(crate) async fn update_session_servers(
+        &self,
+        servers: Vec<agentkit_acp::McpServer>,
+        cwd: &Path,
+    ) -> Result<(), String> {
+        if servers.is_empty() {
+            return Ok(());
+        }
+        let source = session_config_source(servers, cwd)?;
+        self.reload_config_with_session(Some(source)).await
+    }
+
     async fn reload_config(&self) -> Result<(), String> {
+        self.reload_config_with_session(None).await
+    }
+
+    async fn reload_config_with_session(
+        &self,
+        session_source: Option<ConfigSource>,
+    ) -> Result<(), String> {
         self.ensure_healthy()?;
         let permit = Arc::clone(&self.inner.reload_flight)
             .acquire_owned()
@@ -2071,7 +2178,7 @@ impl McpRuntime {
             // inputs but before that reload publishes.
             let _permit = permit;
             let result = runtime
-                .reload_config_inner()
+                .reload_config_inner(session_source)
                 .await
                 .map_err(crate::plugins::bounded_diagnostic);
             runtime
@@ -2085,7 +2192,10 @@ impl McpRuntime {
         .map_err(|error| format!("MCP config reload task failed: {error}"))?
     }
 
-    async fn reload_config_inner(&self) -> Result<(), String> {
+    async fn reload_config_inner(
+        &self,
+        session_source: Option<ConfigSource>,
+    ) -> Result<(), String> {
         loop {
             // Snapshot the published generation, then perform all config reads,
             // downloads, and package resolution without holding runtime locks.
@@ -2118,11 +2228,48 @@ impl McpRuntime {
                 }
                 None => (current_plugins, current_plugin_entries),
             };
-            let mut next_sources = Vec::with_capacity(current_sources.len());
+            // The reload-flight permit covers this snapshot/merge through publication.
+            // Never merge at admission: concurrent disjoint batches must see the
+            // preceding publication. Keep retained source cwd values unchanged.
+            let submitted = match &session_source {
+                Some(source) => {
+                    let raw = read_source(source)
+                        .await?
+                        .ok_or("missing session MCP config")?;
+                    let (prepared, _) =
+                        prepare_config(&raw, &source.path, source.default_stdio_cwd.as_deref())?;
+                    validate_server_names(prepared.keys())?;
+                    prepared.keys().cloned().collect::<BTreeSet<_>>()
+                }
+                None => BTreeSet::new(),
+            };
+            let mut next_sources = Vec::with_capacity(current_sources.len() + 1);
             for current in &current_sources {
+                let mut source = current.source.clone();
+                let mut raw = read_source(&source).await?;
+                if !submitted.is_empty() && source.session_bytes.is_some() {
+                    let mut config: BTreeMap<String, BTreeMap<String, Value>> =
+                        serde_json::from_slice(raw.as_deref().ok_or("missing session MCP config")?)
+                            .map_err(|error| format!("invalid session MCP config: {error}"))?;
+                    let servers = config
+                        .get_mut("mcpServers")
+                        .ok_or("missing session MCP servers")?;
+                    servers.retain(|name, _| !submitted.contains(name));
+                    if servers.is_empty() {
+                        continue;
+                    }
+                    let bytes = serde_json::to_vec(&config)
+                        .map_err(|error| format!("could not encode session MCP config: {error}"))?;
+                    source.session_bytes = Some(Arc::from(bytes.clone()));
+                    raw = Some(bytes);
+                }
+                next_sources.push(SourceState { source, raw });
+            }
+
+            if let Some(source) = &session_source {
                 next_sources.push(SourceState {
-                    source: current.source.clone(),
-                    raw: read_source(&current.source).await?,
+                    source: source.clone(),
+                    raw: read_source(source).await?,
                 });
             }
 
@@ -6472,7 +6619,7 @@ mod tests {
         std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"unused"}}}"#).unwrap();
         let worker = {
             let runtime = runtime.clone();
-            tokio::spawn(async move { runtime.reload_config_inner().await })
+            tokio::spawn(async move { runtime.reload_config_inner(None).await })
         };
         // Backend registration precedes this genuine publication lock boundary.
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -7299,6 +7446,239 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
+    fn session_http_server(token: &str) -> agentkit_acp::McpServer {
+        serde_json::from_value(json!({
+            "type": "http", "name": "remote", "url": "https://example.invalid/mcp",
+            "headers": [{"name": "Authorization", "value": token}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_updates_preserve_omitted_servers_and_reject_whole_invalid_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let original = r#"{"mcpServers":{"host":{"command":"kit-test-missing-command"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let plugins = [plugin(
+            "owner",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "plugin".into(),
+                transport: PluginMcpTransport::StreamableHttp {
+                    url: "https://example.invalid/mcp".into(),
+                    headers: Default::default(),
+                },
+            }],
+        )];
+        let base = super::connect(Some(&path), &plugins, false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let runtime = base
+            .with_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        for name in ["first", "second"] {
+            runtime
+                .update_session_servers(vec![session_server(name)], directory.path())
+                .await
+                .unwrap();
+        }
+        let before = runtime.inner.reload.lock().await.entries.clone();
+        assert_eq!(
+            before.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["first", "host", "plugin", "second"]
+        );
+        for batch in [
+            vec![session_server("new"), session_server("host")],
+            vec![session_server("new"), session_server("plugin")],
+            vec![
+                session_server("new"),
+                session_server("duplicate"),
+                session_server("duplicate"),
+            ],
+            vec![session_server("new"), session_server("")],
+        ] {
+            assert!(
+                runtime
+                    .update_session_servers(batch, directory.path())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(runtime.inner.reload.lock().await.entries, before);
+            runtime.reload_config().await.unwrap();
+            assert_eq!(runtime.inner.reload.lock().await.entries, before);
+            assert!(!runtime.inner.servers.read().await.contains_key("new"));
+        }
+        // An empty update must not even reload a changed host file or advance the epoch.
+        let epoch = runtime.inner.reload_epoch.load(Ordering::Acquire);
+        std::fs::write(&path, "invalid JSON").unwrap();
+        runtime
+            .update_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        assert_eq!(runtime.inner.reload_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(runtime.inner.reload.lock().await.entries, before);
+        std::fs::write(&path, original).unwrap();
+        let (left, right) = tokio::join!(
+            runtime.update_session_servers(vec![session_server("left")], directory.path()),
+            runtime.update_session_servers(vec![session_server("right")], directory.path()),
+        );
+        left.unwrap();
+        right.unwrap();
+        runtime.reload_config().await.unwrap();
+        let state = runtime.inner.reload.lock().await;
+        for (name, fingerprint) in before {
+            assert_eq!(state.entries[&name], fingerprint);
+        }
+        assert!(state.entries.contains_key("left"));
+        assert!(state.entries.contains_key("right"));
+    }
+
+    #[tokio::test]
+    async fn session_overlay_http_updates_only_submitted_session_servers() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = super::connect(None::<&Path>, &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let runtime = base
+            .with_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        runtime
+            .update_session_servers(vec![session_http_server("Bearer first")], directory.path())
+            .await
+            .unwrap();
+        let other_credentials = serde_json::from_value(json!({
+            "type": "http", "name": "retained", "url": "https://example.invalid/other",
+            "headers": [{"name": "Authorization", "value": "Bearer retained"}]
+        }))
+        .unwrap();
+        runtime
+            .update_session_servers(vec![other_credentials], directory.path())
+            .await
+            .unwrap();
+        let retained = runtime.inner.servers.read().await["retained"]
+            .fingerprint
+            .clone();
+        let first = runtime.inner.servers.read().await["remote"]
+            .fingerprint
+            .clone();
+        assert!(runtime.inner.servers.read().await["remote"].static_authorization);
+        assert!(base.inner.servers.read().await.is_empty());
+        runtime
+            .update_session_servers(vec![session_http_server("Bearer second")], directory.path())
+            .await
+            .unwrap();
+        assert_ne!(
+            first,
+            runtime.inner.servers.read().await["remote"].fingerprint
+        );
+        runtime.reload_config().await.unwrap();
+        let sources = runtime.inner.reload.lock().await.sources.clone();
+        let (prepared, _) =
+            super::prepare_sources(&sources, &Default::default(), &Default::default()).unwrap();
+        let McpTransportBinding::StreamableHttp(http) = &prepared["remote"].config.transport else {
+            panic!("expected native HTTP transport");
+        };
+        assert_eq!(http.headers[0].1.to_str().unwrap(), "Bearer second");
+        let McpTransportBinding::StreamableHttp(other) = &prepared["retained"].config.transport
+        else {
+            panic!("expected retained HTTP transport");
+        };
+        assert_eq!(other.headers[0].1.to_str().unwrap(), "Bearer retained");
+        assert_eq!(
+            retained,
+            runtime.inner.servers.read().await["retained"].fingerprint
+        );
+        assert!(matches!(
+            runtime.inner.credential_storage,
+            CredentialStorage::Memory
+        ));
+        let second = runtime.inner.servers.read().await["remote"]
+            .fingerprint
+            .clone();
+        let invalid = serde_json::from_value(json!({
+            "type": "http", "name": "remote", "url": "",
+            "headers": []
+        }))
+        .unwrap();
+        assert!(
+            runtime
+                .update_session_servers(vec![invalid], directory.path())
+                .await
+                .is_err()
+        );
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            second,
+            runtime.inner.servers.read().await["remote"].fingerprint
+        );
+        runtime
+            .update_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            runtime.inner.servers.read().await["remote"].fingerprint
+        );
+        let attached = base
+            .with_session_servers(
+                vec![session_http_server("Bearer attached")],
+                directory.path(),
+            )
+            .await
+            .unwrap();
+        assert!(attached.inner.servers.read().await["remote"].static_authorization);
+    }
+
+    #[tokio::test]
+    async fn session_overlay_update_waits_for_in_flight_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = super::connect(None::<&Path>, &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let runtime = base
+            .with_session_servers(vec![session_http_server("Bearer first")], directory.path())
+            .await
+            .unwrap();
+        let gate = runtime.operation_gate("remote").await;
+        let operation = gate.read_owned().await;
+        let source = super::session_config_source(
+            vec![session_http_server("Bearer second")],
+            directory.path(),
+        )
+        .unwrap();
+        let first = runtime.inner.servers.read().await["remote"]
+            .fingerprint
+            .clone();
+        {
+            let update = runtime.reload_config_inner(Some(source));
+            tokio::pin!(update);
+            // In-memory staging suspends at the held operation gate.
+            assert!(futures_util::poll!(&mut update).is_pending());
+            assert_eq!(
+                first,
+                runtime.inner.servers.read().await["remote"].fingerprint
+            );
+            // Cancel before publication, leaving the original overlay intact.
+        }
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            first,
+            runtime.inner.servers.read().await["remote"].fingerprint
+        );
+        drop(operation);
+        runtime
+            .update_session_servers(vec![session_http_server("Bearer second")], directory.path())
+            .await
+            .unwrap();
+        assert_ne!(
+            first,
+            runtime.inner.servers.read().await["remote"].fingerprint
+        );
+    }
+
     #[tokio::test]
     async fn session_overlay_rejects_invalid_requests_without_mutating_base() {
         let directory = tempfile::tempdir().unwrap();
@@ -7310,12 +7690,10 @@ mod tests {
             "env": [{"name": "KEY", "value": "secret-one"}, {"name": "KEY", "value": "secret-two"}]
         }))
         .unwrap();
-        let http = serde_json::from_value(json!({"type": "http", "name": "http", "url": "https://example.invalid/mcp", "headers": []})).unwrap();
         let sse = serde_json::from_value(json!({"type": "sse", "name": "sse", "url": "https://example.invalid/sse", "headers": []})).unwrap();
         for servers in [
             vec![session_server("local"), session_server("local")],
             vec![duplicate_env],
-            vec![http],
             vec![sse],
             vec![session_server("")],
         ] {
@@ -7700,6 +8078,150 @@ for line in sys.stdin:
             panic!("expected structured MCP response");
         };
         value
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazy_acp_base_leaves_singleton_servers_for_session_discovery() {
+        for source in ["configured", "plugin", "dynamic-plugin"] {
+            for legacy in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let cwd = directory.path().canonicalize().unwrap();
+                let path = cwd.join("mcp.json");
+                let agentkit_acp::McpServer::Stdio(mut configured) =
+                    session_stdio_fixture(&cwd, "singleton")
+                else {
+                    unreachable!();
+                };
+                if source != "configured" {
+                    // Plugin manifests require a bare executable or ./ path.
+                    configured.command = "env".into();
+                }
+                // This server can have only one live owner, like a local MCP
+                // service holding a database lock. Competing startup fails at
+                // the real child-process boundary, not a runtime test hook.
+                let script = configured.args.last_mut().unwrap();
+                *script = script.replace(
+                    "import json, os, sys",
+                    "import json, os, sys, fcntl\nsingleton = open(os.environ['MARKER'] + '.lock', 'w')\nfcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                );
+                let env = configured
+                    .env
+                    .into_iter()
+                    .map(|variable| (variable.name, variable.value))
+                    .collect::<BTreeMap<_, _>>();
+                let server = json!({
+                    "type": "stdio", "command": configured.command,
+                    "args": configured.args, "env": env
+                });
+                let mut runtime = crate::Runtime::new(&cwd, "test-model").unwrap();
+                let mut plugin_mcps = Vec::new();
+                if source == "configured" {
+                    std::fs::write(
+                        &path,
+                        serde_json::to_vec(&json!({
+                            "mcpServers": {"local": server}
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                } else {
+                    // Keep immutable plugin sources separate from runtime cache,
+                    // data, and the MCP process marker/lock files.
+                    let package = cwd.join("plugin");
+                    std::fs::create_dir_all(&package).unwrap();
+                    let resolved = plugin(
+                        "singleton",
+                        &package,
+                        vec![PluginMcpServer {
+                            name: "local".into(),
+                            transport: PluginMcpTransport::Stdio {
+                                command: configured.command.to_string_lossy().into_owned(),
+                                args: configured.args,
+                                env,
+                                cwd: Some("${PLUGIN_ROOT}".into()),
+                            },
+                        }],
+                    );
+                    if source == "dynamic-plugin" {
+                        std::fs::write(package.join("plugin.json"),
+                            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"singleton-manifest"}"#).unwrap();
+                        std::fs::write(package.join("mcp.json"), serde_json::to_vec(&json!({
+                            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                            "mcpServers": {"local": server}
+                        })).unwrap()).unwrap();
+                        let config = cwd.join("config.toml");
+                        std::fs::write(
+                            &config,
+                            format!(
+                                "[plugins.singleton]\nsource = 'path'\npath = '{}'\n",
+                                package.display()
+                            ),
+                        )
+                        .unwrap();
+                        let plugins = PluginRuntime::new(
+                            config,
+                            cwd.clone(),
+                            cwd.join("cache"),
+                            cwd.join("data"),
+                            ResolvedPlugins {
+                                mcp_plugins: vec![resolved],
+                                ..Default::default()
+                            },
+                        );
+                        runtime =
+                            crate::Runtime::with_plugin_runtime(runtime, Some(plugins)).unwrap();
+                    } else {
+                        plugin_mcps.push(resolved);
+                    }
+                }
+                runtime = crate::Runtime::with_lazy_mcp_initialization(runtime).unwrap();
+                let configured_path = (source == "configured").then_some(path.as_path());
+                runtime = if legacy {
+                    crate::Runtime::with_mcp_config(
+                        runtime,
+                        configured_path,
+                        plugin_mcps,
+                        false,
+                        CredentialStorage::Memory,
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    crate::Runtime::with_mcp_sources(
+                        runtime,
+                        configured_path,
+                        None,
+                        plugin_mcps,
+                        false,
+                        CredentialStorage::Memory,
+                    )
+                    .await
+                    .unwrap()
+                };
+                let base = runtime.mcp_for_test();
+                // No detached initializer owns the otherwise unused base.
+                assert_eq!(Arc::strong_count(&base.inner), 1);
+                assert!(!cwd.join("singleton.started").exists());
+                let weak_base = Arc::downgrade(&base.inner);
+                let session = runtime.isolated_session_mcp(vec![], &cwd).await.unwrap();
+                assert!(!cwd.join("singleton.started").exists());
+                let found = session.search("inspect").await.unwrap();
+                assert_eq!(
+                    found["servers"][0]["status"], "authenticated",
+                    "{source}: {found}"
+                );
+                assert!(cwd.join("singleton.started").exists());
+                assert_eq!(call_session_stdio(&session).await["value"], "singleton");
+                assert!(matches!(
+                    runtime.mcp_for_test().inner.servers.read().await["local"].status,
+                    ServerStatus::Uninitialized
+                ));
+                drop(runtime);
+                assert!(weak_base.upgrade().is_none());
+                assert_eq!(call_session_stdio(&session).await["value"], "singleton");
+            }
+        }
     }
 
     #[cfg(unix)]

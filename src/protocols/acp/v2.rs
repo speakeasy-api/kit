@@ -44,6 +44,57 @@ use super::{
     SessionRegistry, skill_catalog, terminal_auth_method_specs,
 };
 
+/// Adds or updates client-owned servers without removing omitted registrations.
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcRequest,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[request(method = "_kit/session/update_mcp", response = UpdateMcpResponse)]
+struct UpdateMcpRequest {
+    session_id: wire::SessionId,
+    mcp_servers: Vec<wire::McpServer>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcResponse,
+)]
+struct UpdateMcpResponse {}
+
+fn client_mcp_servers(
+    mcp_servers: Vec<wire::McpServer>,
+) -> Result<Vec<agentkit_acp::McpServer>, AcpRuntimeError> {
+    mcp_servers
+        .into_iter()
+        .map(|server| match server {
+            wire::McpServer::Stdio(server) => Ok(agentkit_acp::McpServer::Stdio(
+                agentkit_acp::McpServerStdio::new(server.name, server.command.0)
+                    .args(server.args)
+                    .env(
+                        server
+                            .env
+                            .into_iter()
+                            .map(|entry| agentkit_acp::EnvVariable::new(entry.name, entry.value))
+                            .collect(),
+                    ),
+            )),
+            wire::McpServer::Http(server) => Ok(agentkit_acp::McpServer::Http(
+                agentkit_acp::McpServerHttp::new(server.name, server.url).headers(
+                    server
+                        .headers
+                        .into_iter()
+                        .map(|header| agentkit_acp::HttpHeader::new(header.name, header.value))
+                        .collect(),
+                ),
+            )),
+            _ => Err(AcpRuntimeError::Unsupported(
+                "client MCP servers support only stdio and HTTP transports".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
 const PAGE_SIZE: usize = 100;
 
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
@@ -560,6 +611,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    mcp: crate::tools::mcp::McpRuntime,
     subagents: Option<crate::tools::Subagents>,
     voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
@@ -797,7 +849,21 @@ impl Server {
         capabilities
             .session
             .get_or_insert_with(wire::SessionCapabilities::new)
-            .mcp = Some(wire::McpCapabilities::new().stdio(wire::McpStdioCapabilities::new()));
+            .mcp = Some(
+            wire::McpCapabilities::new()
+                .stdio(wire::McpStdioCapabilities::new())
+                .http(wire::McpHttpCapabilities::new())
+                .meta(serde_json::Map::from_iter([(
+                    "kit/updateMcp".into(),
+                    Value::Object(Map::from_iter([
+                        (
+                            "method".into(),
+                            Value::String("_kit/session/update_mcp".into()),
+                        ),
+                        ("upsert".into(), Value::Bool(true)),
+                    ])),
+                )])),
+        );
         Ok(wire::InitializeResponse::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
@@ -961,28 +1027,8 @@ impl Server {
             .begin_attachment()
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
-        let servers = mcp_servers
-            .into_iter()
-            .map(|server| match server {
-                wire::McpServer::Stdio(server) => Ok(agentkit_acp::McpServer::Stdio(
-                    agentkit_acp::McpServerStdio::new(server.name, server.command.0)
-                        .args(server.args)
-                        .env(
-                            server
-                                .env
-                                .into_iter()
-                                .map(|entry| {
-                                    agentkit_acp::EnvVariable::new(entry.name, entry.value)
-                                })
-                                .collect(),
-                        ),
-                )),
-                _ => Err(AcpRuntimeError::Unsupported(
-                    "client MCP servers support only stdio transport".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mcp = self.runtime.session_mcp(servers, &cwd).await?;
+        let servers = client_mcp_servers(mcp_servers)?;
+        let mcp = self.runtime.isolated_session_mcp(servers, &cwd).await?;
         let mcp_events = mcp
             .subscribe(session_id.to_string())
             .map_err(AcpRuntimeError::Loop)?;
@@ -1013,7 +1059,7 @@ impl Server {
         };
         let driver = self
             .runtime
-            .start_acp_driver_with_mcp(context, &mut claim, None, mcp)
+            .start_acp_driver_with_mcp(context, &mut claim, None, mcp.clone())
             .await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let reasoning = driver
@@ -1101,6 +1147,7 @@ impl Server {
                 completed: completion,
                 session_id: session_id.clone(),
                 session: SessionHandle {
+                    mcp,
                     subagents: Some(driver.subagents),
                     voice_state,
                     token,
@@ -1169,6 +1216,30 @@ impl Server {
                 Err(AcpRuntimeError::ClientClosed)
             }
         }
+    }
+
+    async fn update_mcp(
+        &self,
+        request: UpdateMcpRequest,
+    ) -> Result<UpdateMcpResponse, AcpRuntimeError> {
+        let servers = client_mcp_servers(request.mcp_servers)?;
+        // Clone the owner under the map guard; reconciliation and backend waits
+        // must never hold the session registry lock or block its actor mailbox.
+        let mcp = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+            sessions
+                .get(&request.session_id)
+                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?
+                .mcp
+                .clone()
+        };
+        mcp.update_session_servers(servers, self.runtime.root())
+            .await
+            .map_err(AcpRuntimeError::Loop)?;
+        Ok(UpdateMcpResponse {})
     }
 
     fn prompt_route(
@@ -2599,6 +2670,20 @@ pub(crate) fn component(
                 async move |request: CancelBackgroundRequest, responder, _cx| {
                     responder
                         .respond_with_result(state.cancel_background(request).map_err(sdk_error))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: UpdateMcpRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder
+                            .respond_with_result(state.update_mcp(request).await.map_err(sdk_error))
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -5020,6 +5105,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             id.clone(),
             SessionHandle {
+                mcp: server.runtime.mcp_for_test().clone(),
                 subagents: None,
                 voice_state: state,
                 token: 1,
@@ -5088,6 +5174,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                mcp: server.runtime.mcp_for_test().clone(),
                 subagents: None,
                 voice_state: Default::default(),
                 token: 1,
@@ -5231,6 +5318,7 @@ mod tests {
                 completed: completion,
                 session_id,
                 session: SessionHandle {
+                    mcp: server.runtime.mcp_for_test().clone(),
                     subagents: None,
                     voice_state: Default::default(),
                     token,
@@ -5552,6 +5640,7 @@ mod tests {
                     completed: completion,
                     session_id: published_session_id,
                     session: SessionHandle {
+                        mcp: publisher_server.runtime.mcp_for_test().clone(),
                         subagents: None,
                         voice_state: Default::default(),
                         token,
@@ -5741,7 +5830,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_mcp_rejection_releases_attachment_and_claim() {
-        for poison in [false, true] {
+        for _ in 0..2 {
             let root = tempfile::tempdir().unwrap();
             let session_id = crate::session::new_id();
             let runtime = Runtime::with_session_provider_and_credentials(
@@ -5757,23 +5846,7 @@ mod tests {
             )
             .unwrap();
             let registry = SessionRegistry::new();
-            let expected = if poison {
-                let routes = runtime.mcp_for_test().event_route_registry();
-                assert!(
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _guard = routes.lock().unwrap();
-                        panic!("interrupted event route admission");
-                    }))
-                    .is_err()
-                );
-                "MCP event routes are poisoned"
-            } else {
-                runtime
-                    .mcp_for_test()
-                    .event_route_counter()
-                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-                "MCP event route generation space exhausted"
-            };
+            let expected = "duplicate session MCP server";
             let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
             let router = v2_router(runtime.clone(), registry.clone());
             let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
@@ -5790,10 +5863,21 @@ mod tests {
                         .await?;
                     for _ in 0..2 {
                         let error = connection
-                            .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                            .send_request(
+                                wire::NewSessionRequest::new(workspace.clone()).mcp_servers(vec![
+                                    wire::McpServer::Http(wire::McpServerHttp::new(
+                                        "duplicate",
+                                        "https://example.invalid/mcp",
+                                    )),
+                                    wire::McpServer::Http(wire::McpServerHttp::new(
+                                        "duplicate",
+                                        "https://example.invalid/mcp",
+                                    )),
+                                ]),
+                            )
                             .block_task()
                             .await
-                            .expect_err("unavailable MCP routes must reject attachment");
+                            .expect_err("invalid MCP overlay must reject attachment");
                         assert!(error.data.unwrap().to_string().contains(expected));
                         assert!(!registry.inner.state.is_poisoned());
                         {
@@ -5909,10 +5993,14 @@ mod tests {
                     .send_request(terminal_auth_initialize_request())
                     .block_task()
                     .await?;
-                let unsupported = vec![wire::McpServer::Http(wire::McpServerHttp::new(
-                    "kithub",
-                    "https://example.invalid/mcp",
+                let unsupported = vec![wire::McpServer::Other(wire::OtherMcpServer::new(
+                    "sse",
+                    Default::default(),
                 ))];
+                let http = vec![wire::McpServer::Http(
+                    wire::McpServerHttp::new("remote", "http://127.0.0.1:9/mcp")
+                        .headers(vec![wire::HttpHeader::new("Authorization", "Bearer first")]),
+                )];
                 // A failed connection remains discoverable; it does not reject attachment.
                 let stdio = vec![wire::McpServer::Stdio(
                     wire::McpServerStdio::new("kithub", root.path().join("missing-bridge"))
@@ -5926,7 +6014,7 @@ mod tests {
                     )
                     .block_task()
                     .await
-                    .expect_err("new must reject HTTP MCP transport");
+                    .expect_err("new must reject unsupported MCP transport");
                 assert!(error.data.unwrap().to_string().contains("only stdio"));
                 let error = connection
                     .send_request(
@@ -5948,10 +6036,35 @@ mod tests {
                     .send_request(
                         wire::NewSessionRequest::new(root.path().to_path_buf())
                             .additional_directories(vec![extra_path.clone()])
-                            .mcp_servers(stdio.clone()),
+                            .mcp_servers(http.clone()),
                     )
                     .block_task()
                     .await?;
+                connection
+                    .send_request(UpdateMcpRequest {
+                        session_id: source.session_id.clone(),
+                        mcp_servers: stdio.clone(),
+                        meta: None,
+                    })
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(UpdateMcpRequest {
+                        session_id: source.session_id.clone(),
+                        mcp_servers: vec![],
+                        meta: Some(serde_json::Map::new()),
+                    })
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(UpdateMcpRequest {
+                        session_id: source.session_id.clone(),
+                        mcp_servers: unsupported.clone(),
+                        meta: None,
+                    })
+                    .block_task()
+                    .await
+                    .expect_err("invalid upsert must be rejected");
                 let listed = connection
                     .send_request(wire::ListSessionsRequest::new())
                     .block_task()
@@ -5987,7 +6100,7 @@ mod tests {
                             root.path().to_path_buf(),
                         )
                         .additional_directories(vec![extra_path.clone()])
-                        .mcp_servers(stdio),
+                        .mcp_servers(http),
                     )
                     .block_task()
                     .await?;
@@ -6002,6 +6115,44 @@ mod tests {
         server.abort();
         let _ = server.await;
         result.expect("MCP lifecycle client timed out").unwrap();
+    }
+
+    #[test]
+    fn update_mcp_requires_explicit_batch_and_preserves_http_headers() {
+        for servers in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "type": "http", "name": "remote", "url": "https://example.invalid/mcp", "headers": []
+            }]),
+        ] {
+            let request: UpdateMcpRequest = serde_json::from_value(serde_json::json!({
+                "sessionId": "s", "mcpServers": servers,
+                "_meta": {"example.com/trace": "123"}
+            }))
+            .unwrap();
+            assert_eq!(request.meta.unwrap()["example.com/trace"], "123");
+        }
+        assert!(
+            serde_json::from_value::<UpdateMcpRequest>(serde_json::json!({
+                "sessionId":"s", "mcpServers":[], "_meta": "invalid"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<UpdateMcpRequest>(serde_json::json!({"sessionId":"s"}))
+                .is_err()
+        );
+        let request: UpdateMcpRequest = serde_json::from_value(serde_json::json!({
+            "sessionId":"s",
+            "mcpServers":[{"type":"http","name":"remote","url":"https://example.invalid/mcp","headers":[{"name":"Authorization","value":"Bearer session-secret"}]}]
+        })).unwrap();
+        let servers = client_mcp_servers(request.mcp_servers).unwrap();
+        let agentkit_acp::McpServer::Http(server) = &servers[0] else {
+            panic!("HTTP transport lost")
+        };
+        assert_eq!(server.url, "https://example.invalid/mcp");
+        assert_eq!(server.headers[0].name, "Authorization");
+        assert_eq!(server.headers[0].value, "Bearer session-secret");
     }
 
     #[test]
@@ -6084,7 +6235,12 @@ mod tests {
         let session = response.capabilities.session.expect("session capabilities");
         let mcp = session.mcp.expect("session MCP capabilities");
         assert!(mcp.stdio.is_some());
-        assert!(mcp.http.is_none());
+        assert!(mcp.http.is_some());
+        let metadata = mcp.meta.unwrap();
+        let update = &metadata["kit/updateMcp"];
+        assert_eq!(update["method"], "_kit/session/update_mcp");
+        assert_eq!(update["upsert"], true);
+        assert!(update.get("replacement").is_none());
         assert!(session.inject.is_some());
         assert!(session.delete.is_none());
         assert!(session.fork.is_none());

@@ -1603,3 +1603,206 @@ async fn cancelled_detach_reply_keeps_committed_generation_fence() {
         assert_eq!(status, expected);
     }
 }
+
+#[test]
+fn resident_startup_omitted_or_empty_mcp_retains_overlay() {
+    for via_attach in [false, true] {
+        for method in ["session/new", "session/resume"] {
+            for servers in [None, Some(json!([]))] {
+                let mut actor = isolated_actor();
+                actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+                actor.output(state_update("running"));
+                let (writes, mut receiver) = mpsc::channel(4);
+                let mut startup = json!({"jsonrpc":"2.0","id":71,"method":method,"params":{"sessionId":"resident"}});
+                if let Some(servers) = &servers {
+                    startup["params"]["mcpServers"] = servers.clone();
+                }
+                let attached = actor
+                    .command(
+                        Request::Attach {
+                            session: actor.id.clone(),
+                            replace: true,
+                            replay: false,
+                            startup: if via_attach {
+                                Some(startup.clone())
+                            } else {
+                                None
+                            },
+                        },
+                        &writes,
+                    )
+                    .unwrap();
+                if !via_attach {
+                    actor
+                        .command(
+                            Request::Send {
+                                session: actor.id.clone(),
+                                attachment: attached["attachment"].as_str().unwrap().into(),
+                                message: startup,
+                                charge: None,
+                            },
+                            &writes,
+                        )
+                        .unwrap();
+                }
+                // No child request means the resident overlay is left untouched.
+                assert!(actor.pending.is_empty());
+                assert!(receiver.try_recv().is_err());
+                let attachment = actor.attachment.as_ref().unwrap();
+                assert!(attachment.live);
+                let response = &attachment.events.back().unwrap().1;
+                assert_eq!(response["id"], 71);
+                assert_eq!(response["result"]["sessionId"], "resident");
+                assert!(attachment.events.iter().any(
+                    |(_, message)| message["params"]["update"]["state"] == actor.state["state"]
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_startup_preserves_mcp_servers() {
+    for restore in [false, true] {
+        let mut actor = isolated_actor();
+        actor.restore = restore;
+        let (writes, mut receiver) = mpsc::channel(4);
+        let attached = actor
+            .command(
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: false,
+                    replay: false,
+                    startup: None,
+                },
+                &writes,
+            )
+            .unwrap();
+        let servers =
+            json!([{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]);
+        actor.command(Request::Send {
+        session: actor.id.clone(),
+        attachment: attached["attachment"].as_str().unwrap().into(),
+        message: json!({"jsonrpc":"2.0","id":74,"method":"session/new","params":{"mcpServers":servers}}),
+        charge: None,
+    }, &writes).unwrap();
+        let startup = receiver.try_recv().unwrap().message;
+        assert_eq!(
+            startup["method"],
+            if restore {
+                "session/resume"
+            } else {
+                "session/new"
+            }
+        );
+        assert_eq!(startup["params"]["mcpServers"], servers);
+    }
+}
+
+#[test]
+fn resident_nonempty_mcp_rejected_without_replacing_controller() {
+    for via_attach in [false, true] {
+        for method in ["session/new", "session/resume"] {
+            let mut actor = isolated_actor();
+            actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+            let (writes, mut receiver) = mpsc::channel(4);
+            actor
+                .command(
+                    if via_attach {
+                        resident_claim(&actor, false, 75)
+                    } else {
+                        Request::Attach {
+                            session: actor.id.clone(),
+                            replace: true,
+                            replay: false,
+                            startup: None,
+                        }
+                    },
+                    &writes,
+                )
+                .unwrap();
+            let owner = actor.attachment.as_ref().unwrap().id.clone();
+            let events = actor.attachment.as_ref().unwrap().events.clone();
+            let startup = json!({"jsonrpc":"2.0","id":76,"method":method,"params":{
+                "sessionId":"resident",
+                "mcpServers":[{"name":"remote","type":"http","url":"https://example.com/mcp","headers":[]}]
+            }});
+            let request = if via_attach {
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: true,
+                    replay: false,
+                    startup: Some(startup),
+                }
+            } else {
+                Request::Send {
+                    session: actor.id.clone(),
+                    attachment: owner.clone(),
+                    message: startup,
+                    charge: None,
+                }
+            };
+            let error = actor.command(request, &writes).unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert!(error.1.contains("_kit/session/update_mcp"));
+            let attachment = actor.attachment.as_ref().unwrap();
+            assert_eq!(attachment.id, owner);
+            assert_eq!(attachment.live, via_attach);
+            assert_eq!(attachment.events, events);
+            assert_eq!(actor.committed_owner.as_ref().unwrap().id, owner);
+            assert!(actor.pending.is_empty());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+}
+
+#[test]
+fn direct_mcp_update_keeps_owner_and_returns_extension_response() {
+    let mut actor = isolated_actor();
+    actor.session_result = Some(json!({"sessionId":"resident","configOptions":[]}));
+    let (writes, mut receiver) = mpsc::channel(4);
+    let attached = actor
+        .command(resident_claim(&actor, false, 80), &writes)
+        .unwrap();
+    let owner = attached["attachment"].as_str().unwrap().to_owned();
+    for (id, session) in [
+        (81, Value::Null),
+        (82, json!("wrong")),
+        (83, json!("resident")),
+        (84, json!("resident")),
+    ] {
+        let result = actor.command(Request::Send {
+            session: actor.id.clone(), attachment: owner.clone(), charge: None,
+            message: json!({"jsonrpc":"2.0","id":id,"method":"_kit/session/update_mcp","params":{"sessionId":session,"mcpServers":[]}}),
+        }, &writes);
+        if id < 83 {
+            assert!(result.is_err());
+            assert!(receiver.try_recv().is_err());
+        } else {
+            result.unwrap();
+            let update = receiver.try_recv().unwrap().message;
+            assert_eq!(update["method"], "_kit/session/update_mcp");
+            assert_eq!(update["params"]["mcpServers"], json!([]));
+            let response = if id == 83 {
+                json!({"jsonrpc":"2.0","id":update["id"],"error":{"code":-32602,"message":"invalid MCP configuration"}})
+            } else {
+                json!({"jsonrpc":"2.0","id":update["id"],"result":{}})
+            };
+            actor.output(response);
+            let attachment = actor.attachment.as_ref().unwrap();
+            assert_eq!(attachment.id, owner);
+            assert!(attachment.live);
+            let response = &attachment.events.back().unwrap().1;
+            assert_eq!(response["id"], id);
+            if id == 83 {
+                assert_eq!(response["error"]["code"], -32602);
+            } else {
+                assert_eq!(response["result"], json!({}));
+            }
+            assert_eq!(
+                actor.session_result.as_ref().unwrap()["sessionId"],
+                "resident"
+            );
+        }
+    }
+}

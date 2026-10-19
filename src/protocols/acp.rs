@@ -6943,10 +6943,7 @@ pub(super) mod tests {
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(client_transport, async move |connection| {
-                let unsupported = vec![McpServer::Http(McpServerHttp::new(
-                    "kithub",
-                    "https://example.invalid/mcp",
-                ))];
+                let unsupported = vec![McpServer::Http(McpServerHttp::new("kithub", ""))];
                 // Missing executables remain discoverable connection failures; they
                 // must not prevent attachment or leak into another session.
                 let stdio = vec![McpServer::Stdio(McpServerStdio::new(

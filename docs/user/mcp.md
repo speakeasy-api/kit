@@ -343,3 +343,69 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 - **`OAuth credential path must be a regular file`**: remove the conflicting symlink or non-file entry.
 - **`OAuth credential file is accessible by other users`**: on Unix, restrict the file to its owner (for example, mode `0600`) before retrying.
 - **Credential-store read/write failures**: confirm the operating-system store is available and unlocked. On macOS, also confirm that the installed binary has the expected stable signing identity.
+
+## ACP session MCP configuration
+
+Use session-scoped MCP servers when an ACP client needs tools or credentials for
+one session without changing the host's MCP files. ACP v2 advertises
+`capabilities.session.mcp.stdio` and `.http`. Supply `mcpServers` with
+`session/new` or cold `session/resume` restoration; for example, a Streamable HTTP entry is:
+
+```json
+{
+  "type": "http",
+  "name": "project-tools",
+  "url": "https://mcp.example.com/mcp",
+  "headers": [{ "name": "Authorization", "value": "Bearer REPLACE_ME" }]
+}
+```
+
+Replace the example URL and token with your server's values. These settings and
+credentials remain in memory, not in MCP files or transcripts. Supply them again
+when restoring a stopped session. Legacy SSE MCP transport is not supported.
+For gateway host execution and reattachment rules, see [the gateway guide](gateway.md#start-the-host).
+
+When reconnecting to a resident gateway session, omit `mcpServers` or send `[]`
+to retain its current overlay. A nonempty list is rejected with guidance to use
+`_kit/session/update_mcp`; reconnect does not replace or clear the overlay.
+
+### Use MCP servers that require exclusive resources
+
+ACP v2 sessions have separate MCP connections, including connections to host and
+plugin servers. If a stdio server requires an exclusive lock or fixed port, do
+not use it concurrently from multiple sessions in one raw ACP v2 process. Use
+separate resource settings per session, or a shared HTTP MCP service designed
+for concurrent clients. The gateway runs one child per session, but multiple
+children can still compete for the same host-wide lock or port.
+
+For singleton stdio servers, prefer `kit acp --protocol-version 2` (including
+the gateway child path), which defers unused base connections. Mixed-protocol
+`kit serve` retains eager base initialization for its other protocols; its ACP
+v2 session can compete with that base connection. Use a concurrent HTTP service
+in that deployment instead.
+
+### Add or update a live session's MCP servers
+
+To add client tools or rotate credentials without restarting the model session,
+check `capabilities.session.mcp._meta["kit/updateMcp"]` for Kit's extension:
+
+```json
+{ "method": "_kit/session/update_mcp", "upsert": true }
+```
+
+Send that JSON-RPC method with `params` containing `sessionId` and `mcpServers`.
+Both fields are required. An optional ACP `_meta` object is accepted. New client-owned names are added. An existing
+client-owned name updates only that server's configuration and credentials.
+Omitted servers remain registered; `[]` is a no-op. There is no removal operation.
+Host and plugin servers and built-in tools are not replaced by client entries.
+
+The response is `{}` after the batch succeeds. Duplicate names within the batch,
+invalid transports or configuration, and collisions with host or plugin names
+reject the whole batch without changing the client configuration. Correct the
+batch and retry. Do not send credentials with each prompt.
+
+Changes wait for in-flight operations on affected servers before updating their
+connections and credentials. Unrelated registrations and background tasks remain.
+Await the response before starting work that requires the updated credentials.
+A client disconnect or request cancellation after reconciliation begins does not
+roll the update back; retry the same batch to establish the desired configuration.

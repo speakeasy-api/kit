@@ -1082,7 +1082,7 @@ impl Actor {
                 })
             {
                 return Err(Failure::conflict(
-                    "resident session retains its MCP servers; omit mcpServers or send an empty array",
+                    "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to add or update client servers",
                 ));
             }
             let metadata = startup
@@ -1272,6 +1272,10 @@ impl Actor {
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
+                if method == "_kit/session/update_mcp" && message["params"]["sessionId"] != self.id
+                {
+                    return Err(Failure::bad("ACP session does not match gateway session"));
+                }
                 if method == "kit/background/cancel" && message["params"]["session_id"] != self.id {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
@@ -1293,6 +1297,7 @@ impl Actor {
                         | "session/cancel"
                         | "kit/background/cancel"
                         | "session/set_config_option"
+                        | "_kit/session/update_mcp"
                 ) {
                     return Err(Failure::bad(
                         "ACP method is not supported by the gateway; disconnect to detach",
@@ -1338,7 +1343,7 @@ impl Actor {
                             !servers.is_null() && servers != &Value::Array(Vec::new())
                         }) {
                             return Err(Failure::conflict(
-                                "resident session retains its MCP servers; omit mcpServers or send an empty array",
+                                "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to add or update client servers",
                             ));
                         }
                         let Some(id) = original else {
