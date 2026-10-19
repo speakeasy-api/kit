@@ -2270,6 +2270,23 @@ fn transcript_replay(
                 let mut messages: Vec<(wire::MessageId, bool, Vec<wire::ContentBlock>)> =
                     Vec::new();
                 for part in &item.parts {
+                    if let Part::Reasoning(reasoning) = part
+                        && let Some(sections) = reasoning.metadata.get(identity::SECTIONS_KEY)
+                        && let Ok(sections) = serde_json::from_value::<Vec<identity::ThoughtSection>>(
+                            sections.clone(),
+                        )
+                    {
+                        for section in sections {
+                            messages.push((
+                                wire::MessageId::new(section.id),
+                                true,
+                                vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                    section.text,
+                                ))],
+                            ));
+                        }
+                        continue;
+                    }
                     let (metadata, thought, content) = match part {
                         Part::Text(text) => (&text.metadata, false, replay_content(part)),
                         Part::Reasoning(reasoning) => (

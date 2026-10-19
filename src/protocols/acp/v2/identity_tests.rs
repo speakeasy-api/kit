@@ -26,6 +26,7 @@ impl ModelSession for Session {
             for (index, (kind, text)) in [
                 (PartKind::Reasoning, "first thought"),
                 (PartKind::Reasoning, "second thought"),
+                (PartKind::Reasoning, "third thought"),
                 (PartKind::Text, "answer"),
                 (PartKind::Text, " continued"),
             ]
@@ -52,6 +53,13 @@ impl ModelSession for Session {
                 parts.push(part);
             }
         }
+        // Responses emits separate summary-index streams, then aggregates the
+        // first two into one final reasoning item before a subsequent item.
+        let mut aggregated = agentkit_core::ReasoningPart::summary("first thought\nsecond thought");
+        aggregated
+            .metadata
+            .insert("provider.continuation".into(), json!("opaque-token"));
+        parts.splice(0..2, [Part::Reasoning(aggregated)]);
         events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
             finish_reason: FinishReason::Completed,
             output_items: parts
@@ -225,7 +233,26 @@ async fn cold_restore_preserves_live_user_agent_and_separate_thought_ids() {
             };
             assert_eq!(text(content), text(&live_content[id]));
         }
-        assert_eq!(live_ids.len(), 4);
+        assert_eq!(live_ids.len(), 5);
+        if !cancelled {
+            let reasoning = restored
+                .transcript
+                .iter()
+                .flat_map(|item| &item.parts)
+                .find_map(|part| match part {
+                    Part::Reasoning(reasoning) => Some(reasoning),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                reasoning.summary.as_deref(),
+                Some("first thought\nsecond thought")
+            );
+            assert_eq!(
+                reasoning.metadata["provider.continuation"],
+                json!("opaque-token")
+            );
+        }
         assert_eq!(
             replay_ids, live_ids,
             "replacement={replacement}, cancelled={cancelled}"

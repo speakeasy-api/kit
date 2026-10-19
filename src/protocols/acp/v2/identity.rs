@@ -10,6 +10,12 @@ use std::{
     sync::Arc,
 };
 pub(super) const KEY: &str = "dev.kit.acp.message_id";
+pub(super) const SECTIONS_KEY: &str = "dev.kit.acp.thought_sections";
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct ThoughtSection {
+    pub(super) id: String,
+    pub(super) text: String,
+}
 pub(super) fn stamp_user(items: &mut [agentkit_core::Item]) -> super::wire::MessageId {
     let id = super::wire::MessageId::new(format!("kit-user-{}", crate::session::new_id()));
     for item in items {
@@ -38,6 +44,7 @@ struct Identity {
     thoughts: Vec<String>,
     parts: HashMap<PartId, String>,
     committed_thoughts: usize,
+    sections: Vec<ThoughtSection>,
 }
 impl Identity {
     fn new() -> Self {
@@ -46,6 +53,7 @@ impl Identity {
             thoughts: Vec::new(),
             parts: HashMap::new(),
             committed_thoughts: 0,
+            sections: Vec::new(),
         }
     }
     fn thought(&mut self, index: usize) -> String {
@@ -61,10 +69,21 @@ impl Identity {
                 text.metadata.insert(KEY.into(), self.agent.clone().into());
             }
             Part::Reasoning(reasoning) => {
-                reasoning
-                    .metadata
-                    .insert(KEY.into(), self.thought(*thought).into());
-                *thought += 1;
+                if self.sections.is_empty() {
+                    reasoning
+                        .metadata
+                        .insert(KEY.into(), self.thought(*thought).into());
+                    *thought += 1;
+                } else {
+                    // Providers may aggregate several live sections into one final
+                    // reasoning part. Preserve their presentation independently of
+                    // the provider summary, encrypted data and continuation metadata.
+                    let sections = &self.sections[(*thought).min(self.sections.len())..];
+                    reasoning
+                        .metadata
+                        .insert(SECTIONS_KEY.into(), serde_json::json!(sections));
+                    *thought = self.sections.len();
+                }
             }
             _ => {}
         }
@@ -139,6 +158,24 @@ impl<T: ModelTurn> ModelTurn for Turn<T> {
                             part_id: part_id.clone(),
                             metadata: [(KEY.into(), id.into())].into(),
                         }));
+                }
+            }
+            Some(ModelTurnEvent::Delta(Delta::AppendText { part_id, chunk })) => {
+                if let Some(id) = identity.parts.get(part_id)
+                    && identity.thoughts.contains(id)
+                {
+                    if let Some(section) = identity
+                        .sections
+                        .iter_mut()
+                        .find(|section| section.id == *id)
+                    {
+                        section.text.push_str(chunk);
+                    } else {
+                        identity.sections.push(ThoughtSection {
+                            id: id.clone(),
+                            text: chunk.clone(),
+                        });
+                    }
                 }
             }
             Some(ModelTurnEvent::Delta(Delta::SetMetadata { part_id, metadata })) => {
