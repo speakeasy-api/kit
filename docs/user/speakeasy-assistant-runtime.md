@@ -1,23 +1,20 @@
-# Speakeasy assistant runtime inference
+# Run a Speakeasy assistant with a provisioned credential
 
-A trusted control plane can provision one revocable assistant-wide inference
-credential before starting Kit. The same credential serves multiple ACP sessions;
-each session carries its own canonical Gram chat binding. Kit does not mint or
-refresh this credential, or call a per-turn credential API.
+Use this guide to run Kit for an AI Control Plane (AICP) assistant without an
+interactive provider login. One assistant-wide credential can serve multiple ACP
+sessions, each associated with its own control-plane chat.
+
+Before starting, obtain a durable, revocable inference credential from your
+control plane, the Speakeasy server origin, and an eligible model ID. Your ACP
+client must supply the canonical chat association described in the
+[adapter reference](../reference/speakeasy-assistant-inference.md#associate-an-acp-session-with-a-chat).
+A standalone `kit prompt` or ordinary terminal client does not supply that
+association and cannot use this credential by itself. For interactive dashboard
+login instead, see [Speakeasy setup](getting-started-and-configuration.md#speakeasy-ai-control-plane).
 
 ## Provisioning
 
-Select the existing file credential backend with `--credential-store file` and
-`--credential-dir <private-directory>`. Provision this file inside that directory:
-
-```text
-f5a93b2411bbf44d12df4db53aa064d87685df4fad637f3c61a653f4bc5b200f.json
-```
-
-The filename is the lowercase BLAKE3 digest of `speakeasy`, a NUL byte, and
-`assistant-runtime`, followed by `.json`. Use a private directory and a file
-readable only by the runtime user. Do not put the credential in ACP metadata,
-transcripts, command-line arguments, or logs.
+Have your deployment's secret manager supply a JSON file with these fields:
 
 ```json
 {
@@ -27,51 +24,94 @@ transcripts, command-line arguments, or logs.
 }
 ```
 
-Set `SPEAKEASY_ORIGIN` to the same origin. Runtime credentials have no default
-production origin. Origins cannot contain URL credentials, paths other than `/`,
-queries, or fragments. HTTPS is required unless `SPEAKEASY_ALLOW_INSECURE_HTTP=1`
-is explicitly set for development. For local Docker, both origins can be
-`http://aicp:8080` with that opt-in. Authenticated requests do not follow redirects.
+Use the durable assistant inference credential, not a short-lived turn token.
+Kit does not mint or refresh it. Arrange replacement through the control plane
+before expiry; after replacing it, restart the Kit runtime so sessions use the
+replacement. Revoke a compromised credential at the control plane.
 
-The runtime record takes precedence over the existing `speakeasy/default` API-key
-record. Malformed runtime records, unsupported versions, and origin mismatches
-fail closed; Kit does not fall back to a different identity. Existing API-key
-records retain their format and default production origin.
+Install the file before starting Kit. Run these commands as the runtime user;
+replace the source path with the file supplied by your secret manager:
+
+```sh
+credential_dir="$HOME/.kit/credentials"
+credential_name=f5a93b2411bbf44d12df4db53aa064d87685df4fad637f3c61a653f4bc5b200f.json
+install -d -m 700 "$credential_dir"
+install -m 600 /run/secrets/speakeasy-runtime.json \
+  "$credential_dir/$credential_name"
+```
+
+Use a real, private directory and a regular file owned by the runtime user; do
+not use symlinks. Do not put the token in ACP metadata, prompts, command-line
+arguments, or logs. This provider credential is separate from the credential
+used to access a [Kit gateway](gateway.md#start-the-host).
+
+Configure your ACP client to launch Kit with the same credential directory.
+Replace the project path and model with an existing directory and a model your
+Speakeasy server offers:
+
+```sh
+export SPEAKEASY_ORIGIN='https://your-gram-origin.example'
+kit acp --protocol-version 2 \
+  --provider speakeasy --model provider/eligible-model \
+  --root /absolute/project \
+  --credential-store file --credential-dir "$credential_dir"
+```
+
+The process serves ACP on standard input/output; it is not an interactive shell.
+After the client creates a session with its chat association, Kit advertises the
+eligible models and can run prompts against that chat. Runtime credentials
+require an explicit `SPEAKEASY_ORIGIN` matching the JSON `origin`. Use an origin
+only: no URL credentials, endpoint path, query, or fragment. Invalid records or
+origin mismatches fail rather than falling back to a saved API key.
+
+For local Docker development, the hostname must be reachable **from the Kit
+container**. Set the same HTTP origin in the credential file and runtime
+environment, and explicitly allow unencrypted development traffic:
+
+```sh
+export SPEAKEASY_ORIGIN='http://aicp:8080'
+export SPEAKEASY_ALLOW_INSECURE_HTTP=1
+```
+
+Use HTTPS without this opt-in outside a trusted development environment. Kit
+does not follow authenticated redirects; configure the final server origin.
 
 ## Models and inference
 
-Kit sends the bearer credential to `GET /chat/models` and `POST /chat/completions`
-at the configured origin. The model endpoint must return the server-filtered
-OpenRouter-compatible shape `{"data":[{"id":"provider/model","context_length":123456}]}`.
-Only returned models are advertised for Speakeasy: discovery failure does not fall
-back to the public OpenRouter listing or add a guessed current model. Catalogs
-retain the existing response bounds of 2 MiB and 10,000 entries.
+Select a model from the session's advertised Speakeasy list. The list comes from
+your authenticated server, not the public OpenRouter catalog. If discovery fails,
+Kit does not invent fallback models or add an unavailable current selection.
+
+If the list is empty, check credential admission and the server's model-catalog
+route with your control-plane operator. The server must return an eligible-model
+list within Kit's limits of 2 MiB and 10,000 entries. The exact response contract
+is in the [model discovery reference](../reference/speakeasy-assistant-inference.md#discover-eligible-models).
 
 ## Canonical chat association
 
-For ACP session creation or restoration, the trusted control plane supplies:
+Create each session with its intended control-plane chat. Reconnect or resume
+that session to continue the same chat; do not replace its association with a
+different chat ID. Cold resume can recover the saved association when the client
+omits it. An older unbound session cannot acquire a binding during resume: create
+a new, explicitly associated session instead.
 
-```json
-{
-  "_meta": {
-    "ai.speakeasy/gram-chat-id": "<existing assistant_threads.chat_id UUID>"
-  }
-}
-```
+Built-in Kit children share the parent's authorized inference association,
+including child forks and restarts. External harnesses do not receive it. Direct
+ACP forks require the caller to provide the intended association explicitly. See
+[the adapter lifecycle rules](../reference/speakeasy-assistant-inference.md#preserve-chat-identity-through-session-lifecycle)
+when implementing these operations.
 
-This is the existing control-plane chat UUID, not an ACP session UUID or hash.
-The binding is immutable for the session, persists across restoration, and is
-forwarded as `Gram-Chat-ID` for runtime inference. Runtime inference requires a
-non-nil UUID binding. The model catalog request does not require a chat binding.
+The control plane must validate chat ownership and suppress inference transcript
+capture. AICP's ACP projection is the sole transcript writer; enabling both
+capture paths can duplicate conversation history.
 
-Built-in Kit child sessions explicitly receive their parent's authorized inference
-chat association, including child forks and restarts. External harnesses do not
-receive this metadata. This shares only inference attribution: the server still
-suppresses inference capture, and child transcripts are not independently written
-to the Gram chat. Direct ACP forks use the binding explicitly supplied by their
-caller, not an implicitly inherited parent binding.
+## Resolve startup and inference failures
 
-The server must validate that the supplied chat belongs to the authenticated
-assistant/runtime and suppress inference transcript capture. AICP's ACP
-projection is the sole transcript writer. This contract supports the assistant's
-`runtime_version=3`; it does not change Kit's ACP protocol version.
+| Symptom | Action |
+| --- | --- |
+| `SPEAKEASY_ORIGIN is required for runtime credentials` | Set the origin on the Kit process, not only on the client connecting to it. |
+| Credential origin does not match `SPEAKEASY_ORIGIN` | Correct the deployment environment or provision a credential for the intended server; do not redirect the request to another host. |
+| Invalid runtime credential record or version | Re-provision the version-1 JSON file with only the documented fields. Fix file ownership and permissions if the store cannot read it. |
+| Runtime inference requires canonical `ai.speakeasy/gram-chat-id` metadata | Fix the ACP client's session creation request using the adapter reference; do not substitute an ACP session ID. |
+| `Gram chat binding cannot change on resume` | Resume with the saved association, or create a new session for the other chat. |
+| The server rejects catalog or completion requests | Check expiry, revocation, runtime admission, chat ownership, and model eligibility with the control-plane operator. Kit does not obtain a replacement credential automatically. |
