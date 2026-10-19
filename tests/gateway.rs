@@ -534,7 +534,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
     sdk.detach().await;
 
-    // Nonempty resident resume replaces the cleared overlay without recreating the session.
+    // Nonempty resident resume rejects; only the explicit update replaces the overlay.
     let mut sdk = SdkClient::connect(&url).await;
     let resumed = sdk
         .request(
@@ -543,14 +543,37 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
             json!({"sessionId":id,"cwd":fixture.root,"mcpServers":servers}),
         )
         .await;
+    assert!(
+        resumed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("_kit/session/update_mcp")
+    );
+    sdk.detach().await;
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root}),
+        )
+        .await;
     assert_eq!(resumed["result"]["sessionId"], id, "{resumed}");
+    let replaced = sdk
+        .request(
+            4,
+            "_kit/session/update_mcp",
+            json!({"sessionId":id,"mcpServers":servers}),
+        )
+        .await;
+    assert_eq!(replaced["result"], json!({}), "{replaced}");
     sdk.start_prompt(3, &id, "Discover the replaced session MCP fixture")
         .await;
     sdk.wait_idle().await;
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
     sdk.detach().await;
 
-    // Explicit empty resident resume clears rather than retaining the overlay.
+    // Empty resident resume retains the overlay and its existing connections.
     let mut sdk = SdkClient::connect(&url).await;
     let resumed = sdk
         .request(
@@ -560,7 +583,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         )
         .await;
     assert!(resumed.get("error").is_none(), "{resumed}");
-    sdk.start_prompt(3, &id, "Discover after resident clear")
+    sdk.start_prompt(3, &id, "Discover after resident retention")
         .await;
     sdk.wait_idle().await;
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
