@@ -34,10 +34,10 @@ recurring cap. No key cap does not imply unlimited account credits. Budget recur
 is shown separately: a nonrecurring cap has no recurring reset, and an exact next
 budget reset timestamp is not reported by this endpoint.
 
-Checks run concurrently with bounded HTTP timeouts and response sizes. Successful
-providers remain visible if another provider fails. Usage calls use the providers'
-canonical usage endpoints, not custom model API base URLs. OpenAI authentication
-may refresh through the existing login mechanism; no model requests are made.
+If one provider check fails, results from successful providers remain visible.
+Usage checks contact the providers' canonical usage endpoints, even when you
+configure a custom model API base URL. OpenAI credentials may refresh automatically;
+no model requests are made.
 
 ## Related documentation
 

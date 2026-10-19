@@ -31,9 +31,9 @@ are also required. If audio libraries or usable devices are missing, `/voice on`
 fails locally before creating a subscription call. See [Native voice](native-voice.md)
 for setup and controls; using the packaged binary does not require build tools.
 
-The container images are headless builds without the `tui` Cargo feature: they
-omit the terminal client, voice, and the audio libraries. Debian flavors include
-`libstdc++6`; Alpine includes `libstdc++`. The Alpine container is a separate
+Use the packaged binary when you need the terminal client or voice. The container
+images are headless: they omit the terminal client, voice, and audio libraries.
+Debian flavors include `libstdc++6`; Alpine includes `libstdc++`. The Alpine container is a separate
 dynamically linked musl build, not a fully static binary for arbitrary
 distributions or `scratch`. The release workflow publishes an x86-64 GNU Linux
 tarball with the full feature set, not a static musl tarball.
@@ -52,9 +52,8 @@ kit auth status openai --credential-store keychain
 kit tui --root /path/to/project --credential-store keychain
 ```
 
-Login opens OpenAI's browser authorization flow and accepts the callback only on
-`http://localhost:1455/auth/callback` or port 1457. Kit uses PKCE plus state and
-nonce checks and validates RS256 access and ID tokens against OpenAI's JWKS.
+Login opens OpenAI's browser authorization flow. Keep localhost port 1455 or
+1457 available for the browser callback.
 OpenAI and MCP use one selected credential backend. The default is process-local
 `memory`, but standalone OpenAI login rejects it; select persistent `keychain` or
 `file` storage, including `--credential-dir` when selecting `file`.
@@ -64,7 +63,7 @@ automatically and require no additional configuration. Kit retries temporary fai
 when it is safe to do so; if a request fails, it reports the error rather than risk
 silently repeating an accepted request.
 
-Use `kit auth status openai` to check the credential.
+Use `kit auth status openai` with the same credential-store options to check the credential.
 
 `kit auth logout openai` revokes the refresh token before local deletion and keeps
 the local credential if revocation fails. `kit auth logout openai --local-only`
@@ -158,15 +157,13 @@ kit prompt --credential-store keychain \
   --root /path/to/project "Reply with a short project summary"
 ```
 
-Kit requests a producer-scoped Gram API key through a loopback form POST, verifies
-the key and its accessible projects with `app.getgram.ai`, and stores the key and
-selected project. Runtime requests use `Gram-Key` and `Gram-Project` against
-`https://app.getgram.ai/chat/completions`. Kit deterministically maps its durable
-session ID to `Gram-Chat-ID`, keeping new and resumed conversations together in AI
-Control Plane Agent Sessions. Speakeasy does not currently provide a
-public model catalog, so Kit uses OpenRouter's catalog as a v0 selector fallback; a
-model outside Speakeasy's allowlist can fail at runtime. Logout removes the local
-credential. Revoke the API key remotely in the Speakeasy dashboard.
+Login verifies your key and accessible projects with `app.getgram.ai` and saves
+the selected project with the credential. New and resumed Kit conversations stay
+together in AI Control Plane Agent Sessions. The model selector uses OpenRouter's
+catalog because Speakeasy does not provide a public model catalog; confirm that
+your selected model is allowed by your Speakeasy project if requests fail.
+Logout removes only the local credential. Revoke the API key remotely in the
+Speakeasy dashboard.
 
 ## Run common command workflows
 
@@ -187,11 +184,11 @@ kit tui --root /path/to/project --resume
 kit tui --root /path/to/project --resume <session-id>
 ```
 
-Without an ID, `--resume` opens the same workspace-scoped, newest-first picker as `/sessions`, including session names and inline rename. Workspace selection honors `--root` and configured root defaults as in normal startup. No new persisted session is created just to show the picker. Plain `kit tui` is unchanged.
+Without an ID, `--resume` opens the same workspace-scoped, newest-first picker as `/sessions`, including session names and inline rename. Workspace selection honors `--root` and configured root defaults as in normal startup. Opening the picker does not create a persisted session.
 
 `Esc` at the top level or `Ctrl+C` cancels startup successfully without creating or resuming a session; `Esc` while renaming only cancels the rename. An empty catalog reports no resumable sessions and exits successfully. Catalog read failures exit unsuccessfully with an actionable error; a selected session that cannot be resumed reports its resume error instead of starting a new session.
 
-If a dead process left a stale session lock, `--force` can accompany either form of `--resume`. With the picker, it applies only to the selected session and never takes over a lock held by a live process. It is not a general overwrite option and Clap rejects it without `--resume`. See [session locks and recovery](tui-and-sessions.md#session-locks---resume-and---force).
+If a dead process left a stale session lock, `--force` can accompany either form of `--resume`. With the picker, it applies only to the selected session and never takes over a lock held by a live process. Use it only with `--resume`; it is not a general overwrite option. See [session locks and recovery](tui-and-sessions.md#session-locks---resume-and---force).
 
 ### One-shot automation with `kit prompt`
 
@@ -221,7 +218,7 @@ kit serve --root /path/to/project --http 127.0.0.1:7331
 kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 # daemon
 ```
 
-Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection defaults to ACP v1; the hidden `--stdio-protocol-version 2` flag selects v2 for that connection only. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
+Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection defaults to ACP v1; the hidden `--stdio-protocol-version 2` flag selects v2 for that connection only. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM interrupt active ACP sessions and allow about five seconds for cleanup before shutdown.
 
 Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. A non-loopback daemon must not be exposed without authentication and suitable network controls. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener. Select the wire version explicitly with `--protocol-version 1|2`; omitting it defaults to ACP v1:
 
@@ -403,7 +400,7 @@ Review the change and run the smallest relevant checks.
 
 The `skill` entry in `compose` initially discloses only valid skill names and descriptions. When a task matches, the agent loads the skill before proceeding; the result contains the full Markdown body, skill directory, and paths to supporting resources. Project and user skill files are read with the Kit process's normal host permissions. Invalid or unreadable skills are omitted, and the same skill can be loaded repeatedly.
 
-The hidden-tool catalog is captured when Kit creates the session's compose source. Restart the session after adding or removing a skill so its advertised schema is refreshed.
+Start a new session after adding or removing a skill so the agent sees the updated skill catalog.
 
 ## Troubleshoot startup and configuration
 
@@ -419,16 +416,15 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 `kit prompt --request-budget-seconds 300 "..."` gives each logical provider
 request a total 300-second budget, including retries, backoff, and streamed
 response reads. The global CLI option overrides `request_budget_seconds = 300`
-in the existing Kit TOML configuration. Accepted values are integer seconds
+in `~/.kit/config.toml`. Accepted values are integer seconds
 from 1 through 3600; omission preserves the 60-second default. Stream idle
-and attempt timeouts remain 30 seconds, and retry/backoff policy is unchanged.
+and attempt timeouts remain 30 seconds.
 This applies to the resilient OpenRouter and Speakeasy completions paths, not
 the OpenAI subscription transport. It does not extend an external container
 or task deadline.
 
-The setting is resolved once per Kit process. Native Kit ACP children and the
-TUI's Kit server receive the exact resolved value as a CLI argument, for both
-new and resumed sessions; their local TOML cannot override it.
+Native Kit ACP children and the TUI server inherit this request budget for new
+and resumed sessions; their local TOML cannot override it.
 
 ### Experimental evaluations
 

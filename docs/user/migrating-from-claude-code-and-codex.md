@@ -1,6 +1,6 @@
 # Migrate from Claude Code or Codex
 
-Kit does not have a migration slash command or a fixed importer. Source harness formats change, and a useful migration usually needs choices about global versus project scope. Start Kit in the project that you want to migrate and ask the agent to inspect, translate, and validate the relevant configuration. This guide is bundled into Kit so the agent can search it with `docs`.
+To bring Claude Code or Codex configuration into Kit, start Kit in the target project and ask the agent to inspect, translate, and validate the settings you want to keep. Choose project-local or global scope and review the plan before changing files. Kit provides assisted migration rather than a migration slash command or fixed importer; the agent can find this guide with `docs`.
 
 ## Start an assisted migration
 
