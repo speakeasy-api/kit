@@ -2629,7 +2629,14 @@ async fn status_matches_external_reconnect_capacity_and_preserves_retired_work()
             "status-parent",
             resume,
             false,
-            Vec::new(),
+            if resume {
+                Vec::new()
+            } else {
+                vec![agentkit_core::Item::text(
+                    agentkit_core::ItemKind::System,
+                    "parent",
+                )]
+            },
         )
         .unwrap()
     };
