@@ -67,7 +67,12 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
     .unwrap();
     let hooks = Hooks::new(registration, options().unwrap()).unwrap();
     hooks
-        .session_start("environment-test", SessionStartInputTrigger::Startup, None)
+        .session_start(
+            "environment-test",
+            SessionStartInputTrigger::Startup,
+            None,
+            false,
+        )
         .await
         .unwrap();
     hooks.sdk.shutdown().await.unwrap();
@@ -641,7 +646,7 @@ async fn session_and_tool_context_wait_for_the_next_request() {
     );
     backend.respond("tool.after", json!([context_injection("tool context")]));
     let _lease = hooks
-        .session_start("session", SessionStartInputTrigger::Startup, None)
+        .session_start("session", SessionStartInputTrigger::Startup, None, false)
         .await
         .unwrap();
     call(&hooks, &Echo::new(), json!({"text":"result"})).await;
@@ -668,7 +673,7 @@ async fn session_and_tool_context_wait_for_the_next_request() {
 async fn failed_tools_can_inject_recovery_context_without_becoming_successful() {
     let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
     let _lease = hooks
-        .session_start("session", SessionStartInputTrigger::Startup, None)
+        .session_start("session", SessionStartInputTrigger::Startup, None, false)
         .await
         .unwrap();
     backend.respond("tool.after", json!([context_injection("recovery context")]));
@@ -1394,7 +1399,7 @@ async fn concurrent_model_payloads_keep_owned_context_usage_and_safe_parameters(
         SessionStartInputTrigger::Startup,
     );
     let run = |id: &'static str| {
-        let adapter = adapter.clone();
+        let adapter = adapter.clone().with_child(id != "one");
         async move {
             let mut session = adapter.start_session(SessionConfig::new(id)).await.unwrap();
             let request = TurnRequest {
@@ -1425,6 +1430,11 @@ async fn concurrent_model_payloads_keep_owned_context_usage_and_safe_parameters(
         assert!(!events.is_empty(), "missing {name}");
         for event in events {
             let session = event["session"]["id"].as_str().unwrap();
+            if session == "one" {
+                assert!(event["session"].get("agent").is_none());
+            } else {
+                assert_eq!(event["session"]["agent"], json!({"id": session}));
+            }
             assert_eq!(event["turn"]["id"], format!("turn-{session}"));
             assert_eq!(event["session"]["cwd"], "/workspace");
             assert_eq!(event["session"]["workspaceRoots"], json!(["/workspace"]));
@@ -1902,6 +1912,88 @@ async fn media_and_file_descriptors_obey_owning_category_selection() {
                     Some("text" | "media" | "file")
                 ))
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_identity_is_session_local_through_the_hook_lifecycle() {
+    let event_types = [
+        "user.message.inbound",
+        "session.start",
+        "session.end",
+        "turn.start",
+        "turn.end",
+        "model.request.before",
+        "model.response.after",
+        "tool.before",
+        "tool.after",
+        "context.compact.before",
+        "context.compact.after",
+    ];
+    let (hooks, backend) = hooks(vec![observe(&event_types)]);
+    let run = |id: &'static str, child| {
+        let hooks = hooks.clone();
+        async move {
+            let mut registry = ToolRegistry::new();
+            registry.register_arc(Echo::new());
+            let mut driver = Agent::builder()
+                .model(
+                    HookedAdapter::new(
+                        ToolRoundModel(true),
+                        Some(hooks.clone()),
+                        SessionStartInputTrigger::Startup,
+                    )
+                    .with_child(child),
+                )
+                .observer(TurnHook(hooks.clone()))
+                .mutator(PromptHook::new(
+                    hooks.clone(),
+                    "a2a",
+                    PromptRecord::Transient(crate::session::TransientTranscript::new(vec![])),
+                ))
+                .add_tool_source(hooked_tools(registry, &hooks))
+                .input(vec![Item::text(ItemKind::User, "hello")])
+                .build()
+                .unwrap()
+                .start(SessionConfig::new(id))
+                .await
+                .unwrap();
+            // Both sessions remain active while model and tool events interleave.
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(_)
+            ));
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Finished(_)
+            ));
+            hooks.compact_before(id, &[], true, "summarize", None).await;
+            hooks.compact_after(id, &[], "summary".into(), false).await;
+            hooks
+                .session_end(id, SessionEndInputOutcome::Completed)
+                .await;
+        }
+    };
+    tokio::join!(run("root", false), run("child", true));
+    hooks.sdk.shutdown().await.unwrap();
+    for event_type in event_types {
+        let events = backend.events(event_type);
+        for (id, child) in [("root", false), ("child", true)] {
+            let events: Vec<_> = events
+                .iter()
+                .filter(|event| event["session"]["id"] == id)
+                .collect();
+            assert!(!events.is_empty(), "missing {event_type} for {id}");
+            for event in events {
+                if child {
+                    assert_eq!(event["session"]["agent"], json!({"id": id}), "{event_type}");
+                } else {
+                    assert!(event["session"].get("agent").is_none(), "{event_type}");
+                }
+            }
         }
     }
 }

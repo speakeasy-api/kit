@@ -23,13 +23,18 @@ struct Pending {
     bytes: usize,
     in_flight_items: usize,
     closed: bool,
+    // Immutable for this active generation, including after delivery retires.
+    child: bool,
 }
 
 impl Injections {
     /// Own one active generation, including across startup cancellation.
     /// Store the returned lease in HookedSession, not a temporary local.
-    pub(super) fn open(&self, session: &str) -> Result<SessionLease, String> {
-        let queue = Arc::new(Mutex::new(Pending::default()));
+    pub(super) fn open(&self, session: &str, child: bool) -> Result<SessionLease, String> {
+        let queue = Arc::new(Mutex::new(Pending {
+            child,
+            ..Pending::default()
+        }));
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         if sessions.contains_key(session) {
             return Err("injection session is already active".into());
@@ -41,6 +46,13 @@ impl Injections {
             session: session.to_owned(),
             queue,
         })
+    }
+
+    /// Identity follows the same lease as injection delivery. Read without holding
+    /// the registry lock while acquiring the queue lock; no callbacks or awaits.
+    pub(super) fn is_child(&self, session: &str) -> bool {
+        self.queue(session)
+            .is_ok_and(|queue| queue.lock().unwrap_or_else(PoisonError::into_inner).child)
     }
 
     /// Retire delivery but retain the active slot until the session owner drops.
@@ -279,7 +291,7 @@ mod tests {
     #[test]
     fn rollback_order_and_one_shot_commit() {
         let queues = Injections::default();
-        let _owner_a = queues.open("a").unwrap();
+        let _owner_a = queues.open("a", false).unwrap();
         enqueue(&queues, "a", "first");
         let delivery = queues.claim("a").unwrap();
         enqueue(&queues, "a", "second");
@@ -293,7 +305,7 @@ mod tests {
     #[test]
     fn commit_preserves_concurrent_enqueue() {
         let queues = Injections::default();
-        let _owner_a = queues.open("a").unwrap();
+        let _owner_a = queues.open("a", false).unwrap();
         enqueue(&queues, "a", "first");
         let delivery = queues.claim("a").unwrap();
         enqueue(&queues, "a", "second");
@@ -302,14 +314,31 @@ mod tests {
     }
 
     #[test]
+    fn child_identity_survives_retirement_but_not_lease_release() {
+        let queues = Injections::default();
+        let child = queues.open("child", true).unwrap();
+        let _root = queues.open("root", false).unwrap();
+        assert!(queues.is_child("child"));
+        assert!(!queues.is_child("root"));
+        assert!(queues.open("child", false).is_err());
+        assert!(queues.is_child("child"));
+        queues.close("child").unwrap();
+        assert!(queues.is_child("child"));
+        drop(child);
+        assert!(!queues.is_child("child"));
+        let _resumed = queues.open("child", false).unwrap();
+        assert!(!queues.is_child("child"));
+    }
+
+    #[test]
     fn isolated_sessions_and_stale_receipts() {
         let queues = Injections::default();
-        let _owner_a = queues.open("a").unwrap();
-        let _owner_b = queues.open("b").unwrap();
+        let _owner_a = queues.open("a", false).unwrap();
+        let _owner_b = queues.open("b", false).unwrap();
         enqueue(&queues, "a", "old");
         let old = queues.claim("a").unwrap();
         queues.close("a").unwrap();
-        assert!(queues.open("a").is_err());
+        assert!(queues.open("a", false).is_err());
         assert!(
             queues
                 .producer("a")
@@ -318,7 +347,7 @@ mod tests {
                 .is_err()
         );
         drop(_owner_a);
-        let _owner_a = queues.open("a").unwrap();
+        let _owner_a = queues.open("a", false).unwrap();
         enqueue(&queues, "a", "new");
         old.commit().unwrap();
         assert_eq!(texts(&queues.claim("a").unwrap()), ["new"]);
@@ -328,12 +357,12 @@ mod tests {
     #[test]
     fn stale_producer_cannot_inject_into_resumed_session() {
         let queues = Injections::default();
-        let owner = queues.open("a").unwrap();
+        let owner = queues.open("a", false).unwrap();
         let producer = queues.producer("a").unwrap();
         producer.enqueue(&outcome("retired payload")).unwrap();
-        assert!(queues.open("a").is_err());
+        assert!(queues.open("a", false).is_err());
         drop(owner);
-        let _resumed = queues.open("a").unwrap();
+        let _resumed = queues.open("a", false).unwrap();
         assert!(producer.enqueue(&outcome("stale")).is_err());
         assert!(texts(&queues.claim("a").unwrap()).is_empty());
     }
@@ -345,22 +374,24 @@ mod tests {
         let task = tokio::spawn({
             let queues = queues.clone();
             async move {
-                let _owner = queues.open("a").unwrap();
+                let _owner = queues.open("a", true).unwrap();
                 ready.send(()).unwrap();
                 std::future::pending::<()>().await;
             }
         });
         received.await.unwrap();
-        assert!(queues.open("a").is_err());
+        assert!(queues.is_child("a"));
+        assert!(queues.open("a", false).is_err());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        let _resumed = queues.open("a").unwrap();
+        assert!(!queues.is_child("a"));
+        let _resumed = queues.open("a", false).unwrap();
     }
 
     #[test]
     fn invalid_batch_does_not_partially_enqueue() {
         let queues = Injections::default();
-        let _owner_a = queues.open("a").unwrap();
+        let _owner_a = queues.open("a", false).unwrap();
         let mut too_many_parts = outcome("");
         let part = too_many_parts.injections[0].value.0[0].parts[0].clone();
         too_many_parts.injections[0].value.0[0].parts = vec![part; MAX_MESSAGES + 1];
@@ -390,7 +421,7 @@ mod tests {
     #[test]
     fn in_flight_context_still_counts_toward_limits() {
         let queues = Injections::default();
-        let _owner = queues.open("a").unwrap();
+        let _owner = queues.open("a", false).unwrap();
         let producer = queues.producer("a").unwrap();
         for _ in 0..MAX_MESSAGES {
             enqueue(&queues, "a", "");
@@ -411,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_releases_reservation_without_losing_context() {
         let queues = Arc::new(Injections::default());
-        let _owner_a = queues.open("a").unwrap();
+        let _owner_a = queues.open("a", false).unwrap();
         enqueue(&queues, "a", "retained");
         let (ready, received) = tokio::sync::oneshot::channel();
         let task = tokio::spawn({

@@ -27,6 +27,7 @@ pub(crate) struct HookedAdapter<A> {
     inner: A,
     hooks: Option<Arc<Hooks>>,
     trigger: SessionStartInputTrigger,
+    child: bool,
 }
 
 impl<A> HookedAdapter<A> {
@@ -39,7 +40,14 @@ impl<A> HookedAdapter<A> {
             inner,
             hooks,
             trigger,
+            child: false,
         }
+    }
+
+    /// Classify this session, never the shared hook backend or process.
+    pub(crate) fn with_child(mut self, child: bool) -> Self {
+        self.child = child;
+        self
     }
 }
 
@@ -53,7 +61,12 @@ impl<A: ModelAdapter> ModelAdapter for HookedAdapter<A> {
         let injection_session = if let Some(hooks) = &self.hooks {
             Some(
                 hooks
-                    .session_start(&session_id, self.trigger.clone(), inner.model_name())
+                    .session_start(
+                        &session_id,
+                        self.trigger.clone(),
+                        inner.model_name(),
+                        self.child,
+                    )
                     .await
                     .map_err(LoopError::InvalidState)?,
             )
