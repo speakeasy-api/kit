@@ -19,6 +19,8 @@ struct PeerState {
     gates: VecDeque<(oneshot::Receiver<()>, oneshot::Sender<()>)>,
     modern: bool,
     listen_error: Option<i64>,
+    capabilities: Value,
+    listen_requests: usize,
     resource_subscriptions: std::collections::BTreeSet<String>,
 }
 
@@ -51,6 +53,8 @@ impl Peer {
             gates: VecDeque::new(),
             modern,
             listen_error: None,
+            capabilities: json!({"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true}}),
+            listen_requests: 0,
             resource_subscriptions: Default::default(),
         }));
         let (notifications, _) = broadcast::channel(32);
@@ -192,10 +196,14 @@ async fn serve(
                 response(&mut stream, "200 OK", Some(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"legacy peer"}}))).await;
                 return;
             }
-            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true}},"ttlMs":0,"cacheScope":"private"})
+            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":state.lock().await.capabilities.clone(),"ttlMs":0,"cacheScope":"private"})
         }
         "subscriptions/listen" => {
-            let error = state.lock().await.listen_error;
+            let error = {
+                let mut state = state.lock().await;
+                state.listen_requests += 1;
+                state.listen_error
+            };
             if let Some(code) = error {
                 response(
                     &mut stream,
@@ -683,6 +691,41 @@ async fn authentication_reconnect_fences_the_old_connection_epoch() {
     eventually(async || schema(&runtime, "mcp_remote_authenticated").is_some()).await;
     assert!(schema(&runtime, "mcp_remote_obsolete").is_none());
     assert!(schema(&runtime, "mcp_remote_original").is_none());
+}
+
+#[tokio::test]
+async fn unadvertised_list_changes_do_not_open_subscription_streams() {
+    for capabilities in [
+        json!({}),
+        json!({"tools":{},"resources":{},"prompts":{}}),
+        json!({"tools":{"listChanged":false},"resources":{"listChanged":false},"prompts":{"listChanged":false}}),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let peer = Peer::with_protocol(vec![tool("inspect", "string")], true).await;
+        {
+            let mut state = peer.state.lock().await;
+            state.capabilities = capabilities.clone();
+            state.listen_error = Some(-32601);
+        }
+        let path = directory.path().join("mcp.json");
+        config(&path, &[("remote", &peer)]);
+        let runtime = connect(Some(path.as_path()), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        runtime
+            .initialize_servers(&["remote".to_string()])
+            .await
+            .unwrap();
+        let search = ToolSearch::new(runtime.clone(), directory.path().into());
+        let found = invoke_discovery(&search, json!({"query":"mcp"}))
+            .await
+            .unwrap();
+        assert_eq!(found["servers"][0]["status"], "authenticated");
+        // Initialization and discovery await subscription establishment if attempted.
+        // This records requests at the real MCP peer, not internal implementation work.
+        assert_eq!(peer.state.lock().await.listen_requests, 0, "{capabilities}");
+        assert!(found["servers"][0].get("subscription").is_none());
+    }
 }
 
 #[tokio::test]
