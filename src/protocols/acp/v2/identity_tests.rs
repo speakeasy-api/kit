@@ -26,8 +26,8 @@ impl ModelSession for Session {
             for (index, (kind, text)) in [
                 (PartKind::Reasoning, "first thought"),
                 (PartKind::Reasoning, "second thought"),
-                (PartKind::Reasoning, "third thought"),
                 (PartKind::Text, "answer"),
+                (PartKind::Reasoning, "third thought"),
                 (PartKind::Text, " continued"),
             ]
             .into_iter()

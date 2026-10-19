@@ -2243,6 +2243,7 @@ fn transcript_replay(
     transcript: &[Item],
 ) -> Vec<wire::UpdateSessionNotification> {
     let mut replay = Vec::new();
+    let mut presentation_order: HashMap<wire::MessageId, (String, usize)> = HashMap::new();
     for (item_index, item) in transcript.iter().enumerate() {
         let message_id =
             |kind: &str| wire::MessageId::new(format!("{session_id}-replay-{item_index}-{kind}"));
@@ -2277,6 +2278,12 @@ fn transcript_replay(
                         )
                     {
                         for section in sections {
+                            if !section.group.is_empty() {
+                                presentation_order.insert(
+                                    wire::MessageId::new(section.id.clone()),
+                                    (section.group, section.order),
+                                );
+                            }
                             messages.push((
                                 wire::MessageId::new(section.id),
                                 true,
@@ -2306,6 +2313,12 @@ fn transcript_replay(
                         .and_then(Value::as_str)
                         .map(wire::MessageId::new)
                         .unwrap_or_else(|| message_id(if thought { "thought" } else { "agent" }));
+                    if !thought
+                        && let Some(order) =
+                            metadata.get(identity::ORDER_KEY).and_then(Value::as_u64)
+                    {
+                        presentation_order.insert(id.clone(), (id.to_string(), order as usize));
+                    }
                     if let Some(existing) = messages
                         .iter_mut()
                         .find(|(existing, kind, _)| *existing == id && *kind == thought)
@@ -2394,6 +2407,34 @@ fn transcript_replay(
             }
             ItemKind::System | ItemKind::Developer | ItemKind::Context | ItemKind::Notification => {
             }
+        }
+    }
+    // Provider summaries can aggregate sections across final part boundaries.
+    // Restore first-seen live message order within each response, without moving
+    // user/tool updates or mixing different model responses.
+    let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (index, update) in replay.iter().enumerate() {
+        let id = match update {
+            wire::SessionUpdate::AgentMessage(message) => &message.message_id,
+            wire::SessionUpdate::AgentThought(message) => &message.message_id,
+            _ => continue,
+        };
+        if let Some((group, order)) = presentation_order.get(id) {
+            groups
+                .entry(group.clone())
+                .or_default()
+                .push((index, *order));
+        }
+    }
+    for slots in groups.values() {
+        let mut ordered = slots.clone();
+        ordered.sort_by_key(|(_, order)| *order);
+        let messages = ordered
+            .iter()
+            .map(|(index, _)| replay[*index].clone())
+            .collect::<Vec<_>>();
+        for ((index, _), message) in slots.iter().zip(messages) {
+            replay[*index] = message;
         }
     }
     replay

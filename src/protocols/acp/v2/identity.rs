@@ -10,11 +10,16 @@ use std::{
     sync::Arc,
 };
 pub(super) const KEY: &str = "dev.kit.acp.message_id";
+pub(super) const ORDER_KEY: &str = "dev.kit.acp.presentation_order";
 pub(super) const SECTIONS_KEY: &str = "dev.kit.acp.thought_sections";
 #[derive(serde::Deserialize)]
 pub(super) struct ThoughtSection {
     pub(super) id: String,
     pub(super) text: String,
+    #[serde(default)]
+    pub(super) group: String,
+    #[serde(default)]
+    pub(super) order: usize,
 }
 pub(super) fn stamp_user(items: &mut [agentkit_core::Item]) -> super::wire::MessageId {
     let id = super::wire::MessageId::new(format!("kit-user-{}", crate::session::new_id()));
@@ -45,6 +50,8 @@ struct Identity {
     parts: HashMap<PartId, String>,
     committed_thoughts: usize,
     sections: Vec<ThoughtSection>,
+    agent_order: Option<usize>,
+    next_order: usize,
 }
 impl Identity {
     fn new() -> Self {
@@ -54,6 +61,8 @@ impl Identity {
             parts: HashMap::new(),
             committed_thoughts: 0,
             sections: Vec::new(),
+            agent_order: None,
+            next_order: 0,
         }
     }
     fn thought(&mut self, index: usize) -> String {
@@ -67,6 +76,9 @@ impl Identity {
         match part {
             Part::Text(text) => {
                 text.metadata.insert(KEY.into(), self.agent.clone().into());
+                if let Some(order) = self.agent_order {
+                    text.metadata.insert(ORDER_KEY.into(), order.into());
+                }
             }
             Part::Reasoning(reasoning) => {
                 if self.sections.is_empty() {
@@ -89,6 +101,8 @@ impl Identity {
                                         [
                                             ("id".into(), section.id.clone().into()),
                                             ("text".into(), section.text.clone().into()),
+                                            ("group".into(), section.group.clone().into()),
+                                            ("order".into(), section.order.into()),
                                         ]
                                         .into_iter()
                                         .collect(),
@@ -176,6 +190,12 @@ impl<T: ModelTurn> ModelTurn for Turn<T> {
                 }
             }
             Some(ModelTurnEvent::Delta(Delta::AppendText { part_id, chunk })) => {
+                if identity.parts.get(part_id) == Some(&identity.agent)
+                    && identity.agent_order.is_none()
+                {
+                    identity.agent_order = Some(identity.next_order);
+                    identity.next_order += 1;
+                }
                 if let Some(id) = identity.parts.get(part_id)
                     && identity.thoughts.contains(id)
                 {
@@ -189,7 +209,10 @@ impl<T: ModelTurn> ModelTurn for Turn<T> {
                         identity.sections.push(ThoughtSection {
                             id: id.clone(),
                             text: chunk.clone(),
+                            group: identity.agent.clone(),
+                            order: identity.next_order,
                         });
+                        identity.next_order += 1;
                     }
                 }
             }
