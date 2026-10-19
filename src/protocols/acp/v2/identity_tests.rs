@@ -114,6 +114,7 @@ async fn cold_restore_preserves_live_user_agent_and_separate_thought_ids() {
                 .observer(observer)
                 .transcript_observer(opened.observer)
                 .build()
+                .unwrap()
                 .start(SessionConfig::new(loop_id).with_response_attempt_supersession())
                 .await
                 .unwrap();
