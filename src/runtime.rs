@@ -16,8 +16,8 @@ use agentkit_core::{
     ToolOutput, ToolResultPart,
 };
 use agentkit_loop::{
-    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
-    SessionConfig,
+    Agent, ContextRecoveryPolicy, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep,
+    PromptCacheRequest, SessionConfig,
 };
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
 use agentkit_tool_compose::{
@@ -1527,6 +1527,12 @@ impl Runtime {
                 SessionStartInputTrigger::Startup
             };
             let mut builder = Agent::builder()
+                .context_recovery(ContextRecoveryPolicy {
+                    max_attempts: 3,
+                    budget: Duration::from_secs(
+                        crate::request_budget::RequestBudget::current().seconds(),
+                    ),
+                })
                 .cancellation(controller.handle())
                 .observer(crate::fatal::RetryLog)
                 .model(HookedAdapter::new(
@@ -1703,6 +1709,12 @@ impl Runtime {
             .with_transient_parent(recorded.clone())
             .with_prompt_cache_key(crate::tools::subagent::prompt_cache_key(&session));
         let builder = Agent::builder()
+            .context_recovery(ContextRecoveryPolicy {
+                max_attempts: 3,
+                budget: Duration::from_secs(
+                    crate::request_budget::RequestBudget::current().seconds(),
+                ),
+            })
             .model(HookedAdapter::new(
                 self.adapter.clone(),
                 self.hooks.clone(),
@@ -1929,6 +1941,12 @@ impl Runtime {
             SessionStartInputTrigger::Startup
         };
         let mut builder = Agent::builder()
+            .context_recovery(ContextRecoveryPolicy {
+                max_attempts: 3,
+                budget: Duration::from_secs(
+                    crate::request_budget::RequestBudget::current().seconds(),
+                ),
+            })
             .model(HookedAdapter::new(
                 adapter.clone(),
                 self.hooks.clone(),

@@ -341,6 +341,12 @@ fn classify(
 )> {
     match error {
         LoopError::Cancelled => None,
+        LoopError::ContextRecoveryDeadlineExceeded => Some((
+            "runtime",
+            "context_recovery_deadline",
+            "context recovery exceeded its request budget".into(),
+            None,
+        )),
         LoopError::ProviderFailure(failure)
             if failure.reason == agentkit_loop::ProviderFailureReason::Cancelled =>
         {
@@ -1226,6 +1232,16 @@ mod tests {
             "provider error: openai-subscription stream transport failed"
         );
         assert!(!rendered.contains("kit-internal-transport"));
+    }
+
+    #[test]
+    fn context_recovery_deadline_has_a_payload_free_classification() {
+        let (kind, code, message, diagnostics) =
+            classify(&LoopError::ContextRecoveryDeadlineExceeded).unwrap();
+        assert_eq!(kind, "runtime");
+        assert_eq!(code, "context_recovery_deadline");
+        assert_eq!(message, "context recovery exceeded its request budget");
+        assert!(diagnostics.is_none());
     }
 
     #[test]

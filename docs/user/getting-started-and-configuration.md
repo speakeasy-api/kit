@@ -454,8 +454,11 @@ in `~/.kit/config.toml`. Accepted values are integer seconds
 from 1 through 3600; omission preserves the 60-second default. Stream idle
 and attempt timeouts remain 30 seconds.
 This applies to the resilient OpenRouter and Speakeasy completions paths, not
-the OpenAI subscription transport. It does not extend an external container
-or task deadline.
+ordinary requests on the OpenAI subscription transport. Background compaction
+preparation and context-length recovery use this budget on all backends, including
+OpenAI subscription. Recovery shares one budget across compaction and replacement
+generation rather than restarting it on each attempt. It does not extend an
+external container or task deadline.
 
 Native Kit ACP children and the TUI server inherit this request budget for new
 and resumed sessions; their local TOML cannot override it.

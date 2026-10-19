@@ -272,6 +272,12 @@ fn render_summary_item(item: &Item) -> Result<String, CompactionError> {
     ))
 }
 
+fn render_protected_summary_item(item: &Item) -> Result<String, CompactionError> {
+    serde_json::to_string(item)
+        .map(|rendered| format!("[{:?}] {rendered}", item.kind))
+        .map_err(|error| CompactionError::Failed(error.to_string()))
+}
+
 fn estimate_item_tokens(item: &Item) -> usize {
     serde_json::to_vec(item)
         .map(|value| value.len().div_ceil(4))
@@ -466,13 +472,6 @@ struct KitCompactionBackend<M> {
 }
 
 fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionError> {
-    let budget = request
-        .metadata
-        .get(SUMMARY_PROMPT_BUDGET_METADATA_KEY)
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(SUMMARY_PROMPT_FALLBACK_BYTES)
-        .min(SUMMARY_PROMPT_MAX_BYTES);
     let previous = request
         .items
         .iter()
@@ -482,15 +481,27 @@ fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionEr
     let mut conversation =
         String::from("Here is the conversation to checkpoint:\n\n<conversation>\n");
     let mut first = true;
-    for item in request
+    let latest_user = request
         .items
         .iter()
-        .filter(|item| !is_compaction_summary(item))
+        .rposition(|item| item.kind == ItemKind::User);
+    for (index, item) in request
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !is_compaction_summary(item))
     {
         if !first {
             conversation.push_str("\n\n");
         }
-        conversation.push_str(&render_summary_item(item)?);
+        let rendered = if Some(index) == latest_user
+            || matches!(item.kind, ItemKind::System | ItemKind::Context)
+        {
+            render_protected_summary_item(item)?
+        } else {
+            render_summary_item(item)?
+        };
+        conversation.push_str(&rendered);
         first = false;
     }
     conversation.push_str("\n</conversation>");
@@ -501,20 +512,74 @@ fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionEr
                 "\n\nHere is the prior checkpoint:\n\n<prior-checkpoint>\n{previous}\n</prior-checkpoint>\n\n{SUMMARY_UPDATE}"
             )
         })
-        .map(|section| {
-            truncate_middle_bytes(
-                &section,
-                budget / 3,
-                "\n[prior checkpoint truncated for compaction budget]\n",
-            )
-        })
         .unwrap_or_default();
-    let conversation = truncate_middle_bytes(
-        &conversation,
-        budget.saturating_sub(previous_section.len()),
-        "\n[older transcript content omitted for compaction budget]\n",
-    );
     Ok(format!("{conversation}{previous_section}"))
+}
+
+/// Only called after a typed provider rejection. Never truncate a checkpoint
+/// or the newest directive; losing either silently is worse than stopping.
+fn smaller_summary_prompt(
+    request: &SummaryRequest,
+    budget: usize,
+) -> Result<String, CompactionError> {
+    let latest_user = request
+        .items
+        .iter()
+        .rposition(|item| item.kind == ItemKind::User);
+    let mut protected = String::new();
+    let mut history = String::new();
+    for (index, item) in request.items.iter().enumerate() {
+        let is_protected = is_compaction_summary(item)
+            || Some(index) == latest_user
+            || matches!(item.kind, ItemKind::System | ItemKind::Context);
+        let rendered = if is_protected {
+            render_protected_summary_item(item)?
+        } else {
+            render_summary_item(item)?
+        };
+        let target = if is_protected {
+            &mut protected
+        } else {
+            &mut history
+        };
+        target.push_str(&rendered);
+        target.push_str("\n\n");
+    }
+    let marker = "\n[intermediate history omitted after provider context rejection]\n";
+    let framing =
+        "Conversation (oldest history first; protected checkpoint and latest directive follow):\n";
+    let remaining = budget
+        .checked_sub(protected.len() + framing.len() + marker.len() + 1)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            CompactionError::Failed(
+                "protected checkpoint and latest directive exceed recovery budget".into(),
+            )
+        })?;
+    let history = if history.len() > remaining {
+        let mut head = remaining * 7 / 8;
+        while !history.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = history.len() - remaining / 8;
+        while !history.is_char_boundary(tail) {
+            tail += 1;
+        }
+        format!("{}{}{}", &history[..head], marker, &history[tail..])
+    } else {
+        history
+    };
+    Ok(format!("{framing}{history}\n{protected}"))
+}
+
+fn recovery_attempt(reason: &CompactionReason) -> u32 {
+    match reason {
+        CompactionReason::Custom(reason) => reason
+            .strip_prefix("context-length-rejected:")
+            .and_then(|attempt| attempt.parse().ok())
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 #[async_trait]
@@ -569,51 +634,119 @@ where
                 None => {}
             }
         }
-        let prompt = build_summary_prompt(&request)?;
-        let mut builder = Agent::builder()
-            .model(self.adapter.clone())
-            .input(vec![
-                Item::text(ItemKind::System, instructions),
-                Item::text(ItemKind::User, prompt),
-            ])
-            .telemetry(self.telemetry);
-        if let Some(cancellation) = &cancellation {
-            builder = builder.cancellation(cancellation.handle().clone());
+        let recovery = recovery_attempt(&request.reason);
+        if recovery > 0 {
+            let budget = 8_000usize >> recovery.min(4);
+            instructions.push_str(&format!("\nKeep the checkpoint within {budget} bytes; preserve directives and unresolved work first."));
         }
-        let mut driver = builder
-            .build()
-            .map_err(|error| CompactionError::Failed(error.to_string()))?
-            .start(SessionConfig::new(self.session_id.clone()).without_cache())
-            .await
-            .map_err(|error| CompactionError::Failed(error.to_string()))?;
+        let mut prompt = build_summary_prompt(&request)?;
+        // One original proposal, then at most three geometrically smaller
+        // requests. The enclosing recovery pass supplies its absolute deadline.
+        let mut deadline = None;
+        let mut attempt = 0;
         let summary = loop {
-            match driver.next().await {
-                Ok(LoopStep::Finished(result)) => {
-                    if result.finish_reason == FinishReason::Cancelled {
-                        return Err(CompactionError::Cancelled);
+            // Each summary Agent creates a fresh cancellation checkpoint. Do
+            // not let a new generation hide cancellation between attempts.
+            if cancellation
+                .as_ref()
+                .is_some_and(|value| value.is_cancelled())
+            {
+                return Err(CompactionError::Cancelled);
+            }
+            let proposed = prompt.clone();
+            let run = async {
+                let mut builder = Agent::builder()
+                    .model(self.adapter.clone())
+                    .input(vec![
+                        Item::text(ItemKind::System, instructions.clone()),
+                        Item::text(ItemKind::User, proposed),
+                    ])
+                    .telemetry(self.telemetry);
+                if let Some(cancellation) = &cancellation {
+                    builder = builder.cancellation(cancellation.handle().clone());
+                }
+                let mut driver = builder
+                    .build()?
+                    .start(SessionConfig::new(self.session_id.clone()).without_cache())
+                    .await?;
+                loop {
+                    match driver.next().await? {
+                        LoopStep::Finished(result) => {
+                            if result.finish_reason == FinishReason::Cancelled {
+                                return Err(LoopError::Cancelled);
+                            }
+                            return Ok(result
+                                .items
+                                .iter()
+                                .flat_map(|item| &item.parts)
+                                .filter_map(|part| match part {
+                                    Part::Text(text) => Some(text.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""));
+                        }
+                        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+                        LoopStep::Interrupt(_) => {
+                            return Err(LoopError::Mutator(
+                                "compaction agent unexpectedly interrupted".into(),
+                            ));
+                        }
                     }
-                    break result
-                        .items
-                        .iter()
-                        .flat_map(|item| &item.parts)
-                        .filter_map(|part| match part {
-                            Part::Text(text) => Some(text.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
                 }
-                Ok(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))) => continue,
-                Ok(LoopStep::Interrupt(_)) => {
-                    return Err(CompactionError::Failed(
-                        "compaction agent unexpectedly interrupted".into(),
-                    ));
-                }
+            };
+            let outcome = if let Some(deadline) = deadline {
+                tokio::time::timeout_at(deadline, run).await.map_err(|_| {
+                    CompactionError::Failed("compaction recovery deadline exceeded".into())
+                })?
+            } else {
+                run.await
+            };
+            match outcome {
+                Ok(summary) => break summary,
                 Err(LoopError::Cancelled) => return Err(CompactionError::Cancelled),
+                Err(error) if error.is_context_length_exceeded() && attempt < 3 => {
+                    deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(
+                                crate::request_budget::RequestBudget::current().seconds(),
+                            )
+                    });
+                    attempt += 1;
+                    let smaller = smaller_summary_prompt(&request, prompt.len() / 2)?;
+                    if smaller.len() >= prompt.len() {
+                        return Err(CompactionError::Failed(
+                            "compaction recovery made no progress".into(),
+                        ));
+                    }
+                    prompt = smaller;
+                }
                 Err(error) => return Err(CompactionError::Failed(error.to_string())),
             }
         };
-        self.installed(&request, summary, false).await
+        if cancellation
+            .as_ref()
+            .is_some_and(|value| value.is_cancelled())
+        {
+            return Err(CompactionError::Cancelled);
+        }
+        let installed = self.installed(&request, summary, false);
+        let result = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, installed)
+                .await
+                .map_err(|_| {
+                    CompactionError::Failed("compaction recovery deadline exceeded".into())
+                })?
+        } else {
+            installed.await
+        };
+        if cancellation
+            .as_ref()
+            .is_some_and(|value| value.is_cancelled())
+        {
+            return Err(CompactionError::Cancelled);
+        }
+        result
     }
 }
 
@@ -709,8 +842,27 @@ impl CompactionStrategy for SummarizeForContinuation {
             .map(|(_, item)| item.clone())
             .collect::<Vec<_>>();
         compact_conversation_tool_outputs(&mut conversation);
-        let recent_tokens = recent_token_budget(&request.transcript, self.recent_tokens);
-        let split = recent_start(&conversation, recent_tokens);
+        let divisor = 1usize << recovery_attempt(&request.reason).min(16);
+        let recent_tokens = recent_token_budget(&request.transcript, self.recent_tokens) / divisor;
+        let mut split = recent_start(&conversation, recent_tokens);
+        let latest_user = conversation
+            .iter()
+            .rposition(|item| item.kind == ItemKind::User);
+        if let Some(index) = latest_user.filter(|index| {
+            conversation[*index]
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::ToolCall(_) | Part::ToolResult(_)))
+        }) {
+            split = split.min(index);
+            let safe = tool_safe_boundaries(&conversation);
+            while split > 0 && !safe[split] {
+                split -= 1;
+            }
+        }
+        let retained_directive = latest_user
+            .filter(|index| recovery_attempt(&request.reason) > 0 && *index < split)
+            .map(|index| conversation[index].clone());
         let (head, recent) = conversation.split_at(split);
 
         if head.is_empty() {
@@ -761,6 +913,7 @@ impl CompactionStrategy for SummarizeForContinuation {
 
         let mut replacement = bootstrap;
         replacement.extend(summary.items);
+        replacement.extend(retained_directive);
         replacement.extend_from_slice(recent);
         if let Some((marker, part_index, next)) = manual.filter(|(_, _, next)| !next.is_empty()) {
             replacement.push(user_message_from_marker(marker.clone(), part_index, &next)?);
@@ -817,6 +970,25 @@ impl LoopMutator for AutomaticCompactor {
         cursor: &mut TranscriptCursor<'_>,
         ctx: LoopCtx<'_>,
     ) -> Result<(), LoopError> {
+        if let Some(recovery) = ctx.recovery {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(recovery.deadline),
+                self.mutate_inner(cursor, ctx),
+            )
+            .await
+            .map_err(|_| LoopError::ContextRecoveryDeadlineExceeded)?
+        } else {
+            self.mutate_inner(cursor, ctx).await
+        }
+    }
+}
+
+impl AutomaticCompactor {
+    async fn mutate_inner(
+        &self,
+        cursor: &mut TranscriptCursor<'_>,
+        ctx: LoopCtx<'_>,
+    ) -> Result<(), LoopError> {
         // Cancellation can race the loop's pre-mutator check. Avoid starting
         // preparation or emitting a compaction lifecycle after that race.
         if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
@@ -825,7 +997,13 @@ impl LoopMutator for AutomaticCompactor {
             }
             return Err(LoopError::Cancelled);
         }
-        let Some(reason) = self.inner.should_compact(cursor.as_slice(), ctx.point) else {
+        let reason = ctx
+            .recovery
+            .map(|recovery| {
+                CompactionReason::Custom(format!("context-length-rejected:{}", recovery.attempt))
+            })
+            .or_else(|| self.inner.should_compact(cursor.as_slice(), ctx.point));
+        let Some(reason) = reason else {
             if let Some(preparation) = &self.preparation {
                 preparation.arm(cursor.as_slice(), &self.policy, ctx.cancellation.clone());
             }
@@ -871,6 +1049,19 @@ impl LoopMutator for AutomaticCompactor {
         } else {
             None
         };
+        let prepared = prepared.filter(|prepared| {
+            ctx.recovery.is_none()
+                || cursor
+                    .as_slice()
+                    .iter()
+                    .rev()
+                    .find(|item| item.kind == ItemKind::User)
+                    .is_none_or(|directive| {
+                        prepared.iter().any(|item| {
+                            item.parts == directive.parts && item.kind == ItemKind::User
+                        })
+                    })
+        });
         let preparation_wait_millis =
             u64::try_from(preparation_wait_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let used_prepared = prepared.is_some();
@@ -899,6 +1090,10 @@ impl LoopMutator for AutomaticCompactor {
 
         match result {
             Ok(compacted) => {
+                if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    finish(false, false);
+                    return Err(LoopError::Cancelled);
+                }
                 if compacted == **cursor {
                     ctx.emitter.emit(AgentEvent::MutationFinished {
                         session_id: ctx.session_id.clone(),
@@ -923,14 +1118,17 @@ impl LoopMutator for AutomaticCompactor {
                     finish(false, false);
                     return Err(LoopError::Mutator(error));
                 }
-                if let Some(persistence) = &self.persistence
+                if ctx.recovery.is_none()
+                    && let Some(persistence) = &self.persistence
                     && let Err(error) = persistence.replace(&compacted)
                 {
                     // Storage, poison, and lost ownership stop persistence,
                     // never the already-computed in-memory compaction.
                     metadata.insert("persistence_error".into(), error.into());
                 }
-                if let Some(mirror) = &self.mirror {
+                if ctx.recovery.is_none()
+                    && let Some(mirror) = &self.mirror
+                {
                     mirror.replace(&compacted);
                 }
                 metadata.insert(
@@ -1062,6 +1260,328 @@ mod tests {
         ) -> Result<Option<agentkit_loop::ModelTurnEvent>, LoopError> {
             Err(LoopError::Provider("unexpected model turn".into()))
         }
+    }
+
+    #[derive(Clone)]
+    struct RejectingSummary {
+        requests: std::sync::mpsc::Sender<String>,
+        context_error: bool,
+        accept_below: usize,
+    }
+
+    struct SummaryTurn(Option<agentkit_loop::ModelTurnEvent>);
+
+    #[async_trait]
+    impl ModelAdapter for RejectingSummary {
+        type Session = Self;
+        async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+            Ok(self.clone())
+        }
+    }
+
+    #[async_trait]
+    impl agentkit_loop::ModelSession for RejectingSummary {
+        type Turn = SummaryTurn;
+        async fn begin_turn(
+            &mut self,
+            request: agentkit_loop::TurnRequest,
+            _: Option<agentkit_core::TurnCancellation>,
+        ) -> Result<SummaryTurn, LoopError> {
+            let prompt = request
+                .transcript
+                .iter()
+                .filter(|item| item.kind == ItemKind::User)
+                .filter_map(item_text)
+                .collect::<Vec<_>>()
+                .join("");
+            self.requests.send(prompt.clone()).unwrap();
+            if prompt.len() <= self.accept_below {
+                return Ok(SummaryTurn(Some(agentkit_loop::ModelTurnEvent::Finished(
+                    agentkit_loop::ModelTurnResult {
+                        finish_reason: FinishReason::Completed,
+                        output_items: vec![Item::text(ItemKind::Assistant, "checkpoint")],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                        model: None,
+                        response_id: None,
+                    },
+                ))));
+            }
+            if !self.context_error {
+                return Err(LoopError::Provider("not a context rejection".into()));
+            }
+            Err(LoopError::ProviderFailure(Box::new(
+                agentkit_loop::ProviderFailure {
+                    route: agentkit_loop::ProviderRoute::Unknown,
+                    reason: agentkit_loop::ProviderFailureReason::InvalidRequest,
+                    last_attempt_reason: None,
+                    upstream: agentkit_loop::ProviderClassification {
+                        code: agentkit_loop::UpstreamErrorKind::ContextLengthExceeded,
+                        ..Default::default()
+                    },
+                    accounting: agentkit_loop::RetryAccounting::default(),
+                },
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl agentkit_loop::ModelTurn for SummaryTurn {
+        async fn next_event(
+            &mut self,
+            _: Option<agentkit_core::TurnCancellation>,
+        ) -> Result<Option<agentkit_loop::ModelTurnEvent>, LoopError> {
+            Ok(self.0.take())
+        }
+    }
+
+    fn recovery_summary_request() -> SummaryRequest {
+        SummaryRequest::new(
+            vec![
+                Item::text(
+                    ItemKind::Assistant,
+                    format!("{}{}", "H".repeat(12_000), "T".repeat(12_000)),
+                ),
+                Item::text(ItemKind::User, "protected latest directive"),
+            ],
+            CompactionReason::TranscriptTooLong,
+        )
+    }
+
+    fn rejecting_backend(
+        context_error: bool,
+        accept_below: usize,
+    ) -> (
+        KitCompactionBackend<RejectingSummary>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        (
+            KitCompactionBackend {
+                adapter: RejectingSummary {
+                    requests,
+                    context_error,
+                    accept_below,
+                },
+                telemetry: TelemetryConfig::default(),
+                session_id: "summary-recovery".into(),
+                owner_session_id: "summary-recovery".into(),
+                hooks: None,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn summary_retries_only_after_typed_rejection_and_favors_head() {
+        let (backend, requests) = rejecting_backend(true, 10_000);
+        let request = recovery_summary_request();
+        let original = build_summary_prompt(&request).unwrap();
+        let result = backend.summarize(request, None).await.unwrap();
+        assert_eq!(item_text(&result.items[0]), Some("checkpoint"));
+        let sent = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], original);
+        assert!(sent[1].len() <= sent[0].len() / 2);
+        assert!(sent[1].contains("protected latest directive"));
+        assert!(sent[1].contains("omitted after provider context rejection"));
+        assert!(sent[1].matches('H').count() > sent[1].matches('T').count() * 4);
+    }
+
+    #[tokio::test]
+    async fn summary_does_not_retry_other_errors_and_bounds_context_retries() {
+        for (typed, expected) in [(false, 1), (true, 4)] {
+            let (backend, requests) = rejecting_backend(typed, 0);
+            assert!(
+                backend
+                    .summarize(recovery_summary_request(), None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(requests.try_iter().count(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_summary_is_not_preemptively_shrunk() {
+        let (backend, requests) = rejecting_backend(true, usize::MAX);
+        let request = recovery_summary_request();
+        let original = build_summary_prompt(&request).unwrap();
+        backend.summarize(request, None).await.unwrap();
+        assert_eq!(requests.try_iter().collect::<Vec<_>>(), [original]);
+    }
+
+    /// External model boundary that rejects the first proposal and leaves a
+    /// reduced request in flight until the owning deadline drops it.
+    #[derive(Clone)]
+    struct StalledSummary {
+        inner: RejectingSummary,
+        cancel_on_rejection: Option<Arc<agentkit_core::CancellationController>>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for StalledSummary {
+        type Session = Self;
+        async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+            Ok(self.clone())
+        }
+    }
+
+    #[async_trait]
+    impl agentkit_loop::ModelSession for StalledSummary {
+        type Turn = SummaryTurn;
+        async fn begin_turn(
+            &mut self,
+            request: agentkit_loop::TurnRequest,
+            cancellation: Option<agentkit_core::TurnCancellation>,
+        ) -> Result<SummaryTurn, LoopError> {
+            let reduced = request.transcript.iter().filter_map(item_text).any(|text| {
+                text.contains("intermediate history omitted after provider context rejection")
+            });
+            if reduced {
+                self.inner
+                    .requests
+                    .send("reduced request in flight".into())
+                    .unwrap();
+                return std::future::pending().await;
+            }
+            let result =
+                agentkit_loop::ModelSession::begin_turn(&mut self.inner, request, cancellation)
+                    .await;
+            if let Some(controller) = &self.cancel_on_rejection {
+                controller.interrupt();
+            }
+            result
+        }
+    }
+
+    fn stalled_backend(
+        cancel: Option<Arc<agentkit_core::CancellationController>>,
+    ) -> (
+        KitCompactionBackend<StalledSummary>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (backend, requests) = rejecting_backend(true, 0);
+        (
+            KitCompactionBackend {
+                adapter: StalledSummary {
+                    inner: backend.adapter,
+                    cancel_on_rejection: cancel,
+                },
+                telemetry: backend.telemetry,
+                session_id: backend.session_id,
+                owner_session_id: backend.owner_session_id,
+                hooks: None,
+            },
+            requests,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_retry_exhausts_one_shared_deadline_without_installing() {
+        use crate::ahp::test_support::{hooks, intercept};
+        let (mut backend, requests) = stalled_backend(None);
+        let (hooks, hook_backend) = hooks(vec![intercept(&[
+            "context.compact.before",
+            "context.compact.after",
+        ])]);
+        backend.hooks = Some(hooks);
+        let result = backend.summarize(recovery_summary_request(), None).await;
+        assert!(matches!(result, Err(CompactionError::Failed(message))
+            if message == "compaction recovery deadline exceeded"));
+        assert_eq!(requests.try_iter().count(), 2);
+        assert_eq!(hook_backend.events("context.compact.before").len(), 1);
+        assert!(hook_backend.events("context.compact.after").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_between_summary_attempts_stops_before_another_send() {
+        use crate::ahp::test_support::{hooks, intercept};
+        let controller = Arc::new(agentkit_core::CancellationController::new());
+        let cancellation = controller.handle().checkpoint();
+        let (mut backend, requests) = stalled_backend(Some(controller));
+        let (hooks, hook_backend) = hooks(vec![intercept(&[
+            "context.compact.before",
+            "context.compact.after",
+        ])]);
+        backend.hooks = Some(hooks);
+        let result = backend
+            .summarize(recovery_summary_request(), Some(cancellation))
+            .await;
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
+        assert_eq!(requests.try_iter().count(), 1);
+        assert_eq!(hook_backend.events("context.compact.before").len(), 1);
+        assert!(hook_backend.events("context.compact.after").is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_hooks_run_once_across_typed_context_retries() {
+        use crate::ahp::test_support::{hooks, intercept};
+        let (mut backend, requests) = rejecting_backend(true, 5_000);
+        let (hooks, hook_backend) = hooks(vec![intercept(&[
+            "context.compact.before",
+            "context.compact.after",
+        ])]);
+        backend.hooks = Some(hooks);
+        let result = backend
+            .summarize(recovery_summary_request(), None)
+            .await
+            .unwrap();
+        assert_eq!(item_text(&result.items[0]), Some("checkpoint"));
+        assert_eq!(requests.try_iter().count(), 3);
+        assert_eq!(hook_backend.events("context.compact.before").len(), 1);
+        assert_eq!(hook_backend.events("context.compact.after").len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outer_recovery_deadline_wins_over_summary_retry_budget() {
+        let (summary_backend, summary_requests) = stalled_backend(None);
+        let compactor = AutomaticCompactor {
+            inner: StrategyCompactor::new(
+                |_: &[Item], _| None,
+                CompactionPipeline::new().with_strategy(test_strategy()),
+            )
+            .with_backend(summary_backend),
+            persistence: None,
+            mirror: None,
+            policy: CompactionConfig::default(),
+            preparation: None,
+        };
+        let history = recovery_summary_request().items;
+        let (main_backend, _main_requests) = rejecting_backend(true, 0);
+        let outer_budget = std::time::Duration::from_millis(100);
+        let mut driver = Agent::builder()
+            .model(main_backend.adapter)
+            .transcript(history.clone())
+            .input(vec![Item::text(ItemKind::User, "current request")])
+            .context_recovery(agentkit_loop::ContextRecoveryPolicy {
+                max_attempts: 3,
+                budget: outer_budget,
+            })
+            .mutator(compactor)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("outer-summary-deadline"))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            driver.next().await,
+            Err(LoopError::ContextRecoveryDeadlineExceeded)
+        ));
+        // Virtual time proves that the earlier enclosing deadline, not the
+        // standalone RequestBudget timer, ended the in-flight reduced request.
+        assert!(
+            started.elapsed()
+                < std::time::Duration::from_secs(
+                    crate::request_budget::RequestBudget::current().seconds()
+                )
+        );
+        assert_eq!(summary_requests.try_iter().count(), 2);
+        let snapshot = driver.snapshot().transcript;
+        assert_eq!(&snapshot[..history.len()], &history);
+        assert_eq!(item_text(snapshot.last().unwrap()), Some("current request"));
+        assert!(!snapshot.iter().any(is_compaction_summary));
     }
 
     #[tokio::test]
@@ -1551,7 +2071,160 @@ mod tests {
         assert_eq!(result.call_id.to_string(), "call-1");
     }
 
+    struct RejectStagedRecovery;
+
+    #[async_trait]
+    impl LoopMutator for RejectStagedRecovery {
+        async fn mutate(
+            &self,
+            cursor: &mut TranscriptCursor<'_>,
+            ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            if ctx.point != MutationPoint::ContextLengthRejected {
+                return Ok(());
+            }
+            assert!(cursor.iter().any(is_compaction_summary));
+            assert!(
+                cursor
+                    .iter()
+                    .any(|item| item_text(item) == Some("current request"))
+            );
+            assert!(cursor.iter().any(|item| {
+                item.parts
+                    .iter()
+                    .any(|part| matches!(part, Part::ToolCall(_)))
+            }));
+            assert!(cursor.iter().any(|item| {
+                item.parts
+                    .iter()
+                    .any(|part| matches!(part, Part::ToolResult(_)))
+            }));
+            Err(LoopError::Mutator("reject staged recovery".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_recovery_stages_without_changing_canonical_or_mirror_on_failure() {
+        let history = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::User, "old request"),
+            Item::text(ItemKind::Assistant, "old answer"),
+        ];
+        let mut input = vec![
+            Item::text(ItemKind::User, "current request"),
+            Item::new(
+                ItemKind::Assistant,
+                vec![Part::ToolCall(ToolCallPart::new(
+                    "call",
+                    "shell",
+                    json!({}),
+                ))],
+            ),
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "call",
+                    ToolOutput::text("result"),
+                ))],
+            ),
+        ];
+        // Input timestamps are normally assigned by the loop before mutation.
+        // Fix them in the fixture so exact equality also proves rollback kept
+        // every field of the original user request and tool pair.
+        for item in &mut input {
+            item.created_at = Some(Timestamp(123));
+        }
+        let original = history.iter().chain(&input).cloned().collect::<Vec<_>>();
+        let mirror = crate::session::TransientTranscript::new(original.clone());
+        let compactor = AutomaticCompactor {
+            inner: StrategyCompactor::new(
+                |_: &[Item], _| None,
+                CompactionPipeline::new().with_strategy(test_strategy()),
+            )
+            .with_backend(FixedBackend),
+            persistence: None,
+            mirror: Some(mirror.clone()),
+            policy: CompactionConfig::default(),
+            preparation: None,
+        };
+        let (backend, _requests) = rejecting_backend(true, 0);
+        let mut driver = Agent::builder()
+            .model(backend.adapter)
+            .transcript(history)
+            .input(input)
+            .context_recovery(agentkit_loop::ContextRecoveryPolicy {
+                max_attempts: 3,
+                budget: std::time::Duration::from_secs(30),
+            })
+            .mutator(compactor)
+            .mutator(RejectStagedRecovery)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("staged-compaction"))
+            .await
+            .unwrap();
+        assert!(matches!(driver.next().await,
+            Err(LoopError::Mutator(message)) if message == "reject staged recovery"));
+        assert_eq!(driver.snapshot().transcript, original);
+        assert_eq!(mirror.snapshot(), original);
+    }
+
     struct PriorBackend;
+
+    #[tokio::test]
+    async fn recovery_preserves_current_directive_and_complete_recent_tool_pair() {
+        let transcript = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::User, "current request"),
+            Item::text(ItemKind::Developer, "previous summary"),
+            Item::new(
+                ItemKind::Assistant,
+                vec![Part::ToolCall(ToolCallPart::new(
+                    "call-1",
+                    "shell",
+                    json!({"command": "test"}),
+                ))],
+            ),
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "call-1",
+                    ToolOutput::text("tool result"),
+                ))],
+            ),
+        ];
+        let backend = FixedBackend;
+        let mut context = CompactionContext::new().with_backend(&backend);
+        let result = test_strategy()
+            .apply(
+                CompactionRequest::new(
+                    transcript,
+                    CompactionReason::Custom("context-length-rejected:3".into()),
+                ),
+                &mut context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .transcript
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            [
+                ItemKind::System,
+                ItemKind::Developer,
+                ItemKind::User,
+                ItemKind::Assistant,
+                ItemKind::Tool,
+            ]
+        );
+        let Part::ToolResult(result) = &result.transcript.last().unwrap().parts[0] else {
+            panic!("latest tool result should remain structured");
+        };
+        assert_eq!(result.call_id.to_string(), "call-1");
+    }
 
     #[async_trait]
     impl CompactionBackend for PriorBackend {
@@ -1954,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_prompt_is_hard_bounded() {
+    fn summary_prompt_first_sends_protected_content_without_preflight_truncation() {
         let mut metadata = MetadataMap::new();
         metadata.insert(SUMMARY_PROMPT_BUDGET_METADATA_KEY.into(), json!(4_000));
         let mut previous = Item::text(ItemKind::Developer, "prior checkpoint ".repeat(10_000));
@@ -1974,11 +2647,12 @@ mod tests {
 
         let prompt = build_summary_prompt(&request).unwrap();
 
-        assert!(prompt.len() <= 4_000);
+        assert!(prompt.len() > 4_000);
         assert!(prompt.contains("first objective"));
         assert!(prompt.contains("latest state"));
         assert!(prompt.contains("prior checkpoint"));
-        assert!(prompt.contains("omitted for compaction budget"));
+        assert!(prompt.contains(&"prior checkpoint ".repeat(10_000)));
+        assert!(smaller_summary_prompt(&request, 4_000).is_err());
     }
 
     #[test]
