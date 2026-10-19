@@ -766,11 +766,16 @@ impl Runtime {
                 .hooks
                 .as_ref()
                 .is_some_and(|hooks| hooks.intercepts_compaction());
+        let compactor_session = if persistence.is_some() {
+            format!("compaction-{}", crate::session::new_id())
+        } else {
+            format!("compaction-{owner_session}")
+        };
         let compactor = crate::compaction::automatic_with_policy(
             adapter.clone(),
             self.agentkit_telemetry(),
             persistence,
-            format!("compaction-{}", crate::session::new_id()),
+            compactor_session,
             owner_session.clone(),
             self.hooks.clone(),
             self.compaction,

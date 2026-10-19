@@ -817,6 +817,8 @@ impl LoopMutator for AutomaticCompactor {
         cursor: &mut TranscriptCursor<'_>,
         ctx: LoopCtx<'_>,
     ) -> Result<(), LoopError> {
+        // Cancellation can race the loop's pre-mutator check. Avoid starting
+        // preparation or emitting a compaction lifecycle after that race.
         if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
             if let Some(preparation) = &self.preparation {
                 preparation.cancel(false);
@@ -863,7 +865,7 @@ impl LoopMutator for AutomaticCompactor {
                 None
             } else {
                 preparation
-                    .take(cursor.as_slice(), &self.policy, ctx.cancellation.clone())
+                    .take(cursor.as_slice(), ctx.cancellation.clone())
                     .await
             }
         } else {
@@ -999,10 +1001,9 @@ fn context_window(transcript: &[Item]) -> Option<u64> {
 }
 
 fn configured_reason(transcript: &[Item], policy: &CompactionConfig) -> Option<CompactionReason> {
-    // Unknown attachment footprints cannot be treated as an infinite measured
-    // occupancy. Keep the provider baseline until fresh usage is available;
-    // this is a trigger estimate, not a strict context-cap guarantee.
-    let used = background::occupancy(transcript).or_else(|| latest_context_tokens(transcript))?;
+    // The configured headroom accommodates growth between provider reports.
+    // Local serialization sizes are not token usage and must not move the trigger.
+    let used = latest_context_tokens(transcript)?;
     let window = context_window(transcript)?;
     let threshold = policy.resolve(window).apply_tokens;
     if used < threshold {
@@ -2048,12 +2049,31 @@ mod tests {
     }
 
     #[test]
-    fn post_usage_tail_can_cross_configured_apply_threshold() {
-        let transcript = [
-            measured(100_000, Some(200_000)),
-            Item::text(ItemKind::User, "x".repeat(70_000)),
+    fn large_unreported_tail_does_not_move_the_configured_threshold() {
+        let policy = CompactionConfig {
+            threshold_percent: 55,
+            max_context_tokens: Some(200_000),
+            ..CompactionConfig::default()
+        };
+        let mut transcript = vec![
+            measured(60_000, Some(200_000)),
+            Item::text(ItemKind::User, "x".repeat(120_000)),
         ];
-        assert!(configured_reason(&transcript, &CompactionConfig::default()).is_some());
+        assert!(configured_reason(&transcript, &policy).is_none());
+        transcript.push(Item::new(
+            ItemKind::User,
+            vec![
+                Part::text("y".repeat(300_000)),
+                Part::media(
+                    agentkit_core::Modality::Image,
+                    "image/png",
+                    DataRef::Uri("https://x/i".into()),
+                ),
+            ],
+        ));
+        assert!(configured_reason(&transcript, &policy).is_none());
+        transcript.push(measured(110_000, Some(200_000)));
+        assert!(configured_reason(&transcript, &policy).is_some());
     }
 
     #[test]

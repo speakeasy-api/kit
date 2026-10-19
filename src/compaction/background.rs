@@ -1,9 +1,16 @@
 //! Speculation owns only snapshots and a cancellable task, never live transcripts.
 use super::{context_window, latest_context_tokens, policy::CompactionConfig};
 use agentkit_compaction::{CompactionError, CompactionReason, Compactor, StrategyCompactor};
-use agentkit_core::{Item, Part, ToolOutput, TurnCancellation};
+use agentkit_core::{Item, Part, TurnCancellation};
 use futures_util::future::{Either, select};
-use std::{pin::pin, sync::Mutex};
+use std::{
+    pin::pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::task::JoinHandle;
 
 type Factory = dyn Fn() -> Result<(StrategyCompactor, u64), String> + Send + Sync;
@@ -15,14 +22,26 @@ pub(super) struct Preparation {
     state: Mutex<State>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Checkpoint {
+    usage_position: usize,
+    used: u64,
+    window: u64,
+    generation: Option<u64>,
+    revision: u64,
+}
+
 #[derive(Default)]
 struct State {
-    // All writers are arm, take, and cancel. One attempt is reserved before
-    // invoking external code; failures/panics leave it spent until foreground
-    // compaction succeeds. Tickets only coordinate task ownership, never content.
-    attempted: bool,
+    // Writers: arm reserves/publishes, take transfers ownership, cancel invalidates.
+    // Reservations survive callback failure/unwind. A distinct usage checkpoint,
+    // cancellation generation, or selection revision can reserve the second (last)
+    // attempt; only successful foreground compaction resets the cycle.
+    // All guarded fields are scalars except task, which is always moved out before
+    // drop. Task/Preparation destruction and unwinding abort without a held guard.
+    attempts: u8,
+    checkpoint: Option<Checkpoint>,
     ticket: u64,
-    revision: Option<u64>,
     task: Option<Task>,
 }
 
@@ -30,6 +49,12 @@ struct Task {
     snapshot: Vec<Item>,
     revision: u64,
     cancellation: Option<TurnCancellation>,
+    deadline: tokio::time::Instant,
+    // Completion outcome only; not a second ownership registry. The worker is
+    // the sole writer and publishes success before returning. Readers use it
+    // only after handle.is_finished(); panic/abort leave the default false.
+    // No destructor or unwind path acquires the registry lock.
+    succeeded: Arc<AtomicBool>,
     handle: JoinHandle<Result<Vec<Item>, CompactionError>>,
 }
 
@@ -54,7 +79,10 @@ impl Preparation {
     pub(super) fn cancel(&self, reset: bool) {
         let task = if let Ok(mut state) = self.state.lock() {
             state.ticket = state.ticket.wrapping_add(1);
-            state.attempted = !reset;
+            if reset {
+                state.attempts = 0;
+                state.checkpoint = None;
+            }
             state.task.take()
         } else {
             None
@@ -70,32 +98,65 @@ impl Preparation {
         policy: &CompactionConfig,
         cancellation: Option<TurnCancellation>,
     ) {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(crate::request_budget::RequestBudget::current().seconds());
         let Ok(revision) = (self.revision)() else {
             self.cancel(false);
             return;
+        };
+        // Provider measurements alone determine eligibility; resolve policy and
+        // inspect the immutable transcript before taking the registry lock.
+        let Some(used) = latest_context_tokens(live) else {
+            return;
+        };
+        let Some(window) = context_window(live) else {
+            return;
+        };
+        let thresholds = policy.resolve(window);
+        let eligible = used >= thresholds.prepare_tokens
+            && used < thresholds.apply_tokens
+            && !cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled);
+        let checkpoint = Checkpoint {
+            usage_position: live
+                .iter()
+                .rposition(|item| item.usage.is_some())
+                .unwrap_or(0),
+            used,
+            window,
+            generation: cancellation.as_ref().map(TurnCancellation::generation),
+            revision,
         };
         let (ticket, old_task, eligible) = {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
-            let changed = state.revision.is_some_and(|previous| previous != revision);
-            state.revision = Some(revision);
-            if changed {
-                // Usage may still describe the previous selection. Do not arm
-                // again in this cycle; the normal foreground path is authoritative.
-                state.attempted = true;
+            let invalid = state.task.as_ref().is_some_and(|task| {
+                task.revision != revision
+                    // New provider usage permits one retry of a completed
+                    // failure, never replacement of a paid successful summary.
+                    || (eligible
+                        && state.attempts < 2
+                        && task.handle.is_finished()
+                        && !task.succeeded.load(Ordering::Acquire)
+                        && state.checkpoint != Some(checkpoint))
+                    || task
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(TurnCancellation::is_cancelled)
+            });
+            let old_task = if invalid { state.task.take() } else { None };
+            let eligible = eligible
+                && state.task.is_none()
+                && state.attempts < 2
+                && state.checkpoint != Some(checkpoint);
+            if invalid || eligible {
                 state.ticket = state.ticket.wrapping_add(1);
             }
-            let old_task = if changed { state.task.take() } else { None };
-            let eligible = !state.attempted
-                && context_window(live).is_some_and(|window| {
-                    let thresholds = policy.resolve(window);
-                    occupancy(live).is_some_and(|used| {
-                        used >= thresholds.prepare_tokens && used < thresholds.apply_tokens
-                    })
-                });
             if eligible {
-                state.attempted = true;
+                state.attempts += 1;
+                state.checkpoint = Some(checkpoint);
             }
             (state.ticket, old_task, eligible)
         };
@@ -112,6 +173,8 @@ impl Preparation {
         let snapshot = live.to_vec();
         let input = snapshot.clone();
         let arm_cancellation = cancellation.clone();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let completion = succeeded.clone();
         let handle = tokio::spawn(async move {
             let cancelled = async {
                 if let Some(cancellation) = &cancellation {
@@ -126,20 +189,31 @@ impl Preparation {
                 cancellation.clone(),
             );
             // Poll cancellation first when both futures are ready.
-            match select(pin!(cancelled), pin!(compact)).await {
+            let compact = tokio::time::timeout_at(deadline, compact);
+            let result = match select(pin!(cancelled), pin!(compact)).await {
                 Either::Left(_) => Err(CompactionError::Cancelled),
-                Either::Right((result, _)) => result,
-            }
+                Either::Right((result, _)) => result.unwrap_or_else(|_| {
+                    Err(CompactionError::Failed(
+                        "preparation request budget expired".into(),
+                    ))
+                }),
+            };
+            completion.store(
+                result.as_ref().is_ok_and(|items| !items.is_empty()),
+                Ordering::Release,
+            );
+            result
         });
         let mut task = Some(Task {
             snapshot,
             revision,
             cancellation: arm_cancellation,
+            deadline,
+            succeeded,
             handle,
         });
         if let Ok(mut state) = self.state.lock()
             && state.ticket == ticket
-            && state.attempted
             && state.task.is_none()
         {
             state.task = task.take();
@@ -150,7 +224,6 @@ impl Preparation {
     pub(super) async fn take(
         &self,
         live: &[Item],
-        policy: &CompactionConfig,
         cancellation: Option<TurnCancellation>,
     ) -> Option<Vec<Item>> {
         let task = {
@@ -159,7 +232,10 @@ impl Preparation {
             state.task.take()
         };
         let mut task = task?;
-        if task.cancellation.as_ref().is_some_and(|c| c.is_cancelled())
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+            || task.cancellation.as_ref().is_some_and(|c| c.is_cancelled())
             || (self.revision)().ok()? != task.revision
         {
             return None;
@@ -174,74 +250,32 @@ impl Preparation {
                 std::future::pending::<()>().await;
             }
         };
-        let compacted = match select(pin!(cancelled), &mut task.handle).await {
+        // The whole preparation shares one request budget measured from arm,
+        // including multi-step/subscription pipelines. Taking never extends it.
+        // Timeout polls the handle first: an already completed result remains
+        // reusable after this computation deadline, which is not a cache TTL.
+        // Timeout drops Task (aborting it), allowing foreground fallback.
+        let wait = tokio::time::timeout_at(task.deadline, &mut task.handle);
+        let compacted = match select(pin!(cancelled), pin!(wait)).await {
             Either::Left(_) => return None,
-            Either::Right((result, _)) => result.ok()?.ok()?,
+            Either::Right((result, _)) => result.ok()?.ok()?.ok()?,
         };
-        if task.cancellation.as_ref().is_some_and(|c| c.is_cancelled())
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+            || task.cancellation.as_ref().is_some_and(|c| c.is_cancelled())
             || (self.revision)().ok()? != task.revision
         {
             return None;
         }
-        merge(&task.snapshot, compacted, live, policy)
+        merge(&task.snapshot, compacted, live)
     }
 }
 
-/// Usage covers its request/response, not items appended after that response.
-pub(super) fn occupancy(live: &[Item]) -> Option<u64> {
-    let position = live.iter().rposition(|item| item.usage.is_some())?;
-    let tail = conservative_tokens(&live[position + 1..]);
-    // Unknown content costs reject speculation. Foreground triggering can
-    // separately retain the provider baseline instead of inventing occupancy.
-    if tail == u64::MAX {
-        return None;
-    }
-    Some(latest_context_tokens(live)?.saturating_add(tail))
-}
-
-/// One serialized byte per token deliberately overestimates text, metadata and
-/// structured content. Unlike a calibrated ratio it cannot hide an uncounted
-/// post-usage tool result or assume that a model's tokenizer matches another's.
-fn conservative_tokens(items: &[Item]) -> u64 {
-    items.iter().fold(0u64, |total, item| {
-        if item.parts.iter().any(opaque) {
-            return u64::MAX;
-        }
-        total.saturating_add(
-            serde_json::to_vec(item)
-                .ok()
-                .and_then(|bytes| u64::try_from(bytes.len()).ok())
-                .unwrap_or(u64::MAX),
-        )
-    })
-}
-
-// A reference length (or compressed inline byte length) says nothing about the
-// provider's image/file token cost. Unknown provider extensions are equally
-// unbounded. Reject these candidates rather than guessing at their occupancy.
-fn opaque(part: &Part) -> bool {
-    match part {
-        Part::Media(_) | Part::File(_) | Part::Custom(_) => true,
-        Part::Reasoning(reasoning) => reasoning.data.is_some(),
-        Part::ToolResult(result) => match &result.output {
-            ToolOutput::Parts(parts) => parts.iter().any(opaque),
-            ToolOutput::Files(files) => !files.is_empty(),
-            ToolOutput::Text(_) | ToolOutput::Structured(_) => false,
-        },
-        Part::Text(_) | Part::Structured(_) | Part::ToolCall(_) => false,
-    }
-}
-
-fn merge(
-    snapshot: &[Item],
-    mut compacted: Vec<Item>,
-    live: &[Item],
-    policy: &CompactionConfig,
-) -> Option<Vec<Item>> {
+fn merge(snapshot: &[Item], mut compacted: Vec<Item>, live: &[Item]) -> Option<Vec<Item>> {
     if compacted.is_empty() || !live.starts_with(snapshot) {
         return None;
     }
-    let threshold = policy.resolve(context_window(live)?).prepare_tokens;
     for mut item in live[snapshot.len()..].iter().cloned() {
         item.parts
             .retain(|part| !matches!(part, Part::Reasoning(_)));
@@ -254,7 +288,7 @@ fn merge(
     for item in &mut compacted {
         item.usage = None;
     }
-    (conservative_tokens(&compacted) < threshold).then_some(compacted)
+    Some(compacted)
 }
 
 #[cfg(test)]
@@ -294,7 +328,6 @@ mod tests {
                 &snapshot,
                 vec![Item::text(ItemKind::Assistant, "summary")],
                 &live,
-                &CompactionConfig::default()
             )
             .is_none()
         );
@@ -310,7 +343,6 @@ mod tests {
             &snapshot,
             vec![Item::text(ItemKind::Assistant, "summary")],
             &live,
-            &CompactionConfig::default(),
         )
         .unwrap();
         assert_eq!(result.len(), 3);
@@ -318,21 +350,22 @@ mod tests {
         assert!(result.iter().all(|item| item.usage.is_none()));
     }
 
-    #[test]
-    fn fit_counts_the_entire_post_usage_tail() {
-        let snapshot = vec![response(145_000)];
-        let mut live = snapshot.clone();
+    #[tokio::test]
+    async fn unmeasured_tail_does_not_override_provider_usage() {
+        let (preparation, started, dropped) = pending();
+        let mut live = vec![response(145_000)];
         live.push(Item::text(ItemKind::User, "x".repeat(200_000)));
-        assert!(occupancy(&live).unwrap() > 320_000);
-        assert!(
-            merge(
-                &snapshot,
-                vec![Item::text(ItemKind::Assistant, "summary")],
-                &live,
-                &CompactionConfig::default()
-            )
-            .is_none()
-        );
+        preparation.arm(&live, &CompactionConfig::default(), None);
+        observed(&started).await;
+        let result = merge(
+            &live[..1],
+            vec![Item::text(ItemKind::Assistant, "summary")],
+            &live,
+        )
+        .unwrap();
+        assert_eq!(result[1], live[1]);
+        preparation.cancel(false);
+        observed(&dropped).await;
     }
 
     struct Pending {
@@ -418,12 +451,7 @@ mod tests {
         let cancellation = CancellationController::new();
         let checkpoint = cancellation.handle().checkpoint();
         cancellation.interrupt();
-        assert!(
-            preparation
-                .take(&live, &CompactionConfig::default(), Some(checkpoint))
-                .await
-                .is_none()
-        );
+        assert!(preparation.take(&live, Some(checkpoint)).await.is_none());
         observed(&dropped).await;
     }
 
@@ -434,9 +462,9 @@ mod tests {
         observed(&started).await;
         preparation.cancel(false);
         observed(&dropped).await;
-        assert!(preparation.state.lock().unwrap().attempted);
+        assert_eq!(preparation.state.lock().unwrap().attempts, 1);
         preparation.cancel(true);
-        assert!(!preparation.state.lock().unwrap().attempted);
+        assert_eq!(preparation.state.lock().unwrap().attempts, 0);
     }
 
     #[tokio::test]
@@ -475,12 +503,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         revision.store(1, Ordering::SeqCst);
-        assert!(
-            preparation
-                .take(&live, &CompactionConfig::default(), None)
-                .await
-                .is_none()
-        );
+        assert!(preparation.take(&live, None).await.is_none());
     }
 
     struct Gated {
@@ -533,8 +556,7 @@ mod tests {
         preparation.arm(&live, &CompactionConfig::default(), None);
         observed(&started).await;
         live.push(Item::text(ItemKind::User, "appended instruction"));
-        let policy = CompactionConfig::default();
-        let take = preparation.take(&live, &policy, None);
+        let take = preparation.take(&live, None);
         let release_work = async {
             release.notify_one();
         };
@@ -574,11 +596,7 @@ mod tests {
         cancellation.interrupt();
         assert!(
             preparation
-                .take(
-                    &live,
-                    &CompactionConfig::default(),
-                    Some(cancellation.handle().checkpoint())
-                )
+                .take(&live, Some(cancellation.handle().checkpoint()))
                 .await
                 .is_none()
         );
@@ -591,17 +609,12 @@ mod tests {
         preparation.arm(&live, &CompactionConfig::default(), None);
         observed(&started).await;
         live[0].parts.push(Part::text("edited"));
-        assert!(
-            preparation
-                .take(&live, &CompactionConfig::default(), None)
-                .await
-                .is_none()
-        );
+        assert!(preparation.take(&live, None).await.is_none());
         observed(&dropped).await;
     }
 
     #[test]
-    fn short_media_and_file_references_are_not_assumed_to_fit() {
+    fn media_and_files_are_preserved_in_prepared_output_and_tail() {
         use agentkit_core::{DataRef, Modality};
         for part in [
             Part::media(
@@ -617,28 +630,26 @@ mod tests {
             ),
         ] {
             let snapshot = vec![response(145_000)];
+            let item = Item::new(ItemKind::User, vec![part]);
             let mut live = snapshot.clone();
-            live.push(Item::new(ItemKind::User, vec![part.clone()]));
-            assert_eq!(occupancy(&live), None);
-            assert!(
-                merge(
-                    &snapshot,
-                    vec![Item::text(ItemKind::Assistant, "summary")],
-                    &live,
-                    &CompactionConfig::default()
-                )
-                .is_none()
-            );
-            assert!(
-                merge(
-                    &snapshot,
-                    vec![Item::new(ItemKind::User, vec![part])],
-                    &snapshot,
-                    &CompactionConfig::default()
-                )
-                .is_none()
-            );
+            live.push(item.clone());
+            let result = merge(&snapshot, vec![item.clone()], &live).unwrap();
+            assert_eq!(result, vec![item.clone(), item]);
         }
+    }
+
+    #[test]
+    fn large_retained_system_message_does_not_reject_prepared_output() {
+        let snapshot = vec![response(145_000)];
+        let system = Item::new(ItemKind::System, vec![Part::text("x".repeat(1_000_000))]);
+        let prepared = vec![
+            system,
+            Item::new(ItemKind::Assistant, vec![Part::text("summary")]),
+        ];
+        assert_eq!(
+            merge(&snapshot, prepared.clone(), &snapshot),
+            Some(prepared)
+        );
     }
 
     #[test]
@@ -653,7 +664,6 @@ mod tests {
             &snapshot,
             vec![Item::text(ItemKind::Assistant, "summary")],
             &live,
-            &CompactionConfig::default(),
         )
         .unwrap();
         assert_eq!(result[1].parts, vec![Part::text("answer")]);
@@ -668,7 +678,7 @@ mod tests {
         assert!(outcome.is_err());
         assert!(!preparation.state.is_poisoned());
         let state = preparation.state.lock().unwrap();
-        assert!(state.attempted);
+        assert_eq!(state.attempts, 1);
         assert!(state.task.is_none());
         drop(state);
         // A second boundary cannot call the panicking factory again this cycle.
@@ -682,7 +692,7 @@ mod tests {
         let policy = CompactionConfig::default();
         preparation.arm(&live, &policy, None);
         observed(&started).await;
-        let mut take = Box::pin(preparation.take(&live, &policy, None));
+        let mut take = Box::pin(preparation.take(&live, None));
         assert!(futures_util::poll!(&mut take).is_pending());
         drop(take);
         observed(&dropped).await;
@@ -702,12 +712,7 @@ mod tests {
         assert!(preparation.state.is_poisoned());
         preparation.cancel(true);
         preparation.arm(&[response(145_000)], &CompactionConfig::default(), None);
-        assert!(
-            preparation
-                .take(&[response(145_000)], &CompactionConfig::default(), None)
-                .await
-                .is_none()
-        );
+        assert!(preparation.take(&[response(145_000)], None).await.is_none());
         drop(preparation);
         observed(&dropped).await;
     }
@@ -739,10 +744,262 @@ mod tests {
         let policy = CompactionConfig::default();
         preparation.arm(&live, &policy, None);
         observed(&started).await;
-        let mut take = Box::pin(preparation.take(&live, &policy, None));
+        let mut take = Box::pin(preparation.take(&live, None));
         assert!(futures_util::poll!(&mut take).is_pending());
         revision.store(1, Ordering::SeqCst);
         release.notify_one();
         assert!(take.await.is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn preparation_expires_without_a_taker() {
+        let (preparation, started, dropped) = pending();
+        preparation.arm(&[response(145_000)], &CompactionConfig::default(), None);
+        observed(&started).await;
+        tokio::time::advance(Duration::from_secs(
+            crate::request_budget::RequestBudget::current().seconds(),
+        ))
+        .await;
+        observed(&dropped).await;
+        assert!(preparation.take(&[response(145_000)], None).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_waits_only_for_remaining_arm_budget() {
+        let (preparation, started, dropped) = pending();
+        let live = [response(145_000)];
+        preparation.arm(&live, &CompactionConfig::default(), None);
+        observed(&started).await;
+        let budget = Duration::from_secs(crate::request_budget::RequestBudget::current().seconds());
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        let mut take = Box::pin(preparation.take(&live, None));
+        assert!(futures_util::poll!(&mut take).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(take.await.is_none());
+        observed(&dropped).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_rearms_once_on_new_checkpoint_not_each_boundary() {
+        let (preparation, started, dropped) = pending();
+        let policy = CompactionConfig::default();
+        let mut live = vec![response(145_000)];
+        preparation.arm(&live, &policy, None);
+        observed(&started).await;
+        preparation.cancel(false);
+        observed(&dropped).await;
+        preparation.arm(&live, &policy, None);
+        assert!(preparation.state.lock().unwrap().task.is_none());
+        live.push(response(145_001));
+        preparation.arm(&live, &policy, None);
+        observed(&started).await;
+        preparation.cancel(false);
+        observed(&dropped).await;
+        live.push(response(145_002));
+        preparation.arm(&live, &policy, None);
+        assert!(preparation.state.lock().unwrap().task.is_none());
+        preparation.cancel(true);
+        preparation.arm(&live, &policy, None);
+        observed(&started).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_rearms_without_new_usage() {
+        let (preparation, started, dropped) = pending();
+        let controller = CancellationController::new();
+        let live = [response(145_000)];
+        let policy = CompactionConfig::default();
+        preparation.arm(&live, &policy, Some(controller.handle().checkpoint()));
+        observed(&started).await;
+        controller.interrupt();
+        observed(&dropped).await;
+        preparation.arm(&live, &policy, Some(controller.handle().checkpoint()));
+        observed(&started).await;
+        assert_eq!(preparation.state.lock().unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn factory_failure_rearms_only_on_new_usage_checkpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let preparation = Preparation::new(
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err("unavailable".into())
+            },
+            || Ok(0),
+        );
+        let policy = CompactionConfig::default();
+        let mut live = vec![response(145_000)];
+        preparation.arm(&live, &policy, None);
+        preparation.arm(&live, &policy, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        live.push(response(145_000));
+        preparation.arm(&live, &policy, None);
+        live.push(response(145_000));
+        preparation.arm(&live, &policy, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn selection_revision_can_rearm_after_failure_without_new_usage() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let revision = Arc::new(AtomicU64::new(0));
+        let factory_revision = revision.clone();
+        let current = revision.clone();
+        let preparation = Preparation::new(
+            move || {
+                if factory_revision.load(Ordering::SeqCst) == 0 {
+                    return Err("old selection unavailable".into());
+                }
+                Ok((
+                    StrategyCompactor::new(|_, _| None, DropReasoningStrategy::new()),
+                    1,
+                ))
+            },
+            move || Ok(current.load(Ordering::SeqCst)),
+        );
+        let live = [response(145_000)];
+        preparation.arm(&live, &CompactionConfig::default(), None);
+        revision.store(1, Ordering::SeqCst);
+        preparation.arm(&live, &CompactionConfig::default(), None);
+        assert!(preparation.take(&live, None).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn only_provider_prepare_band_arms() {
+        let (preparation, _, _) = pending();
+        let policy = CompactionConfig::default();
+        for live in [
+            vec![Item::text(ItemKind::User, "x".repeat(200_000))],
+            vec![response(1), Item::text(ItemKind::User, "x".repeat(200_000))],
+            vec![response(160_000)],
+        ] {
+            preparation.arm(&live, &policy, None);
+            assert!(preparation.state.lock().unwrap().task.is_none());
+        }
+        assert_eq!(preparation.state.lock().unwrap().attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_taking_aborts_pending_task() {
+        let (preparation, started, dropped) = pending();
+        let live = [response(145_000)];
+        preparation.arm(&live, &CompactionConfig::default(), None);
+        observed(&started).await;
+        let controller = CancellationController::new();
+        let mut take = Box::pin(preparation.take(&live, Some(controller.handle().checkpoint())));
+        assert!(futures_util::poll!(&mut take).is_pending());
+        controller.interrupt();
+        assert!(take.await.is_none());
+        observed(&dropped).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn completed_summary_remains_reusable_after_preparation_deadline() {
+        let (preparation, started, release) = gated();
+        let live = [response(145_000)];
+        preparation.arm(&live, &CompactionConfig::default(), None);
+        observed(&started).await;
+        release.notify_one();
+        loop {
+            if preparation
+                .state
+                .lock()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .handle
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(
+            crate::request_budget::RequestBudget::current().seconds() + 1,
+        ))
+        .await;
+        assert!(preparation.take(&live, None).await.is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_task_rearms_once_at_new_usage_checkpoint() {
+        let (preparation, started, dropped) = pending();
+        let mut live = vec![response(145_000)];
+        let policy = CompactionConfig::default();
+        preparation.arm(&live, &policy, None);
+        observed(&started).await;
+        tokio::time::advance(Duration::from_secs(
+            crate::request_budget::RequestBudget::current().seconds(),
+        ))
+        .await;
+        observed(&dropped).await;
+        // Wait for task completion, not just pipeline-future destruction.
+        loop {
+            if preparation
+                .state
+                .lock()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .handle
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        live.push(response(145_001));
+        preparation.arm(&live, &policy, None);
+        observed(&started).await;
+        assert_eq!(preparation.state.lock().unwrap().attempts, 2);
+    }
+    #[tokio::test]
+    async fn successful_preparation_survives_new_usage_on_either_attempt() {
+        for cancel_first in [false, true] {
+            let (preparation, started, release) = gated();
+            let policy = CompactionConfig::default();
+            let mut live = vec![response(145_000)];
+            if cancel_first {
+                preparation.arm(&live, &policy, None);
+                observed(&started).await;
+                preparation.cancel(false);
+                live.push(response(145_001));
+            }
+            preparation.arm(&live, &policy, None);
+            observed(&started).await;
+            release.notify_one();
+            loop {
+                if preparation
+                    .state
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+                    .handle
+                    .is_finished()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let snapshot_len = live.len();
+            for used in [146_000, 147_000, 160_000] {
+                live.push(response(used));
+                preparation.arm(&live, &policy, None);
+            }
+            let result = preparation.take(&live, None).await.unwrap();
+            assert_eq!(result[0].parts, vec![Part::text("prepared summary")]);
+            assert_eq!(result.len(), 1 + live.len() - snapshot_len);
+            for (actual, expected) in result[1..].iter().zip(&live[snapshot_len..]) {
+                assert_eq!(actual.parts, expected.parts);
+                assert!(actual.usage.is_none());
+            }
+            assert_eq!(
+                preparation.state.lock().unwrap().attempts,
+                if cancel_first { 2 } else { 1 }
+            );
+        }
     }
 }
