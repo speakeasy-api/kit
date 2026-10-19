@@ -157,7 +157,7 @@ kit prompt --credential-store keychain \
   --root /path/to/project "Reply with a short project summary"
 ```
 
-Login verifies your key and accessible projects with `app.getgram.ai` and saves
+Login verifies your key and accessible projects with `ai.speakeasy.com` and saves
 the selected project with the credential. New and resumed Kit conversations stay
 together in AI Control Plane Agent Sessions. The model selector uses OpenRouter's
 catalog because Speakeasy does not provide a public model catalog; confirm that
@@ -381,9 +381,13 @@ For example, with `model = "gpt-5.4"` in TOML, `kit prompt --model anthropic/cla
 
 ## Project instructions from `AGENTS.md`
 
-Kit discovers `AGENTS.md` files at the project working directory and its ancestor directories and loads their content into the initial transcript as agent context. Put repository-wide guidance in a higher-level `AGENTS.md` and project-specific guidance nearer the selected root. Choose `--root` deliberately because it controls both the working directory and which `AGENTS.md` instruction chain is loaded.
+To give Kit instructions for every project, create or edit `$HOME/.kit/AGENTS.md`. For repository-wide guidance, use an `AGENTS.md` in the repository; put subproject-specific guidance nearer the working directory you select with `--root`.
 
-If startup reports `could not load AGENTS.md context`, inspect the `AGENTS.md` files at the root and above it for read or loading problems. Changing `~/.kit/config.toml` does not replace project instructions; configuration selects runtime behavior, while `AGENTS.md` supplies instructions to the agent.
+Kit reads the global file first, then project `AGENTS.md` files from the outermost ancestor down to the selected working directory. It does not discover descendant instruction files: select that subproject with `--root` when its guidance should apply. These instructions supplement Kit's built-in instructions rather than replace them.
+
+Start a new session after editing global or primary project instructions. Active, resumed, and forked sessions keep their saved instructions. Attaching additional project directories through ACP refreshes those directories' instructions, but does not reload global instructions.
+
+If startup reports `could not load AGENTS.md context`, check the named file's readability and permissions. Missing instruction files are optional; other read errors prevent loading. Changing `~/.kit/config.toml` does not replace instructions: use it for runtime settings and `AGENTS.md` for guidance to the agent.
 
 ## Agent Skills
 

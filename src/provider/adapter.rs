@@ -528,7 +528,7 @@ pub struct OpenRouterKitAdapter {
     context_window: Arc<tokio::sync::OnceCell<u64>>,
 }
 
-const SPEAKEASY_COMPLETIONS_URL: &str = "https://app.getgram.ai/chat/completions";
+const SPEAKEASY_COMPLETIONS_URL: &str = "https://ai.speakeasy.com/chat/completions";
 
 #[derive(Clone)]
 pub struct SpeakeasyKitAdapter {

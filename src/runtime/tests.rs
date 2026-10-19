@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use super::{
     BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool,
     LogoutAuthenticationError, Runtime, SessionRequest, SessionSelection, background_route,
-    load_initial_transcript,
+    load_agents_transcript, load_initial_transcript, refresh_workspace_context,
 };
 
 #[tokio::test]
@@ -920,6 +920,87 @@ async fn agents_md_symlink_loads_and_rereads_target() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn global_agents_precede_workspace_and_remain_a_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let kit = home.path().join(".kit");
+    let root = kit.join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let global = kit.join("AGENTS.md");
+    std::fs::write(&global, "global guidance").unwrap();
+    std::fs::write(home.path().join("AGENTS.md"), "outer guidance").unwrap();
+    std::fs::write(root.join("AGENTS.md"), "workspace guidance").unwrap();
+    let mut transcript =
+        load_agents_transcript(&root, "native system".into(), Some(global.clone()))
+            .await
+            .unwrap();
+    assert_eq!(transcript.len(), 4);
+    assert_eq!(transcript[0].kind, ItemKind::System);
+    for (item, expected) in transcript.iter().zip([
+        "native system",
+        "global guidance",
+        "outer guidance",
+        "workspace guidance",
+    ]) {
+        let Part::Text(text) = &item.parts[0] else {
+            panic!("expected text");
+        };
+        assert!(text.text.ends_with(expected));
+    }
+    assert_eq!(
+        transcript[1].metadata["agentkit.context.source"],
+        "agents_md"
+    );
+    assert_eq!(
+        transcript[1].metadata["agentkit.context.path"],
+        global.display().to_string()
+    );
+    let saved_global = transcript[1].clone();
+    std::fs::write(&global, "updated global guidance").unwrap();
+    for _ in 0..2 {
+        refresh_workspace_context(&mut transcript, std::slice::from_ref(&root))
+            .await
+            .unwrap();
+        let globals = transcript
+            .iter()
+            .filter(|item| {
+                item.metadata.get("agentkit.context.path")
+                    == saved_global.metadata.get("agentkit.context.path")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(globals.len(), 1);
+        assert_eq!(
+            serde_json::to_value(globals[0]).unwrap(),
+            serde_json::to_value(&saved_global).unwrap()
+        );
+    }
+    let fresh = load_agents_transcript(&root, "native system".into(), Some(global))
+        .await
+        .unwrap();
+    let Part::Text(text) = &fresh[1].parts[0] else {
+        panic!("expected text")
+    };
+    assert!(text.text.ends_with("updated global guidance"));
+}
+
+#[tokio::test]
+async fn global_agents_missing_is_optional_and_read_errors_are_reported() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let global = home.path().join(".kit/AGENTS.md");
+    let transcript = load_agents_transcript(&root, "system".into(), Some(global.clone()))
+        .await
+        .unwrap();
+    assert_eq!(transcript.len(), 1);
+    std::fs::create_dir_all(&global).unwrap();
+    let error = load_agents_transcript(&root, "system".into(), Some(global.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.contains(&global.display().to_string()));
+    assert!(error.contains("could not load AGENTS.md context"));
 }
 
 #[tokio::test]

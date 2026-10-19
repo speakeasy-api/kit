@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 
 use crate::credentials::CredentialStorage;
 
-const DASHBOARD_URL: &str = "https://app.getgram.ai/";
-const VERIFY_URL: &str = "https://app.getgram.ai/rpc/keys.verify";
+const DASHBOARD_URL: &str = "https://ai.speakeasy.com/";
+const VERIFY_URL: &str = "https://ai.speakeasy.com/rpc/keys.verify";
 const NAMESPACE: &str = "speakeasy";
 const IDENTITY: &str = "default";
 const MAX_HTTP_BYTES: usize = 16 * 1024;

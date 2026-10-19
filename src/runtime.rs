@@ -2852,7 +2852,9 @@ async fn refresh_workspace_context(
     }
     let mut additions = Vec::new();
     for root in additional_directories {
-        let context = load_initial_transcript(root, String::new()).await?;
+        // Global instructions belong to the initial session snapshot, not the
+        // replaceable additional-directory context on load/resume/fork.
+        let context = load_agents_transcript(root, String::new(), None).await?;
         for mut item in context.into_iter().skip(1) {
             let path = item.metadata.get("agentkit.context.path");
             if transcript
@@ -2894,14 +2896,31 @@ async fn refresh_workspace_context(
 }
 
 async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<Vec<Item>, String> {
+    let global = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".kit/AGENTS.md"));
+    load_agents_transcript(root, system_prompt, global).await
+}
+
+async fn load_agents_transcript(
+    root: &Path,
+    system_prompt: String,
+    global: Option<PathBuf>,
+) -> Result<Vec<Item>, String> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut transcript = vec![Item::text(ItemKind::System, system_prompt)];
-        // Preserve agentkit-context's outermost-to-innermost ordering and item
-        // metadata, while reading through the same view as other internal IO.
+        // Keep the native system prompt and provenance intact. Global guidance
+        // precedes the outermost-to-innermost workspace instruction chain.
         let ancestors = root.ancestors().collect::<Vec<_>>();
-        for directory in ancestors.into_iter().rev() {
-            let path = directory.join("AGENTS.md");
+        let paths = global.iter().cloned().chain(
+            ancestors
+                .into_iter()
+                .rev()
+                .map(|directory| directory.join("AGENTS.md"))
+                .filter(|path| Some(path) != global.as_ref()),
+        );
+        for path in paths {
             let body = match crate::config_files::read_to_string(&path) {
                 Ok(body) => body,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
