@@ -468,7 +468,8 @@ impl Drop for SessionClaim {
 
 pub(crate) struct AcpDriver {
     pub subagents: Subagents,
-    pub driver: LoopDriver<HookedSession<SelectableSession>>,
+    pub driver:
+        LoopDriver<crate::protocols::acp::v2::identity::Session<HookedSession<SelectableSession>>>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
@@ -1947,11 +1948,10 @@ impl Runtime {
                     crate::request_budget::RequestBudget::current().seconds(),
                 ),
             })
-            .model(HookedAdapter::new(
-                adapter.clone(),
-                self.hooks.clone(),
-                trigger,
-            ))
+            .model(crate::protocols::acp::v2::identity::Adapter {
+                enabled: context.response_attempt_replacement,
+                inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger),
+            })
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs_and_mcp(
                 self.base_depth,
