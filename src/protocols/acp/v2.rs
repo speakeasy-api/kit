@@ -44,6 +44,125 @@ use super::{
     SessionRegistry, skill_catalog, terminal_auth_method_specs,
 };
 
+// The injection API deliberately requires an ACP responder and tracked receipt.
+// This local transport reuses that admission boundary without a second session.
+async fn inject_a2a(
+    integration: Arc<AcpIntegration>,
+    request: wire::InjectSessionRequest,
+) -> Result<wire::MessageId, agent_client_protocol::Error> {
+    let (client, agent) = agent_client_protocol::Channel::duplex();
+    inject_a2a_over(integration, request, client, agent).await
+}
+
+async fn finish_a2a_injection(
+    integration: Arc<AcpIntegration>,
+    request: wire::InjectSessionRequest,
+    responder: Responder<wire::InjectSessionResponse>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<(), agent_client_protocol::Error> {
+    // The pinned SDK allocates a FIFO sequence before awaiting its permit and
+    // installs Drop cleanup only afterward. Never cancel/drop this await: even
+    // abandoned ingress must reach the permit and advance the global queue.
+    let Some(reserved) = integration
+        .reserve_inject_request(request, responder)
+        .await?
+    else {
+        return Ok(());
+    };
+    if cancellation.is_cancelled() {
+        drop(reserved);
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+    let Some(acceptance) = reserved.respond_tracked()? else {
+        return Ok(());
+    };
+    // FIFO ownership is now released. Dropping pending activation is safe and
+    // discards its unactivated reservation; prefer cancellation on a tie.
+    match select(
+        Box::pin(cancellation.cancelled()),
+        Box::pin(acceptance.activate_after_response()),
+    )
+    .await
+    {
+        Either::Left(((), pending)) => {
+            drop(pending);
+            Err(agent_client_protocol::Error::request_cancelled())
+        }
+        Either::Right((result, _)) => result,
+    }
+}
+
+// Keep the receipt paired with the SDK transport-queue acknowledgment.
+async fn inject_a2a_over(
+    integration: Arc<AcpIntegration>,
+    request: wire::InjectSessionRequest,
+    client: impl ConnectTo<Client>,
+    agent: impl ConnectTo<agent_client_protocol::Agent>,
+) -> Result<wire::MessageId, agent_client_protocol::Error> {
+    // Cancel commitment/activation on ingress drop, but let an already-started
+    // SDK FIFO waiter drain to its permit so later steering cannot be stranded.
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let (activated, mut activation) = mpsc::unbounded_channel();
+    let host = agent_client_protocol::Agent
+        .v2()
+        .on_receive_request(
+            async move |request: wire::InitializeRequest, responder, _cx| {
+                responder.respond(wire::InitializeResponse::new(
+                    request.protocol_version,
+                    wire::Implementation::new("kit-a2a-admission", "0"),
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: wire::InjectSessionRequest, responder, cx| {
+                let integration = Arc::clone(&integration);
+                let activated = activated.clone();
+                let cancellation = cancellation.clone();
+                // Keep FIFO cleanup alive even if the SDK connection task is
+                // dropped. This task owns ingress bookkeeping only, never a model
+                // turn; cancellation fences commitment after permit acquisition.
+                let reservation = tokio::spawn(finish_a2a_injection(
+                    integration,
+                    request,
+                    responder,
+                    cancellation,
+                ));
+                cx.spawn(async move {
+                    let result = reservation.await.map_err(|error| {
+                        agent_client_protocol::util::internal_error(error.to_string())
+                    })?;
+                    let _ = activated.send(result.clone());
+                    result
+                })?;
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+    // Keep the client transport alive until the tracked receipt activates.
+    let client = agent_client_protocol::Client
+        .v2()
+        .connect_with(client, async move |cx| {
+            cx.send_request(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("kit-a2a", "0"),
+            ))
+            .block_task()
+            .await?;
+            let response = cx.send_request(request).block_task().await?;
+            activation.recv().await.ok_or_else(|| {
+                agent_client_protocol::util::internal_error("injection activation closed")
+            })??;
+            Ok(response.message_id)
+        });
+    let (client, _) = futures_util::future::join(client, host.connect_to(agent)).await;
+    client
+}
+
+#[cfg(test)]
+mod a2a_tests;
+
 const PAGE_SIZE: usize = 100;
 
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
@@ -647,7 +766,25 @@ struct PendingSessionPublication {
     session: SessionHandle,
 }
 
+// Busy is returned only before sending a command or admitting input.
+enum PromptAdmissionError {
+    Busy,
+    Runtime(AcpRuntimeError),
+}
+
+impl PromptAdmissionError {
+    fn into_runtime(self) -> AcpRuntimeError {
+        match self {
+            Self::Busy => {
+                AcpRuntimeError::Unsupported("session is already running a prompt".into())
+            }
+            Self::Runtime(error) => error,
+        }
+    }
+}
+
 struct Server {
+    bind_a2a: bool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -675,6 +812,7 @@ impl Server {
     fn new(runtime: Arc<Runtime>, registry: SessionRegistry) -> Self {
         Self {
             runtime,
+            bind_a2a: false,
             integration: Arc::new(AcpIntegration::default()),
             registry,
             sessions: Mutex::new(HashMap::new()),
@@ -1123,6 +1261,23 @@ impl Server {
                 SessionPublicationError::Commit(error) => error,
             });
         }
+        if self.bind_a2a {
+            let server = Arc::downgrade(self);
+            let bound_id = session_id.clone();
+            self.registry.bind_a2a(
+                token,
+                Arc::new(move |prompt| {
+                    let server = server.clone();
+                    let session_id = bound_id.clone();
+                    Box::pin(async move {
+                        let server = server
+                            .upgrade()
+                            .ok_or("Interactive ACP connection is closed")?;
+                        server.admit_a2a(session_id, prompt).await
+                    })
+                }),
+            );
+        }
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
             session_id: session_id.to_string(),
         });
@@ -1135,24 +1290,100 @@ impl Server {
         })
     }
 
+    async fn admit_a2a(
+        &self,
+        session_id: wire::SessionId,
+        prompt: String,
+    ) -> Result<String, String> {
+        let content = vec![wire::ContentBlock::Text(wire::TextContent::new(prompt))];
+        // Try the real idle admission, not a racy observation of its busy flag.
+        let prepared = self
+            .try_prepare_prompt(wire::PromptRequest::new(
+                session_id.clone(),
+                content.clone(),
+            ))
+            .await;
+        let message_id = match prepared {
+            Ok((start, message_id)) => {
+                start
+                    .send(())
+                    .map_err(|_| "Interactive ACP session closed before activation")?;
+                message_id
+            }
+            Err(PromptAdmissionError::Busy) => {
+                match inject_a2a(
+                    Arc::clone(&self.integration),
+                    wire::InjectSessionRequest::new(
+                        session_id.clone(),
+                        wire::SessionInjectMode::Steer,
+                        content.clone(),
+                    ),
+                )
+                .await
+                {
+                    Ok(message_id) => message_id,
+                    // The SDK rejects this before reservation/commit. The turn may
+                    // have ended while the local transport was initializing. Retry
+                    // idle admission exactly once, never an already-admitted input.
+                    Err(error)
+                        if i32::from(error.code)
+                            == i32::from(wire::Error::inject_no_running_turn().code)
+                            && error
+                                .data
+                                .as_ref()
+                                .and_then(|data| data.get("reason"))
+                                .and_then(Value::as_str)
+                                == Some("no_running_turn") =>
+                    {
+                        let (start, message_id) = self
+                            .try_prepare_prompt(wire::PromptRequest::new(
+                                session_id.clone(),
+                                content,
+                            ))
+                            .await
+                            .map_err(|error| error.into_runtime().to_string())?;
+                        start
+                            .send(())
+                            .map_err(|_| "Interactive ACP session closed before activation")?;
+                        message_id
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err(PromptAdmissionError::Runtime(error)) => return Err(error.to_string()),
+        };
+        Ok(format!(
+            "Accepted into ACP session {session_id} as message {message_id}. This acknowledges admission, not completion; output is delivered through that ACP session."
+        ))
+    }
+
     async fn prepare_prompt(
         &self,
         request: wire::PromptRequest,
     ) -> Result<(oneshot::Sender<()>, wire::MessageId), AcpRuntimeError> {
-        let (sender, busy, handle) = self.prompt_route(&request.session_id)?;
+        self.try_prepare_prompt(request)
+            .await
+            .map_err(PromptAdmissionError::into_runtime)
+    }
+
+    async fn try_prepare_prompt(
+        &self,
+        request: wire::PromptRequest,
+    ) -> Result<(oneshot::Sender<()>, wire::MessageId), PromptAdmissionError> {
+        let (sender, busy, handle) = self
+            .prompt_route(&request.session_id)
+            .map_err(PromptAdmissionError::Runtime)?;
         // Reject overlaps before waiting: mailbox pressure must not queue another turn.
         if busy.load(Ordering::Acquire) {
-            return Err(AcpRuntimeError::Unsupported(
-                "session is already running a prompt".into(),
-            ));
+            return Err(PromptAdmissionError::Busy);
         }
         // Claim only after capacity is available so cancellation cannot strand
         // ownership. Recheck atomically afterward in case another request now owns it.
         let permit = sender
             .reserve()
             .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        claim_prompt(&busy)?;
+            .map_err(|_| PromptAdmissionError::Runtime(AcpRuntimeError::ClientClosed))?;
+        claim_prompt(&busy).map_err(|_| PromptAdmissionError::Busy)?;
         handle.prepare_injection_turn();
         let cancellation_generation = handle.cancellation_handle().generation();
         let (reply, response) = oneshot::channel();
@@ -1162,11 +1393,11 @@ impl Server {
             reply,
         }));
         match response.await {
-            Ok(response) => response,
+            Ok(response) => response.map_err(PromptAdmissionError::Runtime),
             Err(_) => {
                 handle.stop_injection_turn();
                 busy.store(false, Ordering::Release);
-                Err(AcpRuntimeError::ClientClosed)
+                Err(PromptAdmissionError::Runtime(AcpRuntimeError::ClientClosed))
             }
         }
     }
@@ -2347,7 +2578,12 @@ pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    super::connect_stdio(v2_router(runtime, registry)).await
+    super::connect_stdio(
+        agent_client_protocol::Agent
+            .protocol_router()
+            .with_v2(stdio_component(runtime, registry)),
+    )
+    .await
 }
 
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
@@ -2375,7 +2611,24 @@ pub(crate) fn component(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> impl ConnectTo<Client> {
-    let state = Arc::new(Server::new(runtime, registry));
+    component_with_binding(runtime, registry, false)
+}
+
+pub(super) fn stdio_component(
+    runtime: Arc<Runtime>,
+    registry: SessionRegistry,
+) -> impl ConnectTo<Client> {
+    component_with_binding(runtime, registry, true)
+}
+
+fn component_with_binding(
+    runtime: Arc<Runtime>,
+    registry: SessionRegistry,
+    bind_a2a: bool,
+) -> impl ConnectTo<Client> {
+    let mut server = Server::new(runtime, registry);
+    server.bind_a2a = bind_a2a;
+    let state = Arc::new(server);
     agent_client_protocol::Agent
         .v2()
         .name("kit")
@@ -4179,6 +4432,478 @@ mod tests {
         handle
     }
 
+    #[tokio::test]
+    async fn a2a_busy_admission_steers_the_bound_driver() {
+        assert_a2a_busy_admission(false).await;
+    }
+
+    #[tokio::test]
+    async fn a2a_idle_to_busy_race_steers_without_duplicate_admission() {
+        assert_a2a_busy_admission(true).await;
+    }
+
+    async fn assert_a2a_busy_admission(competing_turn: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let server = Server::new(runtime, SessionRegistry::new());
+        let session_id = wire::SessionId::new("a2a-busy");
+        let recording = RecordingSink::default();
+        let handle = bind_test_session(&server.integration, &session_id, recording.clone());
+        let (commands, mut received) = mpsc::channel(1);
+        let sender = commands.clone();
+        let busy = Arc::new(AtomicBool::new(!competing_turn));
+        server.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                subagents: None,
+                voice_state: crate::runtime::voice_state::VoiceState::default(),
+                token: 1,
+                commands,
+                integration: handle.clone(),
+                busy: busy.clone(),
+                background_jobs: BackgroundJobs::default(),
+                structured_completion: false,
+                tasks: AsyncTaskManager::new().handle(),
+            },
+        );
+        if competing_turn {
+            handle.stop_injection_turn();
+        }
+        let (reply, _closed) = oneshot::channel();
+        if competing_turn {
+            sender.send(Command::Close { reply }).await.unwrap();
+        }
+        let admission = server.admit_a2a(session_id.clone(), "a2a steer".into());
+        tokio::pin!(admission);
+        if competing_turn {
+            assert!(futures_util::poll!(admission.as_mut()).is_pending());
+            claim_prompt(&busy).unwrap();
+            handle.prepare_injection_turn();
+            handle.start_injection_turn();
+            let _ = received.recv().await.unwrap();
+        }
+        let acknowledgment = timeout(Duration::from_secs(2), admission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(acknowledgment.contains("not completion"));
+        let (mut driver, _) = test_driver(TestOutcome::Content, "a2a-busy").await;
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "existing turn")])
+            .unwrap();
+        drive_prompt(
+            &session_id,
+            &mut driver,
+            &handle,
+            handle.cancellation_handle().generation(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(driver.snapshot().transcript.iter().any(|item| {
+            item.kind == ItemKind::User
+                && item
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, Part::Text(text) if text.text == "a2a steer"))
+        }));
+        assert!(recording.updates.lock().unwrap().iter().any(|update| update.session_id == session_id && matches!(&update.update, wire::SessionUpdate::UserMessage(message) if serde_json::to_string(message).unwrap().contains("a2a steer"))));
+        handle.close();
+        assert!(
+            server
+                .admit_a2a(session_id, "closed steer".into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a2a_idle_admission_prompts_the_bound_driver() {
+        assert_a2a_idle_admission(false).await;
+    }
+
+    #[tokio::test]
+    async fn a2a_busy_to_idle_race_retries_only_before_commit() {
+        assert_a2a_idle_admission(true).await;
+    }
+
+    async fn assert_a2a_idle_admission(ending_turn: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let server = Server::new(runtime.clone(), SessionRegistry::new());
+        let session_id = wire::SessionId::new("a2a-idle");
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let handle = server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new("a2a-idle"),
+                sink.clone(),
+            ))
+            .unwrap();
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let busy = Arc::new(AtomicBool::new(ending_turn));
+        if ending_turn {
+            handle.prepare_injection_turn();
+            handle.start_injection_turn();
+        }
+        let (commands, mut received) = mpsc::channel(1);
+        let tasks = AsyncTaskManager::new().handle();
+        let background_jobs = BackgroundJobs::default();
+        server.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                subagents: None,
+                voice_state: crate::runtime::voice_state::VoiceState::default(),
+                token: 1,
+                commands,
+                integration: handle.clone(),
+                busy: busy.clone(),
+                background_jobs: background_jobs.clone(),
+                structured_completion: false,
+                tasks: tasks.clone(),
+            },
+        );
+        let (mut driver, _) = test_driver(TestOutcome::Content, "a2a-idle").await;
+        let mut catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+        let mut voice = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
+        let admission = server.admit_a2a(session_id.clone(), "idle a2a message".into());
+        tokio::pin!(admission);
+        if ending_turn {
+            assert!(futures_util::poll!(admission.as_mut()).is_pending());
+            handle.stop_injection_turn();
+            busy.store(false, Ordering::Release);
+        }
+        let execution = async {
+            let Command::Prompt(command) = received.recv().await.unwrap() else {
+                panic!("expected prompt")
+            };
+            prepare_prompt(
+                TurnContext {
+                    session_id: &session_id,
+                    integration: &server.integration,
+                    handle: &handle,
+                    sink: &sink,
+                    activity: &activity,
+                },
+                PromptPreparation {
+                    runtime: &runtime,
+                    skill_catalog: &mut catalog,
+                    voice_monitor: &mut voice,
+                    tasks: &tasks,
+                    background_jobs: &background_jobs,
+                    structured_completion: false,
+                },
+                &mut driver,
+                command,
+            )
+            .await
+            .unwrap();
+        };
+        let (acknowledgment, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(admission, execution)
+        })
+        .await
+        .unwrap();
+        assert!(acknowledgment.unwrap().contains("a2a-idle"));
+        assert!(driver.snapshot().transcript.iter().any(|item| {
+            item.kind == ItemKind::User
+                && item
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, Part::Text(text) if text.text == "idle a2a message"))
+        }));
+        assert!(
+            recording
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|update| update.session_id == session_id
+                    && matches!(update.update, wire::SessionUpdate::UserMessage(_)))
+        );
+        assert!(
+            server
+                .admit_a2a(wire::SessionId::new("missing"), "message".into())
+                .await
+                .is_err()
+        );
+    }
+
+    // The SDK receipt commits at queue admission, before physical transport writes.
+    mod a2a_transport_support {
+        use super::*;
+        use futures_util::StreamExt as _;
+
+        pub(super) async fn inbound_inject(
+            session_id: &wire::SessionId,
+            text: &str,
+        ) -> (
+            wire::InjectSessionRequest,
+            Responder<wire::InjectSessionResponse>,
+            agent_client_protocol::Channel,
+            tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>,
+        ) {
+            let (mut client, agent) = agent_client_protocol::Channel::duplex();
+            let (received, mut requests) = mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                agent_client_protocol::Agent
+                    .v2()
+                    .on_receive_request(
+                        async move |request: wire::InitializeRequest, responder, _cx| {
+                            responder.respond(wire::InitializeResponse::new(
+                                request.protocol_version,
+                                wire::Implementation::new("fifo-boundary-test", "0"),
+                            ))
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |request: wire::InjectSessionRequest, responder, _cx| {
+                            received.send((request, responder)).map_err(|error| {
+                                agent_client_protocol::util::internal_error(error.to_string())
+                            })?;
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .connect_to(agent)
+                    .await
+            });
+            send_wire(
+                &client,
+                "initialize",
+                1,
+                serde_json::to_value(wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("fifo-client", "0"),
+                ))
+                .unwrap(),
+            );
+            assert!(
+                receive_wire(&mut client, "FIFO initialize")
+                    .await
+                    .get("result")
+                    .is_some()
+            );
+            send_wire(
+                &client,
+                "session/inject",
+                2,
+                serde_json::to_value(wire::InjectSessionRequest::new(
+                    session_id.clone(),
+                    wire::SessionInjectMode::Steer,
+                    vec![wire::ContentBlock::Text(wire::TextContent::new(text))],
+                ))
+                .unwrap(),
+            );
+            let (request, responder) = timeout(Duration::from_secs(2), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            (request, responder, client, server)
+        }
+
+        pub(super) fn suspended_bridge(
+            integration: Arc<AcpIntegration>,
+            session_id: wire::SessionId,
+        ) -> (
+            tokio::task::JoinHandle<Result<wire::MessageId, agent_client_protocol::Error>>,
+            mpsc::UnboundedReceiver<()>,
+            Arc<Notify>,
+        ) {
+            let (client, agent) = agent_client_protocol::Channel::duplex();
+            let (entered, received) = mpsc::unbounded_channel();
+            let release = Arc::new(Notify::new());
+            let outgoing = futures_util::sink::unfold(
+                (agent.tx, entered, release.clone()),
+                async move |(tx, entered, release), line: String| {
+                    let value: Value =
+                        serde_json::from_str(&line).map_err(std::io::Error::other)?;
+                    if value["result"]["messageId"].is_string() {
+                        entered.send(()).map_err(std::io::Error::other)?;
+                        release.notified().await;
+                    }
+                    let message = serde_json::from_str(&line).map_err(std::io::Error::other)?;
+                    tx.unbounded_send(agent_client_protocol::TransportFrame::Single(message))
+                        .map_err(std::io::Error::other)?;
+                    Ok::<_, std::io::Error>((tx, entered, release))
+                },
+            );
+            let incoming = agent.rx.map(|frame| {
+                let agent_client_protocol::TransportFrame::Single(message) = frame else {
+                    panic!("single bridge request expected")
+                };
+                serde_json::to_string(&message).map_err(std::io::Error::other)
+            });
+            let transport =
+                agent_client_protocol::Lines::new(Box::pin(outgoing), Box::pin(incoming));
+            let bridge = tokio::spawn(inject_a2a_over(
+                integration,
+                wire::InjectSessionRequest::new(
+                    session_id,
+                    wire::SessionInjectMode::Steer,
+                    vec![wire::ContentBlock::Text(wire::TextContent::new(
+                        "receipt-gated steer",
+                    ))],
+                ),
+                client,
+                transport,
+            ));
+            (bridge, received, release)
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_cancelled_fifo_waiter_advances_before_later_a2a_and_tui_steering() {
+        let integration = Arc::new(AcpIntegration::default());
+        let session_id = wire::SessionId::new("a2a-fifo-cancellation");
+        let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
+        let (a_request, a_responder, _a_client, a_server) =
+            a2a_transport_support::inbound_inject(&session_id, "held A").await;
+        let held = integration
+            .reserve_inject_request(a_request, a_responder)
+            .await
+            .unwrap()
+            .unwrap();
+        let (b_request, b_responder, _b_client, b_server) =
+            a2a_transport_support::inbound_inject(&session_id, "cancelled B").await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut waiting = Box::pin(finish_a2a_injection(
+            integration.clone(),
+            b_request,
+            b_responder,
+            cancellation.clone(),
+        ));
+        // A holds the real permit; this first poll allocates B's SDK sequence
+        // and suspends at its FIFO wait, without implementation instrumentation.
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        cancellation.cancel();
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "cancelled ingress must still drain to its FIFO permit"
+        );
+        let drain = tokio::spawn(waiting);
+        drop(held);
+        let error = timeout(Duration::from_secs(2), drain)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            agent_client_protocol::Error::request_cancelled().code
+        );
+        timeout(
+            Duration::from_secs(2),
+            inject_a2a(
+                integration.clone(),
+                wire::InjectSessionRequest::new(
+                    session_id.clone(),
+                    wire::SessionInjectMode::Steer,
+                    vec![wire::ContentBlock::Text(wire::TextContent::new("later C"))],
+                ),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (ordinary, _tui_client, tui_server) =
+            staged_injection((*integration).clone(), &session_id).await;
+        ordinary.activate_after_response().await.unwrap();
+        let (mut driver, _) = test_driver(TestOutcome::Content, &session_id.to_string()).await;
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "existing request")])
+            .unwrap();
+        timeout(
+            Duration::from_secs(2),
+            drive_prompt(
+                &session_id,
+                &mut driver,
+                &handle,
+                handle.cancellation_handle().generation(),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let transcript = driver.snapshot().transcript;
+        for text in ["later C", "pending steer"] {
+            assert!(transcript.iter().any(|item| {
+                item.kind == ItemKind::User
+                    && item
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, Part::Text(part) if part.text == text))
+            }));
+        }
+        assert!(!transcript.iter().any(|item| item.parts.iter().any(|part| matches!(part, Part::Text(part) if part.text == "cancelled B" || part.text == "held A"))));
+        for server in [a_server, b_server, tui_server] {
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_queue_activated_injection_survives_later_transport_cancellation() {
+        for cancel in [false, true] {
+            let integration = Arc::new(AcpIntegration::default());
+            let session_id = wire::SessionId::new(if cancel {
+                "a2a-receipt-cancel"
+            } else {
+                "a2a-receipt-success"
+            });
+            let recording = RecordingSink::default();
+            let handle = bind_test_session(&integration, &session_id, recording);
+            let (bridge, mut entered, release) =
+                a2a_transport_support::suspended_bridge(integration, session_id.clone());
+            timeout(Duration::from_secs(2), entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !bridge.is_finished(),
+                "the client response still waits for the physical transport write"
+            );
+            if cancel {
+                bridge.abort();
+                assert!(bridge.await.unwrap_err().is_cancelled());
+                release.notify_one();
+            } else {
+                release.notify_one();
+                timeout(Duration::from_secs(2), bridge)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            let (mut driver, _) = test_driver(TestOutcome::Content, &session_id.to_string()).await;
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "existing request")])
+                .unwrap();
+            timeout(
+                Duration::from_secs(2),
+                drive_prompt(
+                    &session_id,
+                    &mut driver,
+                    &handle,
+                    handle.cancellation_handle().generation(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let delivered = driver.snapshot().transcript.iter().any(|item| item.kind == ItemKind::User && item.parts.iter().any(|part| matches!(part, Part::Text(text) if text.text == "receipt-gated steer")));
+            assert!(
+                delivered,
+                "queue-activated steers survive later transport cancellation"
+            );
+        }
+    }
+
     // Hold a real response-committed receipt at the external ACP transport boundary.
     // Until activation, the real injection coordinator must wait rather than lose the steer.
     async fn staged_injection(
@@ -4420,6 +5145,53 @@ mod tests {
         }
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn a2a_pending_activation_is_discarded_on_owner_drop_and_session_close() {
+        for close in [false, true] {
+            let integration = AcpIntegration::default();
+            let session_id = wire::SessionId::new(if close {
+                "a2a-pending-close"
+            } else {
+                "a2a-pending-drop"
+            });
+            let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
+            let (receipt, _client, server) = staged_injection(integration, &session_id).await;
+            let (mut driver, _) = test_driver(TestOutcome::Content, &session_id.to_string()).await;
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "existing request")])
+                .unwrap();
+            let generation = handle.cancellation_handle().generation();
+            {
+                let turn = drive_prompt(&session_id, &mut driver, &handle, generation, None);
+                tokio::pin!(turn);
+                assert!(
+                    futures_util::poll!(turn.as_mut()).is_pending(),
+                    "a committed but unactivated steer must hold the boundary"
+                );
+                if close {
+                    handle.close();
+                    receipt.activate_after_response().await.unwrap();
+                } else {
+                    // This is the real ownership cleanup used when scoped ingress
+                    // cancellation drops its suspended activation future.
+                    drop(receipt);
+                }
+                let result = timeout(Duration::from_secs(2), turn).await.unwrap();
+                if !close {
+                    assert_eq!(result.unwrap(), FinishReason::Completed);
+                }
+            }
+            assert!(!driver.snapshot().transcript.iter().any(|item| {
+                item.kind == ItemKind::User
+                    && item.parts.iter().any(
+                        |part| matches!(part, Part::Text(text) if text.text == "pending steer"),
+                    )
+            }));
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]

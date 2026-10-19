@@ -589,6 +589,40 @@ struct RegisteredSession {
     completed: watch::Receiver<bool>,
 }
 
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+pub(super) mod a2a_test_support {
+    use super::*;
+
+    pub(in crate::protocols) fn bound_registry(admit: AdmitA2a) -> SessionRegistry {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        let mut admission = registry.begin_attachment().unwrap();
+        let actor = tokio::spawn(std::future::pending::<()>());
+        actor.abort();
+        let (_completed, completion) = watch::channel(true);
+        registry
+            .register_v2(
+                &mut admission,
+                token,
+                Arc::new(|| {}),
+                Arc::new(|| Box::pin(async {})),
+                actor.abort_handle(),
+                completion,
+            )
+            .unwrap();
+        registry.bind_a2a(token, admit);
+        registry
+    }
+}
+
 type CloseV2Session =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync + 'static>;
 
@@ -601,11 +635,16 @@ struct RegisteredV2Session {
     completed: watch::Receiver<bool>,
 }
 
+type AdmitA2a = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync,
+>;
+
 struct RegistryState {
     accepting: bool,
     permanently_closed: bool,
     generation: u64,
     pending_attachments: usize,
+    a2a_target: Option<(u64, AdmitA2a)>,
     sessions: HashMap<u64, RegisteredSession>,
     v2_sessions: HashMap<u64, RegisteredV2Session>,
 }
@@ -639,6 +678,8 @@ impl SessionRegistryInner {
             // awaits: admission counts are checked before incrementing; completion
             // consumes a validated admission; insertion rejects existing tokens;
             // removal extracts ownership; gate closure cannot wrap its generation.
+            // A2A binding moves a prepared Arc into an empty slot and never replaces
+            // it; rejected callback ownership is dropped after releasing the guard.
             // Snapshots clone only concrete Arc/channel/handle types. Reopening
             // happens only after teardown and the external reset have succeeded;
             // cancellation or panic before then leaves admission closed. Thus unwind
@@ -696,6 +737,7 @@ impl SessionRegistry {
                     permanently_closed: false,
                     generation: 0,
                     pending_attachments: 0,
+                    a2a_target: None,
                     sessions: HashMap::new(),
                     v2_sessions: HashMap::new(),
                 }),
@@ -710,6 +752,42 @@ impl SessionRegistry {
                 token.checked_add(1)
             })
             .map_err(|_| AcpRuntimeError::Loop("ACP session registry token space exhausted".into()))
+    }
+
+    // Only the explicitly designated stdio v2 component binds the listener.
+    // Retain its token after removal: a closed default must never retarget.
+    pub(super) fn bind_a2a(&self, token: u64, admit: AdmitA2a) {
+        let mut state = self.inner.lock_state();
+        if state.accepting && state.v2_sessions.contains_key(&token) && state.a2a_target.is_none() {
+            state.a2a_target = Some((token, admit));
+            return;
+        }
+        drop(state);
+        drop(admit);
+    }
+
+    pub(crate) async fn admit_a2a(&self, prompt: String) -> Result<String, String> {
+        // Reuse the lifecycle admission claim so shutdown also waits for accepted
+        // ingress. Drop rolls back the count on rejection, cancellation, or unwind.
+        let admission = self
+            .begin_attachment()
+            .map_err(|()| "ACP session admission is closed".to_owned())?;
+        let admit = {
+            let state = self.inner.lock_state();
+            if !state.accepting || state.generation != admission.generation {
+                return Err("ACP session admission is closed".into());
+            }
+            let (token, admit) = state
+                .a2a_target
+                .as_ref()
+                .ok_or("A2A listener has no bound interactive ACP v2 session")?;
+            if !state.v2_sessions.contains_key(token) {
+                return Err("The bound interactive ACP session is closed".into());
+            }
+            Arc::clone(admit)
+        };
+        // Never hold the registry lock across session callbacks or awaits.
+        admit(prompt).await
     }
 
     fn begin_attachment(&self) -> Result<SessionAdmission, ()> {
@@ -4052,6 +4130,83 @@ pub(super) mod tests {
         assert!(!background_jobs.activity().active);
         late_actor.abort();
         late_actor.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a2a_registry_requires_explicit_sticky_binding_and_open_admission() {
+        let registry = SessionRegistry::new();
+        assert!(registry.admit_a2a("missing".into()).await.is_err());
+        let mut admission = registry.begin_attachment().unwrap();
+        let token = registry.next_token().unwrap();
+        register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
+        // Merely publishing an HTTP session must not select it as the default.
+        assert!(registry.admit_a2a("unbound".into()).await.is_err());
+        registry.bind_a2a(
+            token,
+            Arc::new(|prompt| Box::pin(async move { Ok(prompt) })),
+        );
+        assert_eq!(
+            registry.admit_a2a("accepted".into()).await.unwrap(),
+            "accepted"
+        );
+        let mut second_admission = registry.begin_attachment().unwrap();
+        let second = registry.next_token().unwrap();
+        register_test_v2(&registry, &mut second_admission, second, Arc::new(|| {})).unwrap();
+        registry.remove(token);
+        registry.bind_a2a(
+            second,
+            Arc::new(|prompt| Box::pin(async move { Ok(prompt) })),
+        );
+        assert!(
+            registry
+                .admit_a2a("must not retarget".into())
+                .await
+                .unwrap_err()
+                .contains("closed")
+        );
+        registry.close_gate_and_snapshot(false);
+        assert!(
+            registry
+                .admit_a2a("closed gate".into())
+                .await
+                .unwrap_err()
+                .contains("admission is closed")
+        );
+        registry.remove(second);
+    }
+
+    #[tokio::test]
+    async fn a2a_ingress_cancellation_and_unwind_release_lifecycle_claim() {
+        let (entered, mut received) = mpsc::unbounded_channel();
+        let registry = a2a_test_support::bound_registry(Arc::new(move |_prompt| {
+            let entered = entered.clone();
+            Box::pin(async move {
+                entered.send(()).unwrap();
+                std::future::pending().await
+            })
+        }));
+        let ingress = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admit_a2a("pending".into()).await }
+        });
+        received.recv().await.unwrap();
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        ingress.abort();
+        assert!(ingress.await.unwrap_err().is_cancelled());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        registry.shutdown().await;
+
+        let registry = a2a_test_support::bound_registry(Arc::new(|_prompt| {
+            Box::pin(async { panic!("admission backend panic") })
+        }));
+        let ingress = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admit_a2a("panic".into()).await }
+        });
+        assert!(ingress.await.unwrap_err().is_panic());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(!registry.inner.state.is_poisoned());
+        registry.shutdown().await;
     }
 
     fn register_test_v2(

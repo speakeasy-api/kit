@@ -107,6 +107,13 @@ impl Drop for HttpServer {
     }
 }
 
+/// Select A2A behavior at startup, never as a fallback after failed admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum A2aExecutionMode {
+    Standalone,
+    SessionAdmission,
+}
+
 pub async fn start(
     runtime: Arc<Runtime>,
     address: String,
@@ -114,13 +121,14 @@ pub async fn start(
     serve_remote_acp: bool,
     credential_file: Option<&Path>,
 ) -> Result<HttpServer, Box<dyn std::error::Error>> {
-    start_with_registry(
+    start_with_registry_and_mode(
         runtime,
         address,
         serve_a2a,
         serve_remote_acp,
         credential_file,
         crate::protocols::acp::SessionRegistry::new(),
+        A2aExecutionMode::Standalone,
     )
     .await
 }
@@ -132,6 +140,27 @@ pub async fn start_with_registry(
     serve_remote_acp: bool,
     credential_file: Option<&Path>,
     sessions: crate::protocols::acp::SessionRegistry,
+) -> Result<HttpServer, Box<dyn std::error::Error>> {
+    start_with_registry_and_mode(
+        runtime,
+        address,
+        serve_a2a,
+        serve_remote_acp,
+        credential_file,
+        sessions,
+        A2aExecutionMode::SessionAdmission,
+    )
+    .await
+}
+
+pub async fn start_with_registry_and_mode(
+    runtime: Arc<Runtime>,
+    address: String,
+    serve_a2a: bool,
+    serve_remote_acp: bool,
+    credential_file: Option<&Path>,
+    sessions: crate::protocols::acp::SessionRegistry,
+    a2a_mode: A2aExecutionMode,
 ) -> Result<HttpServer, Box<dyn std::error::Error>> {
     if !serve_a2a && !serve_remote_acp {
         return Err(io::Error::new(
@@ -152,7 +181,14 @@ pub async fn start_with_registry(
     let listener = tokio::net::TcpListener::bind(&address).await?;
     let bound = listener.local_addr()?;
     let a2a = serve_a2a
-        .then(|| crate::protocols::a2a::dispatcher(runtime.clone(), bound, credential.is_some()))
+        .then(|| {
+            crate::protocols::a2a::dispatcher(
+                runtime.clone(),
+                bound,
+                credential.is_some(),
+                (a2a_mode == A2aExecutionMode::SessionAdmission).then(|| sessions.clone()),
+            )
+        })
         .transpose()?
         .map(Arc::new);
     let acp = serve_remote_acp.then(|| {
@@ -182,7 +218,7 @@ pub async fn start_with_registry(
 
 async fn serve_bound(
     listener: tokio::net::TcpListener,
-    a2a: Option<Arc<a2a_protocol_server::JsonRpcDispatcher>>,
+    a2a: Option<Arc<crate::protocols::a2a::Dispatcher>>,
     acp: Option<Router>,
     credential: Option<BearerToken>,
     stop_accepting: CancellationToken,
@@ -316,7 +352,7 @@ fn report_connection(result: Result<(), tokio::task::JoinError>) {
 
 async fn dispatch(
     request: Request<hyper::body::Incoming>,
-    a2a: Option<Arc<a2a_protocol_server::JsonRpcDispatcher>>,
+    a2a: Option<Arc<crate::protocols::a2a::Dispatcher>>,
     acp: Option<Router>,
     credential: Option<BearerToken>,
 ) -> Result<Response<Body>, Infallible> {
@@ -340,7 +376,7 @@ async fn dispatch(
     }
 
     if let Some(dispatcher) = a2a {
-        return Ok(dispatcher.dispatch(request).await.map(Body::new));
+        return Ok(dispatcher.dispatch(request).await);
     }
 
     let mut response = Response::new(Body::from("not found"));
@@ -360,7 +396,10 @@ async fn dispatch(
 mod tests {
     use std::time::Duration;
 
-    use super::{BearerToken, start};
+    use super::{
+        A2aExecutionMode, BearerToken, start, start_with_registry, start_with_registry_and_mode,
+    };
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
@@ -395,6 +434,137 @@ mod tests {
             std::fs::write(&path, contents).unwrap();
             assert!(BearerToken::load(&path).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_standalone_mode_does_not_require_an_interactive_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let sessions = crate::protocols::acp::SessionRegistry::new();
+        let mut server = start_with_registry_and_mode(
+            runtime,
+            "127.0.0.1:0".into(),
+            true,
+            true,
+            None,
+            sessions.clone(),
+            A2aExecutionMode::Standalone,
+        )
+        .await
+        .unwrap();
+        // Empty input exercises the standalone executor without contacting a provider.
+        let response: serde_json::Value = reqwest::Client::new().post(format!("http://{}/", server.address()))
+            .header("A2A-Version", "1.0").json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
+                "message": {"messageId": "standalone", "role": "ROLE_USER", "parts": [{"text": " "}]}
+            }
+        })).send().await.unwrap().json().await.unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            response["result"]["task"]["status"]["state"],
+            "TASK_STATE_FAILED"
+        );
+        assert!(
+            response["result"]["task"]["artifacts"]
+                .to_string()
+                .contains("must contain a text part")
+        );
+        sessions.shutdown().await;
+        server.shutdown();
+        server.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a2a_shared_listener_returns_admission_message_and_never_falls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let client = reqwest::Client::new();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
+            "message": {"messageId": "http-admission", "role": "ROLE_USER", "parts": [{"text": "admit"}]}
+        }});
+        let mut unbound = start_with_registry(
+            runtime.clone(),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            crate::protocols::acp::SessionRegistry::new(),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = client
+            .post(format!("http://{}/", unbound.address()))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no bound")
+        );
+        unbound.shutdown();
+        unbound.join().await.unwrap();
+
+        let sessions =
+            crate::protocols::acp::a2a_test_support::bound_registry(Arc::new(|_prompt| {
+                Box::pin(async { Ok("Admission only, not completion".into()) })
+            }));
+        let mut server =
+            start_with_registry(runtime, "127.0.0.1:0".into(), true, false, None, sessions)
+                .await
+                .unwrap();
+        let response: serde_json::Value = client
+            .post(format!("http://{}/", server.address()))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["message"]["role"], "ROLE_AGENT");
+        assert_eq!(
+            response["result"]["message"]["metadata"]["kind"],
+            "admission_acknowledgment"
+        );
+        assert!(response["result"]["message"].get("status").is_none());
+        assert!(response["result"]["message"].get("taskId").is_none());
+        let a2a_client =
+            a2a_protocol_client::ClientBuilder::new(format!("http://{}/", server.address()))
+                .build()
+                .unwrap();
+        let decoded = a2a_client
+            .send_message(serde_json::from_value(request["params"].clone()).unwrap())
+            .await
+            .unwrap();
+        let a2a_protocol_types::responses::SendMessageResponse::Message(message) = decoded else {
+            panic!("expected an admission Message, not a Task")
+        };
+        assert_eq!(
+            message.metadata.unwrap()["kind"],
+            "admission_acknowledgment"
+        );
+        let mut malformed = request.clone();
+        malformed["id"] = serde_json::json!({"invalid": "id"});
+        let response: serde_json::Value = client
+            .post(format!("http://{}/", server.address()))
+            .json(&malformed)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(response["id"].is_null());
+        assert_eq!(response["error"]["code"], -32600);
+        server.shutdown();
+        server.join().await.unwrap();
     }
 
     #[tokio::test]
