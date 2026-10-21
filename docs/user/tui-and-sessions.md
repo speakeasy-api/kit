@@ -133,6 +133,19 @@ Press `Command+B` to detach the newest running foreground top-level compose call
 
 At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
 
+## Answer agent questions
+
+When an agent needs a decision, Kit can show a form with single-choice or multiple-choice options and optional custom-answer fields. The form identifies the requesting agent and explains what it needs. Answers stay local to the form until you submit the review page.
+
+- Use `Up` / `Down` to highlight an option and `Space` to select it. For multiple-choice fields, `Space` toggles each option independently.
+- Type into text or numeric fields. Use `Left` / `Right` to choose false / true for a boolean field, or `Space` to toggle it.
+- Press `Enter` to advance and `Shift+Tab` to go back without losing answers. Optional custom answers appear on a separate page.
+- On the review page, press `Enter` to submit all answers together, or `Shift+Tab` to revise them.
+- Press `Delete` to clear the current field and `PageUp` / `PageDown` to scroll.
+- Press `Esc` to dismiss the request, or `Ctrl+D` to explicitly decline. Neither action submits selections.
+
+Do not enter passwords, API keys, or other credentials in these forms. Kit supports session-scoped ACP form elicitation, not URL elicitation. Unsupported form constraints are rejected rather than silently ignored. If your ACP client does not support forms, ask and answer in ordinary chat instead.
+
 ## Read the transcript
 
 The transcript keeps a three-column gutter: `›` marks your prompts, `⋮` reasoning, a spinner, `✓`, or `✗` each compose program, `⇅` a compaction, and `↩` a background result landing after its turn ended. Prose has an empty gutter, so the left edge alone shows the turn's shape.

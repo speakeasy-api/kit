@@ -1,6 +1,14 @@
 # Compose, Runlet, and Local Tools
 
-Kit exposes one model-visible tool, `compose`. A compose call contains a Runlet program that can invoke Kit's hidden tools, including `shell`, `edit`, `a2a`, subagents, Agent Skills, bundled documentation, and MCP meta-tools. Users normally ask Kit to do work through an installed-binary command such as `kit tui --root /path/to/project` or `kit prompt --root /path/to/project "Run the smallest relevant test"`; the agent writes the Runlet program. Use `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
+Kit exposes `compose` for tool orchestration and, when the connected client supports forms, `ask_user` for interactive decisions. A compose call contains a Runlet program that can invoke Kit's hidden tools, including `shell`, `edit`, `a2a`, subagents, Agent Skills, bundled documentation, and MCP meta-tools. Users normally ask Kit to do work through an installed-binary command such as `kit tui --root /path/to/project` or `kit prompt --root /path/to/project "Run the smallest relevant test"`; the agent writes the Runlet program. Use `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
+
+## Ask for a user decision
+
+When an ACP v2 client advertises form elicitation, Kit also exposes `ask_user` as a standalone tool. It is not a Runlet function and cannot run in the background. Use it for decisions that need explicit user input, not credentials or secrets.
+
+A request contains a `message` and 1–8 `questions`. Each question has a stable `id`, `title`, `prompt`, and 1–32 `options` with stable IDs and display labels. Set `multiple: true` for multiple selections and `allow_custom: true` to offer a separate text field. Both flags default to false. The complete form request is limited to 128 KiB; shorten descriptions or split the batch if the tool reports that the form is too large.
+
+Accepted answers are keyed by question ID, with selected option IDs in `selected` and optional text in `custom`. A declined or dismissed request returns `action: "decline"` or `action: "cancel"` without answers; do not treat either as a selection. The bundled TUI supports [paged forms and answer review](tui-and-sessions.md#answer-agent-questions). Clients without form support do not receive this tool; use ordinary chat questions instead.
 
 ## How a compose Runlet works
 

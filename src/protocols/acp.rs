@@ -1810,6 +1810,7 @@ impl Server {
         )
         .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
+            ask_user: None,
             cwd,
             additional_directories,
             integration: Arc::new(observer),

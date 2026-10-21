@@ -323,6 +323,7 @@ pub(crate) struct AcpForkState {
 }
 
 pub(crate) struct AcpDriverContext<I = AcpIntegration> {
+    pub ask_user: Option<crate::tools::ask_user::AskUserTool>,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub integration: Arc<I>,
@@ -1977,6 +1978,16 @@ impl Runtime {
                 crate::ahp::PromptRecord::Session(opened.observer.clone()),
             ));
         }
+        if let Some(ask_user) = context.ask_user {
+            // User interaction remains foreground-only, outside backgroundable compose.
+            let questions = agentkit_tools_core::ToolRegistry::new().with(Observed::new(ask_user));
+            let questions = if let Some(hooks) = &self.hooks {
+                crate::ahp::hooked_tools(questions, hooks)
+            } else {
+                questions
+            };
+            builder = builder.add_tool_source(questions);
+        }
         let driver = builder
             .observer(context.integration.as_ref().clone())
             .observer(crate::fatal::RetryLog)
@@ -3311,6 +3322,7 @@ mod additional_directory_tests {
             let driver = runtime
                 .start_acp_driver_with_mcp(
                     AcpDriverContext {
+                        ask_user: None,
                         cwd: root.path().to_path_buf(),
                         additional_directories: vec![],
                         integration: Arc::new(Observer),

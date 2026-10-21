@@ -35,7 +35,8 @@ const AGENTS_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 
 pub(super) fn native_links_obscured(app: &App) -> bool {
-    app.model_switch.is_some()
+    !app.elicitations.is_empty()
+        || app.model_switch.is_some()
         || app.file_picker.is_some()
         || app.session_dialog.is_some()
         || app.model_dialog.is_some()
@@ -55,6 +56,12 @@ type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     images.poll();
+    app.elicitations
+        .retain(|pending| !pending.reply.is_closed());
+    if let Some(pending) = app.elicitations.front_mut() {
+        pending.form.render(frame);
+        return;
+    }
     app.child_back_area = Rect::default();
     if let Some(id) = app.child_focus.clone()
         && let Some(mut child) = app.child_views.remove(&id)

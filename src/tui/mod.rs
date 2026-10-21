@@ -11,6 +11,8 @@ mod attachment;
 mod background;
 mod command;
 mod editor;
+mod elicitation;
+mod elicitation_requests;
 mod hyperlinks;
 mod image;
 mod input;
@@ -885,7 +887,9 @@ fn credential_storage_for_launch(
 }
 
 fn client_capabilities(credential_storage: &CredentialStorage) -> wire::ClientCapabilities {
-    let capabilities = wire::ClientCapabilities::new();
+    let capabilities = wire::ClientCapabilities::new().elicitation(
+        wire::ElicitationCapabilities::new().form(wire::ElicitationFormCapabilities::new()),
+    );
     if credential_storage.is_persistent() {
         capabilities
             .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()))
@@ -1645,6 +1649,11 @@ async fn run_client(
             Ok::<_, std::io::Error>(())
         });
 
+        let questions = Arc::new(elicitation_requests::Ingress::new(
+            updates_tx.clone(),
+            Arc::clone(&active_persisted_id),
+        ));
+        let question_origin = questions.origin.clone();
         let notifications = updates_tx.clone();
         let cleanup_root = root.clone();
         let transition_session = Arc::clone(&active_persisted_id);
@@ -1658,6 +1667,12 @@ async fn run_client(
             let resume_session_id = resume_session_id.clone();
             agent_client_protocol::Client
         .v2()
+        .on_receive_request(
+            async move |request: elicitation_requests::RawRequest, responder, _cx| {
+                questions.dispatch(request, responder)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
                 if is_remote {
@@ -1724,6 +1739,7 @@ async fn run_client(
                     std::io::Error::other("the agent did not negotiate ACP v2"),
                 ));
             }
+            let _ = question_origin.set(initialized.info.name.clone());
             let auth_methods = if is_remote {
                 Vec::new()
             } else {
@@ -3484,7 +3500,8 @@ fn clipboard_paste_key(key: KeyEvent) -> bool {
 }
 
 fn paste_blocked(app: &App) -> bool {
-    app.model_switch.is_some()
+    !app.elicitations.is_empty()
+        || app.model_switch.is_some()
         || app.model_dialog.is_some()
         || app.effort_dialog.is_some()
         || (app.session_dialog.is_some() && !app.session_rename_active())
@@ -3552,7 +3569,7 @@ fn apply_clipboard_completion(
 }
 
 fn handle_paste(app: &mut App, text: &str) -> bool {
-    if app.child_focus.is_some() {
+    if !app.elicitations.is_empty() || app.child_focus.is_some() {
         app.paste(text);
         return true;
     }
@@ -3786,6 +3803,7 @@ fn draw_frame<W: std::io::Write>(
         ui::draw(frame, app, images);
         // Child views render no overlays, including command completions for
         // literal slash drafts. Only the root view uses those controls.
+        let form_obscures = !app.elicitations.is_empty();
         let (app, obscured) = app
             .child_focus
             .as_ref()
@@ -3798,7 +3816,7 @@ fn draw_frame<W: std::io::Write>(
             rows: app.row_links.clone(),
             left: app.transcript_left,
             top: app.transcript_top,
-            obscured,
+            obscured: obscured || form_obscures,
         }
     })
 }
