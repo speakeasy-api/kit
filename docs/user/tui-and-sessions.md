@@ -139,9 +139,10 @@ When an agent needs a decision, Kit can show a form with single-choice or multip
 
 - Use `Up` / `Down` to highlight an option and `Space` to select it. For multiple-choice fields, `Space` toggles each option independently.
 - Text and numeric fields use the composer editor: move the cursor with arrow keys, use `Alt+Left` / `Alt+Right` to move by word, and `Alt+Backspace` or `Ctrl+W` to delete the previous word. `Ctrl+U` / `Ctrl+K` delete to the start / end of the line. `Shift+Enter` inserts a newline; `Ctrl+V` / `Shift+Insert` and bracketed paste insert text at the cursor. Clipboard images are not accepted in form fields. Use `Left` / `Right` to choose false / true for a boolean field, or `Space` to toggle it.
-- When a question offers **Other**, its text input appears below the choices on the same page. Press `Tab` to switch focus between the choices and Other. You can keep selected options and an Other answer together, or enter only an Other answer.
-- Press `Enter` to advance and `Shift+Tab` to go back without losing answers. Required questions must have a selection or non-blank Other text before you can advance. Unrelated form fields remain on separate pages.
-- On the review page, press `Enter` to submit all answers together, or `Shift+Tab` to revise them.
+- When a question offers **Other**, its text input appears below the choices on the same page. Press `Tab` to move from the choices to Other, then to the next question. You can keep selected options and an Other answer together, or enter only an Other answer.
+- Press `Tab` to move forward through inputs and questions to review, even when an answer is blank. `Shift+Tab` moves backwards through the same inputs: from Other to choices, or from choices to the previous question’s last input. Neither key validates answers or submits the form; drafts are preserved. Unrelated form fields remain on separate pages.
+- Press `Enter` to validate the current question and advance. A required choice question must have a selection or non-blank Other text.
+- On the review page, press `Enter` to validate and submit all answers together, or `Shift+Tab` to revise them. Skipped required answers return you to the input that needs attention. `Tab` on review stays there without submitting.
 - Press `Delete` to clear a choice or boolean field; in text fields it deletes forward from the cursor. Use `PageUp` / `PageDown` to scroll the question or review.
 - Press `Esc` to dismiss the request, or `Ctrl+D` to explicitly decline. Neither action submits selections.
 

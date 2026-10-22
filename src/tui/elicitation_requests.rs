@@ -660,7 +660,7 @@ mod tests {
                         assert!(screen(&mut app).contains("Focus: Other"));
                         app.paste("Also docs, please");
                         let stale = app.clipboard_route();
-                        press(&mut app, KeyCode::Tab);
+                        press(&mut app, KeyCode::BackTab);
                         assert!(screen(&mut app).contains("Focus: choices"));
                         assert_eq!(crate::tui::apply_clipboard_completion(&mut app, &route, 1, stale,
                             crate::tui::ClipboardResult::Text("stale".into())), None);

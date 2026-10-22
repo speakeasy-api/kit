@@ -695,14 +695,26 @@ impl Form {
                 wire::ElicitationAction::Decline,
             ));
         }
-        if key.code == KeyCode::Tab
-            && self
-                .pages
-                .get(self.page)
-                .and_then(|i| self.custom_field(*i))
-                .is_some()
-        {
-            self.other_focus = !self.other_focus;
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let backwards =
+                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+            if backwards {
+                if self.other_focus {
+                    self.other_focus = false;
+                } else if self.page > 0 {
+                    self.page -= 1;
+                    self.other_focus = self.custom_field(self.pages[self.page]).is_some();
+                }
+            } else if self.page < self.pages.len() {
+                if !self.other_focus && self.custom_field(self.pages[self.page]).is_some() {
+                    self.other_focus = true;
+                } else {
+                    self.page += 1;
+                    self.other_focus = false;
+                }
+            }
+            self.scroll = 0;
+            self.error = None;
             return None;
         }
         if let Some(field) = self
@@ -716,12 +728,6 @@ impl Form {
             return None;
         }
         match key.code {
-            KeyCode::BackTab => {
-                self.other_focus = false;
-                self.page = self.page.saturating_sub(1);
-                self.scroll = 0;
-                self.error = None;
-            }
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(5),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
             KeyCode::Enter => {
@@ -844,7 +850,7 @@ impl Form {
             if !field.options.is_empty() {
                 let custom = self.custom_field(selection);
                 text.push_str(if self.other_focus {
-                    "Focus: Other (Tab: choices)\n"
+                    "Focus: Other (Tab: next; Shift+Tab: choices)\n"
                 } else if custom.is_some() {
                     "Focus: choices (Tab: Other)\n"
                 } else {
@@ -997,7 +1003,7 @@ impl Form {
             }
             render_text(frame, parts[0], text, &mut self.scroll);
         }
-        frame.render_widget(Paragraph::new(format!("{}\nEnter: next/submit • Shift+Tab: back • Space: select • Tab: focus\nEsc: cancel • Ctrl+D: decline • PgUp/PgDn: scroll", self.error.as_deref().unwrap_or(""))).wrap(Wrap { trim: false }), parts[1]);
+        frame.render_widget(Paragraph::new(format!("{}\nEnter: next/submit • Shift+Tab: back • Space: select • Tab: forward\nEsc: cancel • Ctrl+D: decline • PgUp/PgDn: scroll", self.error.as_deref().unwrap_or(""))).wrap(Wrap { trim: false }), parts[1]);
     }
 }
 
@@ -1228,6 +1234,63 @@ mod tests {
         assert!(form(json!({"x":{"type":"_future"}}), json!([])).is_err());
     }
     #[test]
+    fn tab_traverses_unanswered_inputs_symmetrically_without_submitting() {
+        let mut f = Form::from_value(json!({"mode":"form","message":"Choose","requestedSchema":{
+            "type":"object","required":["plain"],"properties":{
+                "plain":{"type":"string","minLength":1},"pick":{"type":"string","enum":["a"]},
+                "custom":{"type":"string"}
+            },"_meta":{"kit/questions":{"order":["plain","pick","custom"],
+                "require_answer":[{"selection":"pick","custom":"custom"}]}}
+        }}))
+        .unwrap();
+        assert!(press(&mut f, KeyCode::BackTab).is_none());
+        assert_eq!((f.page, f.other_focus), (0, false));
+        for expected in [(1, false), (1, true), (2, false), (2, false)] {
+            assert!(press(&mut f, KeyCode::Tab).is_none());
+            assert_eq!((f.page, f.other_focus), expected);
+            assert!(f.error.is_none());
+        }
+        // Both terminal encodings move backwards, including from review.
+        for (key, expected) in [
+            (KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), (1, true)),
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+                (1, false),
+            ),
+            (KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), (0, false)),
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+                (0, false),
+            ),
+        ] {
+            assert!(f.key(key).is_none());
+            assert_eq!((f.page, f.other_focus), expected);
+        }
+        assert!(f.fields.iter().all(|field| field.editor.text().is_empty()));
+        for _ in 0..3 {
+            press(&mut f, KeyCode::Tab);
+        }
+        assert!(press(&mut f, KeyCode::Enter).is_none());
+        assert_eq!((f.page, f.other_focus), (0, false));
+        assert!(f.error.is_some());
+        f.paste("draft");
+        let stale = f.clipboard_target();
+        press(&mut f, KeyCode::Tab);
+        assert_ne!(f.clipboard_target(), stale);
+        assert!(f.error.is_none());
+        press(&mut f, KeyCode::Tab);
+        f.paste("   ");
+        press(&mut f, KeyCode::Tab);
+        assert!(press(&mut f, KeyCode::Enter).is_none());
+        assert_eq!((f.page, f.other_focus), (1, true));
+        assert!(f.error.as_deref().unwrap().contains("non-blank"));
+        press(&mut f, KeyCode::BackTab);
+        assert!(f.error.is_none());
+        press(&mut f, KeyCode::BackTab);
+        assert_eq!(f.fields[f.focused_field().unwrap()].editor.text(), "draft");
+    }
+
+    #[test]
     fn grouped_single_choice_keeps_generic_fields_and_inline_text() {
         let mut f = Form::from_value(json!({"mode":"form","message":"Choose","requestedSchema":{
             "type":"object","properties":{
@@ -1243,7 +1306,7 @@ mod tests {
         press(&mut f, KeyCode::Tab);
         f.paste("context");
         let clipboard = f.clipboard_target();
-        press(&mut f, KeyCode::Tab);
+        press(&mut f, KeyCode::BackTab);
         assert_ne!(clipboard, f.clipboard_target());
         f.paste("ignored");
         press(&mut f, KeyCode::Enter);
