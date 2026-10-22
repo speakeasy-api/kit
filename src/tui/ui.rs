@@ -832,25 +832,29 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
         width,
         height,
     );
-    let (labels, title, enter, esc) = match &dialog.provider {
+    // Rows flagged `true` are signed-out providers; entering one starts login.
+    let (labels, title, esc) = match &dialog.provider {
         None => (
             app.selected_model_providers()
                 .into_iter()
-                .map(str::to_owned)
+                .map(|row| (row.name.to_owned(), row.login.is_some()))
                 .collect::<Vec<_>>(),
             " provider ".to_owned(),
-            "open",
             "close",
         ),
         Some(provider) => (
             app.selected_model_choices()
                 .into_iter()
-                .map(|choice| choice.model.clone())
+                .map(|choice| (choice.model.clone(), false))
                 .collect(),
             format!(" {provider} · model "),
-            "select",
             "back",
         ),
+    };
+    let enter = match (&dialog.provider, labels.get(dialog.selected)) {
+        (Some(_), _) => "select",
+        (None, Some((_, true))) => "sign in",
+        (None, _) => "open",
     };
     let footer = format!(
         "tab defaults [{}]  ·  enter {enter}  ·  esc {esc}",
@@ -871,13 +875,14 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     let lines = labels[viewport.clone()]
         .iter()
         .zip(viewport)
-        .map(|(label, index)| {
+        .map(|((label, signed_out), index)| {
             let selected = index == dialog.selected;
             let marker = if selected { "› " } else { "  " };
-            let style = if selected {
-                theme::accent()
-            } else {
-                theme::text()
+            let style = match (selected, *signed_out) {
+                (true, false) => theme::accent(),
+                (true, true) => theme::dim(),
+                (false, false) => theme::text(),
+                (false, true) => theme::faint(),
             };
             Line::from(Span::styled(format!("{marker}{label}"), style))
         })

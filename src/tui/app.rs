@@ -234,6 +234,14 @@ pub struct ModelSwitch {
     pub cancelling: bool,
 }
 
+/// A row on the model dialog's provider page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderRow<'a> {
+    pub name: &'a str,
+    /// Set for providers without models until the user signs in.
+    pub login: Option<&'a AuthMethodTerminal>,
+}
+
 pub struct ModelDialog {
     pub query: String,
     pub selected: usize,
@@ -3600,11 +3608,40 @@ impl App {
             .filter(move |choice| choice.provider == provider)
     }
 
-    /// Providers matching the search on the provider page; empty on the model page.
-    pub fn selected_model_providers(&self) -> Vec<&str> {
+    /// Advertised sign-in methods for providers that have no models yet.
+    fn login_providers(&self) -> Vec<ProviderRow<'_>> {
+        let active = self.model_providers();
+        self.auth_methods
+            .iter()
+            .filter_map(|method| {
+                let name = crate::protocols::acp::terminal_auth_method_specs()
+                    .iter()
+                    .find(|spec| spec.method_id == method.method_id.0.as_ref())?
+                    .provider
+                    .as_str();
+                (!active.contains(&name)).then_some(ProviderRow {
+                    name,
+                    login: Some(method),
+                })
+            })
+            .collect()
+    }
+
+    /// Providers matching the search on the provider page, with signed-out
+    /// providers after the active ones; empty on the model page.
+    pub fn selected_model_providers(&self) -> Vec<ProviderRow<'_>> {
         match &self.model_dialog {
             Some(dialog) if dialog.provider.is_none() => {
-                rank_by_name(self.model_providers(), &dialog.query, |provider| provider)
+                let active = self
+                    .model_providers()
+                    .into_iter()
+                    .map(|name| ProviderRow { name, login: None })
+                    .collect();
+                let mut rows = rank_by_name(active, &dialog.query, |row| row.name);
+                rows.extend(rank_by_name(self.login_providers(), &dialog.query, |row| {
+                    row.name
+                }));
+                rows
             }
             _ => Vec::new(),
         }
@@ -3734,12 +3771,21 @@ impl App {
                     .as_ref()
                     .is_some_and(|dialog| dialog.provider.is_none())
                 {
-                    let provider = self
-                        .selected_model_providers()
-                        .get(selected)
-                        .map(|provider| (*provider).to_owned());
-                    if let Some(provider) = provider {
-                        self.open_model_provider(provider);
+                    let row = self.selected_model_providers().get(selected).copied();
+                    match row {
+                        Some(ProviderRow {
+                            login: Some(method),
+                            ..
+                        }) => {
+                            let method = method.clone();
+                            self.model_dialog = None;
+                            return Action::Login(method);
+                        }
+                        Some(ProviderRow { name, login: None }) => {
+                            let provider = name.to_owned();
+                            self.open_model_provider(provider);
+                        }
+                        None => {}
                     }
                     return Action::None;
                 }
@@ -4699,7 +4745,7 @@ impl App {
                         }
                     },
                     Parsed::Model { query: None } => {
-                        if self.model_choices.is_empty() {
+                        if self.model_choices.is_empty() && self.auth_methods.is_empty() {
                             self.toast("no models are available");
                         } else {
                             self.open_model_dialog();
@@ -9051,6 +9097,59 @@ mod tests {
         ]
     }
 
+    fn provider_names(app: &App) -> Vec<&str> {
+        app.selected_model_providers()
+            .into_iter()
+            .map(|row| row.name)
+            .collect()
+    }
+
+    #[test]
+    fn model_dialog_lists_signed_out_providers_after_active_ones_and_logs_in() {
+        let mut app = app();
+        app.set_model_choices(vec![model_choice("openai-subscription", "gpt-5.4")]);
+        app.auth_methods = vec![
+            AuthMethodTerminal::new("openai", "Sign in with ChatGPT"),
+            AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter"),
+            AuthMethodTerminal::new("anthropic", "Sign in with Anthropic"),
+        ];
+        app.open_model_dialog();
+
+        let rows = app.selected_model_providers();
+        assert_eq!(
+            rows.iter().map(|row| row.name).collect::<Vec<_>>(),
+            ["openai-subscription", "openrouter", "anthropic"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.login.is_some())
+                .collect::<Vec<_>>(),
+            [false, true, true]
+        );
+
+        for character in "anthr".chars() {
+            app.handle_key(press(KeyCode::Char(character)));
+        }
+        assert_eq!(provider_names(&app), ["anthropic"]);
+        let Action::Login(method) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected login");
+        };
+        assert_eq!(method.method_id.0.as_ref(), "anthropic");
+        assert!(app.model_dialog.is_none());
+    }
+
+    #[test]
+    fn model_command_opens_the_provider_page_with_only_sign_in_methods() {
+        let mut app = app();
+        app.auth_methods = vec![AuthMethodTerminal::new(
+            "anthropic",
+            "Sign in with Anthropic",
+        )];
+        app.editor.insert_str("/model");
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(provider_names(&app), ["anthropic"]);
+    }
+
     #[test]
     fn sessions_command_defers_catalog_work_to_the_event_loop() {
         let mut app = app();
@@ -9361,7 +9460,7 @@ mod tests {
         assert_eq!(dialog.provider, None);
         assert_eq!(dialog.selected, 0);
         assert_eq!(
-            app.selected_model_providers(),
+            provider_names(&app),
             ["openai-subscription", "anthropic", "openrouter"]
         );
         assert!(app.selected_model_choices().is_empty());
@@ -9370,7 +9469,7 @@ mod tests {
         for character in "openr".chars() {
             app.handle_key(press(KeyCode::Char(character)));
         }
-        assert_eq!(app.selected_model_providers(), ["openrouter"]);
+        assert_eq!(provider_names(&app), ["openrouter"]);
         app.handle_key(press(KeyCode::Enter));
         let dialog = app.model_dialog.as_ref().expect("model dialog");
         assert_eq!(dialog.provider.as_deref(), Some("openrouter"));
