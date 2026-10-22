@@ -287,6 +287,52 @@ mod tests {
     }
 
     #[test]
+    fn elicitation_keeps_status_and_durability_warnings_below_controls() {
+        let ingress = ingress();
+        let (queued, _receiver) = ingress.prepare(request("session")).unwrap();
+        let mut app = app();
+        app.apply(queued.update);
+        app.toast = Some(("Example status toast".into(), std::time::Instant::now()));
+        let mut images = crate::tui::image::ImageRuntime::disabled();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        for exhausted in [false, true] {
+            app.storage_pending = !exhausted;
+            app.storage_exhausted = exhausted;
+            terminal
+                .draw(|frame| crate::tui::ui::draw(frame, &mut app, &mut images))
+                .unwrap();
+            let rows: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(100)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            assert!(rows.iter().any(|row| row.contains("Choose a scope")));
+            let controls = rows
+                .iter()
+                .position(|row| row.contains("Esc: cancel"))
+                .unwrap();
+            let status = rows
+                .iter()
+                .position(|row| row.contains("Example status toast"))
+                .unwrap();
+            let warning = rows
+                .iter()
+                .position(|row| {
+                    row.contains(if exhausted {
+                        "unpersisted data is at risk"
+                    } else {
+                        "data at risk on exit"
+                    })
+                })
+                .unwrap();
+            assert!(controls < status && status < warning);
+        }
+    }
+
+    #[test]
     fn elicitation_panel_keeps_conversation_visible_without_generated_chrome() {
         let ingress = ingress();
         let mut request = request("session");

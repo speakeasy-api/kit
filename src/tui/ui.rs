@@ -66,10 +66,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         // normal composer stays parked while the form owns keyboard input.
         let area = frame.area();
         let panel_rows = (area.height / 2).min(18);
-        let [header, body, panel] = Layout::vertical([
+        let [header, body, panel, status, durability] = Layout::vertical([
             Constraint::Length(u16::from(area.height > 2)),
             Constraint::Min(0),
             Constraint::Length(panel_rows),
+            Constraint::Length(1),
+            Constraint::Length(u16::from(durability_warning(app).is_some())),
         ])
         .areas(area);
         app.child_back_area = Rect::default();
@@ -86,6 +88,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         if let Some(pending) = app.elicitations.front_mut() {
             pending.form.render_in(frame, panel);
         }
+        draw_status(frame, app, status);
+        draw_durability_warning(frame, app, durability);
         return;
     }
     app.child_back_area = Rect::default();
@@ -183,23 +187,36 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
-    if app.runtime_unavailable() || app.storage_pending || app.storage_exhausted {
-        let area = frame.area();
-        let warning = if app.runtime_unavailable() {
-            " Runtime status unavailable: agent, child, compaction and storage state unknown"
-        } else if app.storage_exhausted {
-            " Storage exhausted: shutting down; unpersisted data is at risk"
-        } else {
-            " Memory-only storage: awaiting disk recovery; data at risk on exit"
-        };
+    let area = frame.area();
+    draw_durability_warning(
+        frame,
+        app,
+        Rect::new(
+            area.x,
+            area.bottom().saturating_sub(1),
+            area.width,
+            u16::from(area.height > 0),
+        ),
+    );
+}
+
+fn durability_warning(app: &App) -> Option<&'static str> {
+    if app.runtime_unavailable() {
+        Some(" Runtime status unavailable: agent, child, compaction and storage state unknown")
+    } else if app.storage_exhausted {
+        Some(" Storage exhausted: shutting down; unpersisted data is at risk")
+    } else if app.storage_pending {
+        Some(" Memory-only storage: awaiting disk recovery; data at risk on exit")
+    } else {
+        None
+    }
+}
+
+fn draw_durability_warning(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if let Some(warning) = durability_warning(app) {
         frame.render_widget(
             Paragraph::new(warning).style(Style::default().fg(theme::warn_color())),
-            Rect::new(
-                area.x,
-                area.bottom().saturating_sub(1),
-                area.width,
-                u16::from(area.height > 0),
-            ),
+            area,
         );
     }
 }
@@ -3249,7 +3266,9 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(theme::warn_color()),
         ));
     }
-    let hints = if app.editing_steer() {
+    let hints = if !app.elicitations.is_empty() {
+        ""
+    } else if app.editing_steer() {
         "⏎ save edit   esc restore draft "
     } else if app.queue_focused && !app.pending_steers.is_empty() {
         if app.can_replace_steer
