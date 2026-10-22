@@ -408,6 +408,59 @@ async fn tool_before_denial_skips_the_tool() {
 }
 
 #[tokio::test]
+async fn tool_before_rejects_malformed_original_arguments_without_dispatch() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before", "tool.after"])]);
+    let mut echo = Echo::new();
+    // Use a current schema distinct from the advertised schema, as dynamic tools do.
+    *Arc::get_mut(&mut echo).unwrap().current.get_mut().unwrap() = Some(ToolSpec::new(
+        ToolName::new("echo"),
+        "echo",
+        json!({
+            "type": "object",
+            "properties": {"offset": {"type": "integer", "minimum": 0}},
+            "required": ["offset"],
+        }),
+    ));
+
+    let outcome = call(&hooks, &echo, json!({"offset": "0"})).await;
+
+    match outcome {
+        ToolExecutionOutcome::FailedBeforeInvocation(ToolError::InvalidInput(message)) => {
+            assert!(message.contains("echo"), "{message}");
+            assert!(message.contains("/offset"), "{message}");
+            assert!(message.contains("integer"), "{message}");
+        }
+        other => panic!("expected invalid input, got {other:?}"),
+    }
+    assert!(echo.received.lock().unwrap().is_empty());
+    assert!(backend.all_events().is_empty());
+
+    output(call(&hooks, &echo, json!({"offset": 0})).await);
+    assert_eq!(*echo.received.lock().unwrap(), [json!({"offset": 0})]);
+    assert_eq!(backend.events("tool.before").len(), 1);
+    assert_eq!(backend.events("tool.after").len(), 1);
+}
+
+#[tokio::test]
+async fn tool_before_reports_invalid_schema_as_internal_without_dispatch() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before", "tool.after"])]);
+    let mut echo = Echo::new();
+    Arc::get_mut(&mut echo).unwrap().spec.input_schema = json!({"type": "not-a-type"});
+
+    let outcome = call(&hooks, &echo, json!({"text": "hello"})).await;
+
+    match outcome {
+        ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Internal(message)) => {
+            assert!(message.contains("echo"), "{message}");
+            assert!(message.contains("invalid tool schema"), "{message}");
+        }
+        other => panic!("expected internal error, got {other:?}"),
+    }
+    assert!(echo.received.lock().unwrap().is_empty());
+    assert!(backend.all_events().is_empty());
+}
+
+#[tokio::test]
 async fn tool_before_input_edits_reach_the_tool() {
     let (hooks, backend) = hooks(vec![intercept(&["tool.before"])]);
     backend.respond(
