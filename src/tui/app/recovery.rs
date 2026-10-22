@@ -14,6 +14,7 @@ pub(super) struct Candidate {
 
 impl App {
     fn recovery_failed(&mut self, message: &str) {
+        self.elicitations.clear();
         self.gateway_candidate = None;
         self.gateway_blocked = true;
         self.gateway_status = Some(format!(
@@ -59,6 +60,7 @@ impl App {
                 });
                 self.gateway_epoch = marker.epoch;
                 self.gateway_blocked = true;
+                self.elicitations.clear();
                 self.model_switch = None;
                 self.model_dialog = None;
                 self.effort_dialog = None;

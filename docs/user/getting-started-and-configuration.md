@@ -255,6 +255,27 @@ If the config file is missing, `set` creates it, `get` reports an error, and `un
 
 These commands only inspect or edit the local configuration: they do not run migrations, authenticate, or access the network. They do not open an interactive dialog. Use standard help such as `kit config --help` or `kit config set --help` for command syntax. Runtime commands still validate the settings they consume.
 
+### Disable native user questions
+
+To prevent Kit's native agent from exposing the `ask_user` tool, set the top-level
+`ask_user` boolean to `false`:
+
+```sh
+kit config set ask_user false
+```
+
+This writes `ask_user = false` in `~/.kit/config.toml`. Restart the running Kit
+process to apply the setting; configuration is read at startup. The default is
+`true`, but the tool still requires an ACP v2 client that supports form elicitation.
+This setting does not disable generic form display or change the TUI's advertised
+form capability.
+
+To restore the default, remove the setting and restart Kit:
+
+```sh
+kit config unset ask_user
+```
+
 ### Configuration example
 
 A representative configuration is:

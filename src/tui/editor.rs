@@ -7,7 +7,7 @@
 
 use unicode_width::UnicodeWidthStr;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Editor {
     text: String,
     cursor: usize,

@@ -49,6 +49,7 @@ pub use focus::ChildView;
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    Elicitation(super::elicitation_requests::Pending),
     GatewayRecovery(crate::tui::recovery::Event),
     ChildSteerFinished {
         id: String,
@@ -428,10 +429,17 @@ struct SteerEdit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClipboardRoute {
+    Elicitation {
+        epoch: u64,
+        target: super::elicitation::ClipboardTarget,
+    },
     Blocked(u64),
     Composer(u64),
     Rename(u64),
-    Steer { id: String, token: u64 },
+    Steer {
+        id: String,
+        token: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -849,6 +857,7 @@ pub struct App {
     pub model: String,
     pub model_choices: Vec<ModelChoice>,
     pub model_dialog: Option<ModelDialog>,
+    pub(super) elicitations: VecDeque<super::elicitation_requests::Pending>,
     pub model_switch: Option<ModelSwitch>,
     next_model_switch: u64,
     pub reasoning_effort: String,
@@ -1151,6 +1160,7 @@ impl App {
             model,
             model_choices: Vec::new(),
             model_dialog: None,
+            elicitations: VecDeque::new(),
             model_switch: None,
             next_model_switch: 0,
             reasoning_effort: "default".into(),
@@ -1476,6 +1486,7 @@ impl App {
     /// This does not mean that every poll needs a terminal frame.
     pub fn needs_redraw_tick(&self) -> bool {
         (!self.runtime_status_unavailable && self.runtime_last_frame.is_some())
+            || !self.elicitations.is_empty()
             || self.toast.is_some()
             || self.has_tick_animation()
     }
@@ -1497,6 +1508,10 @@ impl App {
 
     /// Runs periodic maintenance and reports whether a new frame is needed.
     pub fn tick(&mut self) -> bool {
+        let pending_count = self.elicitations.len();
+        self.elicitations
+            .retain(|pending| !pending.reply.is_closed());
+        let forms_changed = self.elicitations.len() != pending_count;
         let animated = self.has_tick_animation();
         let unavailable = self.runtime_status_unavailable;
         let toast = self.toast.is_some();
@@ -1504,6 +1519,7 @@ impl App {
         self.runtime_tick_at(Instant::now());
         self.tick_at(crate::events::now_millis());
         animated
+            || forms_changed
             || unavailable != self.runtime_status_unavailable
             || toast != self.toast.is_some()
             || agents != self.agents.len()
@@ -2254,6 +2270,13 @@ impl App {
     fn apply_observed(&mut self, update: Update) {
         let at = self.observed_at();
         match update {
+            Update::Elicitation(pending) => {
+                self.elicitations
+                    .retain(|pending| !pending.reply.is_closed());
+                if !pending.reply.is_closed() {
+                    self.elicitations.push_back(pending);
+                }
+            }
             Update::GatewayRecovery(event) => self.apply_recovery(event, Vec::new()),
             Update::ChildSteerFinished {
                 id,
@@ -2626,6 +2649,7 @@ impl App {
                 _ => {}
             },
             Update::ProcessExited(error) => {
+                self.elicitations.clear();
                 // Confirmed process exit can retire known roster rows. A mere
                 // diagnostic gap cannot claim those terminal outcomes.
                 self.invalidate_runtime_status();
@@ -3122,6 +3146,7 @@ impl App {
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.elicitations.clear();
         self.model_switch = None;
         self.cancel_steer_edit();
         self.selected_steer = None;
@@ -3469,6 +3494,18 @@ impl App {
     }
 
     pub(super) fn clipboard_route(&self) -> ClipboardRoute {
+        if let Some(pending) = self.elicitations.front() {
+            return if pending.reply.is_closed() {
+                ClipboardRoute::Blocked(self.clipboard_route_epoch)
+            } else if let Some(target) = pending.form.clipboard_target() {
+                ClipboardRoute::Elicitation {
+                    epoch: self.clipboard_route_epoch,
+                    target,
+                }
+            } else {
+                ClipboardRoute::Blocked(self.clipboard_route_epoch)
+            };
+        }
         if self.child_focus.is_some()
             || self.model_switch.is_some()
             || self.model_dialog.is_some()
@@ -3496,6 +3533,11 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if let Some(pending) = self.elicitations.front_mut() {
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+            pending.form.paste(text);
+            return;
+        }
         if self.child_focus.is_some() {
             self.paste_child(text);
             return;
@@ -4211,6 +4253,26 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
+        if self
+            .elicitations
+            .front()
+            .is_some_and(|pending| pending.reply.is_closed())
+        {
+            self.elicitations
+                .retain(|pending| !pending.reply.is_closed());
+            return Action::Redraw;
+        }
+        if let Some(pending) = self.elicitations.front_mut() {
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+            if let Some(response) = pending.form.key(key)
+                && let Some(pending) = self.elicitations.pop_front()
+            {
+                let _ = pending.reply.send(response);
+            }
+            // End the input burst before exposing a new page, queued form or
+            // the composer. Buffered Enter must not act on an unseen target.
+            return Action::Redraw;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::SUPER {
             self.command_copy_observed = true;
         }
@@ -4786,6 +4848,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if !self.elicitations.is_empty() {
+            return Action::None;
+        }
         if let Some(action) = self.handle_focus_mouse(mouse) {
             return action;
         }

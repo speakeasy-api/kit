@@ -11,6 +11,8 @@ mod attachment;
 mod background;
 mod command;
 mod editor;
+mod elicitation;
+mod elicitation_requests;
 mod hyperlinks;
 mod image;
 mod input;
@@ -885,7 +887,9 @@ fn credential_storage_for_launch(
 }
 
 fn client_capabilities(credential_storage: &CredentialStorage) -> wire::ClientCapabilities {
-    let capabilities = wire::ClientCapabilities::new();
+    let capabilities = wire::ClientCapabilities::new().elicitation(
+        wire::ElicitationCapabilities::new().form(wire::ElicitationFormCapabilities::new()),
+    );
     if credential_storage.is_persistent() {
         capabilities
             .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()))
@@ -1645,6 +1649,11 @@ async fn run_client(
             Ok::<_, std::io::Error>(())
         });
 
+        let questions = Arc::new(elicitation_requests::Ingress::new(
+            updates_tx.clone(),
+            Arc::clone(&active_persisted_id),
+        ));
+        let question_origin = questions.origin.clone();
         let notifications = updates_tx.clone();
         let cleanup_root = root.clone();
         let transition_session = Arc::clone(&active_persisted_id);
@@ -1658,6 +1667,12 @@ async fn run_client(
             let resume_session_id = resume_session_id.clone();
             agent_client_protocol::Client
         .v2()
+        .on_receive_request(
+            async move |request: elicitation_requests::RawRequest, responder, _cx| {
+                questions.dispatch(request, responder)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
                 if is_remote {
@@ -1724,6 +1739,7 @@ async fn run_client(
                     std::io::Error::other("the agent did not negotiate ACP v2"),
                 ));
             }
+            let _ = question_origin.set(initialized.info.name.clone());
             let auth_methods = if is_remote {
                 Vec::new()
             } else {
@@ -3484,6 +3500,9 @@ fn clipboard_paste_key(key: KeyEvent) -> bool {
 }
 
 fn paste_blocked(app: &App) -> bool {
+    if !app.elicitations.is_empty() {
+        return !matches!(app.clipboard_route(), ClipboardRoute::Elicitation { .. });
+    }
     app.model_switch.is_some()
         || app.model_dialog.is_some()
         || app.effort_dialog.is_some()
@@ -3543,6 +3562,9 @@ fn apply_clipboard_completion(
     Some(match result {
         ClipboardResult::NoImage => true,
         ClipboardResult::Text(text) => handle_paste(app, &text),
+        ClipboardResult::Attachment(_) if matches!(route, ClipboardRoute::Elicitation { .. }) => {
+            false
+        }
         ClipboardResult::Attachment(attachment) => attach_pasted(app, vec![attachment]),
         ClipboardResult::Error(error) => {
             app.note(error);
@@ -3552,7 +3574,7 @@ fn apply_clipboard_completion(
 }
 
 fn handle_paste(app: &mut App, text: &str) -> bool {
-    if app.child_focus.is_some() {
+    if !app.elicitations.is_empty() || app.child_focus.is_some() {
         app.paste(text);
         return true;
     }

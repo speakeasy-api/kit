@@ -1,5 +1,6 @@
 mod a2a;
 mod artifact;
+pub(crate) mod ask_user;
 mod docs;
 mod edit;
 pub(crate) mod mcp;

@@ -728,6 +728,8 @@ struct PendingSessionPublication {
 }
 
 struct Server {
+    // Connection-local negotiated snapshot; only initialize writes it.
+    form_elicitation: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -754,6 +756,7 @@ impl Server {
 
     fn new(runtime: Arc<Runtime>, registry: SessionRegistry) -> Self {
         Self {
+            form_elicitation: AtomicBool::new(false),
             runtime,
             integration: Arc::new(AcpIntegration::default()),
             registry,
@@ -870,6 +873,14 @@ impl Server {
         &self,
         request: wire::InitializeRequest,
     ) -> Result<wire::InitializeResponse, AcpRuntimeError> {
+        self.form_elicitation.store(
+            request
+                .capabilities
+                .elicitation
+                .as_ref()
+                .is_some_and(|value| value.form.is_some()),
+            Ordering::Release,
+        );
         // This handler only speaks v2. Initialization must return our supported
         // version even when the requested version is unsupported; the client
         // then disconnects if it cannot speak v2. It does not switch wire schemas.
@@ -1065,6 +1076,9 @@ impl Server {
             .subscribe(session_id.to_string())
             .map_err(AcpRuntimeError::Loop)?;
         let cancellation = CancellationController::new();
+        let ask_user = self.form_elicitation.load(Ordering::Acquire).then(|| {
+            crate::tools::ask_user::AskUserTool::new(connection.clone(), session_id.clone())
+        });
         let sink = ResponseReplacementSink::new(ConnectionSink(connection));
         let activity = native_activity(session_id.clone(), sink.clone());
         let binding =
@@ -1083,6 +1097,7 @@ impl Server {
         )
         .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
+            ask_user,
             cwd,
             additional_directories,
             integration: Arc::new(observer),
@@ -6706,6 +6721,39 @@ mod tests {
             .initialize(terminal_auth_initialize_request())
             .unwrap();
 
+        assert!(!server.form_elicitation.load(Ordering::Acquire));
+        for (capabilities, expected) in [
+            (
+                wire::ClientCapabilities::new().elicitation(
+                    wire::ElicitationCapabilities::new()
+                        .form(wire::ElicitationFormCapabilities::new()),
+                ),
+                true,
+            ),
+            (
+                wire::ClientCapabilities::new().elicitation(wire::ElicitationCapabilities::new()),
+                false,
+            ),
+            (
+                wire::ClientCapabilities::new().elicitation(
+                    wire::ElicitationCapabilities::new()
+                        .url(wire::ElicitationUrlCapabilities::new()),
+                ),
+                false,
+            ),
+            (wire::ClientCapabilities::new(), false),
+        ] {
+            server
+                .initialize(
+                    wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("questions-client", "0"),
+                    )
+                    .capabilities(capabilities),
+                )
+                .unwrap();
+            assert_eq!(server.form_elicitation.load(Ordering::Acquire), expected);
+        }
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
         assert_eq!(response.auth_methods.len(), 4);
         assert!(matches!(

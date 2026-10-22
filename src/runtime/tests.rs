@@ -262,6 +262,7 @@ mod reasoning_effort_persistence {
         let driver = runtime
             .start_acp_driver_with_mcp(
                 AcpDriverContext {
+                    ask_user: None,
                     cwd: runtime.root().to_path_buf(),
                     additional_directories: vec![],
                     integration: Arc::new(Observer),
@@ -1424,7 +1425,20 @@ async fn compose_can_load_a_skill_added_after_its_spec_is_frozen() {
 fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-    let specs = runtime.compose(0).specs();
+    let compose = runtime.compose(0);
+    let specs = compose.specs();
+    assert!(
+        compose
+            .backgroundable
+            .hidden_tools
+            .get(&ToolName::new("ask_user"))
+            .is_none(),
+        "foreground user questions must never be available through compose"
+    );
+    assert!(
+        !specs.iter().any(|spec| spec.name.0 == "ask_user"),
+        "ordinary non-ACP runtime catalogs must not advertise user questions"
+    );
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].name.0, "compose");
     assert_eq!(

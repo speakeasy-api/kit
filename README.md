@@ -30,11 +30,11 @@ kit init && kit auth login openai && kit tui
 
 ## Why Kit
 
-Most agent harnesses expose many tools and require one model round trip for each call. Kit exposes one tool: `compose`. The `compose` argument is a short program in [Runlet](https://github.com/danielkov/runlet). In one round trip, the program can read files, run tests, apply edits, retry failed commands, delegate work to subagents, and return structured data.
+Most agent harnesses expose many tools and require one model round trip for each call. Kit exposes `compose` for tool orchestration, plus `ask_user` for interactive decisions when the connected client supports forms. The `compose` argument is a short program in [Runlet](https://github.com/danielkov/runlet). In one round trip, the program can read files, run tests, apply edits, retry failed commands, delegate work to subagents, and return structured data.
 
 Fewer model round trips repeat less context and complete more work in each request. In size-matched production tasks, Kit used approximately half the input tokens and active time per hand-written line of Codex CLI or Claude Code ([comparison](#how-it-compares)).
 
-- **One tool, unlimited composition.** The model receives one tool: `compose`. A `compose` program can call `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool_schema`, `tool`, `auth`, `skill`, `a2a`, and `docs`. Independent calls run concurrently. Use data dependencies or `after` blocks to control execution order. Use `boundary retry N` and `fail()` to handle errors in the program.
+- **One tool for orchestration, unlimited composition.** The model uses `compose` to orchestrate work. A `compose` program can call `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool_schema`, `tool`, `auth`, `skill`, `a2a`, and `docs`. Independent calls run concurrently. Use data dependencies or `after` blocks to control execution order. Use `boundary retry N` and `fail()` to handle errors in the program.
 - **Reusable subagents.** A subagent is a reusable value. You can continue, fork, inspect, and close a subagent. You can require JSON that matches a schema. You can also use Claude Code, Codex, Cursor, or Kit as the subagent harness over ACP.
 - **Open protocols.** Kit supports ACP v1 and v2 over stdio, HTTP/SSE, and WebSocket. Kit supports A2A v1 in both directions. It also supports MCP, Agent Skills, and Agent Plugin packages.
 - **Long sessions.** Kit synchronizes each append-only JSONL transcript item to disk before it accepts the item. It compacts context automatically at 80% of the context window. You can resume a session from `tui`, `prompt`, or any ACP client. Kit also uses crash-safe locks. It retries eligible `openai-subscription` failures for up to 24 hours.
