@@ -5082,11 +5082,16 @@ impl App {
             return false;
         }
         let bottom = self.total_lines.saturating_sub(self.viewport);
-        let (_, length) = self.scrollbar_thumb();
+        let (start, length) = self.scrollbar_thumb();
         let last = track - length;
         let target = usize::from(row.saturating_sub(bar.y))
             .saturating_sub(grab)
             .min(last);
+        // Many offsets draw the thumb on one row; keep the current one while
+        // the thumb stays put, including when it fills the track.
+        if last == 0 || target == start {
+            return false;
+        }
         // The smallest scroll whose thumb rounds to `target`, so a dragged
         // thumb lands exactly where it is drawn.
         let span = bottom.saturating_sub(1) + track;
@@ -5623,6 +5628,23 @@ mod tests {
         app.handle_mouse(down(5));
         assert_eq!(app.scrollbar_thumb().0, 4);
         assert!(!app.follow);
+
+        // Grabbing a thumb drawn at a non-canonical offset keeps that offset.
+        app.total_lines = 1010;
+        app.scroll = 500;
+        app.handle_mouse(down(5));
+        assert!(matches!(app.handle_mouse(drag(5)), Action::None));
+        assert_eq!((app.scroll, app.follow), (500, false));
+        app.handle_mouse(up(5));
+
+        // A thumb that fills the track has nowhere to go and keeps following.
+        app.total_lines = 11;
+        app.scroll = 1;
+        app.follow = true;
+        app.handle_mouse(down(5));
+        app.handle_mouse(drag(40));
+        app.handle_mouse(drag(0));
+        assert_eq!((app.scroll, app.follow), (1, true));
 
         // With the release lost, the next press off the bar selects text.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 2));
