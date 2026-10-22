@@ -18,6 +18,8 @@ pub(super) struct Form {
     message: String,
     fields: Vec<Field>,
     require_answer: Vec<AnswerRequirement>,
+    pages: Vec<usize>,
+    other_focus: bool,
     page: usize,
     scroll: u16,
     error: Option<String>,
@@ -27,15 +29,15 @@ pub(super) struct Form {
 
 // The marker is private immutable ownership, not shared mutable state. A
 // clipboard operation retains it, so a replacement form can never reuse its
-// identity. Page and app route epoch fence navigation and intervening edits.
+// identity. Focused field and app route epoch fence navigation and intervening edits.
 #[derive(Clone, Debug)]
 pub(super) struct ClipboardTarget {
     identity: Arc<()>,
-    page: usize,
+    field: usize,
 }
 impl PartialEq for ClipboardTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.page == other.page && Arc::ptr_eq(&self.identity, &other.identity)
+        self.field == other.field && Arc::ptr_eq(&self.identity, &other.identity)
     }
 }
 impl Eq for ClipboardTarget {}
@@ -512,16 +514,52 @@ fn answer_requirements(schema: &Value, fields: &[Field]) -> Result<Vec<AnswerReq
 }
 
 impl Form {
+    fn custom_field(&self, selection: usize) -> Option<usize> {
+        self.require_answer
+            .iter()
+            .find(|r| r.selection == selection)
+            .map(|r| r.custom)
+    }
+    fn focused_field(&self) -> Option<usize> {
+        let selection = *self.pages.get(self.page)?;
+        Some(if self.other_focus {
+            self.custom_field(selection).unwrap_or(selection)
+        } else {
+            selection
+        })
+    }
+    fn validate_page(&self, page: usize) -> Result<(), (usize, String)> {
+        let selection = self.pages[page];
+        self.fields[selection]
+            .validate()
+            .map_err(|e| (selection, e))?;
+        if let Some(custom) = self.custom_field(selection) {
+            let text = self.fields[custom].validate().map_err(|e| (custom, e))?;
+            let selected = self.fields[selection]
+                .options
+                .iter()
+                .any(|o| self.fields[selection].selected(o));
+            if !selected && !text.as_str().is_some_and(|s| !s.trim().is_empty()) {
+                return Err((
+                    custom,
+                    "Select an option or enter a non-blank custom answer.".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
     pub(super) fn clipboard_target(&self) -> Option<ClipboardTarget> {
-        self.fields
-            .get(self.page)
+        self.focused_field()
+            .and_then(|index| self.fields.get(index))
             .filter(|field| {
                 field.options.is_empty()
                     && matches!(field.kind.as_str(), "string" | "number" | "integer")
             })
-            .map(|_| ClipboardTarget {
-                identity: Arc::clone(&self.clipboard_identity),
-                page: self.page,
+            .and_then(|_| {
+                Some(ClipboardTarget {
+                    identity: Arc::clone(&self.clipboard_identity),
+                    field: self.focused_field()?,
+                })
             })
     }
 
@@ -604,7 +642,12 @@ impl Form {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let require_answer = answer_requirements(schema, &fields)?;
+        let pages = (0..fields.len())
+            .filter(|index| !require_answer.iter().any(|r| r.custom == *index))
+            .collect();
         Ok(Self {
+            pages,
+            other_focus: false,
             message: [
                 annotation(&request, "message"),
                 annotation(schema, "title"),
@@ -625,7 +668,9 @@ impl Form {
     }
 
     pub(super) fn paste(&mut self, text: &str) {
-        if let Some(field) = self.fields.get_mut(self.page)
+        if let Some(field) = self
+            .focused_field()
+            .and_then(|index| self.fields.get_mut(index))
             && field.options.is_empty()
             && matches!(field.kind.as_str(), "string" | "number" | "integer")
         {
@@ -650,7 +695,19 @@ impl Form {
                 wire::ElicitationAction::Decline,
             ));
         }
-        if let Some(field) = self.fields.get_mut(self.page)
+        if key.code == KeyCode::Tab
+            && self
+                .pages
+                .get(self.page)
+                .and_then(|i| self.custom_field(*i))
+                .is_some()
+        {
+            self.other_focus = !self.other_focus;
+            return None;
+        }
+        if let Some(field) = self
+            .focused_field()
+            .and_then(|index| self.fields.get_mut(index))
             && field.options.is_empty()
             && matches!(field.kind.as_str(), "string" | "number" | "integer")
             && field.edit(key, self.editor_width)
@@ -660,6 +717,7 @@ impl Form {
         }
         match key.code {
             KeyCode::BackTab => {
+                self.other_focus = false;
                 self.page = self.page.saturating_sub(1);
                 self.scroll = 0;
                 self.error = None;
@@ -667,38 +725,28 @@ impl Form {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(5),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
             KeyCode::Enter => {
-                if self.page == self.fields.len() {
-                    let mut content = Map::new();
-                    for (index, field) in self.fields.iter().enumerate() {
-                        match field.validate() {
-                            Ok(value) => {
-                                if !value.is_null() {
-                                    content.insert(field.name.clone(), value);
-                                }
-                            }
-                            Err(error) => {
-                                self.page = index;
-                                self.error = Some(error);
-                                return None;
-                            }
-                        }
+                let reviewing = self.page == self.pages.len();
+                let pages = if reviewing {
+                    0..self.pages.len()
+                } else {
+                    self.page..self.page + 1
+                };
+                for page in pages {
+                    if let Err((field, error)) = self.validate_page(page) {
+                        self.page = page;
+                        self.other_focus = self.custom_field(self.pages[page]) == Some(field);
+                        self.scroll = 0;
+                        self.error = Some(error);
+                        return None;
                     }
-                    for requirement in &self.require_answer {
-                        let selected = match content.get(&self.fields[requirement.selection].name) {
-                            Some(Value::String(_)) => true,
-                            Some(Value::Array(values)) => !values.is_empty(),
-                            _ => false,
-                        };
-                        let custom = content
-                            .get(&self.fields[requirement.custom].name)
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| !value.trim().is_empty());
-                        if !selected && !custom {
-                            self.page = requirement.custom;
-                            self.scroll = 0;
-                            self.error =
-                                Some("Select an option or enter a non-blank custom answer.".into());
-                            return None;
+                }
+                if reviewing {
+                    let mut content = Map::new();
+                    for field in &self.fields {
+                        if let Ok(value) = field.validate()
+                            && !value.is_null()
+                        {
+                            content.insert(field.name.clone(), value);
                         }
                     }
                     return serde_json::from_value(Value::Object(Map::from_iter([
@@ -707,17 +755,16 @@ impl Form {
                     ])))
                     .ok();
                 }
-                match self.fields[self.page].validate() {
-                    Ok(_) => {
-                        self.page += 1;
-                        self.scroll = 0;
-                        self.error = None;
-                    }
-                    Err(error) => self.error = Some(error),
-                }
+                self.page += 1;
+                self.other_focus = false;
+                self.scroll = 0;
+                self.error = None;
             }
             _ => {
-                if let Some(field) = self.fields.get_mut(self.page) {
+                if let Some(field) = self
+                    .focused_field()
+                    .and_then(|index| self.fields.get_mut(index))
+                {
                     match key.code {
                         KeyCode::Up => {
                             field.cursor = field.cursor.saturating_sub(1);
@@ -766,14 +813,15 @@ impl Form {
         frame.render_widget(block, area);
         let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
         let mut text = format!("{}\n\n", self.message);
-        if let Some(field) = self.fields.get(self.page) {
+        if let Some(&selection) = self.pages.get(self.page) {
+            let field = &self.fields[selection];
             let title = annotation(&field.schema, "title");
             text.push_str(&format!(
                 "Question {}/{} — {} {}\n{}\n",
                 self.page + 1,
-                self.fields.len(),
+                self.pages.len(),
                 if title.is_empty() { "Answer" } else { &title },
-                if field.required {
+                if field.required || self.custom_field(selection).is_some() {
                     "(required)"
                 } else {
                     "(optional)"
@@ -794,6 +842,60 @@ impl Form {
             }
             text.push('\n');
             if !field.options.is_empty() {
+                let custom = self.custom_field(selection);
+                text.push_str(if self.other_focus {
+                    "Focus: Other (Tab: choices)\n"
+                } else if custom.is_some() {
+                    "Focus: choices (Tab: Other)\n"
+                } else {
+                    "Focus: choices\n"
+                });
+                if let Some(custom) = custom {
+                    let other = &self.fields[custom];
+                    text.push_str(&format!(
+                        "Other: {}\n",
+                        annotation(&other.schema, "description")
+                    ));
+                    for key in ["minLength", "maxLength"] {
+                        if !other.schema[key].is_null() {
+                            text.push_str(&format!("Other {key}: {}\n", other.schema[key]));
+                        }
+                    }
+                    if other.required {
+                        text.push_str("Other text is required.\n");
+                    }
+                }
+                let choice_area = if let Some(custom) = custom {
+                    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(4)])
+                        .split(parts[0]);
+                    let other = &self.fields[custom];
+                    let editor_area = Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
+                        .split(areas[1]);
+                    frame.render_widget(
+                        Paragraph::new(if self.other_focus {
+                            "> Other"
+                        } else {
+                            "  Other"
+                        }),
+                        editor_area[0],
+                    );
+                    let (lines, (row, column)) = other.editor.wrapped(self.editor_width);
+                    let first =
+                        row.saturating_sub(usize::from(editor_area[1].height).saturating_sub(1));
+                    frame.render_widget(
+                        Paragraph::new(display(&lines.join("\n"))).scroll((first as u16, 0)),
+                        editor_area[1],
+                    );
+                    if self.other_focus && editor_area[1].height > 0 && editor_area[1].width > 0 {
+                        frame.set_cursor_position((
+                            editor_area[1].x + (column as u16).min(editor_area[1].width - 1),
+                            editor_area[1].y + (row - first) as u16,
+                        ));
+                    }
+                    areas[0]
+                } else {
+                    parts[0]
+                };
                 let option = &field.options[field.cursor];
                 text.push_str(&format!(
                     "Highlighted: {}\n{}\n",
@@ -801,7 +903,7 @@ impl Form {
                 ));
                 let regions =
                     Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .split(parts[0]);
+                        .split(choice_area);
                 render_text(frame, regions[0], text, &mut self.scroll);
                 let height = usize::from(regions[1].height).max(1);
                 let start = field.cursor.saturating_sub(height - 1);
@@ -814,7 +916,11 @@ impl Form {
                     .map(|(i, o)| {
                         format!(
                             "{} [{}] {}",
-                            if i == field.cursor { ">" } else { " " },
+                            if i == field.cursor && !self.other_focus {
+                                ">"
+                            } else {
+                                " "
+                            },
                             if field.selected(o) { "x" } else { " " },
                             o.label
                         )
@@ -855,9 +961,10 @@ impl Form {
             }
         } else {
             text.push_str("Review answers — BackTab to modify; Enter to submit\n\n");
-            for (index, field) in self.fields.iter().enumerate() {
+            for (index, &selection) in self.pages.iter().enumerate() {
+                let field = &self.fields[selection];
                 let value = field.answer().unwrap_or(Value::Null);
-                let display = if value.is_null() {
+                let mut display = if value.is_null() {
                     "(omitted)".into()
                 } else if !field.options.is_empty() {
                     field
@@ -870,6 +977,16 @@ impl Form {
                 } else {
                     value.to_string()
                 };
+                if let Some(custom) = self.custom_field(selection) {
+                    let custom = self.fields[custom].editor.text();
+                    if !custom.trim().is_empty() {
+                        if display == "(omitted)" || display.is_empty() {
+                            display = custom.to_owned();
+                        } else {
+                            display.push_str(&format!("; Other: {custom}"));
+                        }
+                    }
+                }
                 let title = annotation(&field.schema, "title");
                 let label = if title.is_empty() {
                     format!("Answer {}", index + 1)
@@ -880,7 +997,7 @@ impl Form {
             }
             render_text(frame, parts[0], text, &mut self.scroll);
         }
-        frame.render_widget(Paragraph::new(format!("{}\nEnter: next/submit • Shift+Tab: back • Space: select\nEsc: cancel • Ctrl+D: decline • PgUp/PgDn: scroll", self.error.as_deref().unwrap_or(""))).wrap(Wrap { trim: false }), parts[1]);
+        frame.render_widget(Paragraph::new(format!("{}\nEnter: next/submit • Shift+Tab: back • Space: select • Tab: focus\nEsc: cancel • Ctrl+D: decline • PgUp/PgDn: scroll", self.error.as_deref().unwrap_or(""))).wrap(Wrap { trim: false }), parts[1]);
     }
 }
 
@@ -1110,6 +1227,41 @@ mod tests {
         );
         assert!(form(json!({"x":{"type":"_future"}}), json!([])).is_err());
     }
+    #[test]
+    fn grouped_single_choice_keeps_generic_fields_and_inline_text() {
+        let mut f = Form::from_value(json!({"mode":"form","message":"Choose","requestedSchema":{
+            "type":"object","properties":{
+                "custom":{"type":"string","description":"Add context","maxLength":20},
+                "generic":{"type":"string"},
+                "pick":{"type":"string","oneOf":[{"const":"a","title":"First"}]}
+            },"_meta":{"kit/questions":{"order":["pick","custom","generic"],
+                "require_answer":[{"selection":"pick","custom":"custom"}]}}
+        }}))
+        .unwrap();
+        assert_eq!(f.pages.len(), 2);
+        press(&mut f, KeyCode::Char(' '));
+        press(&mut f, KeyCode::Tab);
+        f.paste("context");
+        let clipboard = f.clipboard_target();
+        press(&mut f, KeyCode::Tab);
+        assert_ne!(clipboard, f.clipboard_target());
+        f.paste("ignored");
+        press(&mut f, KeyCode::Enter);
+        f.paste("unrelated");
+        press(&mut f, KeyCode::Enter);
+        press(&mut f, KeyCode::BackTab);
+        assert_eq!(f.page, 1);
+        press(&mut f, KeyCode::BackTab);
+        assert_eq!(f.page, 0);
+        press(&mut f, KeyCode::Enter);
+        press(&mut f, KeyCode::Enter);
+        let result = serde_json::to_value(press(&mut f, KeyCode::Enter).unwrap()).unwrap();
+        assert_eq!(
+            result["content"],
+            json!({"pick":"a","custom":"context","generic":"unrelated"})
+        );
+    }
+
     #[test]
     fn answer_requirement_metadata_rejects_unsafe_references() {
         let base = json!({"mode":"form","message":"Choose","requestedSchema":{"type":"object","properties":{

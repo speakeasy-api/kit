@@ -568,6 +568,7 @@ mod tests {
                     generation: 1,
                 })),
             ));
+            let route = ingress.route.clone();
             let origin = ingress.origin.clone();
             let client = agent_client_protocol::Client
                 .v2()
@@ -639,43 +640,46 @@ mod tests {
                         let visible = screen(&mut app);
                         assert!(!visible.contains("Request from"));
                         assert!(!visible.contains("Agent request"));
-                        assert!(visible.contains("Question 1/3"));
+                        assert!(visible.contains("Question 1/2"));
                         assert!(visible.contains("Terminal UI"));
+                        assert!(visible.contains("Other"));
+                        // Choice focus does not accept text or paste.
+                        app.paste("not an answer");
+                        press(&mut app, KeyCode::Char('z'));
                         if include_selections {
                             for key in [KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' ')] { press(&mut app, key); }
-                        }
-                        press(&mut app, KeyCode::Enter);
-                        assert!(screen(&mut app).contains("custom answer"));
-                        if include_selections { app.paste("Also docs, please"); }
-                        press(&mut app, KeyCode::Enter);
-                        let visible = screen(&mut app);
-                        assert!(visible.contains("Question 3/3"));
-                        assert!(visible.contains("Strategy"));
-                        // Selecting a second option replaces the first when multiple
-                        // is omitted, rather than returning two single-choice values.
-                        for key in [KeyCode::Down, KeyCode::Char(' '), KeyCode::Up, KeyCode::Char(' '), KeyCode::Enter] { press(&mut app, key); }
-                        if !include_selections {
-                            // The tool's generated metadata requires a choice or
-                            // non-blank custom text. Both empty and whitespace-only
-                            // submissions must stay open and focus the custom field.
-                            assert!(screen(&mut app).contains("Review answers"));
-                            press(&mut app, KeyCode::Enter);
-                            let invalid = screen(&mut app);
-                            assert!(invalid.contains("custom answer"));
-                            assert!(invalid.contains("non-blank"));
-                            assert_eq!(app.elicitations.len(), 1);
-                            app.paste("   ");
-                            press(&mut app, KeyCode::Enter);
-                            press(&mut app, KeyCode::Enter);
-                            assert!(screen(&mut app).contains("Review answers"));
+                            press(&mut app, KeyCode::Tab);
+                        } else {
                             press(&mut app, KeyCode::Enter);
                             assert!(screen(&mut app).contains("non-blank"));
-                            assert_eq!(app.elicitations.len(), 1);
+                            app.paste("   ");
+                            press(&mut app, KeyCode::Enter);
+                            assert!(screen(&mut app).contains("non-blank"));
                             app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-                            app.paste("Also docs, please");
-                            press(&mut app, KeyCode::Enter);
-                            press(&mut app, KeyCode::Enter);
                         }
+                        assert!(screen(&mut app).contains("Focus: Other"));
+                        app.paste("Also docs, please");
+                        let stale = app.clipboard_route();
+                        press(&mut app, KeyCode::Tab);
+                        assert!(screen(&mut app).contains("Focus: choices"));
+                        assert_eq!(crate::tui::apply_clipboard_completion(&mut app, &route, 1, stale,
+                            crate::tui::ClipboardResult::Text("stale".into())), None);
+                        press(&mut app, KeyCode::Tab);
+                        // Moving the cursor and inserting paste uses the same editor.
+                        press(&mut app, KeyCode::Home);
+                        app.paste("X");
+                        press(&mut app, KeyCode::Backspace);
+                        press(&mut app, KeyCode::Enter);
+                        let visible = screen(&mut app);
+                        assert!(visible.contains("Question 2/2"));
+                        assert!(visible.contains("Strategy"));
+                        press(&mut app, KeyCode::BackTab);
+                        assert!(screen(&mut app).contains("Also docs, please"));
+                        press(&mut app, KeyCode::Enter);
+                        // A second single selection replaces the first.
+                        for key in [KeyCode::Down, KeyCode::Char(' '), KeyCode::Up, KeyCode::Char(' '), KeyCode::Enter] { press(&mut app, key); }
+                        press(&mut app, KeyCode::BackTab);
+                        press(&mut app, KeyCode::Enter);
                         let review = screen(&mut app);
                         assert!(review.contains("Review answers"));
                         if include_selections { assert!(review.contains("Terminal UI, Agent runtime")); }
