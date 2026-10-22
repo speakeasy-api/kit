@@ -3500,8 +3500,10 @@ fn clipboard_paste_key(key: KeyEvent) -> bool {
 }
 
 fn paste_blocked(app: &App) -> bool {
-    !app.elicitations.is_empty()
-        || app.model_switch.is_some()
+    if !app.elicitations.is_empty() {
+        return !matches!(app.clipboard_route(), ClipboardRoute::Elicitation { .. });
+    }
+    app.model_switch.is_some()
         || app.model_dialog.is_some()
         || app.effort_dialog.is_some()
         || (app.session_dialog.is_some() && !app.session_rename_active())
@@ -3560,6 +3562,9 @@ fn apply_clipboard_completion(
     Some(match result {
         ClipboardResult::NoImage => true,
         ClipboardResult::Text(text) => handle_paste(app, &text),
+        ClipboardResult::Attachment(_) if matches!(route, ClipboardRoute::Elicitation { .. }) => {
+            false
+        }
         ClipboardResult::Attachment(attachment) => attach_pasted(app, vec![attachment]),
         ClipboardResult::Error(error) => {
             app.note(error);
@@ -3803,7 +3808,6 @@ fn draw_frame<W: std::io::Write>(
         ui::draw(frame, app, images);
         // Child views render no overlays, including command completions for
         // literal slash drafts. Only the root view uses those controls.
-        let form_obscures = !app.elicitations.is_empty();
         let (app, obscured) = app
             .child_focus
             .as_ref()
@@ -3816,7 +3820,7 @@ fn draw_frame<W: std::io::Write>(
             rows: app.row_links.clone(),
             left: app.transcript_left,
             top: app.transcript_top,
-            obscured: obscured || form_obscures,
+            obscured,
         }
     })
 }

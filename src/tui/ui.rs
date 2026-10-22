@@ -35,8 +35,11 @@ const AGENTS_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 
 pub(super) fn native_links_obscured(app: &App) -> bool {
-    !app.elicitations.is_empty()
-        || app.model_switch.is_some()
+    if !app.elicitations.is_empty() {
+        // Forms occupy their own area; no transcript links are covered.
+        return false;
+    }
+    app.model_switch.is_some()
         || app.file_picker.is_some()
         || app.session_dialog.is_some()
         || app.model_dialog.is_some()
@@ -58,8 +61,31 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     images.poll();
     app.elicitations
         .retain(|pending| !pending.reply.is_closed());
-    if let Some(pending) = app.elicitations.front_mut() {
-        pending.form.render(frame);
+    if !app.elicitations.is_empty() {
+        // Keep the conversation visible above a bounded question panel. The
+        // normal composer stays parked while the form owns keyboard input.
+        let area = frame.area();
+        let panel_rows = (area.height / 2).min(18);
+        let [header, body, panel] = Layout::vertical([
+            Constraint::Length(u16::from(area.height > 2)),
+            Constraint::Min(0),
+            Constraint::Length(panel_rows),
+        ])
+        .areas(area);
+        app.child_back_area = Rect::default();
+        app.session_area = draw_header(frame, app, header).unwrap_or_default();
+        if let Some(child) = app
+            .child_focus
+            .as_ref()
+            .and_then(|id| app.child_views.get_mut(id))
+        {
+            draw_body(frame, &mut child.app, images, body);
+        } else {
+            draw_body(frame, app, images, body);
+        }
+        if let Some(pending) = app.elicitations.front_mut() {
+            pending.form.render_in(frame, panel);
+        }
         return;
     }
     app.child_back_area = Rect::default();

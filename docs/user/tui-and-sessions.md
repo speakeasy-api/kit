@@ -135,13 +135,13 @@ At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly
 
 ## Answer agent questions
 
-When an agent needs a decision, Kit can show a form with single-choice or multiple-choice options and optional custom-answer fields. The form identifies the requesting agent and explains what it needs. Answers stay local to the form until you submit the review page.
+When an agent needs a decision, Kit can show a form with single-choice or multiple-choice options and optional custom-answer fields. The form appears in a bounded panel below the conversation, keeping the surrounding context visible. Answers stay local to the form until you submit the review page.
 
 - Use `Up` / `Down` to highlight an option and `Space` to select it. For multiple-choice fields, `Space` toggles each option independently.
-- Type into text or numeric fields. Use `Left` / `Right` to choose false / true for a boolean field, or `Space` to toggle it.
+- Text and numeric fields use the composer editor: move the cursor with arrow keys, use `Alt+Left` / `Alt+Right` to move by word, and `Alt+Backspace` or `Ctrl+W` to delete the previous word. `Ctrl+U` / `Ctrl+K` delete to the start / end of the line. `Shift+Enter` inserts a newline; `Ctrl+V` / `Shift+Insert` and bracketed paste insert text at the cursor. Clipboard images are not accepted in form fields. Use `Left` / `Right` to choose false / true for a boolean field, or `Space` to toggle it.
 - Press `Enter` to advance and `Shift+Tab` to go back without losing answers. Optional custom answers appear on a separate page.
 - On the review page, press `Enter` to submit all answers together, or `Shift+Tab` to revise them.
-- Press `Delete` to clear the current field and `PageUp` / `PageDown` to scroll.
+- Press `Delete` to clear a choice or boolean field; in text fields it deletes forward from the cursor. Use `PageUp` / `PageDown` to scroll the question or review.
 - Press `Esc` to dismiss the request, or `Ctrl+D` to explicitly decline. Neither action submits selections.
 
 Do not enter passwords, API keys, or other credentials in these forms. Kit supports session-scoped ACP form elicitation, not URL elicitation. Unsupported form constraints are rejected rather than silently ignored. If your ACP client does not support forms, ask and answer in ordinary chat instead.

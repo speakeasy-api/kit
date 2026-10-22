@@ -429,10 +429,17 @@ struct SteerEdit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClipboardRoute {
+    Elicitation {
+        epoch: u64,
+        target: super::elicitation::ClipboardTarget,
+    },
     Blocked(u64),
     Composer(u64),
     Rename(u64),
-    Steer { id: String, token: u64 },
+    Steer {
+        id: String,
+        token: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3487,8 +3494,19 @@ impl App {
     }
 
     pub(super) fn clipboard_route(&self) -> ClipboardRoute {
-        if !self.elicitations.is_empty()
-            || self.child_focus.is_some()
+        if let Some(pending) = self.elicitations.front() {
+            return if pending.reply.is_closed() {
+                ClipboardRoute::Blocked(self.clipboard_route_epoch)
+            } else if let Some(target) = pending.form.clipboard_target() {
+                ClipboardRoute::Elicitation {
+                    epoch: self.clipboard_route_epoch,
+                    target,
+                }
+            } else {
+                ClipboardRoute::Blocked(self.clipboard_route_epoch)
+            };
+        }
+        if self.child_focus.is_some()
             || self.model_switch.is_some()
             || self.model_dialog.is_some()
             || self.effort_dialog.is_some()
@@ -3516,6 +3534,7 @@ impl App {
 
     pub fn paste(&mut self, text: &str) {
         if let Some(pending) = self.elicitations.front_mut() {
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
             pending.form.paste(text);
             return;
         }
@@ -4244,6 +4263,7 @@ impl App {
             return Action::Redraw;
         }
         if let Some(pending) = self.elicitations.front_mut() {
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
             if let Some(response) = pending.form.key(key)
                 && let Some(pending) = self.elicitations.pop_front()
             {

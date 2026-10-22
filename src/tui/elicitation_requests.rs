@@ -79,7 +79,7 @@ impl Ingress {
         if route.id.is_empty() || route.id != session {
             return Err("elicitation does not belong to the active session".into());
         }
-        let origin = self
+        let _origin = self
             .origin
             .get()
             .ok_or("agent initialization is incomplete")?;
@@ -89,7 +89,7 @@ impl Ingress {
             .try_acquire_owned()
             .map_err(|_| "too many pending user requests")?;
         // Validate the original wire budget before adding local presentation text.
-        let form = Form::from_value(request.0)?.with_origin(origin);
+        let form = Form::from_value(request.0)?;
         let (reply, receiver) = oneshot::channel();
         let pending = Pending {
             form,
@@ -210,6 +210,148 @@ mod tests {
         assert!(ingress.prepare(RawRequest(request.0.clone())).is_ok());
         request.0["_meta"]["padding"][31] = serde_json::Value::String("x".repeat(4097 - excess));
         assert!(ingress.prepare(request).is_err());
+    }
+
+    #[test]
+    fn elicitation_clipboard_shortcuts_are_text_only_and_fenced_to_field() {
+        use crate::tui::app::{Action, ClipboardRoute};
+        use crate::tui::{ClipboardResult, apply_clipboard_completion, handle_inner};
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let ingress = ingress();
+        let mut raw = request("session");
+        raw.0["requestedSchema"] = serde_json::json!({"type":"object","properties":{
+            "first":{"type":"string"},"second":{"type":"string"}
+        }});
+        let (queued, _receiver) = ingress.prepare(raw.clone()).unwrap();
+        let mut app = app();
+        app.editor.insert_str("parked draft");
+        app.apply(queued.update);
+        for key in [
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+        ] {
+            let Action::ReadClipboard(route, _) = handle_inner(&mut app, Event::Key(key)) else {
+                panic!("expected clipboard request");
+            };
+            assert!(matches!(route, ClipboardRoute::Elicitation { .. }));
+            assert_eq!(
+                apply_clipboard_completion(
+                    &mut app,
+                    &ingress.route,
+                    1,
+                    route,
+                    ClipboardResult::Text("pasted ".into())
+                ),
+                Some(true)
+            );
+        }
+        let stale = app.clipboard_route();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            apply_clipboard_completion(
+                &mut app,
+                &ingress.route,
+                1,
+                stale,
+                ClipboardResult::Text("wrong field".into())
+            ),
+            None
+        );
+        let stale = app.clipboard_route();
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            apply_clipboard_completion(
+                &mut app,
+                &ingress.route,
+                1,
+                stale,
+                ClipboardResult::Text("after edit".into())
+            ),
+            None
+        );
+        let old_form = app.clipboard_route();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let (queued, _next_receiver) = ingress.prepare(raw).unwrap();
+        app.apply(queued.update);
+        assert_eq!(
+            apply_clipboard_completion(
+                &mut app,
+                &ingress.route,
+                1,
+                old_form,
+                ClipboardResult::Text("wrong form".into())
+            ),
+            None
+        );
+        assert_eq!(app.editor.text(), "parked draft");
+    }
+
+    #[test]
+    fn elicitation_panel_keeps_conversation_visible_without_generated_chrome() {
+        let ingress = ingress();
+        let mut request = request("session");
+        request.0["requestedSchema"] = serde_json::json!({"type":"object","properties":{
+            "question_0":{"type":"string","title":"Scope","default":"Small patch"},
+            "question_1":{"type":"string","default":"Notes"}
+        }});
+        let (queued, _receiver) = ingress.prepare(request).unwrap();
+        let mut app = app();
+        app.blocks.push(crate::tui::app::Block::Agent(
+            "Conversation context remains visible".into(),
+        ));
+        app.editor.insert_str("parked draft");
+        app.apply(queued.update);
+        let mut images = crate::tui::image::ImageRuntime::disabled();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app, &mut images))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Conversation context remains visible"));
+        assert!(screen.contains("Choose a scope"));
+        assert!(!screen.contains("parked draft"));
+        assert!(!screen.contains("Agent request"));
+        assert!(!screen.contains("Request from"));
+        assert!(!screen.contains("question_0"));
+        assert!(!crate::tui::ui::native_links_obscured(&app));
+        assert!(
+            app.viewport >= 18,
+            "conversation must retain at least half the available height"
+        );
+        for _ in 0..2 {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app, &mut images))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Scope: \"Small patch\""));
+        assert!(screen.contains("Answer 2: \"Notes\""));
+        assert!(!screen.contains("question_0"));
+        assert!(!screen.contains("question_1"));
+        assert!(screen.contains("Conversation context remains visible"));
+        for (width, height) in [(1, 1), (8, 3), (30, 10)] {
+            let mut tiny =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            tiny.draw(|frame| crate::tui::ui::draw(frame, &mut app, &mut images))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -495,7 +637,8 @@ mod tests {
                         let mut app = app();
                         app.apply(queued.update);
                         let visible = screen(&mut app);
-                        assert!(visible.contains("question-agent"));
+                        assert!(!visible.contains("Request from"));
+                        assert!(!visible.contains("Agent request"));
                         assert!(visible.contains("Question 1/3"));
                         assert!(visible.contains("Terminal UI"));
                         if include_selections {
@@ -528,7 +671,7 @@ mod tests {
                             press(&mut app, KeyCode::Enter);
                             assert!(screen(&mut app).contains("non-blank"));
                             assert_eq!(app.elicitations.len(), 1);
-                            press(&mut app, KeyCode::Delete);
+                            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
                             app.paste("Also docs, please");
                             press(&mut app, KeyCode::Enter);
                             press(&mut app, KeyCode::Enter);

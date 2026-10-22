@@ -3,10 +3,13 @@ use agent_client_protocol::schema::v2 as wire;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::{Map, Value};
+
+use super::editor::Editor;
+use std::sync::Arc;
 
 const MAX_TEXT: usize = 4096;
 
@@ -18,7 +21,24 @@ pub(super) struct Form {
     page: usize,
     scroll: u16,
     error: Option<String>,
+    editor_width: usize,
+    clipboard_identity: Arc<()>,
 }
+
+// The marker is private immutable ownership, not shared mutable state. A
+// clipboard operation retains it, so a replacement form can never reuse its
+// identity. Page and app route epoch fence navigation and intervening edits.
+#[derive(Clone, Debug)]
+pub(super) struct ClipboardTarget {
+    identity: Arc<()>,
+    page: usize,
+}
+impl PartialEq for ClipboardTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.page == other.page && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+impl Eq for ClipboardTarget {}
 
 #[derive(Debug)]
 struct AnswerRequirement {
@@ -35,7 +55,7 @@ struct Field {
     options: Vec<Choice>,
     cursor: usize,
     value: Value,
-    text: String,
+    editor: Editor,
 }
 
 #[derive(Debug)]
@@ -91,6 +111,74 @@ fn bounded(v: &Value) -> Result<(), String> {
 }
 
 impl Field {
+    fn insert(&mut self, text: &str) {
+        // Normalize paste exactly like the composer before applying the form limit.
+        let mut normalized = Editor::default();
+        normalized.insert_str(text);
+        let remaining = MAX_TEXT.saturating_sub(self.editor.text().chars().count());
+        let text: String = normalized.text().chars().take(remaining).collect();
+        if !text.is_empty() {
+            self.editor.insert_str(&text);
+            self.sync_text();
+        }
+    }
+
+    fn sync_text(&mut self) {
+        self.value = if self.editor.text().is_empty() {
+            Value::Null
+        } else if self.kind == "string" {
+            Value::String(self.editor.text().to_owned())
+        } else {
+            self.value.clone()
+        };
+    }
+
+    fn edit(&mut self, key: KeyEvent, width: usize) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let command = key.modifiers.contains(KeyModifiers::SUPER);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let previous = self.editor.text().to_owned();
+        match key.code {
+            KeyCode::Enter if shift || alt || control => self.insert("\n"),
+            KeyCode::Char('j') if control => self.insert("\n"),
+            KeyCode::Tab => self.insert("    "),
+            KeyCode::Backspace if command => self.editor.delete_to_line_start(),
+            KeyCode::Backspace if alt || control => self.editor.delete_word_back(),
+            KeyCode::Backspace => self.editor.backspace(),
+            KeyCode::Delete if alt || control => self.editor.delete_word_forward(),
+            KeyCode::Delete => self.editor.delete_forward(),
+            KeyCode::Char('w') if control => self.editor.delete_word_back(),
+            KeyCode::Char('u') if control => self.editor.delete_to_line_start(),
+            KeyCode::Char('k') if control => self.editor.delete_to_line_end(),
+            KeyCode::Char('d') if alt => self.editor.delete_word_forward(),
+            KeyCode::Char('b') if alt => self.editor.move_word_left(),
+            KeyCode::Char('f') if alt => self.editor.move_word_right(),
+            KeyCode::Char('a') if control => self.editor.move_line_start(),
+            KeyCode::Char('e') if control => self.editor.move_line_end(),
+            KeyCode::Left if command || control => self.editor.move_line_start(),
+            KeyCode::Right if command || control => self.editor.move_line_end(),
+            KeyCode::Left if alt => self.editor.move_word_left(),
+            KeyCode::Right if alt => self.editor.move_word_right(),
+            KeyCode::Left => self.editor.move_left(),
+            KeyCode::Right => self.editor.move_right(),
+            KeyCode::Home => self.editor.move_line_start(),
+            KeyCode::End => self.editor.move_line_end(),
+            KeyCode::Up => {
+                self.editor.move_row_up(width);
+            }
+            KeyCode::Down => {
+                self.editor.move_row_down(width);
+            }
+            KeyCode::Char(c) if !control && !command => self.insert(&c.to_string()),
+            _ => return false,
+        }
+        if previous != self.editor.text() {
+            self.sync_text();
+        }
+        true
+    }
+
     fn new(name: String, schema: Value, required: bool) -> Result<Self, String> {
         let kind = annotation(&schema, "type");
         let mut allowed = vec!["type", "title", "description", "default", "_meta"];
@@ -236,7 +324,13 @@ impl Field {
             options,
             cursor,
             value,
-            text,
+            editor: {
+                let mut editor = Editor::default();
+                for c in text.chars() {
+                    editor.insert_char(c);
+                }
+                editor
+            },
         };
         if !field.value.is_null() {
             field.validate()?;
@@ -249,19 +343,19 @@ impl Field {
             match self.kind.as_str() {
                 "string" => {
                     return Ok(
-                        if self.text.is_empty() && !self.required && self.value.is_null() {
+                        if self.editor.text().is_empty() && !self.required && self.value.is_null() {
                             Value::Null
                         } else {
-                            Value::String(self.text.clone())
+                            Value::String(self.editor.text().to_owned())
                         },
                     );
                 }
                 "number" | "integer" => {
-                    if self.text.is_empty() {
+                    if self.editor.text().is_empty() {
                         return Ok(Value::Null);
                     }
-                    let value: Value =
-                        serde_json::from_str(&self.text).map_err(|_| "Enter a valid number")?;
+                    let value: Value = serde_json::from_str(self.editor.text())
+                        .map_err(|_| "Enter a valid number")?;
                     if !value.is_number() || (self.kind == "integer" && value.as_i64().is_none()) {
                         return Err("Enter a valid number of the requested type".into());
                     }
@@ -418,10 +512,17 @@ fn answer_requirements(schema: &Value, fields: &[Field]) -> Result<Vec<AnswerReq
 }
 
 impl Form {
-    pub(super) fn with_origin(mut self, origin: &str) -> Self {
-        let origin: String = origin.chars().take(MAX_TEXT).collect();
-        self.message = format!("Request from {origin}\n\n{}", self.message);
-        self
+    pub(super) fn clipboard_target(&self) -> Option<ClipboardTarget> {
+        self.fields
+            .get(self.page)
+            .filter(|field| {
+                field.options.is_empty()
+                    && matches!(field.kind.as_str(), "string" | "number" | "integer")
+            })
+            .map(|_| ClipboardTarget {
+                identity: Arc::clone(&self.clipboard_identity),
+                page: self.page,
+            })
     }
 
     #[cfg(test)]
@@ -518,6 +619,8 @@ impl Form {
             page: 0,
             scroll: 0,
             error: None,
+            editor_width: 40,
+            clipboard_identity: Arc::new(()),
         })
     }
 
@@ -526,13 +629,7 @@ impl Form {
             && field.options.is_empty()
             && matches!(field.kind.as_str(), "string" | "number" | "integer")
         {
-            let remaining = MAX_TEXT.saturating_sub(field.text.chars().count());
-            field
-                .text
-                .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
-            if field.kind == "string" {
-                field.value = Value::String(field.text.clone());
-            }
+            field.insert(text);
             self.error = None;
         }
     }
@@ -552,6 +649,14 @@ impl Form {
             return Some(wire::CreateElicitationResponse::new(
                 wire::ElicitationAction::Decline,
             ));
+        }
+        if let Some(field) = self.fields.get_mut(self.page)
+            && field.options.is_empty()
+            && matches!(field.kind.as_str(), "string" | "number" | "integer")
+            && field.edit(key, self.editor_width)
+        {
+            self.error = None;
+            return None;
         }
         match key.code {
             KeyCode::BackTab => {
@@ -636,17 +741,7 @@ impl Form {
                         }
                         KeyCode::Delete => {
                             field.value = Value::Null;
-                            field.text.clear();
-                        }
-                        KeyCode::Backspace => {
-                            field.text.pop();
-                        }
-                        KeyCode::Char(c)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            self.paste(&c.to_string())
+                            field.editor.clear();
                         }
                         _ => {}
                     }
@@ -656,14 +751,18 @@ impl Form {
         None
     }
 
+    #[cfg(test)]
     pub(super) fn render(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+        self.render_in(frame, frame.area());
+    }
+
+    pub(super) fn render_in(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
         let block = Block::default()
-            .title("Agent request")
             .borders(Borders::ALL)
             .border_style(super::theme::accent());
         let inner = block.inner(area);
+        self.editor_width = usize::from(inner.width).max(1);
         frame.render_widget(block, area);
         let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
         let mut text = format!("{}\n\n", self.message);
@@ -673,11 +772,7 @@ impl Form {
                 "Question {}/{} — {} {}\n{}\n",
                 self.page + 1,
                 self.fields.len(),
-                if title.is_empty() {
-                    &field.name
-                } else {
-                    &title
-                },
+                if title.is_empty() { "Answer" } else { &title },
                 if field.required {
                     "(required)"
                 } else {
@@ -727,6 +822,22 @@ impl Form {
                     .collect::<Vec<_>>()
                     .join("\n");
                 frame.render_widget(Paragraph::new(display(&lines)), regions[1]);
+            } else if field.kind != "boolean" {
+                let regions =
+                    Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(parts[0]);
+                render_text(frame, regions[0], text, &mut self.scroll);
+                let (lines, (row, column)) = field.editor.wrapped(self.editor_width);
+                let first = row.saturating_sub(usize::from(regions[1].height).saturating_sub(1));
+                frame.render_widget(
+                    Paragraph::new(display(&lines.join("\n"))).scroll((first as u16, 0)),
+                    regions[1],
+                );
+                if regions[1].height > 0 && regions[1].width > 0 {
+                    frame.set_cursor_position((
+                        regions[1].x + (column as u16).min(regions[1].width - 1),
+                        regions[1].y + row.saturating_sub(first) as u16,
+                    ));
+                }
             } else {
                 text.push_str(&format!(
                     "\nAnswer: {}",
@@ -737,14 +848,14 @@ impl Form {
                             None => "Not answered (← No / → Yes)",
                         }
                     } else {
-                        &field.text
+                        field.editor.text()
                     }
                 ));
                 render_text(frame, parts[0], text, &mut self.scroll);
             }
         } else {
             text.push_str("Review answers — BackTab to modify; Enter to submit\n\n");
-            for field in &self.fields {
+            for (index, field) in self.fields.iter().enumerate() {
                 let value = field.answer().unwrap_or(Value::Null);
                 let display = if value.is_null() {
                     "(omitted)".into()
@@ -759,11 +870,17 @@ impl Form {
                 } else {
                     value.to_string()
                 };
-                text.push_str(&format!("{}: {}\n", field.name, display));
+                let title = annotation(&field.schema, "title");
+                let label = if title.is_empty() {
+                    format!("Answer {}", index + 1)
+                } else {
+                    title
+                };
+                text.push_str(&format!("{label}: {display}\n"));
             }
             render_text(frame, parts[0], text, &mut self.scroll);
         }
-        frame.render_widget(Paragraph::new(format!("{}\nEnter: next/submit • BackTab: back • Space: select • Delete: clear\nEsc: cancel • Ctrl+D: decline • PgUp/PgDn: scroll", self.error.as_deref().unwrap_or(""))).wrap(Wrap { trim: false }), parts[1]);
+        frame.render_widget(Paragraph::new(format!("{}\nEnter: next/submit • Shift+Tab: back • Space: select\nEsc: cancel • Ctrl+D: decline • PgUp/PgDn: scroll", self.error.as_deref().unwrap_or(""))).wrap(Wrap { trim: false }), parts[1]);
     }
 }
 
@@ -811,6 +928,87 @@ mod tests {
         form.key(KeyEvent::new(code, KeyModifiers::NONE))
     }
     #[test]
+    fn navigating_empty_and_whitespace_defaults_preserves_answers() {
+        for value in ["", "   "] {
+            let mut form = form(
+                json!({"input":{"type":"string","default":value}}),
+                json!([]),
+            )
+            .unwrap();
+            for key in [KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End] {
+                press(&mut form, key);
+                assert_eq!(form.fields[0].answer().unwrap(), json!(value));
+            }
+        }
+        let mut form = form(json!({"input":{"type":"string"}}), json!([])).unwrap();
+        form.paste("   ");
+        assert_eq!(form.fields[0].answer().unwrap(), json!("   "));
+    }
+
+    #[test]
+    fn text_fields_match_composer_editing_keys_and_cursor() {
+        let keys = [
+            (KeyCode::Backspace, KeyModifiers::SHIFT),
+            (KeyCode::Backspace, KeyModifiers::ALT),
+            (KeyCode::Backspace, KeyModifiers::CONTROL),
+            (KeyCode::Backspace, KeyModifiers::SUPER),
+            (KeyCode::Delete, KeyModifiers::NONE),
+            (KeyCode::Delete, KeyModifiers::ALT),
+            (KeyCode::Left, KeyModifiers::NONE),
+            (KeyCode::Right, KeyModifiers::NONE),
+            (KeyCode::Left, KeyModifiers::ALT),
+            (KeyCode::Right, KeyModifiers::ALT),
+            (KeyCode::Left, KeyModifiers::CONTROL),
+            (KeyCode::Right, KeyModifiers::SUPER),
+            (KeyCode::Home, KeyModifiers::NONE),
+            (KeyCode::End, KeyModifiers::NONE),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL),
+            (KeyCode::Char('b'), KeyModifiers::ALT),
+            (KeyCode::Char('f'), KeyModifiers::ALT),
+            (KeyCode::Char('d'), KeyModifiers::ALT),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('e'), KeyModifiers::CONTROL),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Char('界'), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+        ];
+        for (code, modifiers) in keys {
+            let mut form = form(json!({"input":{"type":"string"}}), json!([])).unwrap();
+            let mut app =
+                crate::tui::app::App::new(".".into(), "test".into(), "test".into(), String::new());
+            form.paste("first café\nlast word");
+            app.editor.insert_str("first café\nlast word");
+            form.fields[0].editor.move_left();
+            app.editor.move_left();
+            let key = KeyEvent::new(code, modifiers);
+            form.key(key);
+            app.handle_key(key);
+            assert_eq!(form.fields[0].editor.text(), app.editor.text(), "{key:?}");
+            assert_eq!(
+                form.fields[0].editor.cursor(),
+                app.editor.cursor(),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_paste_inserts_at_cursor_and_normalizes_like_composer() {
+        let mut form = form(json!({"input":{"type":"string"}}), json!([])).unwrap();
+        form.paste("ab");
+        press(&mut form, KeyCode::Left);
+        form.paste("é\r\n\t界");
+        assert_eq!(form.fields[0].editor.text(), "aé\n    界b");
+        press(&mut form, KeyCode::Backspace);
+        assert_eq!(form.fields[0].editor.text(), "aé\n    b");
+        press(&mut form, KeyCode::Enter);
+        let result = serde_json::to_value(press(&mut form, KeyCode::Enter).unwrap()).unwrap();
+        assert_eq!(result["content"]["input"], "aé\n    b");
+    }
+
+    #[test]
     fn review_is_required_and_edits_are_preserved() {
         let mut f = form(
             json!({"name":{"type":"string", "minLength":2}}),
@@ -823,7 +1021,7 @@ mod tests {
         assert!(press(&mut f, KeyCode::Enter).is_none());
         assert_eq!(f.page, 1);
         press(&mut f, KeyCode::BackTab);
-        assert_eq!(f.fields[0].text, "Ada");
+        assert_eq!(f.fields[0].editor.text(), "Ada");
         press(&mut f, KeyCode::Enter);
         let result = serde_json::to_value(press(&mut f, KeyCode::Enter).unwrap()).unwrap();
         assert_eq!(result["content"]["name"], "Ada");
@@ -1038,8 +1236,8 @@ mod tests {
     fn bounds_optional_and_cancellation() {
         let mut f = form(json!({"x":{"type":"string"}}), json!([])).unwrap();
         f.paste(&"é".repeat(5000));
-        assert_eq!(f.fields[0].text.chars().count(), MAX_TEXT);
-        press(&mut f, KeyCode::Delete);
+        assert_eq!(f.fields[0].editor.text().chars().count(), MAX_TEXT);
+        f.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         press(&mut f, KeyCode::Enter);
         assert_eq!(
             serde_json::to_value(press(&mut f, KeyCode::Enter).unwrap()).unwrap()["content"],
