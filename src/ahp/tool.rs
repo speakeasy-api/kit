@@ -58,8 +58,21 @@ impl HookedTool {
     ) -> Before {
         let validator = match self.validator() {
             Ok(validator) => validator,
-            Err(error) => return Before::Return(denied(error)),
+            Err(error) => {
+                return Before::Return(ToolExecutionOutcome::FailedBeforeInvocation(
+                    ToolError::Internal(format!("tool {}: {error}", request.tool_name)),
+                ));
+            }
         };
+        if let Err(error) = validator.validate(&request.input) {
+            return Before::Return(ToolExecutionOutcome::FailedBeforeInvocation(
+                ToolError::InvalidInput(format!(
+                    "tool {}: invalid input at JSON instance path '{}': {error}",
+                    request.tool_name,
+                    error.instance_path(),
+                )),
+            ));
+        }
         let mut input = ToolBeforeInput::new(
             request.call_id.to_string(),
             request.tool_name.to_string(),
