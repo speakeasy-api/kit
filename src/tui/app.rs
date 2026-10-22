@@ -989,8 +989,9 @@ pub struct App {
     /// Transcript scrollbar cells from the last frame; empty when no bar shows.
     pub transcript_bar: Rect,
     /// While a left press that began on the scrollbar is held, the grabbed
-    /// cell's distance from the thumb's top, so the thumb tracks the pointer.
-    scrollbar_grab: Option<usize>,
+    /// cell's distance from the thumb's top, so the thumb tracks the pointer,
+    /// and the pointer's last row, so only real movement scrolls.
+    scrollbar_grab: Option<(usize, u16)>,
     pub selection: Option<Selection>,
     /// Observed Command+C forwarding; protocol support alone cannot prove it.
     pub command_copy_observed: bool,
@@ -4988,18 +4989,24 @@ impl App {
                 self.selection = None;
                 let cell = usize::from(mouse.row - self.transcript_bar.y);
                 let (start, length) = self.scrollbar_thumb();
-                // A press on the track centers the thumb under the pointer.
-                let grab = if (start..start + length).contains(&cell) {
-                    cell - start
+                self.scrollbar_grab = Some(if (start..start + length).contains(&cell) {
+                    // Grabbing the thumb leaves the view where it is.
+                    (cell - start, mouse.row)
                 } else {
-                    length / 2
-                };
-                self.scrollbar_grab = Some(grab);
-                self.drag_scrollbar(mouse.row, grab);
+                    // A press on the track centers the thumb under the pointer.
+                    let grab = length / 2;
+                    self.drag_scrollbar(mouse.row, grab);
+                    (grab, mouse.row)
+                });
                 return Action::Redraw;
             }
             MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_grab.is_some() => {
-                let grab = self.scrollbar_grab.unwrap_or_default();
+                let (grab, last_row) = self.scrollbar_grab.unwrap_or_default();
+                // Sideways motion keeps the offset; many offsets share a row.
+                if mouse.row == last_row {
+                    return Action::None;
+                }
+                self.scrollbar_grab = Some((grab, mouse.row));
                 return if self.drag_scrollbar(mouse.row, grab) {
                     Action::Redraw
                 } else {
@@ -5088,8 +5095,9 @@ impl App {
             .saturating_sub(grab)
             .min(last);
         // Many offsets draw the thumb on one row; keep the current one while
-        // the thumb stays put, including when it fills the track.
-        if last == 0 || target == start {
+        // the thumb stays put mid-track, or fills the track. A thumb pushed
+        // against either end still snaps to that end.
+        if last == 0 || (target == start && target != 0 && target != last) {
             return false;
         }
         // The smallest scroll whose thumb rounds to `target`, so a dragged
@@ -5636,6 +5644,21 @@ mod tests {
         assert!(matches!(app.handle_mouse(drag(5)), Action::None));
         assert_eq!((app.scroll, app.follow), (500, false));
         app.handle_mouse(up(5));
+
+        // Dragging past the end snaps there even when the thumb already
+        // draws on its last row.
+        app.transcript_bar = ratatui::layout::Rect::new(20, 0, 1, 18);
+        app.total_lines = 1000;
+        app.viewport = 18;
+        app.scroll = 979;
+        app.handle_mouse(down(17));
+        app.handle_mouse(drag(17));
+        assert_eq!((app.scroll, app.follow), (979, false));
+        app.handle_mouse(drag(40));
+        assert_eq!((app.scroll, app.follow), (982, true));
+        app.handle_mouse(up(40));
+        app.transcript_bar = ratatui::layout::Rect::new(20, 0, 1, 10);
+        app.viewport = 10;
 
         // A thumb that fills the track has nowhere to go and keeps following.
         app.total_lines = 11;
