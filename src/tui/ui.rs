@@ -185,6 +185,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     } else if let Some(dialog) = &app.effort_dialog {
         draw_effort_dialog(frame, app, dialog);
     }
+    if native_links_obscured(app) {
+        // Presses on a dialog over the bar belong to the dialog.
+        app.transcript_bar = Rect::default();
+    }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
     let area = frame.area();
@@ -1205,6 +1209,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         width: text_area.width.saturating_sub(2),
         ..text_area
     };
+    app.transcript_bar = Rect::default();
     if app.blocks.is_empty() {
         app.row_calls.clear();
         app.row_links.clear();
@@ -1354,6 +1359,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         }
     }
     if total > height {
+        app.transcript_bar = bar_area;
         let mut state = ScrollbarState::new(bottom).position(offset);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -4439,6 +4445,59 @@ mod tests {
             assert_eq!(child.editor.text(), if can_steer { text } else { "" });
             assert!(child.attachments.is_empty());
         }
+    }
+
+    #[test]
+    fn dragged_scrollbar_thumb_stays_under_the_pointer() {
+        use crossterm::event::MouseButton;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "test".into(),
+            "test".into(),
+            "0:0".into(),
+        );
+        let numbers: Vec<String> = (1..=100).map(|n| n.to_string()).collect();
+        app.blocks.push(Block::Agent(numbers.join("\n\n")));
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).expect("terminal");
+        let mut images = ImageRuntime::disabled();
+        let mut thumb = |app: &mut App| {
+            terminal
+                .draw(|frame| draw(frame, app, &mut images))
+                .expect("draw succeeds");
+            let bar = app.transcript_bar;
+            let buffer = terminal.backend().buffer();
+            (bar.y..bar.y + bar.height)
+                .filter(|&row| buffer[(bar.x, row)].symbol() == "█")
+                .collect::<Vec<u16>>()
+        };
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let following = thumb(&mut app);
+        let bar = app.transcript_bar;
+        assert!(bar.height > 0);
+        assert_eq!(following.last(), Some(&(bar.y + bar.height - 1)));
+
+        // Grabbing the thumb's top row leaves it in place and still following.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar.x,
+            following[0],
+        ));
+        assert_eq!(thumb(&mut app), following);
+        assert!(app.follow);
+
+        for row in [bar.y + 2, bar.y + 5, bar.y] {
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), bar.x, row));
+            assert_eq!(thumb(&mut app).first(), Some(&row));
+        }
+        assert_eq!(app.scroll, 0);
+        assert!(app.selection.is_none());
     }
 
     #[test]

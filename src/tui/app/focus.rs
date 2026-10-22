@@ -574,7 +574,11 @@ impl App {
             }
         }
         self.child_focus.as_ref()?;
-        if self.agents_area.contains((mouse.column, mouse.row).into()) {
+        // Drags and releases still reach the child, so a scrollbar drag or
+        // selection can cross into the roster beside its transcript.
+        if self.agents_area.contains((mouse.column, mouse.row).into())
+            && !matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+        {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_agents_by(-3),
                 MouseEventKind::ScrollDown => self.scroll_agents_by(3),
