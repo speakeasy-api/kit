@@ -814,6 +814,12 @@ fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App, dialog: &EffortDialog) {
     );
 }
 
+/// A model dialog row; signed-out providers start a sign-in when entered.
+struct DialogRow<'a> {
+    label: &'a str,
+    signed_out: bool,
+}
+
 fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     let outer = frame.area();
     let width = if outer.width > 20 {
@@ -832,28 +838,38 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
         width,
         height,
     );
-    let (labels, title, enter, esc) = match &dialog.provider {
+    let (rows, title, esc) = match &dialog.provider {
         None => (
             app.selected_model_providers()
                 .into_iter()
-                .map(str::to_owned)
+                .map(|row| DialogRow {
+                    label: row.name,
+                    signed_out: row.login.is_some(),
+                })
                 .collect::<Vec<_>>(),
             " provider ".to_owned(),
-            "open",
             "close",
         ),
         Some(provider) => (
             app.selected_model_choices()
                 .into_iter()
-                .map(|choice| choice.model.clone())
+                .map(|choice| DialogRow {
+                    label: &choice.model,
+                    signed_out: false,
+                })
                 .collect(),
             format!(" {provider} · model "),
-            "select",
             "back",
         ),
     };
+    let enter = match (&dialog.provider, rows.get(dialog.selected)) {
+        (_, None) => "",
+        (Some(_), _) => "  ·  enter select",
+        (None, Some(row)) if row.signed_out => "  ·  enter sign in",
+        (None, _) => "  ·  enter open",
+    };
     let footer = format!(
-        "tab defaults [{}]  ·  enter {enter}  ·  esc {esc}",
+        "tab defaults [{}]{enter}  ·  esc {esc}",
         if dialog.save_defaults { "x" } else { " " }
     );
     let panel = Panel::bordered().title(title);
@@ -867,21 +883,32 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     ])
     .areas(inner);
     let visible = list.height as usize;
-    let viewport = model_dialog_viewport(labels.len(), dialog.selected, visible);
-    let lines = labels[viewport.clone()]
+    let viewport = model_dialog_viewport(rows.len(), dialog.selected, visible);
+    let lines = rows[viewport.clone()]
         .iter()
         .zip(viewport)
-        .map(|(label, index)| {
+        .map(|(row, index)| {
             let selected = index == dialog.selected;
             let marker = if selected { "› " } else { "  " };
-            let style = if selected {
-                theme::accent()
-            } else {
-                theme::text()
+            // Signed-out providers stay greyed out, keeping the accent when selected.
+            let style = match (selected, row.signed_out) {
+                (true, false) => theme::accent(),
+                (true, true) => theme::accent().add_modifier(Modifier::DIM),
+                (false, false) => theme::text(),
+                (false, true) => theme::faint(),
             };
-            Line::from(Span::styled(format!("{marker}{label}"), style))
+            Line::from(Span::styled(format!("{marker}{}", row.label), style))
         })
         .collect::<Vec<_>>();
+    // A signed-in provider can have no models when its discovery failed.
+    let lines = match (lines.is_empty(), dialog.query.is_empty(), &dialog.provider) {
+        (true, true, Some(_)) => vec![Line::from(Span::styled(
+            "  no models available; model discovery may have failed",
+            theme::dim(),
+        ))],
+        (true, false, _) => vec![Line::from(Span::styled("  no matches", theme::dim()))],
+        _ => lines,
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(panel, area);
     let search_prefix = if search.width >= 8 {
@@ -4832,6 +4859,34 @@ mod tests {
         assert!(frame.contains("› beta"), "{frame}");
         assert!(!frame.contains("three"), "{frame}");
         assert!(frame.contains("esc close"), "{frame}");
+        assert!(frame.contains("enter open"), "{frame}");
+
+        app.set_catalog_providers(Some(vec!["alpha".into(), "beta".into()]));
+        app.auth_methods = vec![
+            agent_client_protocol::schema::v2::AuthMethodTerminal::new("gamma", "Gamma").meta(
+                serde_json::Map::from_iter([(
+                    crate::protocols::acp::AUTH_PROVIDER_META.into(),
+                    serde_json::Value::from("gamma"),
+                )]),
+            ),
+        ];
+        app.model_dialog.as_mut().unwrap().selected = 2;
+        let signed_out = render(&mut app, 60, 12);
+        assert!(signed_out.contains("› gamma"), "{signed_out}");
+        assert!(signed_out.contains("enter sign in"), "{signed_out}");
+
+        // A signed-in provider whose discovery returned nothing explains the
+        // empty page instead of offering a selection.
+        app.set_catalog_providers(Some(vec!["alpha".into(), "beta".into(), "delta".into()]));
+        app.model_dialog.as_mut().unwrap().provider = Some("delta".into());
+        app.model_dialog.as_mut().unwrap().selected = 0;
+        let empty = render(&mut app, 70, 12);
+        assert!(empty.contains("no models available"), "{empty}");
+        assert!(!empty.contains("enter select"), "{empty}");
+        app.model_dialog.as_mut().unwrap().query = "zzz".into();
+        let unmatched = render(&mut app, 70, 12);
+        assert!(unmatched.contains("no matches"), "{unmatched}");
+        app.model_dialog.as_mut().unwrap().query.clear();
 
         app.model_dialog.as_mut().unwrap().provider = Some("alpha".into());
         app.model_dialog.as_mut().unwrap().selected = 0;

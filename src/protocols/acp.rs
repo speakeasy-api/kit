@@ -104,6 +104,9 @@ impl<'a> AuthenticationRequiredData<'a> {
     }
 }
 
+/// Terminal auth method metadata naming the provider the method signs in to.
+pub(crate) const AUTH_PROVIDER_META: &str = "kit/provider";
+
 pub(crate) struct TerminalAuthMethodSpec {
     pub(crate) method_id: &'static str,
     pub(crate) name: &'static str,

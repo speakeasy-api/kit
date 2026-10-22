@@ -143,7 +143,11 @@ fn terminal_auth_methods(
                     .args(vec![
                         "--terminal-auth-login".into(),
                         method.method_id.into(),
-                    ]),
+                    ])
+                    .meta(Map::from_iter([(
+                        super::AUTH_PROVIDER_META.into(),
+                        Value::from(method.provider.as_str()),
+                    )])),
             )
         })
         .collect()
@@ -1592,7 +1596,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         structured_completion,
         mut skill_catalog,
         adapter,
-        catalog,
+        mut catalog,
         mut commands,
         mut mcp_events,
     } = actor;
@@ -1659,6 +1663,15 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             .is_cancelled_since(cancellation_generation)
                         {
                             return Err(model_switch::error("model change cancelled"));
+                        }
+                        // A terminal login since the session opened changes which
+                        // providers resolve credentials; rebuild the catalog so the
+                        // client's post-login refresh advertises their models.
+                        if !catalog_matches_providers(&catalog, &adapter.catalog_providers()) {
+                            let current = adapter
+                                .selection()
+                                .map_err(|error| model_switch::error(&error))?;
+                            catalog = adapter.model_catalog(&current).await;
                         }
                         if request.config_id.to_string() == super::MODEL_CONFIG_ID {
                             let target = request.value.as_id().ok_or_else(|| {
@@ -2366,6 +2379,16 @@ fn v2_config_options(
     ]
 }
 
+fn catalog_matches_providers(
+    catalog: &[crate::provider::ModelGroup],
+    providers: &[crate::ProviderKind],
+) -> bool {
+    catalog
+        .iter()
+        .map(|group| group.provider)
+        .eq(providers.iter().copied())
+}
+
 fn set_v2_config(
     adapter: &SelectableAdapter,
     catalog: &[crate::provider::ModelGroup],
@@ -3022,6 +3045,25 @@ pub(crate) fn component(
 )]
 mod tests {
     include!("v2/identity_tests.rs");
+    #[test]
+    fn catalog_matches_providers_detects_logins_and_logouts() {
+        let group = |provider| crate::provider::ModelGroup {
+            provider,
+            models: Vec::new(),
+            context_windows: Default::default(),
+        };
+        let catalog = [group(ProviderKind::OpenAiSubscription)];
+        assert!(catalog_matches_providers(
+            &catalog,
+            &[ProviderKind::OpenAiSubscription]
+        ));
+        assert!(!catalog_matches_providers(
+            &catalog,
+            &[ProviderKind::OpenAiSubscription, ProviderKind::Anthropic]
+        ));
+        assert!(!catalog_matches_providers(&catalog, &[]));
+    }
+
     #[test]
     fn compose_title_replay_preserves_identity_and_trims_intent() {
         let call = agentkit_core::ToolCallPart::new(
@@ -6789,6 +6831,23 @@ mod tests {
         });
         let method_ids = terminal_auth_method_ids(&methods);
         assert_eq!(method_ids, ["openai", "speakeasy", "anthropic"]);
+        let providers = methods
+            .iter()
+            .map(|method| match method {
+                wire::AuthMethod::Terminal(method) => {
+                    method.meta.as_ref().unwrap()[crate::protocols::acp::AUTH_PROVIDER_META].clone()
+                }
+                _ => unreachable!("only terminal methods are advertised"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            providers,
+            [
+                json!("openai-subscription"),
+                json!("speakeasy"),
+                json!("anthropic")
+            ]
+        );
         assert!(
             terminal_auth_method_specs()
                 .iter()

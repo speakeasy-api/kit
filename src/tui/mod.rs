@@ -71,8 +71,8 @@ use tokio::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wire::{
     CancelSessionNotification, CloseSessionRequest, ContentBlock, SessionConfigKind,
-    SessionConfigOption, SessionConfigSelectOptions, SessionUpdate, SetSessionConfigOptionRequest,
-    ToolCallContent, UpdateSessionNotification,
+    SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOptions, SessionUpdate,
+    SetSessionConfigOptionRequest, ToolCallContent, UpdateSessionNotification,
 };
 
 use crate::{
@@ -1270,6 +1270,12 @@ fn refresh_config_state(app: &mut App, options: Option<&[SessionConfigOption]>) 
         app.model = choice.model;
     }
     app.set_model_choices(model_choices(options));
+    app.set_catalog_providers(model_groups(options).map(|groups| {
+        groups
+            .iter()
+            .map(|group| group.group_id.to_string())
+            .collect()
+    }));
     if let Some((current, choices)) = effort_state(options) {
         app.set_effort(current, choices);
     } else {
@@ -1277,21 +1283,25 @@ fn refresh_config_state(app: &mut App, options: Option<&[SessionConfigOption]>) 
     }
 }
 
-fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
-    let Some(SessionConfigOption {
-        kind: SessionConfigKind::Select(select),
-        ..
-    }) = options
+/// The model option's provider groups, one per provider with credentials.
+fn model_groups(options: Option<&[SessionConfigOption]>) -> Option<&[SessionConfigSelectGroup]> {
+    let SessionConfigKind::Select(select) = &options
         .unwrap_or_default()
         .iter()
-        .find(|option| option.config_id.to_string() == MODEL_CONFIG_ID)
+        .find(|option| option.config_id.to_string() == MODEL_CONFIG_ID)?
+        .kind
     else {
-        return Vec::new();
+        return None;
     };
-    let SessionConfigSelectOptions::Grouped(groups) = &select.options else {
-        return Vec::new();
-    };
-    groups
+    match &select.options {
+        SessionConfigSelectOptions::Grouped(groups) => Some(groups),
+        _ => None,
+    }
+}
+
+fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
+    model_groups(options)
+        .unwrap_or_default()
         .iter()
         .flat_map(|group| {
             let provider = group.group_id.to_string();
@@ -2781,6 +2791,7 @@ async fn run_client(
                                             method.name
                                         )),
                                     }
+                                    app.finish_provider_login();
                                     images = resume_terminal(&mut terminal).map_err(
                                         agent_client_protocol::Error::into_internal_error,
                                     )?;
