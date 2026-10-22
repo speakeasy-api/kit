@@ -503,6 +503,7 @@ impl std::fmt::Display for LogoutAuthenticationError {
 }
 
 pub struct Runtime {
+    ask_user_enabled: bool,
     eval: Option<crate::tools::EvalTool>,
     root: PathBuf,
     adapter: SelectableAdapter,
@@ -622,6 +623,7 @@ impl Runtime {
             prompt_cache_key: None,
         });
         Ok(Arc::new(Self {
+            ask_user_enabled: true,
             eval: None,
             root,
             adapter,
@@ -813,6 +815,31 @@ impl Runtime {
             .map_err(|_| "could not configure agent hooks after runtime was shared".to_string())?;
         runtime.hooks = crate::ahp::Hooks::load(&runtime.root);
         Ok(Arc::new(runtime))
+    }
+
+    /// Controls native user questions before publishing the runtime to sessions.
+    /// ACP client form capability is still required when enabled.
+    pub fn with_ask_user(runtime: Arc<Self>, enabled: bool) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
+            "could not configure user questions after runtime was shared".to_string()
+        })?;
+        runtime.ask_user_enabled = enabled;
+        Ok(Arc::new(runtime))
+    }
+
+    fn user_question_tools(
+        &self,
+        ask_user: Option<crate::tools::ask_user::AskUserTool>,
+    ) -> agentkit_tools_core::ToolRegistry {
+        let mut questions = agentkit_tools_core::ToolRegistry::new();
+        if let Some(ask_user) = ask_user.filter(|_| self.ask_user_enabled) {
+            questions = questions.with(Observed::new(ask_user));
+        }
+        if let Some(hooks) = &self.hooks {
+            crate::ahp::hooked_tools(questions, hooks)
+        } else {
+            questions
+        }
     }
 
     /// Enables evaluation only after explicit user opt-in and credential resolution.
@@ -1978,16 +2005,8 @@ impl Runtime {
                 crate::ahp::PromptRecord::Session(opened.observer.clone()),
             ));
         }
-        if let Some(ask_user) = context.ask_user {
-            // User interaction remains foreground-only, outside backgroundable compose.
-            let questions = agentkit_tools_core::ToolRegistry::new().with(Observed::new(ask_user));
-            let questions = if let Some(hooks) = &self.hooks {
-                crate::ahp::hooked_tools(questions, hooks)
-            } else {
-                questions
-            };
-            builder = builder.add_tool_source(questions);
-        }
+        // User interaction remains foreground-only, outside backgroundable compose.
+        builder = builder.add_tool_source(self.user_question_tools(context.ask_user));
         let driver = builder
             .observer(context.integration.as_ref().clone())
             .observer(crate::fatal::RetryLog)
@@ -3402,3 +3421,48 @@ mod additional_directory_tests {
 
 #[cfg(test)]
 mod prompt_tests;
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+mod user_question_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ask_user_catalog_requires_setting_and_client_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        assert!(runtime.ask_user_enabled);
+        let (_client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        agent_client_protocol::Agent
+            .v2()
+            .connect_with(agent_transport, async move |connection| {
+                let mut runtime = runtime;
+                for enabled in [false, true, false] {
+                    runtime = Runtime::with_ask_user(runtime, enabled).unwrap();
+                    for capable in [false, true] {
+                        let tool = capable.then(|| {
+                            crate::tools::ask_user::AskUserTool::new(
+                                connection.clone(),
+                                agentkit_acp::v2::wire::SessionId::new("catalog-test"),
+                            )
+                        });
+                        let catalog = runtime.user_question_tools(tool);
+                        assert_eq!(
+                            catalog.get(&ToolName::new("ask_user")).is_some(),
+                            enabled && capable,
+                        );
+                        assert_eq!(catalog.specs().len(), usize::from(enabled && capable));
+                    }
+                }
+                Ok::<(), agent_client_protocol::Error>(())
+            })
+            .await
+            .unwrap();
+    }
+}

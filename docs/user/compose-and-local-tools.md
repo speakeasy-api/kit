@@ -4,7 +4,7 @@ Kit exposes `compose` for tool orchestration and, when the connected client supp
 
 ## Ask for a user decision
 
-When an ACP v2 client advertises form elicitation, Kit also exposes `ask_user` as a standalone tool. It is not a Runlet function and cannot run in the background. Use it for decisions that need explicit user input, not credentials or secrets.
+When an ACP v2 client advertises form elicitation and `ask_user` is enabled (the default), Kit also exposes `ask_user` as a standalone tool. It is not a Runlet function and cannot run in the background. Use it for decisions that need explicit user input, not credentials or secrets. To disable this tool, see [Disable native user questions](getting-started-and-configuration.md#disable-native-user-questions).
 
 A request contains a `message` and 1–8 `questions`. Each question has a stable `id`, `title`, `prompt`, and 1–32 `options` with stable IDs and display labels. Set `multiple: true` for multiple selections and `allow_custom: true` to offer a separate text field. Both flags default to false. The complete form request is limited to 128 KiB; shorten descriptions or split the batch if the tool reports that the form is too large.
 

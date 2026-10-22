@@ -1313,7 +1313,16 @@ const CONFIG_MIGRATIONS: &[ConfigMigration] = &[
     ConfigMigration {
         apply: migrate_compaction_policy,
     },
+    ConfigMigration {
+        apply: migrate_ask_user,
+    },
 ];
+
+fn migrate_ask_user(config: &mut toml::Table) {
+    config
+        .entry("ask_user")
+        .or_insert(toml::Value::Boolean(true));
+}
 
 // Additive policy: preserve explicit values and malformed shapes for validation.
 // This migration only changes the in-memory document, never the user's file.
@@ -1364,6 +1373,7 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
+    ask_user: Option<bool>,
     #[serde(default)]
     compaction: kit::compaction::policy::CompactionConfig,
     #[serde(default, deserialize_with = "deserialize_experimental_config")]
@@ -2297,6 +2307,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
+            let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
@@ -2397,6 +2408,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
+            let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
@@ -2472,6 +2484,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
+            let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
@@ -2934,6 +2947,65 @@ mod tests {
             let text = format!("[experimental]\neval = {value}");
             assert!(toml::from_str::<Config>(&text).is_err());
         }
+    }
+
+    #[test]
+    fn config_ask_user_defaults_and_strict_boolean() {
+        assert!(Config::default().ask_user.unwrap_or(true));
+        for (text, expected) in [
+            ("", true),
+            ("ask_user = true", true),
+            ("ask_user = false", false),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.ask_user.unwrap_or(true), expected);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, text).unwrap();
+            assert_eq!(
+                Config::load(&path).unwrap().ask_user.unwrap_or(true),
+                expected
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            let migrated = super::migrate_config(toml::from_str(text).unwrap());
+            assert_eq!(migrated["ask_user"].as_bool(), Some(expected));
+            assert_eq!(super::migrate_config(migrated.clone()), migrated);
+        }
+        for value in ["'true'", "1", "0.0", "[]", "{}"] {
+            let text = format!("ask_user = {value}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, &text).unwrap();
+            assert!(Config::load(&path).is_err(), "{text}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn config_ask_user_writer_preserves_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# preserved\nask_user = false # opt out\nmodel = 'old'\nfuture = 'keep'\n",
+        )
+        .unwrap();
+        kit::config_editor::set(&path, "model", "'new'").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("ask_user = false # opt out"));
+        assert!(updated.starts_with("# preserved\n"));
+        assert!(!Config::load(&path).unwrap().ask_user.unwrap_or(true));
+        kit::config_editor::set(&path, "ask_user", "true").unwrap();
+        assert!(Config::load(&path).unwrap().ask_user.unwrap_or(true));
+        kit::config_editor::set(&path, "ask_user", "false").unwrap();
+        assert!(!Config::load(&path).unwrap().ask_user.unwrap_or(true));
+        kit::config_editor::unset(&path, "ask_user").unwrap();
+        assert!(Config::load(&path).unwrap().ask_user.unwrap_or(true));
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(!updated.contains("ask_user"));
+        assert!(updated.contains("future = 'keep'"));
+        assert!(updated.contains("model = 'new'"));
     }
 
     #[cfg(feature = "tui")]
