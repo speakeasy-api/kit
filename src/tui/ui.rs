@@ -863,12 +863,13 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
         ),
     };
     let enter = match (&dialog.provider, rows.get(dialog.selected)) {
-        (Some(_), _) => "select",
-        (None, Some(row)) if row.signed_out => "sign in",
-        (None, _) => "open",
+        (_, None) => "",
+        (Some(_), _) => "  ·  enter select",
+        (None, Some(row)) if row.signed_out => "  ·  enter sign in",
+        (None, _) => "  ·  enter open",
     };
     let footer = format!(
-        "tab defaults [{}]  ·  enter {enter}  ·  esc {esc}",
+        "tab defaults [{}]{enter}  ·  esc {esc}",
         if dialog.save_defaults { "x" } else { " " }
     );
     let panel = Panel::bordered().title(title);
@@ -899,6 +900,15 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
             Line::from(Span::styled(format!("{marker}{}", row.label), style))
         })
         .collect::<Vec<_>>();
+    // A signed-in provider can have no models when its discovery failed.
+    let lines = match (lines.is_empty(), dialog.query.is_empty(), &dialog.provider) {
+        (true, true, Some(_)) => vec![Line::from(Span::styled(
+            "  no models available; model discovery may have failed",
+            theme::dim(),
+        ))],
+        (true, false, _) => vec![Line::from(Span::styled("  no matches", theme::dim()))],
+        _ => lines,
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(panel, area);
     let search_prefix = if search.width >= 8 {
@@ -4864,6 +4874,19 @@ mod tests {
         let signed_out = render(&mut app, 60, 12);
         assert!(signed_out.contains("› gamma"), "{signed_out}");
         assert!(signed_out.contains("enter sign in"), "{signed_out}");
+
+        // A signed-in provider whose discovery returned nothing explains the
+        // empty page instead of offering a selection.
+        app.set_catalog_providers(Some(vec!["alpha".into(), "beta".into(), "delta".into()]));
+        app.model_dialog.as_mut().unwrap().provider = Some("delta".into());
+        app.model_dialog.as_mut().unwrap().selected = 0;
+        let empty = render(&mut app, 70, 12);
+        assert!(empty.contains("no models available"), "{empty}");
+        assert!(!empty.contains("enter select"), "{empty}");
+        app.model_dialog.as_mut().unwrap().query = "zzz".into();
+        let unmatched = render(&mut app, 70, 12);
+        assert!(unmatched.contains("no matches"), "{unmatched}");
+        app.model_dialog.as_mut().unwrap().query.clear();
 
         app.model_dialog.as_mut().unwrap().provider = Some("alpha".into());
         app.model_dialog.as_mut().unwrap().selected = 0;
