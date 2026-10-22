@@ -242,6 +242,12 @@ pub struct ProviderRow<'a> {
     pub login: Option<&'a AuthMethodTerminal>,
 }
 
+/// A sign-in started from the provider page, resumed on its models afterward.
+struct ProviderLogin {
+    provider: String,
+    save_defaults: bool,
+}
+
 pub struct ModelDialog {
     pub query: String,
     pub selected: usize,
@@ -864,6 +870,10 @@ pub struct App {
     pub provider: String,
     pub model: String,
     pub model_choices: Vec<ModelChoice>,
+    /// Providers with resolved credentials, from the catalog's model groups;
+    /// `None` until the agent advertises a catalog.
+    catalog_providers: Option<Vec<String>>,
+    provider_login: Option<ProviderLogin>,
     pub model_dialog: Option<ModelDialog>,
     pub(super) elicitations: VecDeque<super::elicitation_requests::Pending>,
     pub model_switch: Option<ModelSwitch>,
@@ -1167,6 +1177,8 @@ impl App {
             provider,
             model,
             model_choices: Vec::new(),
+            catalog_providers: None,
+            provider_login: None,
             model_dialog: None,
             elicitations: VecDeque::new(),
             model_switch: None,
@@ -3586,14 +3598,24 @@ impl App {
         self.model_choices = choices;
     }
 
+    pub fn set_catalog_providers(&mut self, providers: Option<Vec<String>>) {
+        self.catalog_providers = providers;
+    }
+
     pub fn set_effort(&mut self, current: String, choices: Vec<EffortChoice>) {
         self.reasoning_effort = current;
         self.effort_choices = choices;
     }
 
-    /// Distinct providers in catalog order.
+    /// Distinct signed-in providers in catalog order, including any whose
+    /// model discovery came back empty.
     fn model_providers(&self) -> Vec<&str> {
-        let mut providers = Vec::<&str>::new();
+        let mut providers = self
+            .catalog_providers
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         for choice in &self.model_choices {
             if !providers.contains(&choice.provider.as_str()) {
                 providers.push(&choice.provider);
@@ -3608,23 +3630,33 @@ impl App {
             .filter(move |choice| choice.provider == provider)
     }
 
-    /// Advertised sign-in methods for providers that have no models yet.
-    fn login_providers(&self) -> Vec<ProviderRow<'_>> {
+    /// Signed-in providers followed by advertised sign-in methods for the
+    /// rest. Sign-in rows need the agent's catalog to know who is signed in.
+    fn provider_rows(&self) -> (Vec<ProviderRow<'_>>, Vec<ProviderRow<'_>>) {
         let active = self.model_providers();
-        self.auth_methods
-            .iter()
-            .filter_map(|method| {
-                let name = crate::protocols::acp::terminal_auth_method_specs()
-                    .iter()
-                    .find(|spec| spec.method_id == method.method_id.0.as_ref())?
-                    .provider
-                    .as_str();
-                (!active.contains(&name)).then_some(ProviderRow {
-                    name,
-                    login: Some(method),
+        let signed_out = if self.catalog_providers.is_some() {
+            self.auth_methods
+                .iter()
+                .filter_map(|method| {
+                    let name = method
+                        .meta
+                        .as_ref()?
+                        .get(crate::protocols::acp::AUTH_PROVIDER_META)?
+                        .as_str()?;
+                    (!active.contains(&name)).then_some(ProviderRow {
+                        name,
+                        login: Some(method),
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let active = active
+            .into_iter()
+            .map(|name| ProviderRow { name, login: None })
+            .collect();
+        (active, signed_out)
     }
 
     /// Providers matching the search on the provider page, with signed-out
@@ -3632,18 +3664,28 @@ impl App {
     pub fn selected_model_providers(&self) -> Vec<ProviderRow<'_>> {
         match &self.model_dialog {
             Some(dialog) if dialog.provider.is_none() => {
-                let active = self
-                    .model_providers()
-                    .into_iter()
-                    .map(|name| ProviderRow { name, login: None })
-                    .collect();
+                let (active, signed_out) = self.provider_rows();
                 let mut rows = rank_by_name(active, &dialog.query, |row| row.name);
-                rows.extend(rank_by_name(self.login_providers(), &dialog.query, |row| {
-                    row.name
-                }));
+                rows.extend(rank_by_name(signed_out, &dialog.query, |row| row.name));
                 rows
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Reopens the model page of a provider signed in from the picker, once the
+    /// refreshed catalog lists it.
+    pub fn finish_provider_login(&mut self) {
+        let Some(login) = self.provider_login.take() else {
+            return;
+        };
+        if self.working() || !self.model_providers().contains(&login.provider.as_str()) {
+            return;
+        }
+        self.open_model_dialog();
+        self.open_model_provider(login.provider);
+        if let Some(dialog) = &mut self.model_dialog {
+            dialog.save_defaults = login.save_defaults;
         }
     }
 
@@ -3771,20 +3813,27 @@ impl App {
                     .as_ref()
                     .is_some_and(|dialog| dialog.provider.is_none())
                 {
-                    let row = self.selected_model_providers().get(selected).copied();
+                    let row = self
+                        .selected_model_providers()
+                        .get(selected)
+                        .map(|row| (row.name.to_owned(), row.login.cloned()));
                     match row {
-                        Some(ProviderRow {
-                            login: Some(method),
-                            ..
-                        }) => {
-                            let method = method.clone();
-                            self.model_dialog = None;
+                        Some((provider, Some(method))) => {
+                            if self.model_switch.is_some() || self.working() {
+                                self.toast("sign in after the current turn finishes");
+                                return Action::None;
+                            }
+                            let save_defaults = self
+                                .model_dialog
+                                .take()
+                                .is_some_and(|dialog| dialog.save_defaults);
+                            self.provider_login = Some(ProviderLogin {
+                                provider,
+                                save_defaults,
+                            });
                             return Action::Login(method);
                         }
-                        Some(ProviderRow { name, login: None }) => {
-                            let provider = name.to_owned();
-                            self.open_model_provider(provider);
-                        }
+                        Some((provider, None)) => self.open_model_provider(provider),
                         None => {}
                     }
                     return Action::None;
@@ -4745,7 +4794,8 @@ impl App {
                         }
                     },
                     Parsed::Model { query: None } => {
-                        if self.model_choices.is_empty() && self.auth_methods.is_empty() {
+                        let (active, signed_out) = self.provider_rows();
+                        if active.is_empty() && signed_out.is_empty() {
                             self.toast("no models are available");
                         } else {
                             self.open_model_dialog();
@@ -9104,15 +9154,30 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn model_dialog_lists_signed_out_providers_after_active_ones_and_logs_in() {
+    fn sign_in(method_id: &str, provider: &str) -> AuthMethodTerminal {
+        AuthMethodTerminal::new(method_id, format!("Sign in to {provider}")).meta(
+            serde_json::Map::from_iter([(
+                crate::protocols::acp::AUTH_PROVIDER_META.into(),
+                serde_json::Value::from(provider),
+            )]),
+        )
+    }
+
+    fn signed_in_app(providers: &[&str]) -> App {
         let mut app = app();
         app.set_model_choices(vec![model_choice("openai-subscription", "gpt-5.4")]);
+        app.set_catalog_providers(Some(providers.iter().map(|&name| name.into()).collect()));
         app.auth_methods = vec![
-            AuthMethodTerminal::new("openai", "Sign in with ChatGPT"),
-            AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter"),
-            AuthMethodTerminal::new("anthropic", "Sign in with Anthropic"),
+            sign_in("openai", "openai-subscription"),
+            sign_in("openrouter", "openrouter"),
+            sign_in("anthropic", "anthropic"),
         ];
+        app
+    }
+
+    #[test]
+    fn model_dialog_lists_signed_out_providers_after_active_ones_and_logs_in() {
+        let mut app = signed_in_app(&["openai-subscription"]);
         app.open_model_dialog();
 
         let rows = app.selected_model_providers();
@@ -9127,6 +9192,7 @@ mod tests {
             [false, true, true]
         );
 
+        app.handle_key(press(KeyCode::Tab));
         for character in "anthr".chars() {
             app.handle_key(press(KeyCode::Char(character)));
         }
@@ -9136,15 +9202,88 @@ mod tests {
         };
         assert_eq!(method.method_id.0.as_ref(), "anthropic");
         assert!(app.model_dialog.is_none());
+
+        // The refreshed catalog lists the provider, so its models reopen with
+        // the defaults choice the user made before signing in.
+        app.set_model_choices(vec![
+            model_choice("openai-subscription", "gpt-5.4"),
+            model_choice("anthropic", "claude-sonnet-4-5"),
+        ]);
+        app.set_catalog_providers(Some(vec!["openai-subscription".into(), "anthropic".into()]));
+        app.finish_provider_login();
+        let dialog = app.model_dialog.as_ref().expect("model dialog");
+        assert_eq!(dialog.provider.as_deref(), Some("anthropic"));
+        assert!(dialog.save_defaults);
+        assert_eq!(
+            app.selected_model_choices()
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-sonnet-4-5"]
+        );
     }
 
     #[test]
-    fn model_command_opens_the_provider_page_with_only_sign_in_methods() {
+    fn failed_provider_sign_in_does_not_reopen_the_dialog() {
+        let mut app = signed_in_app(&["openai-subscription"]);
+        app.open_model_dialog();
+        for character in "anthr".chars() {
+            app.handle_key(press(KeyCode::Char(character)));
+        }
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::Login(_)
+        ));
+        app.finish_provider_login();
+        assert!(app.model_dialog.is_none());
+    }
+
+    #[test]
+    fn signed_in_providers_without_models_are_not_offered_sign_in() {
+        // Anthropic has credentials but its model discovery came back empty.
+        let mut app = signed_in_app(&["openai-subscription", "anthropic"]);
+        app.open_model_dialog();
+        let rows = app.selected_model_providers();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name, row.login.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                ("openai-subscription", false),
+                ("anthropic", false),
+                ("openrouter", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_sign_in_waits_for_the_current_turn() {
+        let mut app = signed_in_app(&["openai-subscription"]);
+        app.open_model_dialog();
+        app.phase = Phase::Working;
+        app.model_dialog.as_mut().unwrap().selected = 2;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.model_dialog.is_some());
+        assert!(app.provider_login.is_none());
+    }
+
+    #[test]
+    fn model_command_offers_sign_in_only_once_the_catalog_is_known() {
         let mut app = app();
-        app.auth_methods = vec![AuthMethodTerminal::new(
-            "anthropic",
-            "Sign in with Anthropic",
-        )];
+        app.auth_methods = vec![
+            sign_in("anthropic", "anthropic"),
+            AuthMethodTerminal::new("unknown", "Sign in elsewhere"),
+        ];
+        app.editor.insert_str("/model");
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.model_dialog.is_none());
+
+        app.set_catalog_providers(Some(Vec::new()));
+        app.editor.clear();
+        app.last_key = None;
         app.editor.insert_str("/model");
         app.handle_key(press(KeyCode::Enter));
         assert_eq!(provider_names(&app), ["anthropic"]);

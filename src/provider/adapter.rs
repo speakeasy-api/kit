@@ -357,6 +357,15 @@ impl SelectableAdapter {
         .await
     }
 
+    /// Providers whose credentials resolve now, in catalog order.
+    pub fn catalog_providers(&self) -> Vec<ProviderKind> {
+        available_catalog_providers(
+            &self.credential_storage,
+            self.openrouter_api_key.as_ref(),
+            |name| std::env::var(name),
+        )
+    }
+
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());

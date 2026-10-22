@@ -814,6 +814,12 @@ fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App, dialog: &EffortDialog) {
     );
 }
 
+/// A model dialog row; signed-out providers start a sign-in when entered.
+struct DialogRow<'a> {
+    label: &'a str,
+    signed_out: bool,
+}
+
 fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     let outer = frame.area();
     let width = if outer.width > 20 {
@@ -832,12 +838,14 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
         width,
         height,
     );
-    // Rows flagged `true` are signed-out providers; entering one starts login.
-    let (labels, title, esc) = match &dialog.provider {
+    let (rows, title, esc) = match &dialog.provider {
         None => (
             app.selected_model_providers()
                 .into_iter()
-                .map(|row| (row.name.to_owned(), row.login.is_some()))
+                .map(|row| DialogRow {
+                    label: row.name,
+                    signed_out: row.login.is_some(),
+                })
                 .collect::<Vec<_>>(),
             " provider ".to_owned(),
             "close",
@@ -845,15 +853,18 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
         Some(provider) => (
             app.selected_model_choices()
                 .into_iter()
-                .map(|choice| (choice.model.clone(), false))
+                .map(|choice| DialogRow {
+                    label: &choice.model,
+                    signed_out: false,
+                })
                 .collect(),
             format!(" {provider} · model "),
             "back",
         ),
     };
-    let enter = match (&dialog.provider, labels.get(dialog.selected)) {
+    let enter = match (&dialog.provider, rows.get(dialog.selected)) {
         (Some(_), _) => "select",
-        (None, Some((_, true))) => "sign in",
+        (None, Some(row)) if row.signed_out => "sign in",
         (None, _) => "open",
     };
     let footer = format!(
@@ -871,20 +882,21 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     ])
     .areas(inner);
     let visible = list.height as usize;
-    let viewport = model_dialog_viewport(labels.len(), dialog.selected, visible);
-    let lines = labels[viewport.clone()]
+    let viewport = model_dialog_viewport(rows.len(), dialog.selected, visible);
+    let lines = rows[viewport.clone()]
         .iter()
         .zip(viewport)
-        .map(|((label, signed_out), index)| {
+        .map(|(row, index)| {
             let selected = index == dialog.selected;
             let marker = if selected { "› " } else { "  " };
-            let style = match (selected, *signed_out) {
+            // Signed-out providers stay greyed out, keeping the accent when selected.
+            let style = match (selected, row.signed_out) {
                 (true, false) => theme::accent(),
-                (true, true) => theme::dim(),
+                (true, true) => theme::accent().add_modifier(Modifier::DIM),
                 (false, false) => theme::text(),
                 (false, true) => theme::faint(),
             };
-            Line::from(Span::styled(format!("{marker}{label}"), style))
+            Line::from(Span::styled(format!("{marker}{}", row.label), style))
         })
         .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
@@ -4837,6 +4849,21 @@ mod tests {
         assert!(frame.contains("› beta"), "{frame}");
         assert!(!frame.contains("three"), "{frame}");
         assert!(frame.contains("esc close"), "{frame}");
+        assert!(frame.contains("enter open"), "{frame}");
+
+        app.set_catalog_providers(Some(vec!["alpha".into(), "beta".into()]));
+        app.auth_methods = vec![
+            agent_client_protocol::schema::v2::AuthMethodTerminal::new("gamma", "Gamma").meta(
+                serde_json::Map::from_iter([(
+                    crate::protocols::acp::AUTH_PROVIDER_META.into(),
+                    serde_json::Value::from("gamma"),
+                )]),
+            ),
+        ];
+        app.model_dialog.as_mut().unwrap().selected = 2;
+        let signed_out = render(&mut app, 60, 12);
+        assert!(signed_out.contains("› gamma"), "{signed_out}");
+        assert!(signed_out.contains("enter sign in"), "{signed_out}");
 
         app.model_dialog.as_mut().unwrap().provider = Some("alpha".into());
         app.model_dialog.as_mut().unwrap().selected = 0;
