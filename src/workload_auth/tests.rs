@@ -16,6 +16,7 @@ fn config() -> Config {
         expected_issuer: "https://issuer.example/tenant".into(),
         token_endpoint: "https://issuer.example/tenant/token".into(),
         resource: "https://resource.example/mcp".into(),
+        ..Default::default()
     }
 }
 
@@ -91,9 +92,8 @@ async fn projected_symlink_rotation_is_supported() {
 }
 
 #[test]
-fn response_requires_expiry_and_bearer_fields() {
+fn response_requires_bearer_fields_and_unsigned_expiry() {
     for body in [
-        r#"{"access_token":"secret","token_type":"Bearer"}"#,
         r#"{"access_token":"secret","expires_in":60}"#,
         r#"{"access_token":"secret","token_type":"Bearer","expires_in":-1}"#,
     ] {
@@ -147,4 +147,55 @@ async fn caches_are_resource_local_and_invalidatable() {
         .invalidate_acquisition(&first.acquisition().await.unwrap())
         .await;
     assert!(first.cached.lock().await.is_none());
+}
+
+#[test]
+fn explicit_configuration_and_extensions_are_strict() {
+    let mut candidate = config();
+    candidate.endpoint_mode = EndpointMode::Explicit;
+    candidate.expected_issuer.clear();
+    candidate.resource = "urn:example:inference".into();
+    assert!(candidate.validate().is_ok());
+    candidate
+        .extensions
+        .insert("federation_policy_id".into(), "example".into());
+    assert!(candidate.validate().is_ok());
+    for key in [
+        "grant_type",
+        "subject_token",
+        "assertion",
+        "requested_token_type",
+        "client_secret",
+        "client_assertion",
+        "resource",
+        "scope",
+        "Authorization",
+        "actor_token",
+    ] {
+        candidate.extensions.insert(key.into(), "no".into());
+        assert!(candidate.validate().is_err(), "{key}");
+        candidate.extensions.remove(key);
+    }
+    for endpoint in [
+        "http://issuer.example/token",
+        "https://issuer.example/token?secret=value",
+        "https://user@issuer.example/token",
+        "https://issuer.example/token#part",
+    ] {
+        candidate.token_endpoint = endpoint.into();
+        assert!(candidate.validate().is_err());
+    }
+    let decoded: Config = serde_json::from_value(serde_json::json!({
+        "tokenFile":"/run/identity/token", "tokenEndpoint":"https://issuer.example/token",
+        "endpointMode":"explicit", "grant":"tokenExchange"
+    }))
+    .unwrap();
+    assert!(decoded.validate().is_ok());
+    assert!(decoded.grant == Grant::TokenExchange);
+    assert!(config().grant == Grant::JwtBearer);
+    candidate = decoded;
+    candidate
+        .extensions
+        .insert("custom".into(), "x".repeat(1025));
+    assert!(candidate.validate().is_err());
 }

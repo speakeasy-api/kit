@@ -1,5 +1,6 @@
-//! Clientless RFC 7523 workload authentication. Assertions never enter credential storage.
+//! Clientless RFC 7523 and RFC 8693 workload authentication. Assertions never enter credential storage.
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -37,14 +38,44 @@ pub(crate) mod test_support {
     }
 }
 
+const ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Grant {
+    #[default]
+    JwtBearer,
+    TokenExchange,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EndpointMode {
+    #[default]
+    Discovery,
+    Explicit,
+}
+
 /// Trusted deployment configuration, not input supplied by an MCP server or model.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub token_file: PathBuf,
+    #[serde(default)]
     pub expected_issuer: String,
     pub token_endpoint: String,
+    #[serde(default)]
     pub resource: String,
+    #[serde(default)]
+    pub grant: Grant,
+    #[serde(default)]
+    pub endpoint_mode: EndpointMode,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub extensions: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -52,11 +83,87 @@ impl Config {
         if !self.token_file.is_absolute() {
             return Err("workload tokenFile must be an absolute path".into());
         }
-        let issuer = https_url(&self.expected_issuer)?;
         let endpoint = https_url(&self.token_endpoint)?;
-        https_url(&self.resource)?;
-        if issuer.query().is_some() || issuer.origin() != endpoint.origin() {
-            return Err("workload token endpoint must share the expected issuer origin".into());
+        if self.endpoint_mode == EndpointMode::Discovery {
+            let issuer = https_url(&self.expected_issuer)?;
+            https_url(&self.resource)?;
+            if issuer.query().is_some() || issuer.origin() != endpoint.origin() {
+                return Err("workload token endpoint must share the expected issuer origin".into());
+            }
+        } else {
+            if !self.expected_issuer.is_empty() || endpoint.query().is_some() {
+                return Err("explicit workload endpoints cannot specify an issuer or query".into());
+            }
+            if !self.resource.is_empty() {
+                if self.resource.chars().any(char::is_whitespace) {
+                    return Err("invalid workload resource".into());
+                }
+                let resource = url::Url::parse(&self.resource)
+                    .map_err(|_| "workload resource must be an absolute URI")?;
+                if resource.fragment().is_some()
+                    || !resource.username().is_empty()
+                    || resource.password().is_some()
+                {
+                    return Err("invalid workload resource".into());
+                }
+            }
+        }
+        for value in self.audience.iter().chain(self.scope.iter()) {
+            if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
+                return Err("invalid workload audience or scope".into());
+            }
+        }
+        if self.scope.as_ref().is_some_and(|scope| {
+            scope.split(' ').any(|part| {
+                part.is_empty()
+                    || !part.bytes().all(|c| {
+                        c == 0x21 || (0x23..=0x5b).contains(&c) || (0x5d..=0x7e).contains(&c)
+                    })
+            })
+        }) {
+            return Err("invalid workload scope".into());
+        }
+        // Extensions are non-secret deployment parameters, never alternative credentials.
+        const RESERVED: &[&str] = &[
+            "grant_type",
+            "assertion",
+            "resource",
+            "audience",
+            "scope",
+            "subject_token",
+            "subject_token_type",
+            "requested_token_type",
+            "actor_token",
+            "actor_token_type",
+            "client_id",
+            "client_secret",
+            "client_assertion",
+            "client_assertion_type",
+            "refresh_token",
+            "access_token",
+            "token",
+            "token_type",
+            "username",
+            "password",
+            "authorization",
+            "code",
+            "redirect_uri",
+            "code_verifier",
+        ];
+        if self.extensions.len() > 16
+            || self.extensions.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 64
+                    || !key
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                    || RESERVED.contains(&key.as_str())
+                    || value.is_empty()
+                    || value.len() > 1024
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid workload extension parameters".into());
         }
         Ok(())
     }
@@ -142,20 +249,54 @@ impl Session {
             return Ok(token.value.clone());
         }
         *cached = None;
-        self.verify_issuer().await?;
+        if self.config.endpoint_mode == EndpointMode::Discovery {
+            self.verify_issuer().await?;
+        }
         // Reopen on every exchange: projected files rotate through symlinks.
-        let assertion = read_assertion(&self.config.token_file).await?;
+        let limit = if self.config.endpoint_mode == EndpointMode::Explicit {
+            16384
+        } else {
+            MAX_BYTES
+        };
+        let assertion = read_assertion_bounded(&self.config.token_file, limit).await?;
+        let mut form = Vec::new();
+        match self.config.grant {
+            Grant::JwtBearer => {
+                form.push(("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"));
+                form.push(("assertion", assertion.as_str()));
+            }
+            Grant::TokenExchange => {
+                form.push((
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ));
+                form.push(("subject_token", assertion.as_str()));
+                form.push(("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"));
+                form.push(("requested_token_type", ACCESS_TOKEN));
+            }
+        }
+        if !self.config.resource.is_empty() {
+            form.push(("resource", self.config.resource.as_str()));
+        }
+        if let Some(value) = &self.config.audience {
+            form.push(("audience", value));
+        }
+        if let Some(value) = &self.config.scope {
+            form.push(("scope", value));
+        }
+        form.extend(
+            self.config
+                .extensions
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        );
         let started = SystemTime::now();
         // Never automatically retry a POST: the server may already have consumed
         // this assertion's replay identifier, even if the response was lost.
         let response = self
             .client
             .post(&self.config.token_endpoint)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", assertion.as_str()),
-                ("resource", self.config.resource.as_str()),
-            ])
+            .form(&form)
             .send()
             .await
             .map_err(|_| "workload token exchange failed")?;
@@ -166,7 +307,10 @@ impl Session {
         let token: Token =
             serde_json::from_slice(&bytes).map_err(|_| "invalid workload token response")?;
         if !token.token_type.eq_ignore_ascii_case("bearer")
-            || token.expires_in == 0
+            || token.expires_in == Some(0)
+            || (self.config.grant == Grant::JwtBearer && token.expires_in.is_none())
+            || (self.config.grant == Grant::TokenExchange
+                && token.issued_token_type.as_deref() != Some(ACCESS_TOKEN))
             || token.access_token.is_empty()
             || token.access_token.len() > MAX_BYTES
             || !token.access_token.bytes().all(|c| c.is_ascii_graphic())
@@ -174,7 +318,12 @@ impl Session {
             return Err("invalid workload token response".into());
         }
         // Cap long issuer lifetimes; subtract a proportional margin for short ones.
-        let lifetime = token.expires_in.min(86400);
+        let Some(expires_in) = token.expires_in else {
+            // RFC 8693 section 2.2.1 recommends, but does not require, expires_in.
+            // Without a lifetime, return this acquisition without caching it.
+            return Ok(Acquisition(Arc::new(Zeroizing::new(token.access_token))));
+        };
+        let lifetime = expires_in.min(86400);
         let usable = Duration::from_secs(lifetime)
             .saturating_sub(Duration::from_millis((lifetime * 100).min(30000)));
         let refresh_at = started
@@ -244,7 +393,15 @@ struct Metadata {
 struct Token {
     access_token: String,
     token_type: String,
-    expires_in: u64,
+    #[serde(default, deserialize_with = "optional_expiry")]
+    expires_in: Option<u64>,
+    issued_token_type: Option<String>,
+}
+
+fn optional_expiry<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -262,7 +419,15 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Zeroizing<Vec<u
     Ok(bytes)
 }
 
+#[cfg(test)]
 async fn read_assertion(path: &std::path::Path) -> Result<Zeroizing<String>, String> {
+    read_assertion_bounded(path, MAX_BYTES).await
+}
+
+async fn read_assertion_bounded(
+    path: &std::path::Path,
+    limit: usize,
+) -> Result<Zeroizing<String>, String> {
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -280,11 +445,11 @@ async fn read_assertion(path: &std::path::Path) -> Result<Zeroizing<String>, Str
         return Err("workload token must be a regular file".into());
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take((MAX_BYTES + 1) as u64)
+    file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| "could not read workload token file")?;
-    if bytes.len() > MAX_BYTES {
+    if bytes.len() > limit {
         return Err("workload assertion exceeds size limit".into());
     }
     let value = std::str::from_utf8(&bytes)
