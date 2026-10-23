@@ -107,7 +107,7 @@ async fn expiry_and_clock_rollback_reacquire_without_stale_fallback() {
         let mut session = Session::new(config()).unwrap();
         let now = SystemTime::now();
         *session.cached.lock().await = Some(Cached {
-            value: Zeroizing::new("must-not-escape".into()),
+            value: Acquisition(Arc::new(Zeroizing::new("must-not-escape".into()))),
             acquired: if expired {
                 now - Duration::from_secs(60)
             } else {
@@ -135,7 +135,7 @@ async fn caches_are_resource_local_and_invalidatable() {
     let second = Session::new(second_config).unwrap();
     let now = SystemTime::now();
     *first.cached.lock().await = Some(Cached {
-        value: Zeroizing::new("first-resource-token".into()),
+        value: Acquisition(Arc::new(Zeroizing::new("first-resource-token".into()))),
         acquired: now,
         refresh_at: now + Duration::from_secs(60),
     });
@@ -143,6 +143,8 @@ async fn caches_are_resource_local_and_invalidatable() {
     let (a, b) = tokio::join!(first.token(), first.token());
     assert_eq!(a.unwrap(), "first-resource-token");
     assert_eq!(b.unwrap(), "first-resource-token");
-    first.invalidate().await;
+    first
+        .invalidate_acquisition(&first.acquisition().await.unwrap())
+        .await;
     assert!(first.cached.lock().await.is_none());
 }

@@ -1,5 +1,11 @@
 //! Per-request workload authentication, including catalog reads and SSE reconnects.
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use agentkit_mcp::{ClientJsonRpcMessage, McpHttpClient, McpSseStream};
 use async_trait::async_trait;
@@ -8,7 +14,7 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
 };
 
-use crate::workload_auth::{Config, Session};
+use crate::workload_auth::{Acquisition, Config, Session};
 
 type Error = StreamableHttpError<reqwest::Error>;
 
@@ -36,6 +42,7 @@ impl Client {
         }
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| "could not build workload MCP HTTP client")?;
         Ok(Self {
@@ -45,11 +52,34 @@ impl Client {
         })
     }
 
+    async fn post_with_client(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<StreamableHttpPostResponse, Error> {
+        let acquisition = self.authorization(&uri, &custom_headers).await?;
+        let status = PostStatus::default();
+        let http = status.client(builder)?;
+        let result = http
+            .post_message(
+                uri,
+                message,
+                session_id,
+                Some(acquisition.token().to_owned()),
+                custom_headers,
+            )
+            .await;
+        self.finish(&acquisition, status.rejected(), result).await
+    }
+
     async fn authorization(
         &self,
         uri: &str,
         headers: &HashMap<HeaderName, HeaderValue>,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Acquisition, Error> {
         if uri != self.destination
             || headers
                 .keys()
@@ -59,14 +89,19 @@ impl Client {
                 "workload MCP transport destination or authorization override rejected",
             ));
         }
-        self.session.token().await.map(Some).map_err(Self::error)
+        self.session.acquisition().await.map_err(Self::error)
     }
 
     fn error(message: impl Into<String>) -> Error {
         StreamableHttpError::Io(std::io::Error::other(message.into()))
     }
 
-    async fn finish<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+    async fn finish<T>(
+        &self,
+        acquisition: &Acquisition,
+        raw_rejection: bool,
+        result: Result<T, Error>,
+    ) -> Result<T, Error> {
         let rejected = match &result {
             Err(
                 StreamableHttpError::AuthRequired(_) | StreamableHttpError::InsufficientScope(_),
@@ -77,11 +112,43 @@ impl Client {
             ),
             _ => false,
         };
-        if rejected {
+        if raw_rejection || rejected {
             // Do not replay a possibly side-effecting POST or follow challenge URLs.
-            self.session.invalidate().await;
+            self.session.invalidate_acquisition(acquisition).await;
         }
         result
+    }
+}
+
+// rmcp 3.5.1 consumes POST statuses before returning JSON/SSE results. Observe
+// the raw status without replacing its private protocol parser. This client and
+// flag belong to one POST, so concurrent responses cannot overwrite each other.
+#[derive(Default)]
+struct PostStatus(Arc<AtomicBool>);
+
+impl PostStatus {
+    fn client(&self, builder: reqwest::ClientBuilder) -> Result<reqwest::Client, Error> {
+        let rejected = Arc::clone(&self.0);
+        let policy = reqwest::retry::never().classify_fn(move |response| {
+            if matches!(
+                response.status(),
+                Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
+            ) {
+                rejected.store(true, Ordering::Release);
+            }
+            // Always return success: this observes status, never retries a POST.
+            // Do not set max_retries_per_request(0): tower then skips classification.
+            response.success()
+        });
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(policy)
+            .build()
+            .map_err(StreamableHttpError::Client)
+    }
+
+    fn rejected(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -95,11 +162,12 @@ impl McpHttpClient for Client {
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, Error> {
-        let authorization = self.authorization(&uri, &custom_headers).await?;
-        self.finish(
-            self.http
-                .post_message(uri, message, session_id, authorization, custom_headers)
-                .await,
+        self.post_with_client(
+            uri,
+            message,
+            session_id,
+            custom_headers,
+            reqwest::Client::builder(),
         )
         .await
     }
@@ -111,10 +179,17 @@ impl McpHttpClient for Client {
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), Error> {
-        let authorization = self.authorization(&uri, &custom_headers).await?;
+        let acquisition = self.authorization(&uri, &custom_headers).await?;
         self.finish(
+            &acquisition,
+            false,
             self.http
-                .delete_session(uri, session_id, authorization, custom_headers)
+                .delete_session(
+                    uri,
+                    session_id,
+                    Some(acquisition.token().to_owned()),
+                    custom_headers,
+                )
                 .await,
         )
         .await
@@ -128,14 +203,16 @@ impl McpHttpClient for Client {
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<McpSseStream, Error> {
-        let authorization = self.authorization(&uri, &custom_headers).await?;
+        let acquisition = self.authorization(&uri, &custom_headers).await?;
         self.finish(
+            &acquisition,
+            false,
             self.http
                 .get_stream(
                     uri,
                     session_id,
                     last_event_id,
-                    authorization,
+                    Some(acquisition.token().to_owned()),
                     custom_headers,
                 )
                 .await,
@@ -154,6 +231,271 @@ impl McpHttpClient for Client {
 )]
 mod tests {
     use super::*;
+
+    async fn tls_script(
+        replies: impl FnOnce(&str) -> Vec<(u16, String, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::{TlsAcceptor, rustls};
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    include_bytes!("../../../fixtures/workload-auth/server.der").to_vec(),
+                )],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    include_bytes!("../../../fixtures/workload-auth/server-key.der").to_vec(),
+                )
+                .into(),
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("https://{}/mcp", listener.local_addr().unwrap());
+        let origin = format!("https://{}", listener.local_addr().unwrap());
+        let replies = replies(&origin);
+        let task = tokio::spawn(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let mut requests = Vec::new();
+            for (status, content_type, body) in replies {
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(socket).await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    assert!(bytes.len() < 32768);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                let _ = stream.shutdown().await;
+                requests.push(String::from_utf8(bytes).unwrap());
+            }
+            requests
+        });
+        (uri, task)
+    }
+
+    async fn tls_reply(
+        status: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        tls_script(|_| vec![(status, content_type.to_owned(), body.to_owned())]).await
+    }
+
+    fn tls_client() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
+                "../../../fixtures/workload-auth/ca.pem"
+            ))
+            .unwrap()])
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+    }
+
+    #[tokio::test]
+    async fn bare_post_rejection_reacquires_on_next_operation() {
+        for code in [401, 403] {
+            for json in [false, true] {
+                let (uri, server) = tls_script(|origin| {
+                    let discovery = serde_json::json!({"issuer": origin, "token_endpoint": format!("{origin}/token")}).to_string();
+                    let token = |value| serde_json::json!({"access_token": value, "token_type": "Bearer", "expires_in": 600}).to_string();
+                    vec![
+                        (200, "application/json".into(), discovery.clone()),
+                        (200, "application/json".into(), token("T1")),
+                        (code, if json { "application/json" } else { "text/plain" }.into(), if json { r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rejected"}}"# } else { "rejected" }.into()),
+                        (200, "application/json".into(), discovery),
+                        (200, "application/json".into(), token("T2")),
+                        (200, "application/json".into(), r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.into()),
+                    ]
+                }).await;
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("assertion.jwt");
+                std::fs::write(&path, "header.payload.signature").unwrap();
+                let origin = uri.strip_suffix("/mcp").unwrap();
+                let session = crate::workload_auth::test_support::session(
+                    Config {
+                        token_file: path,
+                        expected_issuer: origin.into(),
+                        token_endpoint: format!("{origin}/token"),
+                        resource: uri.clone(),
+                    },
+                    tls_client().build().unwrap(),
+                )
+                .unwrap();
+                let client = Client {
+                    destination: uri.clone(),
+                    session,
+                    http: tls_client().build().unwrap(),
+                };
+                let message = || {
+                    serde_json::from_value(
+                        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+                    )
+                    .unwrap()
+                };
+                let first = client
+                    .post_with_client(
+                        uri.clone().into(),
+                        message(),
+                        None,
+                        HashMap::new(),
+                        tls_client(),
+                    )
+                    .await;
+                assert_eq!(first.is_ok(), json);
+                let second = client
+                    .post_with_client(uri.into(), message(), None, HashMap::new(), tls_client())
+                    .await;
+                assert!(matches!(second, Ok(StreamableHttpPostResponse::Json(_, _))));
+                let requests = server.await.unwrap();
+                assert_eq!(requests.len(), 6);
+                assert!(requests[1].starts_with("POST /token "));
+                assert!(
+                    requests[2]
+                        .to_lowercase()
+                        .contains("authorization: bearer t1")
+                );
+                assert!(requests[4].starts_with("POST /token "));
+                assert!(
+                    requests[5]
+                        .to_lowercase()
+                        .contains("authorization: bearer t2")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_post_rejections_preserve_raw_status_without_replaying() {
+        for code in [401, 403] {
+            for json in [false, true] {
+                let body = if json {
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rejected"}}"#
+                } else {
+                    "rejected"
+                };
+                let (uri, server) = tls_reply(
+                    code,
+                    if json {
+                        "application/json"
+                    } else {
+                        "text/plain"
+                    },
+                    body,
+                )
+                .await;
+                let status = PostStatus::default();
+                let http = status
+                    .client(
+                        reqwest::Client::builder()
+                            .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
+                                "../../../fixtures/workload-auth/ca.pem"
+                            ))
+                            .unwrap()])
+                            .no_proxy()
+                            .timeout(std::time::Duration::from_secs(5)),
+                    )
+                    .unwrap();
+                let message = serde_json::from_value(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+                )
+                .unwrap();
+                let result = http
+                    .post_message(uri.into(), message, None, Some("T1".into()), HashMap::new())
+                    .await;
+                assert!(status.rejected(), "bare HTTP {code} was lost");
+                if json {
+                    assert!(matches!(result, Ok(StreamableHttpPostResponse::Json(_, _))));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(StreamableHttpError::UnexpectedServerResponse(_))
+                    ));
+                }
+                assert!(
+                    server.await.unwrap()[0]
+                        .to_lowercase()
+                        .contains("authorization: bearer t1")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_status_observation_preserves_json_and_sse_success() {
+        use futures_util::StreamExt;
+        for sse in [false, true] {
+            let body = if sse {
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"
+            } else {
+                r#"{"jsonrpc":"2.0","id":1,"result":{}}"#
+            };
+            let (uri, server) = tls_reply(
+                200,
+                if sse {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+                body,
+            )
+            .await;
+            let status = PostStatus::default();
+            let http = status
+                .client(
+                    reqwest::Client::builder()
+                        .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
+                            "../../../fixtures/workload-auth/ca.pem"
+                        ))
+                        .unwrap()])
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(5)),
+                )
+                .unwrap();
+            let message =
+                serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                    .unwrap();
+            let result = http
+                .post_message(uri.into(), message, None, Some("T1".into()), HashMap::new())
+                .await
+                .unwrap();
+            assert!(!status.rejected());
+            if sse {
+                let StreamableHttpPostResponse::Sse(mut events, _) = result else {
+                    panic!("expected SSE")
+                };
+                assert!(events.next().await.unwrap().is_ok());
+            } else {
+                assert!(matches!(result, StreamableHttpPostResponse::Json(_, _)));
+            }
+            server.await.unwrap();
+        }
+    }
 
     fn config() -> Config {
         serde_json::from_value(serde_json::json!({
@@ -185,7 +527,8 @@ mod tests {
         let error = client
             .authorization("https://other.example/mcp", &HashMap::new())
             .await
-            .unwrap_err();
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("override rejected"));
         for name in [reqwest::header::AUTHORIZATION, reqwest::header::HOST] {
             let headers = HashMap::from([(name, HeaderValue::from_static("override"))]);
@@ -193,7 +536,8 @@ mod tests {
                 client
                     .authorization("https://mcp.example/mcp", &headers)
                     .await
-                    .unwrap_err()
+                    .err()
+                    .unwrap()
                     .to_string()
                     .contains("override rejected")
             );

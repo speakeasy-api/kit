@@ -1,6 +1,7 @@
 //! Clientless RFC 7523 workload authentication. Assertions never enter credential storage.
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -13,6 +14,28 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn session(
+        config: super::Config,
+        client: reqwest::Client,
+    ) -> Result<super::Session, String> {
+        config.validate()?;
+        Ok(super::Session {
+            config,
+            client,
+            cached: tokio::sync::Mutex::new(None),
+        })
+    }
+    impl super::Session {
+        pub async fn token(&self) -> Result<String, String> {
+            self.acquisition()
+                .await
+                .map(|value| value.token().to_owned())
+        }
+    }
+}
 
 /// Trusted deployment configuration, not input supplied by an MCP server or model.
 #[derive(Clone, Deserialize)]
@@ -52,8 +75,17 @@ fn https_url(value: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
+#[derive(Clone)]
+pub struct Acquisition(Arc<Zeroizing<String>>);
+
+impl Acquisition {
+    pub fn token(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 struct Cached {
-    value: Zeroizing<String>,
+    value: Acquisition,
     acquired: SystemTime,
     refresh_at: SystemTime,
 }
@@ -70,6 +102,7 @@ impl Session {
         config.validate()?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .timeout(TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             .build()
@@ -81,11 +114,17 @@ impl Session {
         })
     }
 
-    pub async fn invalidate(&self) {
-        *self.cached.lock().await = None;
+    pub async fn invalidate_acquisition(&self, rejected: &Acquisition) {
+        let mut cached = self.cached.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.value.0, &rejected.0))
+        {
+            *cached = None;
+        }
     }
 
-    pub async fn token(&self) -> Result<String, String> {
+    pub async fn acquisition(&self) -> Result<Acquisition, String> {
         // Serialize acquisition, not merely publication, to avoid consuming a
         // single-use assertion concurrently. Waiting and all I/O are bounded.
         tokio::time::timeout(TIMEOUT, self.acquire())
@@ -93,14 +132,14 @@ impl Session {
             .map_err(|_| "workload authentication timed out".to_string())?
     }
 
-    async fn acquire(&self) -> Result<String, String> {
+    async fn acquire(&self) -> Result<Acquisition, String> {
         let mut cached = self.cached.lock().await;
         let now = SystemTime::now();
         if let Some(token) = cached.as_ref()
             && now >= token.acquired
             && now < token.refresh_at
         {
-            return Ok(token.value.to_string());
+            return Ok(token.value.clone());
         }
         *cached = None;
         self.verify_issuer().await?;
@@ -145,8 +184,8 @@ impl Session {
         if completed < started || completed >= refresh_at {
             return Err("workload authentication expired during exchange".into());
         }
-        let value = Zeroizing::new(token.access_token);
-        let result = value.to_string();
+        let value = Acquisition(Arc::new(Zeroizing::new(token.access_token)));
+        let result = value.clone();
         *cached = Some(Cached {
             value,
             acquired: started,

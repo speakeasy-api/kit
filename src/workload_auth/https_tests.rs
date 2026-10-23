@@ -165,18 +165,18 @@ impl Server {
             token_endpoint: format!("{}/token", self.origin),
             resource: resource.into(),
         };
-        config.validate().unwrap();
-        Session {
+        test_support::session(
             config,
-            client: reqwest::Client::builder()
+            reqwest::Client::builder()
                 .tls_certs_only([reqwest::Certificate::from_pem(CA).unwrap()])
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            cached: Mutex::new(None),
-        }
+        )
+        .unwrap()
     }
     fn drain(&mut self) -> Vec<Request> {
         let mut requests = Vec::new();
@@ -277,7 +277,9 @@ async fn https_expiry_and_invalidation_reopen_rotated_source() {
     server.exchange("renewed-access", 3600);
     assert_eq!(session.token().await.unwrap(), "renewed-access");
     std::fs::write(&path, "invalidated.payload.signature").unwrap();
-    session.invalidate().await;
+    session
+        .invalidate_acquisition(&session.acquisition().await.unwrap())
+        .await;
     server.exchange("invalidated-access", 3600);
     assert_eq!(session.token().await.unwrap(), "invalidated-access");
     let requests = server.drain();
@@ -316,7 +318,9 @@ async fn https_projected_symlink_rotation_is_reopened() {
     assert_eq!(session.token().await.unwrap(), "second-access");
     std::os::unix::fs::symlink(&first, &replacement).unwrap();
     std::fs::rename(&replacement, &link).unwrap();
-    session.invalidate().await;
+    session
+        .invalidate_acquisition(&session.acquisition().await.unwrap())
+        .await;
     server.exchange("third-access", 3600);
     assert_eq!(session.token().await.unwrap(), "third-access");
     let assertions: Vec<_> = server
@@ -374,6 +378,24 @@ async fn https_post_failures_are_not_retried_or_leaked() {
         server.exchange("recovered-access", 3600);
         assert_eq!(session.token().await.unwrap(), "recovered-access");
     }
+}
+
+#[tokio::test]
+async fn https_delayed_rejection_preserves_newer_acquisition() {
+    let mut server = Server::start().await;
+    let (_dir, path) = source();
+    let session = server.session(path, "https://api.example/mcp");
+    server.exchange("same-access-value", 3600);
+    let first = session.acquisition().await.unwrap();
+    let delayed = first.clone();
+    session.invalidate_acquisition(&first).await;
+    // An issuer may return the same token bytes for a distinct exchange.
+    server.exchange("same-access-value", 3600);
+    let replacement = session.acquisition().await.unwrap();
+    session.invalidate_acquisition(&delayed).await;
+    let retained = session.acquisition().await.unwrap();
+    assert!(Arc::ptr_eq(&replacement.0, &retained.0));
+    assert_eq!(server.drain().len(), 4);
 }
 
 #[tokio::test]
