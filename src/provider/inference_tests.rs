@@ -508,7 +508,7 @@ async fn federation_speakeasy_explicit_jwt_bearer_contract_and_no_auth_replay() 
             token_file: path,
             token_endpoint: format!("{}/token", server.origin),
             endpoint_mode: crate::workload_auth::EndpointMode::Explicit,
-            resource: "urn:gram:inference".into(),
+            resource: "urn:speakeasy:inference".into(),
             extensions: BTreeMap::from([(
                 "project_id".into(),
                 "00000000-0000-0000-0000-000000000001".into(),
@@ -561,7 +561,7 @@ async fn federation_speakeasy_explicit_jwt_bearer_contract_and_no_auth_replay() 
                 "urn:ietf:params:oauth:grant-type:jwt-bearer".into()
             ),
             ("assertion".into(), ASSERTION.into()),
-            ("resource".into(), "urn:gram:inference".into()),
+            ("resource".into(), "urn:speakeasy:inference".into()),
             (
                 "project_id".into(),
                 "00000000-0000-0000-0000-000000000001".into()
@@ -578,7 +578,7 @@ fn workload_config(endpoint: &str) -> crate::provider::inference::Config {
             token_file: PathBuf::from("/missing/projected-assertion"),
             token_endpoint: "https://issuer.example/token".into(),
             endpoint_mode: crate::workload_auth::EndpointMode::Explicit,
-            resource: "urn:gram:inference".into(),
+            resource: "urn:speakeasy:inference".into(),
             ..Default::default()
         },
     }

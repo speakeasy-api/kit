@@ -156,13 +156,13 @@ tokenFile = "/var/run/identity/assertion.jwt"
 endpointMode = "explicit"
 grant = "jwtBearer"
 tokenEndpoint = "https://ai.speakeasy.com/oauth/usi/<ISSUER_ID>/token"
-resource = "urn:gram:inference"
+resource = "urn:speakeasy:inference"
 [inference_providers.speakeasy.workload.extensions]
 project_id = "<PROJECT_ID>"
 ```
 
 The Speakeasy assertion's audience is the shared issuer URL or its token endpoint,
-not `urn:gram:inference`. Assertions with a `jti` (or `uti`) are single-use: a new
+not `urn:speakeasy:inference`. Assertions with a `jti` (or `uti`) are single-use: a new
 exchange needs a fresh assertion. This is ordinary workload inference, not a
 replacement for managed assistant credentials or chat-bound authorization. Kit
 sends bearer authentication without API-key, project, or assistant/chat headers.
