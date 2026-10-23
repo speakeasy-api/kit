@@ -146,6 +146,9 @@ or behavior configuration.
 
 ### Speakeasy AI Control Plane
 
+For deployment-provided JWT assertions instead of a user login, see
+[Speakeasy workload authentication](speakeasy-workload-auth.md).
+
 Sign in through the Speakeasy dashboard, then use the same persistent credential
 store for runtime commands:
 

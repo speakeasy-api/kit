@@ -38,6 +38,7 @@ pub mod protocols;
 pub mod provider;
 pub mod request_budget;
 pub mod runtime;
+pub mod workload_auth;
 /// Shared internal filesystem and process-lifetime recovery controls.
 pub mod resilient_fs {
     pub use crate::filesystem::*;

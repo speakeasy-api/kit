@@ -6,6 +6,41 @@ Kit merges servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.m
 
 Use `kit config set mcp_config ~/.kit/mcp.json` to select the global MCP file, `kit config get mcp_config` to inspect the saved path, or `kit config unset mcp_config` to remove the override. These commands edit `~/.kit/config.toml`, not the MCP JSON file or its server entries. See [configuration editing](getting-started-and-configuration.md#edit-configuration-from-the-command-line).
 
+## Use a deployment-provided workload assertion
+
+Configure a trusted server with `auth.type: "workload_identity"` to exchange a
+mounted JWT without browser login, client registration, or a client secret:
+
+```json
+{
+  "mcpServers": {
+    "workload-service": {
+      "type": "streamable-http",
+      "url": "https://service.example.com/mcp",
+      "auth": {
+        "type": "workload_identity",
+        "tokenFile": "/run/identity/token",
+        "expectedIssuer": "https://auth.example.com/tenant",
+        "tokenEndpoint": "https://auth.example.com/tenant/token",
+        "resource": "https://service.example.com/mcp"
+      }
+    }
+  }
+}
+```
+
+The resource must match the HTTPS MCP URL. Do not combine this mode with a static
+bearer token, an Authorization header, or a Host override. Each HTTP operation,
+including SSE reconnection, acquires or reuses a valid resource-scoped token.
+Authentication failure does not open a browser or fall back to saved credentials.
+The file is reopened at each token exchange, including symlink-based rotation.
+
+Keep this configuration and the assertion mount under deployment control. See
+[workload authentication](../reference/workload-authentication.md) for issuer
+metadata requirements, bounded acquisition, replay-policy prerequisites, and the
+required process-memory restore barrier. Native inference uses its own
+[Speakeasy workload configuration](speakeasy-workload-auth.md) and resource.
+
 ## Ask the agent to add a server
 
 Kit does not provide an MCP-specific slash command. In a `kit tui` session, describe the server and the scope that you want:

@@ -742,15 +742,22 @@ impl KitAdapter {
                 }))
             }
             ProviderKind::Speakeasy => {
-                let credentials = speakeasy_auth::load(&credential_storage)?
-                    .ok_or_else(|| SPEAKEASY_AUTH_REQUIRED.to_string())?;
+                let workload = super::speakeasy_workload::Config::from_env()?;
+                let (api_key, project) = match &workload {
+                    Some(config) => (String::new(), config.project.clone()),
+                    None => {
+                        let credentials = speakeasy_auth::load(&credential_storage)?
+                            .ok_or_else(|| SPEAKEASY_AUTH_REQUIRED.to_string())?;
+                        (credentials.api_key.clone(), credentials.project.clone())
+                    }
+                };
                 let mut config =
                     OpenRouterConfig::new("unused", model).with_base_url(SPEAKEASY_COMPLETIONS_URL);
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let provider = SpeakeasyProvider {
                     openrouter: OpenRouterProvider::from(config),
-                    api_key: credentials.api_key.clone(),
-                    project: credentials.project.clone(),
+                    api_key,
+                    project,
                     chat_id: None,
                 };
                 let client = reqwest::Client::builder()
@@ -758,9 +765,15 @@ impl KitAdapter {
                     .connect_timeout(Duration::from_secs(10))
                     .build()
                     .map_err(|_| "could not build Speakeasy completions client".to_string())?;
+                let client = match workload {
+                    Some(config) => agentkit_http::Http::new(
+                        super::speakeasy_workload::Client::new(client, config)?,
+                    ),
+                    None => agentkit_http::Http::new(client),
+                };
                 Ok(Self::Speakeasy(Box::new(SpeakeasyKitAdapter {
                     provider,
-                    client: agentkit_http::Http::new(client),
+                    client,
                 })))
             }
         }
@@ -1548,7 +1561,12 @@ fn available_catalog_providers(
     {
         providers.push(ProviderKind::OpenRouter);
     }
-    if speakeasy_auth::load(storage).ok().flatten().is_some() {
+    let speakeasy_available = match super::speakeasy_workload::Config::from_env() {
+        Ok(Some(_)) => true,
+        Ok(None) => speakeasy_auth::load(storage).ok().flatten().is_some(),
+        Err(_) => false,
+    };
+    if speakeasy_available {
         providers.push(ProviderKind::Speakeasy);
     }
     if super::anthropic_auth::credentials(storage)

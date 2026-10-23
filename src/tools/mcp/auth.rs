@@ -33,6 +33,8 @@ pub enum Config {
     Oauth(InteractiveConfig),
     #[serde(rename = "client_credentials")]
     Machine(super::machine::Config),
+    #[serde(rename = "workload_identity")]
+    Workload(crate::workload_auth::Config),
 }
 
 impl Default for Config {
@@ -49,13 +51,20 @@ impl Config {
     pub fn machine(&self) -> Option<&super::machine::Config> {
         match self {
             Self::Machine(config) => Some(config),
-            Self::Oauth(_) => None,
+            Self::Oauth(_) | Self::Workload(_) => None,
         }
     }
+    pub fn workload(&self) -> Option<&crate::workload_auth::Config> {
+        match self {
+            Self::Workload(config) => Some(config),
+            _ => None,
+        }
+    }
+
     fn interactive(&self) -> Result<&InteractiveConfig, String> {
         match self {
             Self::Oauth(config) => Ok(config),
-            Self::Machine(_) => {
+            Self::Machine(_) | Self::Workload(_) => {
                 Err("machine MCP authentication does not support interactive authorization".into())
             }
         }
@@ -143,6 +152,10 @@ pub async fn restore(
     config: &Config,
     credential_storage: &CredentialStorage,
 ) -> Result<Option<(String, AuthorizationManager)>, String> {
+    if config.workload().is_some() {
+        // Workload acquisition belongs to the HTTP client, never the credential store.
+        return Ok(None);
+    }
     if let Some(machine) = config.machine() {
         return super::machine::authenticate(resource_url, machine)
             .await
