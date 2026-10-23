@@ -112,3 +112,14 @@ pub(crate) mod test_support {
         ))
     }
 }
+
+// HTTP-200 error frames and malformed nonstream responses can echo credentials.
+// Typed failures are already sanitized upstream; raw provider errors are not.
+pub(crate) fn redact_response_error(error: agentkit_loop::LoopError) -> agentkit_loop::LoopError {
+    match error {
+        agentkit_loop::LoopError::Provider(_) => {
+            agentkit_loop::LoopError::Provider("workload inference response failed".into())
+        }
+        other => other,
+    }
+}

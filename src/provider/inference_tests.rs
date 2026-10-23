@@ -438,10 +438,21 @@ async fn federation_providers_keep_independent_tokens_and_cached_grants() {
 
 #[tokio::test]
 async fn federation_success_status_error_frames_are_redacted() {
-    for body in [
-        "event: error\ndata: access-secret private-header.private-payload.private-signature\n\n",
-        "data: {\"error\":{\"message\":\"access-secret\"}}\n\n",
-        "event: error\ndata: {\"message\":\"access-secret\"}\n\n",
+    for (streaming, body) in [
+        (
+            true,
+            "event: error\ndata: access-secret private-header.private-payload.private-signature\n\n",
+        ),
+        (
+            true,
+            "data: {\"error\":{\"message\":\"access-secret\"}}\n\n",
+        ),
+        (
+            true,
+            "event: error\ndata: {\"message\":\"access-secret\"}\n\n",
+        ),
+        (false, "{\"error\":{\"message\":\"access-secret\"}}"),
+        (false, "access-secret malformed response"),
     ] {
         let mut server = Server::start().await;
         let (_dir, path) = source();
@@ -449,12 +460,16 @@ async fn federation_success_status_error_frames_are_redacted() {
             path,
             "https://inference.example/resource",
             ProviderKind::OpenRouter,
-            true,
+            streaming,
         );
         server.exchange("access-secret", 3600);
         server.enqueue(Reply {
             status: 200,
-            content_type: "text/event-stream",
+            content_type: if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
             body: body.into(),
         });
         let error = match run_turn(&adapter).await {

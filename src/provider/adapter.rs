@@ -1385,6 +1385,13 @@ impl ModelSession for KitSession {
                 .inner
                 .begin_turn(request, cancellation)
                 .await
+                .map_err(|error| {
+                    if session.federation {
+                        super::inference::redact_response_error(error)
+                    } else {
+                        error
+                    }
+                })
                 .map(|inner| OpenRouterKitTurn {
                     inner,
                     context_window: session.context_window,
@@ -1455,10 +1462,8 @@ impl ModelTurn for KitTurn {
             }
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await.map_err(|error| {
-                    // HTTP-200 error frames can echo credentials too. Typed failures
-                    // are already sanitized upstream; raw provider errors are not.
-                    if turn.federation && matches!(error, LoopError::Provider(_)) {
-                        LoopError::Provider("workload inference response failed".into())
+                    if turn.federation {
+                        super::inference::redact_response_error(error)
                     } else {
                         error
                     }
