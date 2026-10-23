@@ -534,6 +534,13 @@ async fn https_explicit_grants_exact_fields_and_rotation() {
             &session.acquisition().await.unwrap().0
         ));
         assert!(server.drain().is_empty());
+        session.invalidate_acquisition(&renewed).await;
+        std::fs::write(&path, format!("{}.bbb.ccc", "a".repeat(16384))).unwrap();
+        assert_eq!(
+            session.token().await.unwrap_err(),
+            "workload assertion exceeds size limit"
+        );
+        assert!(server.drain().is_empty());
     }
 }
 
@@ -565,11 +572,14 @@ async fn https_exchange_validates_response_and_does_not_cache_unknown_expiry() {
         );
         assert_eq!(server.drain().len(), 1);
     }
+    session.config.resource.clear();
     for _ in 0..2 {
         server.enqueue(exchange_reply(None));
         assert_eq!(session.token().await.unwrap(), "exchange-access");
         assert!(session.cached.lock().await.is_none());
-        assert_eq!(server.drain().len(), 1);
+        let requests = server.drain();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].form().contains_key("resource"));
     }
 }
 
