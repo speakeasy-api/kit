@@ -40,10 +40,7 @@ impl Client {
                 "workload MCP URL must be HTTPS and match the configured resource exactly".into(),
             );
         }
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
+        let http = PostStatus::client(reqwest::Client::builder())
             .map_err(|_| "could not build workload MCP HTTP client")?;
         Ok(Self {
             destination: destination.to_owned(),
@@ -58,19 +55,17 @@ impl Client {
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
-        builder: reqwest::ClientBuilder,
     ) -> Result<StreamableHttpPostResponse, Error> {
         let acquisition = self.authorization(&uri, &custom_headers).await?;
         let status = PostStatus::default();
-        let http = status.client(builder)?;
-        let result = http
-            .post_message(
+        let result = status
+            .observe(self.http.post_message(
                 uri,
                 message,
                 session_id,
                 Some(acquisition.token().to_owned()),
                 custom_headers,
-            )
+            ))
             .await;
         self.finish(&acquisition, status.rejected(), result).await
     }
@@ -120,21 +115,25 @@ impl Client {
     }
 }
 
-// rmcp 3.5.1 consumes POST statuses before returning JSON/SSE results. Observe
-// the raw status without replacing its private protocol parser. This client and
-// flag belong to one POST, so concurrent responses cannot overwrite each other.
+// Pinned reqwest 0.13.5 / tower 0.5.3 call the classifier synchronously in
+// ResponseFuture::poll, inside the scoped POST future. Tokio restores this scope
+// for each poll, including worker migration; concurrent POSTs never share a flag.
+// Revalidate this seam when upgrading reqwest or tower. rmcp retains its parser.
+tokio::task_local! {
+    static POST_REJECTION: Arc<AtomicBool>;
+}
+
 #[derive(Default)]
 struct PostStatus(Arc<AtomicBool>);
 
 impl PostStatus {
-    fn client(&self, builder: reqwest::ClientBuilder) -> Result<reqwest::Client, Error> {
-        let rejected = Arc::clone(&self.0);
+    fn client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, Error> {
         let policy = reqwest::retry::never().classify_fn(move |response| {
             if matches!(
                 response.status(),
                 Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
             ) {
-                rejected.store(true, Ordering::Release);
+                let _ = POST_REJECTION.try_with(|rejected| rejected.store(true, Ordering::Release));
             }
             // Always return success: this observes status, never retries a POST.
             // Do not set max_retries_per_request(0): tower then skips classification.
@@ -145,6 +144,10 @@ impl PostStatus {
             .retry(policy)
             .build()
             .map_err(StreamableHttpError::Client)
+    }
+
+    async fn observe<F: std::future::Future>(&self, future: F) -> F::Output {
+        POST_REJECTION.scope(Arc::clone(&self.0), future).await
     }
 
     fn rejected(&self) -> bool {
@@ -162,14 +165,8 @@ impl McpHttpClient for Client {
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, Error> {
-        self.post_with_client(
-            uri,
-            message,
-            session_id,
-            custom_headers,
-            reqwest::Client::builder(),
-        )
-        .await
+        self.post_with_client(uri, message, session_id, custom_headers)
+            .await
     }
 
     async fn delete_session(
@@ -234,7 +231,14 @@ mod tests {
 
     async fn tls_script(
         replies: impl FnOnce(&str) -> Vec<(u16, String, String)>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    ) -> (String, tokio::task::JoinHandle<(Vec<String>, usize)>) {
+        tls_connections(replies, false).await
+    }
+
+    async fn tls_connections(
+        replies: impl FnOnce(&str) -> Vec<(u16, String, String)>,
+        keep_alive: bool,
+    ) -> (String, tokio::task::JoinHandle<(Vec<String>, usize)>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio_rustls::{TlsAcceptor, rustls};
         let provider = rustls::crypto::aws_lc_rs::default_provider();
@@ -259,13 +263,20 @@ mod tests {
         let task = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::new(config));
             let mut requests = Vec::new();
+            let mut connection = None;
+            let mut accepted = 0;
             for (status, content_type, body) in replies {
+                let connection_header = if keep_alive { "keep-alive" } else { "close" };
                 let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection_header}\r\n\r\n{body}",
                     body.len()
                 );
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut stream = acceptor.accept(socket).await.unwrap();
+                if connection.is_none() {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    connection = Some(acceptor.accept(socket).await.unwrap());
+                    accepted += 1;
+                }
+                let stream = connection.as_mut().unwrap();
                 let mut bytes = Vec::new();
                 loop {
                     let mut chunk = [0; 4096];
@@ -289,10 +300,13 @@ mod tests {
                     }
                 }
                 stream.write_all(response.as_bytes()).await.unwrap();
-                let _ = stream.shutdown().await;
+                if !keep_alive {
+                    let _ = stream.shutdown().await;
+                    connection = None;
+                }
                 requests.push(String::from_utf8(bytes).unwrap());
             }
-            requests
+            (requests, accepted)
         });
         (uri, task)
     }
@@ -301,7 +315,7 @@ mod tests {
         status: u16,
         content_type: &str,
         body: &str,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    ) -> (String, tokio::task::JoinHandle<(Vec<String>, usize)>) {
         tls_script(|_| vec![(status, content_type.to_owned(), body.to_owned())]).await
     }
 
@@ -315,6 +329,134 @@ mod tests {
             .timeout(std::time::Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+    }
+
+    #[tokio::test]
+    async fn sequential_posts_reuse_one_tls_connection() {
+        let reply = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let (uri, mcp) = tls_connections(
+            |_| {
+                vec![
+                    (200, "application/json".into(), reply.into()),
+                    (200, "application/json".into(), reply.into()),
+                ]
+            },
+            true,
+        )
+        .await;
+        let (issuer, auth) = tls_script(|origin| {
+            vec![
+                (
+                    200,
+                    "application/json".into(),
+                    serde_json::json!({"issuer":origin,"token_endpoint":format!("{origin}/token")})
+                        .to_string(),
+                ),
+                (
+                    200,
+                    "application/json".into(),
+                    serde_json::json!({"access_token":"T1","token_type":"Bearer","expires_in":600})
+                        .to_string(),
+                ),
+            ]
+        })
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let token_file = directory.path().join("assertion.jwt");
+        std::fs::write(&token_file, "header.payload.signature").unwrap();
+        let origin = issuer.strip_suffix("/mcp").unwrap();
+        let session = crate::workload_auth::test_support::session(
+            Config {
+                token_file,
+                expected_issuer: origin.into(),
+                token_endpoint: format!("{origin}/token"),
+                resource: uri.clone(),
+            },
+            tls_client().build().unwrap(),
+        )
+        .unwrap();
+        let client = Client {
+            destination: uri.clone(),
+            session,
+            http: PostStatus::client(tls_client()).unwrap(),
+        };
+        for _ in 0..2 {
+            let message =
+                serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                    .unwrap();
+            let result = client
+                .post_message(uri.clone().into(), message, None, None, HashMap::new())
+                .await
+                .unwrap();
+            assert!(matches!(result, StreamableHttpPostResponse::Json(_, _)));
+        }
+        let (requests, accepted) = mcp.await.unwrap();
+        assert_eq!(
+            accepted, 1,
+            "both POSTs must use the same accepted TLS connection"
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("POST /mcp ")
+                    && request.to_lowercase().contains("authorization: bearer t1"))
+        );
+        auth.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_post_status_scopes_are_isolated() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rejected"}}"#;
+        let (rejected_uri, rejected_server) = tls_reply(401, "application/json", body).await;
+        let (successful_uri, successful_server) = tls_reply(200, "application/json", body).await;
+        let http = PostStatus::client(tls_client()).unwrap();
+        let rejected = PostStatus::default();
+        let successful = PostStatus::default();
+        let message = || {
+            serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                .unwrap()
+        };
+        // Poll both scoped futures in one task: a thread-local/unscoped flag would
+        // let the rejection contaminate its concurrently polled neighbour.
+        let (first, second) = tokio::join!(
+            rejected.observe(http.post_message(
+                rejected_uri.into(),
+                message(),
+                None,
+                Some("T1".into()),
+                HashMap::new()
+            )),
+            successful.observe(http.post_message(
+                successful_uri.into(),
+                message(),
+                None,
+                Some("T2".into()),
+                HashMap::new()
+            )),
+        );
+        assert!(matches!(first, Ok(StreamableHttpPostResponse::Json(_, _))));
+        assert!(matches!(second, Ok(StreamableHttpPostResponse::Json(_, _))));
+        assert!(rejected.rejected());
+        assert!(!successful.rejected());
+        assert!(POST_REJECTION.try_with(|_| ()).is_err());
+        rejected_server.await.unwrap();
+        successful_server.await.unwrap();
+
+        // Calls without a POST scope (including GET/DELETE) have no rejection
+        // slot to update, even when the pooled client's classifier runs.
+        let (uri, server) = tls_reply(403, "application/json", body).await;
+        let _ = http
+            .post_message(
+                uri.into(),
+                message(),
+                None,
+                Some("T3".into()),
+                HashMap::new(),
+            )
+            .await;
+        assert!(!successful.rejected());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -350,7 +492,7 @@ mod tests {
                 let client = Client {
                     destination: uri.clone(),
                     session,
-                    http: tls_client().build().unwrap(),
+                    http: PostStatus::client(tls_client()).unwrap(),
                 };
                 let message = || {
                     serde_json::from_value(
@@ -359,20 +501,14 @@ mod tests {
                     .unwrap()
                 };
                 let first = client
-                    .post_with_client(
-                        uri.clone().into(),
-                        message(),
-                        None,
-                        HashMap::new(),
-                        tls_client(),
-                    )
+                    .post_message(uri.clone().into(), message(), None, None, HashMap::new())
                     .await;
                 assert_eq!(first.is_ok(), json);
                 let second = client
-                    .post_with_client(uri.into(), message(), None, HashMap::new(), tls_client())
+                    .post_message(uri.into(), message(), None, None, HashMap::new())
                     .await;
                 assert!(matches!(second, Ok(StreamableHttpPostResponse::Json(_, _))));
-                let requests = server.await.unwrap();
+                let (requests, _) = server.await.unwrap();
                 assert_eq!(requests.len(), 6);
                 assert!(requests[1].starts_with("POST /token "));
                 assert!(
@@ -410,23 +546,28 @@ mod tests {
                 )
                 .await;
                 let status = PostStatus::default();
-                let http = status
-                    .client(
-                        reqwest::Client::builder()
-                            .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
-                                "../../../fixtures/workload-auth/ca.pem"
-                            ))
-                            .unwrap()])
-                            .no_proxy()
-                            .timeout(std::time::Duration::from_secs(5)),
-                    )
-                    .unwrap();
+                let http = PostStatus::client(
+                    reqwest::Client::builder()
+                        .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
+                            "../../../fixtures/workload-auth/ca.pem"
+                        ))
+                        .unwrap()])
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(5)),
+                )
+                .unwrap();
                 let message = serde_json::from_value(
                     serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
                 )
                 .unwrap();
-                let result = http
-                    .post_message(uri.into(), message, None, Some("T1".into()), HashMap::new())
+                let result = status
+                    .observe(http.post_message(
+                        uri.into(),
+                        message,
+                        None,
+                        Some("T1".into()),
+                        HashMap::new(),
+                    ))
                     .await;
                 assert!(status.rejected(), "bare HTTP {code} was lost");
                 if json {
@@ -438,7 +579,7 @@ mod tests {
                     ));
                 }
                 assert!(
-                    server.await.unwrap()[0]
+                    server.await.unwrap().0[0]
                         .to_lowercase()
                         .contains("authorization: bearer t1")
                 );
@@ -466,22 +607,27 @@ mod tests {
             )
             .await;
             let status = PostStatus::default();
-            let http = status
-                .client(
-                    reqwest::Client::builder()
-                        .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
-                            "../../../fixtures/workload-auth/ca.pem"
-                        ))
-                        .unwrap()])
-                        .no_proxy()
-                        .timeout(std::time::Duration::from_secs(5)),
-                )
-                .unwrap();
+            let http = PostStatus::client(
+                reqwest::Client::builder()
+                    .tls_certs_only([reqwest::Certificate::from_pem(include_bytes!(
+                        "../../../fixtures/workload-auth/ca.pem"
+                    ))
+                    .unwrap()])
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(5)),
+            )
+            .unwrap();
             let message =
                 serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
                     .unwrap();
-            let result = http
-                .post_message(uri.into(), message, None, Some("T1".into()), HashMap::new())
+            let result = status
+                .observe(http.post_message(
+                    uri.into(),
+                    message,
+                    None,
+                    Some("T1".into()),
+                    HashMap::new(),
+                ))
                 .await
                 .unwrap();
             assert!(!status.rejected());
