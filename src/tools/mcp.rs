@@ -12,6 +12,7 @@ mod refresh;
 )]
 pub(crate) mod refresh_tests;
 mod subscriptions;
+mod workload;
 pub use subscriptions::McpSubscriptionTool;
 mod schema;
 pub use schema::ToolSchema;
@@ -922,6 +923,17 @@ impl McpAuthResponder for AuthRecorder {
                 .check_available()
                 .map_err(McpError::AuthResolution)?;
         }
+        if record
+            .as_ref()
+            .and_then(|record| record.oauth.as_ref())
+            .and_then(auth::Config::workload)
+            .is_some()
+        {
+            return Err(McpError::AuthResolution(
+                "workload MCP authentication failed; check the provisioned workload identity"
+                    .into(),
+            ));
+        }
         let session = self.oauth_sessions.lock().await.get(&server).cloned();
         if let Some(session) = &session {
             session
@@ -1238,6 +1250,12 @@ fn prepare_server(
                 transport = transport
                     .with_header(name.as_str(), value.as_str())
                     .map_err(|error| format!("invalid MCP config for {id}: {error}"))?;
+            }
+            if let Some(config) = server.auth.as_ref().and_then(auth::Config::workload) {
+                transport = transport.with_http_client(Arc::new(workload::Client::new(
+                    &server.url,
+                    config.clone(),
+                )?));
             }
             Ok((
                 McpTransportBinding::StreamableHttp(transport),
@@ -2752,7 +2770,7 @@ impl McpRuntime {
             )));
         }
         let oauth = record.oauth.clone().unwrap_or_default();
-        if oauth.machine().is_some() {
+        if oauth.machine().is_some() || oauth.workload().is_some() {
             return Err(ToolError::InvalidInput("machine MCP authentication is managed by provisioned credential files, not interactive auth".into()));
         }
 
