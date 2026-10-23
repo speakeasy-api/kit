@@ -4620,7 +4620,7 @@ future_option = true
 
     #[test]
     fn inference_provider_configuration_parses_documented_examples() {
-        let docs = include_str!("../docs/user/getting-started-and-configuration.md");
+        let docs = include_str!("../docs/user/workload-inference.md");
         let mut count = 0;
         for block in docs.split("```toml\n").skip(1) {
             let example = block.split("```").next().unwrap();
