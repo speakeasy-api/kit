@@ -371,6 +371,7 @@ mod tests {
                 expected_issuer: origin.into(),
                 token_endpoint: format!("{origin}/token"),
                 resource: uri.clone(),
+                ..Default::default()
             },
             tls_client().build().unwrap(),
         )
@@ -485,6 +486,7 @@ mod tests {
                         expected_issuer: origin.into(),
                         token_endpoint: format!("{origin}/token"),
                         resource: uri.clone(),
+                        ..Default::default()
                     },
                     tls_client().build().unwrap(),
                 )

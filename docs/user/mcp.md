@@ -31,9 +31,34 @@ mounted JWT without browser login, client registration, or a client secret:
 
 Keep this configuration and token mount under deployment control. `tokenFile`
 must be absolute; symlink rotation is supported. The resource must match the HTTPS
-MCP URL, and the token endpoint must share the expected issuer's origin. Kit checks
-issuer metadata before sending the assertion, disables redirects, and refreshes
-before expiry. No browser or saved-credential fallback occurs.
+MCP URL. The defaults are `grant: "jwtBearer"` (RFC 7523) and
+`endpointMode: "discovery"`: the endpoint must share `expectedIssuer`'s origin,
+and Kit checks RFC 8414 metadata against both before sending an assertion.
+
+For RFC 8693 token exchange, set `grant: "tokenExchange"`. Kit sends the JWT as
+`subject_token`, declares its JWT type, and requests an OAuth access token.
+The response must declare the access-token `issued_token_type` and a Bearer
+`token_type`. A missing `expires_in` is allowed for this grant but disables caching;
+zero, negative, or non-integer lifetimes are rejected. JWT bearer still requires
+a positive lifetime. Kit renews cached tokens before expiry.
+
+For deployments without discovery, set `endpointMode: "explicit"`, omit
+`expectedIssuer`, and configure the trusted HTTPS `tokenEndpoint` directly.
+This URL cannot contain credentials, a query, or a fragment. This explicitly
+trusts the operator-selected endpoint without metadata verification. The token
+file limit is 16 KiB in explicit mode; discovery retains its 8 KiB limit.
+
+Both grants accept optional `audience`, `scope`, and an `extensions` object for
+non-secret deployment parameters, for example `{"project_id":"example"}`.
+Extension names use lowercase ASCII letters, digits, and underscores (1–64 bytes);
+values are 1–1024 bytes without control characters, with at most 16 entries.
+OAuth grant, token, authorization, and client-authentication fields are reserved
+and cannot be overridden. Do not put credentials in extensions. Audience and
+scope are each limited to 2048 bytes without control characters.
+
+Redirects, token-POST retries, browser fallback, and saved-credential fallback
+are disabled. Rejected MCP calls are not replayed. Tokens remain in process
+memory and each configured server has its own acquisition cache.
 
 Do not add static authorization or Host headers. Reusing an unchanged assertion
 requires the issuer's explicit replay-policy support. After a process-memory

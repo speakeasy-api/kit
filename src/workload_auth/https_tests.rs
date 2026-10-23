@@ -164,6 +164,7 @@ impl Server {
             expected_issuer: format!("{}/tenant", self.origin),
             token_endpoint: format!("{}/token", self.origin),
             resource: resource.into(),
+            ..Default::default()
         };
         test_support::session(
             config,
@@ -431,6 +432,7 @@ async fn https_invalid_responses_are_rejected_without_caching_or_leaks() {
     let mut bodies = vec![format!("not-json {ASSERTION}"), "{}".into()];
     for (field, value) in [
         ("token_type", serde_json::json!("Basic")),
+        ("expires_in", serde_json::Value::Null),
         ("expires_in", serde_json::json!(0)),
         ("expires_in", serde_json::json!(-1)),
         ("expires_in", serde_json::json!("3600")),
@@ -456,5 +458,173 @@ async fn https_invalid_responses_are_rejected_without_caching_or_leaks() {
         server.exchange("valid-access", 3600);
         assert_eq!(session.token().await.unwrap(), "valid-access");
         assert_eq!(server.drain().len(), 2);
+    }
+}
+
+fn exchange_reply(expiry: Option<u64>) -> Reply {
+    let mut value = serde_json::json!({
+        "access_token":"exchange-access", "token_type":"bEaReR", "issued_token_type": ACCESS_TOKEN
+    });
+    if let Some(expiry) = expiry {
+        value["expires_in"] = expiry.into();
+    }
+    Reply::json(value)
+}
+
+#[tokio::test]
+async fn https_explicit_grants_exact_fields_and_rotation() {
+    for grant in [Grant::JwtBearer, Grant::TokenExchange] {
+        let mut server = Server::start().await;
+        let (_dir, path) = source();
+        let mut session = server.session(path.clone(), "https://api.example/mcp");
+        session.config.endpoint_mode = EndpointMode::Explicit;
+        session.config.expected_issuer.clear();
+        session.config.grant = grant;
+        session.config.resource = "urn:example:inference".into();
+        session.config.scope = Some("inference".into());
+        session.config.audience = Some("backend".into());
+        session
+            .config
+            .extensions
+            .insert("federation_policy_id".into(), "example".into());
+        session.config.validate().unwrap();
+        server.enqueue(exchange_reply(Some(3600)));
+        let first = session.acquisition().await.unwrap();
+        assert_eq!(first.token(), "exchange-access");
+        assert_eq!(session.token().await.unwrap(), first.token());
+        let requests = server.drain();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/token");
+        let mut expected = BTreeMap::from([
+            ("resource".into(), "urn:example:inference".into()),
+            ("scope".into(), "inference".into()),
+            ("audience".into(), "backend".into()),
+            ("federation_policy_id".into(), "example".into()),
+        ]);
+        let source_field = if grant == Grant::JwtBearer {
+            expected.insert(
+                "grant_type".into(),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer".into(),
+            );
+            "assertion"
+        } else {
+            expected.insert(
+                "grant_type".into(),
+                "urn:ietf:params:oauth:grant-type:token-exchange".into(),
+            );
+            expected.insert(
+                "subject_token_type".into(),
+                "urn:ietf:params:oauth:token-type:jwt".into(),
+            );
+            expected.insert("requested_token_type".into(), ACCESS_TOKEN.into());
+            "subject_token"
+        };
+        expected.insert(source_field.into(), ASSERTION.into());
+        assert_eq!(requests[0].form(), expected);
+        session.invalidate_acquisition(&first).await;
+        let large = format!("{}.bbb.ccc", "a".repeat(12000));
+        std::fs::write(&path, &large).unwrap();
+        server.enqueue(exchange_reply(Some(3600)));
+        let renewed = session.acquisition().await.unwrap();
+        assert_eq!(server.drain()[0].form()[source_field], large);
+        session.invalidate_acquisition(&first).await;
+        assert!(Arc::ptr_eq(
+            &renewed.0,
+            &session.acquisition().await.unwrap().0
+        ));
+        assert!(server.drain().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn https_exchange_validates_response_and_does_not_cache_unknown_expiry() {
+    let mut server = Server::start().await;
+    let (_dir, path) = source();
+    let mut session = server.session(path, "https://api.example/mcp");
+    session.config.endpoint_mode = EndpointMode::Explicit;
+    session.config.expected_issuer.clear();
+    session.config.grant = Grant::TokenExchange;
+    for (field, value) in [
+        ("issued_token_type", serde_json::Value::Null),
+        (
+            "issued_token_type",
+            serde_json::json!("urn:ietf:params:oauth:token-type:jwt"),
+        ),
+        ("token_type", serde_json::json!("N_A")),
+        ("expires_in", serde_json::json!(0)),
+        ("expires_in", serde_json::json!(-1)),
+        ("expires_in", serde_json::json!(0.5)),
+    ] {
+        let mut response = serde_json::json!({"access_token":"secret-access", "token_type":"Bearer", "issued_token_type":ACCESS_TOKEN, "expires_in":3600});
+        response[field] = value;
+        server.enqueue(Reply::json(response));
+        assert_eq!(
+            session.token().await.unwrap_err(),
+            "invalid workload token response"
+        );
+        assert_eq!(server.drain().len(), 1);
+    }
+    for _ in 0..2 {
+        server.enqueue(exchange_reply(None));
+        assert_eq!(session.token().await.unwrap(), "exchange-access");
+        assert!(session.cached.lock().await.is_none());
+        assert_eq!(server.drain().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn https_exchange_discovery_single_flight_and_expiry() {
+    let mut server = Server::start().await;
+    let (_dir, path) = source();
+    let mut session = server.session(path.clone(), "https://api.example/mcp");
+    session.config.grant = Grant::TokenExchange;
+    let session = Arc::new(session);
+    server.discovery();
+    server.enqueue(exchange_reply(Some(1)));
+    let mut jobs = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let session = session.clone();
+        jobs.spawn(async move { session.acquisition().await });
+    }
+    while let Some(result) = jobs.join_next().await {
+        assert_eq!(result.unwrap().unwrap().token(), "exchange-access");
+    }
+    let requests = server.drain();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[1].form()["subject_token"], ASSERTION);
+    // Force the existing cache past expiry without timing-dependent sleeps.
+    session.cached.lock().await.as_mut().unwrap().refresh_at = SystemTime::UNIX_EPOCH;
+    std::fs::write(path, "rotated.jwt.signature").unwrap();
+    server.discovery();
+    server.enqueue(exchange_reply(Some(3600)));
+    assert_eq!(session.token().await.unwrap(), "exchange-access");
+    assert_eq!(
+        server.drain()[1].form()["subject_token"],
+        "rotated.jwt.signature"
+    );
+}
+
+#[tokio::test]
+async fn https_explicit_rejection_never_retries_or_retains_stale_token() {
+    let mut server = Server::start().await;
+    let (_dir, path) = source();
+    let mut session = server.session(path, "https://api.example/mcp");
+    session.config.endpoint_mode = EndpointMode::Explicit;
+    session.config.expected_issuer.clear();
+    session.config.grant = Grant::TokenExchange;
+    for status in [302, 401, 503] {
+        server.enqueue(exchange_reply(Some(3600)));
+        let old = session.acquisition().await.unwrap();
+        session.invalidate_acquisition(&old).await;
+        server.drain();
+        server.enqueue(Reply::status(status));
+        assert_eq!(
+            session.token().await.unwrap_err(),
+            "workload token exchange refused"
+        );
+        assert!(session.cached.lock().await.is_none());
+        assert_eq!(server.drain().len(), 1);
     }
 }
