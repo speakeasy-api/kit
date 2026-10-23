@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
 use super::*;
 
 fn config() -> Config {

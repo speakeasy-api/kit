@@ -14,7 +14,6 @@ const MAX_BYTES: usize = 8192;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
 
 /// Embedders restoring a process-memory snapshot must call this while requests are

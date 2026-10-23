@@ -145,7 +145,13 @@ impl McpHttpClient for Client {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
 
@@ -216,7 +222,7 @@ mod tests {
         let (binding, _) =
             super::super::prepare_server("workload", server, Vec::new(), None).unwrap();
         let super::super::McpTransportBinding::StreamableHttp(transport) = binding else {
-            unreachable!()
+            panic!("expected workload authentication configuration")
         };
         let client = transport.http_client.unwrap();
         assert!(

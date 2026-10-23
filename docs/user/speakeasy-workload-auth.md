@@ -9,7 +9,7 @@ Create a deployment-owned file such as `/etc/kit/speakeasy-workload.json`:
 
 ```json
 {
-  "project": "your-gram-project",
+  "project": "your-project",
   "workload": {
     "tokenFile": "/run/identity/assertion.jwt",
     "expectedIssuer": "https://identity.example.com",
