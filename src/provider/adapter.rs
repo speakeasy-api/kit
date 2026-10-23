@@ -207,6 +207,7 @@ pub struct SelectableAdapter {
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
     openai_model_catalog: SubscriptionModelCatalogCache,
+    inference: super::inference::Instances,
 }
 
 impl SelectableAdapter {
@@ -258,7 +259,16 @@ impl SelectableAdapter {
             credential_storage,
             openrouter_api_key,
             openai_model_catalog: SubscriptionModelCatalogCache::default(),
+            inference: Default::default(),
         })
+    }
+
+    pub(crate) fn with_inference(mut self, inference: super::inference::Instances) -> Self {
+        self.inference = inference;
+        self
+    }
+    pub(crate) fn inference(&self) -> super::inference::Instances {
+        self.inference.clone()
     }
 
     /// Attach persistence before publishing any clones of this session adapter.
@@ -305,6 +315,7 @@ impl SelectableAdapter {
                 credential_storage: self.credential_storage.clone(),
                 openrouter_api_key: self.openrouter_api_key.clone(),
                 openai_model_catalog: self.openai_model_catalog.clone(),
+                inference: self.inference.clone(),
             },
             revision,
         ))
@@ -348,22 +359,46 @@ impl SelectableAdapter {
     }
 
     pub async fn model_catalog(&self, current: &ModelSelection) -> Vec<ModelGroup> {
-        model_catalog_with_openai(
+        let mut groups = model_catalog_with_openai(
             current,
             self.discovered_openai_models(),
             &self.credential_storage,
             self.openrouter_api_key.as_ref(),
+            &self.inference,
         )
-        .await
+        .await;
+        // A workload grant does not imply permission to query a model catalog.
+        // Keep explicit model selection available without resolving legacy keys.
+        for provider in [ProviderKind::OpenRouter, ProviderKind::Speakeasy] {
+            if self.inference.get(provider).is_some() {
+                groups.retain(|group| group.provider != provider);
+                groups.push(ModelGroup {
+                    provider,
+                    models: if current.provider == provider {
+                        vec![current.model.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    context_windows: Default::default(),
+                });
+            }
+        }
+        groups
     }
 
     /// Providers whose credentials resolve now, in catalog order.
     pub fn catalog_providers(&self) -> Vec<ProviderKind> {
-        available_catalog_providers(
+        let mut providers = available_catalog_providers(
             &self.credential_storage,
             self.openrouter_api_key.as_ref(),
             |name| std::env::var(name),
-        )
+        );
+        for provider in [ProviderKind::OpenRouter, ProviderKind::Speakeasy] {
+            if self.inference.get(provider).is_some() && !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        providers
     }
 
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
@@ -371,12 +406,14 @@ impl SelectableAdapter {
             return Err("model name is outside canonical bounds".into());
         }
         let reasoning_effort = self.reasoning_effort()?;
-        KitAdapter::new_with_credentials_and_effort(
+        KitAdapter::new_with_inference(
             selection.provider,
             selection.model.clone(),
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
+            self.openai_model_catalog.clone(),
+            &self.inference,
         )?;
         let mut current = self
             .selection
@@ -392,12 +429,14 @@ impl SelectableAdapter {
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<(), String> {
         let model = self.selection()?;
-        KitAdapter::new_with_credentials_and_effort(
+        KitAdapter::new_with_inference(
             model.provider,
             model.model,
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
+            self.openai_model_catalog.clone(),
+            &self.inference,
         )?;
         let mut current = self
             .selection
@@ -421,6 +460,7 @@ pub struct SelectableSession {
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
     openai_model_catalog: SubscriptionModelCatalogCache,
+    inference: super::inference::Instances,
     config: SessionConfig,
     active: SessionSelection,
     inner: KitSession,
@@ -437,13 +477,14 @@ impl ModelAdapter for SelectableAdapter {
             .lock()
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
-        let inner = KitAdapter::new_with_credentials_effort_and_catalog(
+        let inner = KitAdapter::new_with_inference(
             active.model.provider,
             active.model.model.clone(),
             self.credential_storage.clone(),
             active.reasoning_effort,
             self.openrouter_api_key.as_ref(),
             self.openai_model_catalog.clone(),
+            &self.inference,
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
@@ -453,6 +494,7 @@ impl ModelAdapter for SelectableAdapter {
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
             openai_model_catalog: self.openai_model_catalog.clone(),
+            inference: self.inference.clone(),
             config,
             active,
             inner,
@@ -508,13 +550,14 @@ impl ModelSession for SelectableSession {
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
         if selected != self.active {
-            let replacement = KitAdapter::new_with_credentials_effort_and_catalog(
+            let replacement = KitAdapter::new_with_inference(
                 selected.model.provider,
                 selected.model.model.clone(),
                 self.credential_storage.clone(),
                 selected.reasoning_effort,
                 self.openrouter_api_key.as_ref(),
                 self.openai_model_catalog.clone(),
+                &self.inference,
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
@@ -587,6 +630,8 @@ struct SpeakeasyProvider {
     api_key: String,
     project: String,
     chat_id: Option<String>,
+    federation: bool,
+    name: ProviderKind,
 }
 
 // Matches Gram's chat.SessionIDToChatID mapping for captured agent sessions.
@@ -600,7 +645,19 @@ impl CompletionsProvider for SpeakeasyProvider {
     type Config = OpenRouterRequestConfig;
 
     fn provider_name(&self) -> &str {
-        "Speakeasy"
+        if self.federation {
+            self.name.as_str()
+        } else {
+            "Speakeasy"
+        }
+    }
+
+    fn authentication(&self) -> Option<agentkit_http::Authentication> {
+        if self.federation {
+            self.openrouter.authentication()
+        } else {
+            None
+        }
     }
 
     fn endpoint_url(&self) -> &str {
@@ -615,6 +672,12 @@ impl CompletionsProvider for SpeakeasyProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
+        if self.federation {
+            return self
+                .openrouter
+                .preprocess_request(builder)
+                .header("User-Agent", concat!("kit/", env!("CARGO_PKG_VERSION")));
+        }
         let builder = builder
             .header("Gram-Key", &self.api_key)
             .header("Gram-Project", &self.project)
@@ -654,6 +717,49 @@ impl CompletionsProvider for SpeakeasyProvider {
 }
 
 impl KitAdapter {
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_inference(
+        provider: ProviderKind,
+        model: String,
+        credential_storage: crate::credentials::CredentialStorage,
+        effort: Option<ReasoningEffort>,
+        key: Option<&OpenRouterApiKey>,
+        catalog: SubscriptionModelCatalogCache,
+        instances: &super::inference::Instances,
+    ) -> Result<Self, String> {
+        let Some(instance) = instances.get(provider) else {
+            return Self::new_with_credentials_effort_and_catalog(
+                provider,
+                model,
+                credential_storage,
+                effort,
+                key,
+                catalog,
+            );
+        };
+        let mut config = OpenRouterConfig::new(instance.authentication.clone(), model)
+            .with_base_url(&instance.endpoint);
+        apply_openrouter_reasoning_effort(&mut config, effort);
+        let provider = SpeakeasyProvider {
+            openrouter: OpenRouterProvider::from(config),
+            api_key: String::new(),
+            project: String::new(),
+            chat_id: None,
+            federation: true,
+            name: provider,
+        };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| "could not build inference client".to_string())?;
+        Ok(Self::Speakeasy(Box::new(SpeakeasyKitAdapter {
+            provider,
+            client: agentkit_http::Http::new(super::inference::Transport(client)),
+        })))
+    }
+
     pub fn new(provider: ProviderKind, model: String) -> Result<Self, String> {
         Self::new_with_credentials(provider, model, Default::default())
     }
@@ -752,6 +858,8 @@ impl KitAdapter {
                     api_key: credentials.api_key.clone(),
                     project: credentials.project.clone(),
                     chat_id: None,
+                    federation: false,
+                    name: ProviderKind::Speakeasy,
                 };
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
@@ -934,13 +1042,19 @@ impl ModelAdapter for KitAdapter {
             }
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
-                provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
+                let resilience = if provider.federation {
+                    agentkit_http::ResilienceConfig::no_retries()
+                } else {
+                    provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
+                    crate::request_budget::RequestBudget::current().resilience()
+                };
                 let inner = CompletionsAdapter::with_client(provider, adapter.client.clone())
-                    .with_resilience(crate::request_budget::RequestBudget::current().resilience());
+                    .with_resilience(resilience);
                 inner.start_session(config).await.map(|inner| {
                     KitSession::Speakeasy(SpeakeasyKitSession {
                         inner,
                         context_window: None,
+                        federation: adapter.provider.federation,
                     })
                 })
             }
@@ -951,7 +1065,7 @@ impl ModelAdapter for KitAdapter {
         Some(match self {
             Self::OpenAiSubscription(_) => "openai-subscription",
             Self::OpenRouter(_) => "openrouter",
-            Self::Speakeasy(_) => "speakeasy",
+            Self::Speakeasy(adapter) => adapter.provider.name.as_str(),
             Self::Anthropic(_) => "anthropic",
         })
     }
@@ -972,6 +1086,7 @@ pub struct OpenRouterKitSession {
 pub struct SpeakeasyKitSession {
     inner: CompletionsSession<SpeakeasyProvider>,
     context_window: Option<u64>,
+    federation: bool,
 }
 
 /// Project only the outbound request; the caller's canonical transcript stays typed.
@@ -1255,6 +1370,7 @@ impl ModelSession for KitSession {
                     context_window: session.context_window,
                     media_part: None,
                     next_media: 0,
+                    federation: false,
                 })
                 .map(KitTurn::OpenRouter),
             Self::Anthropic(session, context_window) => {
@@ -1274,6 +1390,7 @@ impl ModelSession for KitSession {
                     context_window: session.context_window,
                     media_part: None,
                     next_media: 0,
+                    federation: session.federation,
                 })
                 .map(KitTurn::Speakeasy),
         }
@@ -1310,6 +1427,7 @@ pub struct OpenRouterKitTurn {
     context_window: Option<u64>,
     media_part: Option<PartId>,
     next_media: usize,
+    federation: bool,
 }
 
 #[async_trait]
@@ -1336,7 +1454,15 @@ impl ModelTurn for KitTurn {
                 Ok(event)
             }
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
-                let mut event = turn.inner.next_event(cancellation).await?;
+                let mut event = turn.inner.next_event(cancellation).await.map_err(|error| {
+                    // HTTP-200 error frames can echo credentials too. Typed failures
+                    // are already sanitized upstream; raw provider errors are not.
+                    if turn.federation && matches!(error, LoopError::Provider(_)) {
+                        LoopError::Provider("workload inference response failed".into())
+                    } else {
+                        error
+                    }
+                })?;
                 if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
                     rewrite_openrouter_media(delta, &mut turn.media_part, &mut turn.next_media);
                 }
@@ -1526,6 +1652,7 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
                 std::future::ready(DiscoveredModels::default()),
                 &Default::default(),
                 None,
+                &Default::default(),
             )
             .await
         }
@@ -1566,9 +1693,13 @@ async fn model_catalog_with_openai(
     openai_catalog: impl std::future::Future<Output = DiscoveredModels>,
     storage: &crate::credentials::CredentialStorage,
     openrouter_api_key: Option<&OpenRouterApiKey>,
+    inference: &super::inference::Instances,
 ) -> Vec<ModelGroup> {
-    let available =
-        available_catalog_providers(storage, openrouter_api_key, |name| std::env::var(name));
+    let available: Vec<_> =
+        available_catalog_providers(storage, openrouter_api_key, |name| std::env::var(name))
+            .into_iter()
+            .filter(|provider| inference.get(*provider).is_none())
+            .collect();
     let openrouter_available = available.contains(&ProviderKind::OpenRouter);
     let speakeasy_available = available.contains(&ProviderKind::Speakeasy);
     let openai_catalog = async {
@@ -2655,6 +2786,8 @@ mod tests {
             api_key: format!("gram_live_{}", "ab".repeat(32)),
             project: "kit-test".into(),
             chat_id: None,
+            federation: false,
+            name: ProviderKind::Speakeasy,
         };
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -2738,6 +2871,7 @@ mod tests {
             credential_storage: Default::default(),
             openrouter_api_key: None,
             openai_model_catalog: Default::default(),
+            inference: Default::default(),
             config: SessionConfig::new("provider-identity-test"),
             active,
             inner,
@@ -3038,6 +3172,7 @@ mod tests {
             },
             &storage,
             None,
+            &Default::default(),
         )
         .await;
         let openai = catalog
@@ -3069,6 +3204,7 @@ mod tests {
             async { panic!("uncredentialed discovery polled") },
             &storage,
             None,
+            &Default::default(),
         )
         .await;
         assert!(
@@ -3146,3 +3282,7 @@ mod image_tests;
 #[cfg(test)]
 #[path = "adapter_background_image_tests.rs"]
 mod background_image_tests;
+
+#[cfg(test)]
+#[path = "inference_tests.rs"]
+mod inference_tests;

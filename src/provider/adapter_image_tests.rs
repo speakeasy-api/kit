@@ -212,6 +212,8 @@ async fn completions_and_openrouter_encode_parallel_mixed_replay_as_user_images(
         api_key: "test".into(),
         project: "test".into(),
         chat_id: None,
+        federation: false,
+        name: ProviderKind::Speakeasy,
     };
     assert_wire(speakeasy, projected.clone()).await;
     assert_wire(

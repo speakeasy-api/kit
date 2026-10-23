@@ -748,6 +748,17 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
+    /// Configures workload inference before publishing the runtime.
+    pub fn with_inference_providers(
+        mut runtime: Arc<Self>,
+        configs: std::collections::BTreeMap<String, crate::provider::inference::Config>,
+    ) -> Result<Arc<Self>, String> {
+        let instances = crate::provider::inference::Instances::new(configs)?;
+        let inner = Arc::get_mut(&mut runtime).ok_or("runtime already shared")?;
+        inner.adapter = inner.adapter.clone().with_inference(instances);
+        Ok(runtime)
+    }
+
     /// Configures compaction before publishing the runtime to any sessions.
     pub fn with_compaction(
         runtime: Arc<Self>,
@@ -865,7 +876,8 @@ impl Runtime {
     }
 
     pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
-        self.credential_storage.is_persistent()
+        self.adapter.inference().get(provider).is_none()
+            && self.credential_storage.is_persistent()
             && (provider != ProviderKind::OpenRouter
                 || (self.openrouter_api_key.is_none() && !self.ambient_openrouter_api_key))
     }
@@ -1520,6 +1532,7 @@ impl Runtime {
                     .unwrap_or(self.adapter.reasoning_effort()?),
                 self.openrouter_api_key.clone(),
             )?
+            .with_inference(self.adapter.inference())
             .with_session_observer(opened.observer.clone(), !request.resume)?;
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
@@ -1939,7 +1952,9 @@ impl Runtime {
             self.openrouter_api_key.clone(),
         )
         .and_then(|adapter| {
-            adapter.with_session_observer(opened.observer.clone(), is_fork || !request.resume)
+            adapter
+                .with_inference(self.adapter.inference())
+                .with_session_observer(opened.observer.clone(), is_fork || !request.resume)
         })
         .map_err(AcpRuntimeError::Loop)?;
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;

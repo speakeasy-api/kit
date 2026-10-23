@@ -1382,6 +1382,8 @@ struct Config {
     root: Option<PathBuf>,
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
+    #[serde(default)]
+    inference_providers: BTreeMap<String, kit::provider::inference::Config>,
     reasoning_effort: Option<kit::ReasoningEffort>,
     a2a: Option<String>,
     capture_error_spans: Option<bool>,
@@ -2305,6 +2307,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_inference_providers(
+                runtime,
+                config.inference_providers.clone(),
+            )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
@@ -2406,6 +2412,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_inference_providers(
+                runtime,
+                config.inference_providers.clone(),
+            )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
@@ -2482,6 +2492,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?;
+            let runtime = kit::Runtime::with_inference_providers(
+                runtime,
+                config.inference_providers.clone(),
+            )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
@@ -4602,6 +4616,26 @@ future_option = true
         .unwrap_err();
         assert_eq!(error.to_string(), "termination signal failed");
         let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
+    }
+
+    #[test]
+    fn inference_provider_configuration_parses_documented_examples() {
+        let docs = include_str!("../docs/user/getting-started-and-configuration.md");
+        let mut count = 0;
+        for block in docs.split("```toml\n").skip(1) {
+            let example = block.split("```").next().unwrap();
+            if !example.contains("[inference_providers.") {
+                continue;
+            }
+            let config: Config = toml::from_str(example).unwrap();
+            assert_eq!(config.inference_providers.len(), 1);
+            let provider = config.provider.unwrap();
+            let inference = config.inference_providers.get(provider.as_str()).unwrap();
+            inference.workload.validate().unwrap();
+            assert!(inference.endpoint.ends_with("/chat/completions"));
+            count += 1;
+        }
+        assert_eq!(count, 2);
     }
 
     #[test]
