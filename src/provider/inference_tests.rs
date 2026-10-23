@@ -304,6 +304,13 @@ fn assert_inference(request: &Request, token: &str, streaming: bool) {
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/chat/completions");
     let headers = request.headers.to_ascii_lowercase();
+    assert_eq!(
+        headers
+            .lines()
+            .filter(|line| line.starts_with("user-agent:"))
+            .count(),
+        1
+    );
     assert!(headers.contains(&format!("authorization: bearer {token}\r\n")));
     for forbidden in [
         "gram-key:",
@@ -648,7 +655,94 @@ async fn federation_missing_assertion_fails_without_legacy_credentials() {
         Ok(_) => panic!("missing assertion unexpectedly succeeded"),
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("workload"), "{error}");
+    assert!(
+        error.contains("could not open workload token file"),
+        "{error}"
+    );
     assert!(!error.contains("projected-assertion"));
     assert!(!error.contains("login"));
+}
+
+#[test]
+fn federation_preserves_configured_deadlines_without_retries() {
+    for seconds in [1, 600] {
+        let budget = crate::request_budget::RequestBudget::try_from(seconds).unwrap();
+        let mut expected = budget.resilience();
+        expected.max_retries = 0;
+        assert_eq!(crate::provider::inference::resilience(budget), expected);
+    }
+}
+
+#[tokio::test]
+async fn federation_refusal_invalidates_only_for_a_new_turn() {
+    for status in [401, 403] {
+        let mut server = Server::start().await;
+        let (_dir, path) = source();
+        let adapter = server.adapter(
+            path.clone(),
+            "https://inference.example/resource",
+            ProviderKind::Speakeasy,
+            false,
+        );
+        server.exchange("refused-secret", 3600);
+        server.enqueue(Reply::status(status));
+        assert!(run_turn(&adapter).await.is_err());
+        let requests = server.drain();
+        assert_eq!(requests.len(), 3, "refused completion must not replay");
+        assert_inference(&requests[2], "refused-secret", false);
+        std::fs::write(path, "rotated.payload.signature").unwrap();
+        server.exchange("renewed-secret", 3600);
+        server.enqueue(completion(false));
+        run_turn(&adapter).await.unwrap();
+        let requests = server.drain();
+        assert_eq!(
+            requests.len(),
+            3,
+            "new turn must exchange the rotated source"
+        );
+        assert_eq!(
+            requests[1].form()["subject_token"],
+            "rotated.payload.signature"
+        );
+        assert_inference(&requests[2], "renewed-secret", false);
+    }
+}
+
+#[tokio::test]
+async fn federation_and_legacy_catalogs_keep_the_same_provider_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::credentials::CredentialStorage::Filesystem(dir.path().join("credentials"));
+    storage
+        .entry("speakeasy", "default")
+        .save(
+            &serde_json::to_vec(&serde_json::json!({
+                "api_key": format!("gram_live_{}", "ab".repeat(32)), "project": "test-project",
+                "email": null, "organization_id": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let instances = crate::provider::inference::Instances::new(BTreeMap::from([(
+        "openrouter".into(),
+        workload_config("https://inference.example/chat/completions"),
+    )]))
+    .unwrap();
+    let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+        ProviderKind::OpenRouter,
+        "test-model",
+        storage,
+        None,
+        Some(OpenRouterApiKey::non_empty("legacy-test-key").unwrap()),
+    )
+    .unwrap()
+    .with_inference(instances);
+    let current = ModelSelection::new(ProviderKind::OpenRouter, "test-model");
+    let groups = adapter.model_catalog(&current).await;
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.provider)
+            .collect::<Vec<_>>(),
+        adapter.catalog_providers()
+    );
 }

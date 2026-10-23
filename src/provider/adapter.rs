@@ -393,8 +393,9 @@ impl SelectableAdapter {
             self.openrouter_api_key.as_ref(),
             |name| std::env::var(name),
         );
+        providers.retain(|provider| self.inference.get(*provider).is_none());
         for provider in [ProviderKind::OpenRouter, ProviderKind::Speakeasy] {
-            if self.inference.get(provider).is_some() && !providers.contains(&provider) {
+            if self.inference.get(provider).is_some() {
                 providers.push(provider);
             }
         }
@@ -673,10 +674,7 @@ impl CompletionsProvider for SpeakeasyProvider {
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
         if self.federation {
-            let builder = self
-                .openrouter
-                .preprocess_request(builder)
-                .header("User-Agent", concat!("kit/", env!("CARGO_PKG_VERSION")));
+            let builder = self.openrouter.preprocess_request(builder);
             return if self.name == ProviderKind::Speakeasy {
                 builder.header("X-Gram-Source", "kit")
             } else {
@@ -1048,7 +1046,7 @@ impl ModelAdapter for KitAdapter {
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
                 let resilience = if provider.federation {
-                    agentkit_http::ResilienceConfig::no_retries()
+                    super::inference::resilience(crate::request_budget::RequestBudget::current())
                 } else {
                     provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
                     crate::request_budget::RequestBudget::current().resilience()
@@ -1386,25 +1384,23 @@ impl ModelSession for KitSession {
                     .await
                     .map(|turn| KitTurn::Anthropic(Box::new(turn), context_window))
             }
-            Self::Speakeasy(session) => session
-                .inner
-                .begin_turn(request, cancellation)
-                .await
-                .map_err(|error| {
-                    if session.federation {
-                        super::inference::redact_response_error(error)
-                    } else {
-                        error
-                    }
+            Self::Speakeasy(session) => {
+                let future = session.inner.begin_turn(request, cancellation);
+                let result = if session.federation {
+                    super::inference::request(future).await
+                } else {
+                    future.await
+                };
+                result.map(|inner| {
+                    KitTurn::Speakeasy(OpenRouterKitTurn {
+                        inner,
+                        context_window: session.context_window,
+                        media_part: None,
+                        next_media: 0,
+                        federation: session.federation,
+                    })
                 })
-                .map(|inner| OpenRouterKitTurn {
-                    inner,
-                    context_window: session.context_window,
-                    media_part: None,
-                    next_media: 0,
-                    federation: session.federation,
-                })
-                .map(KitTurn::Speakeasy),
+            }
         }
     }
 

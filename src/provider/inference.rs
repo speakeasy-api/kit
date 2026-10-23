@@ -71,7 +71,14 @@ impl AuthenticationProvider for WorkloadAuthentication {
                 "workload inference authentication refused; request not replayed".into(),
             ));
         }
-        let token = self.0.acquisition().await.map_err(HttpError::Other)?;
+        let token = self.0.acquisition().await.map_err(|error| {
+            let _ = REQUEST
+                .try_with(|state| state.borrow_mut().authentication_error = Some(error.clone()));
+            HttpError::Other(error)
+        })?;
+        let _ = REQUEST.try_with(|state| {
+            state.borrow_mut().acquisition = Some((self.0.clone(), token.clone()));
+        });
         Authentication::bearer(token.token())
             .authenticate(None)
             .await
@@ -89,6 +96,15 @@ impl agentkit_http::HttpClient for Transport {
         let response = agentkit_http::HttpClient::execute(&self.0, request)
             .await
             .map_err(|_| HttpError::Other("workload inference transport failed".into()))?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            let rejected = REQUEST
+                .try_with(|state| state.borrow().acquisition.clone())
+                .ok()
+                .flatten();
+            if let Some((session, acquisition)) = rejected {
+                session.invalidate_acquisition(&acquisition).await;
+            }
+        }
         if !response.status().is_success() {
             return Err(HttpError::Other(format!(
                 "workload inference refused (HTTP {})",
@@ -97,6 +113,44 @@ impl agentkit_http::HttpClient for Transport {
         }
         Ok(response)
     }
+}
+
+// Authentication and transport run in the same begin-turn future. Task-scoped
+// state preserves the exact acquisition and trusted local error without a token
+// lookup, cross-session mutable state, or exposing credentials in request headers.
+#[derive(Default)]
+struct RequestState {
+    acquisition: Option<(
+        Arc<crate::workload_auth::Session>,
+        crate::workload_auth::Acquisition,
+    )>,
+    authentication_error: Option<String>,
+}
+tokio::task_local! {
+    static REQUEST: std::cell::RefCell<RequestState>;
+}
+
+pub(crate) async fn request<T>(
+    future: impl std::future::Future<Output = Result<T, agentkit_loop::LoopError>>,
+) -> Result<T, agentkit_loop::LoopError> {
+    REQUEST
+        .scope(Default::default(), async {
+            future.await.map_err(|error| {
+                match REQUEST.with(|state| state.borrow_mut().authentication_error.take()) {
+                    Some(message) => agentkit_loop::LoopError::Provider(message),
+                    None => redact_response_error(error),
+                }
+            })
+        })
+        .await
+}
+
+pub(crate) fn resilience(
+    budget: crate::request_budget::RequestBudget,
+) -> agentkit_http::ResilienceConfig {
+    let mut config = budget.resilience();
+    config.max_retries = 0;
+    config
 }
 
 // HTTP-200 error frames and malformed nonstream responses can echo credentials.
