@@ -99,6 +99,17 @@ impl agentkit_http::HttpClient for Transport {
     }
 }
 
+// HTTP-200 error frames and malformed nonstream responses can echo credentials.
+// Typed failures are already sanitized upstream; raw provider errors are not.
+pub(crate) fn redact_response_error(error: agentkit_loop::LoopError) -> agentkit_loop::LoopError {
+    match error {
+        agentkit_loop::LoopError::Provider(_) => {
+            agentkit_loop::LoopError::Provider("workload inference response failed".into())
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) fn authentication(
@@ -110,16 +121,5 @@ pub(crate) mod test_support {
                 crate::workload_auth::test_support::session(config, client)?,
             )),
         ))
-    }
-}
-
-// HTTP-200 error frames and malformed nonstream responses can echo credentials.
-// Typed failures are already sanitized upstream; raw provider errors are not.
-pub(crate) fn redact_response_error(error: agentkit_loop::LoopError) -> agentkit_loop::LoopError {
-    match error {
-        agentkit_loop::LoopError::Provider(_) => {
-            agentkit_loop::LoopError::Provider("workload inference response failed".into())
-        }
-        other => other,
     }
 }
