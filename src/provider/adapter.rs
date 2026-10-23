@@ -673,10 +673,15 @@ impl CompletionsProvider for SpeakeasyProvider {
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
         if self.federation {
-            return self
+            let builder = self
                 .openrouter
                 .preprocess_request(builder)
                 .header("User-Agent", concat!("kit/", env!("CARGO_PKG_VERSION")));
+            return if self.name == ProviderKind::Speakeasy {
+                builder.header("X-Gram-Source", "kit")
+            } else {
+                builder
+            };
         }
         let builder = builder
             .header("Gram-Key", &self.api_key)

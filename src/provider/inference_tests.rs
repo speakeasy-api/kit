@@ -309,7 +309,6 @@ fn assert_inference(request: &Request, token: &str, streaming: bool) {
         "gram-key:",
         "gram-project:",
         "gram-chat-id:",
-        "x-gram-source:",
         "legacy-",
         ASSERTION,
     ] {
@@ -350,6 +349,13 @@ async fn federation_completion_stream_and_nonstream_use_exchanged_bearer_only() 
             assert_eq!(requests[0].method, "GET");
             assert_exchange(&requests[1], resource);
             assert_inference(&requests[2], "inference-secret", streaming);
+            assert_eq!(
+                requests[2]
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("x-gram-source: kit"),
+                name == ProviderKind::Speakeasy
+            );
         }
     }
 }
