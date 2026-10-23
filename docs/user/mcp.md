@@ -29,17 +29,15 @@ mounted JWT without browser login, client registration, or a client secret:
 }
 ```
 
-The resource must match the HTTPS MCP URL. Do not combine this mode with a static
-bearer token, an Authorization header, or a Host override. Each HTTP operation,
-including SSE reconnection, acquires or reuses a valid resource-scoped token.
-Authentication failure does not open a browser or fall back to saved credentials.
-The file is reopened at each token exchange, including symlink-based rotation.
+Keep this configuration and token mount under deployment control. `tokenFile`
+must be absolute; symlink rotation is supported. The resource must match the HTTPS
+MCP URL, and the token endpoint must share the expected issuer's origin. Kit checks
+issuer metadata before sending the assertion, disables redirects, and refreshes
+before expiry. No browser or saved-credential fallback occurs.
 
-Keep this configuration and the assertion mount under deployment control. See
-[workload authentication](../reference/workload-authentication.md) for issuer
-metadata requirements, bounded acquisition, replay-policy prerequisites, and the
-required process-memory restore barrier. Native inference uses its own
-[Speakeasy workload configuration](speakeasy-workload-auth.md) and resource.
+Do not add static authorization or Host headers. Reusing an unchanged assertion
+requires the issuer's explicit replay-policy support. After a process-memory
+restore, restart Kit and resume the transcript rather than reuse resident tokens.
 
 ## Ask the agent to add a server
 

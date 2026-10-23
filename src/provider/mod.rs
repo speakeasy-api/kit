@@ -8,7 +8,6 @@ pub mod chatgpt;
 pub(crate) mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
-mod speakeasy_workload;
 pub(crate) mod typesafe_auth;
 pub mod usage;
 

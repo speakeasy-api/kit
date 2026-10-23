@@ -1,7 +1,6 @@
 //! Clientless RFC 7523 workload authentication. Assertions never enter credential storage.
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -9,19 +8,11 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use zeroize::Zeroizing;
 
-static GENERATION: AtomicU64 = AtomicU64::new(0);
 const MAX_BYTES: usize = 8192;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests;
-
-/// Embedders restoring a process-memory snapshot must call this while requests are
-/// quiesced, before resuming work. Transcript restores create new sessions instead.
-/// This invalidates every workload cache, including acquisitions started earlier.
-pub fn invalidate_after_restore() {
-    GENERATION.fetch_add(1, Ordering::AcqRel);
-}
 
 /// Trusted deployment configuration, not input supplied by an MCP server or model.
 #[derive(Clone, Deserialize)]
@@ -65,7 +56,6 @@ struct Cached {
     value: Zeroizing<String>,
     acquired: SystemTime,
     refresh_at: SystemTime,
-    generation: u64,
 }
 
 /// One resource and one credential source per cache. No refresh tokens or fallback.
@@ -105,10 +95,8 @@ impl Session {
 
     async fn acquire(&self) -> Result<String, String> {
         let mut cached = self.cached.lock().await;
-        let generation = GENERATION.load(Ordering::Acquire);
         let now = SystemTime::now();
         if let Some(token) = cached.as_ref()
-            && token.generation == generation
             && now >= token.acquired
             && now < token.refresh_at
         {
@@ -153,8 +141,9 @@ impl Session {
         let refresh_at = started
             .checked_add(usable)
             .ok_or("invalid workload token expiry")?;
-        if GENERATION.load(Ordering::Acquire) != generation || SystemTime::now() >= refresh_at {
-            return Err("workload authentication invalidated or expired during exchange".into());
+        let completed = SystemTime::now();
+        if completed < started || completed >= refresh_at {
+            return Err("workload authentication expired during exchange".into());
         }
         let value = Zeroizing::new(token.access_token);
         let result = value.to_string();
@@ -162,7 +151,6 @@ impl Session {
             value,
             acquired: started,
             refresh_at,
-            generation,
         });
         Ok(result)
     }
@@ -277,3 +265,6 @@ async fn read_assertion(path: &std::path::Path) -> Result<Zeroizing<String>, Str
     }
     Ok(Zeroizing::new(value.to_string()))
 }
+
+#[cfg(test)]
+mod https_tests;

@@ -102,22 +102,21 @@ fn response_requires_expiry_and_bearer_fields() {
 }
 
 #[tokio::test]
-async fn expiry_and_restore_generation_reacquire_without_stale_fallback() {
+async fn expiry_and_clock_rollback_reacquire_without_stale_fallback() {
     for expired in [false, true] {
         let mut session = Session::new(config()).unwrap();
         let now = SystemTime::now();
         *session.cached.lock().await = Some(Cached {
             value: Zeroizing::new("must-not-escape".into()),
-            acquired: now - Duration::from_secs(60),
+            acquired: if expired {
+                now - Duration::from_secs(60)
+            } else {
+                now + Duration::from_secs(60)
+            },
             refresh_at: if expired {
                 now
             } else {
                 now + Duration::from_secs(60)
-            },
-            generation: if expired {
-                GENERATION.load(Ordering::Acquire)
-            } else {
-                GENERATION.load(Ordering::Acquire).wrapping_sub(1)
             },
         });
         // A failed discovery must not expose a stale cache. This invalid URL
@@ -132,14 +131,13 @@ async fn expiry_and_restore_generation_reacquire_without_stale_fallback() {
 async fn caches_are_resource_local_and_invalidatable() {
     let first = Session::new(config()).unwrap();
     let mut second_config = config();
-    second_config.resource = "https://resource.example/inference".into();
+    second_config.resource = "https://resource.example/other-mcp".into();
     let second = Session::new(second_config).unwrap();
     let now = SystemTime::now();
     *first.cached.lock().await = Some(Cached {
         value: Zeroizing::new("first-resource-token".into()),
         acquired: now,
         refresh_at: now + Duration::from_secs(60),
-        generation: GENERATION.load(Ordering::Acquire),
     });
     assert!(second.cached.lock().await.is_none());
     let (a, b) = tokio::join!(first.token(), first.token());
