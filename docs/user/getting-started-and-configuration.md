@@ -114,6 +114,12 @@ kit prompt --provider openrouter \
 
 Kit uses the CLI or TOML `model`; `OPENROUTER_MODEL` does not override that selection. The adapter also accepts `OPENROUTER_BASE_URL`, `OPENROUTER_APP_NAME`, `OPENROUTER_SITE_URL`, `OPENROUTER_MAX_COMPLETION_TOKENS`, `OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT`. Its model-catalog lookup for the selected model's context length is best-effort, so a catalog failure does not by itself prevent normal provider usage.
 
+### Workload identity for inference
+
+For deployed workloads with projected identity tokens, use
+[workload identity for inference](workload-inference.md) instead of local API-key
+or browser authentication.
+
 ### TypeSafe API key
 
 TypeSafe authentication is BYOK (bring your own key). Create a key at
