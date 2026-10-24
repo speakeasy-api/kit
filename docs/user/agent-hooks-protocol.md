@@ -49,6 +49,24 @@ hooks that you trust with those values.
 Hook backends run local processes or receive session content. Review both files
 before you run Kit in a project you do not trust.
 
+## Use server-provided subscriptions
+
+Omit a backend's `subscriptions` field to let it supply subscriptions through
+`hooks/configuration`. Kit resolves discovery before deciding whether to buffer
+model output or disable speculative compaction. Explicit `subscriptions`,
+including an empty array, bypass discovery.
+
+Kit trusts configured hook backends to supply upload settings, including upload
+destinations, credential bindings, and forwarding of configured backend headers.
+Only configure backends you trust with the selected content and credentials.
+Server-provided subscriptions cannot expand the event or effect authority Kit
+grants in the table below.
+
+If a backend's discovery request fails or its response is invalid, the SDK skips
+that backend for this hook instance. Check the backend's availability and
+`hooks/configuration` response, or configure explicit subscriptions when you
+need client-defined routing and failure policies.
+
 ## Events
 
 | Event | Where Kit emits it | Hook authority |

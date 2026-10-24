@@ -186,6 +186,10 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
             let inner = self.inner.begin_turn(request, cancellation).await?;
             return Ok(HookedTurn::live(inner, None));
         };
+        // Resolve server subscriptions before deciding whether previews are safe.
+        hooks.sdk.initialize().await.map_err(|error| {
+            LoopError::InvalidState(format!("hook configuration discovery failed: {error}"))
+        })?;
         hooks
             .drain_turn_events(&request.session_id.to_string())
             .await;
@@ -411,7 +415,7 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
             if self
                 .call
                 .as_ref()
-                .is_some_and(|call| call.hooks.intercepts_model_response)
+                .is_some_and(|call| call.hooks.intercepts_model_response())
                 && matches!(
                     event,
                     Ok(Some(ModelTurnEvent::Delta(_) | ModelTurnEvent::ToolCall(_)))
@@ -524,7 +528,7 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
             Err(error) => call.failed(error, self.latest_usage.as_ref()).await,
             _ => {}
         }
-        if call.hooks.intercepts_model_response
+        if call.hooks.intercepts_model_response()
             && let Ok(Some(ModelTurnEvent::Finished(result))) = event
         {
             // agentkit-loop gates tool execution on a ToolCall event, not only

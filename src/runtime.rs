@@ -771,18 +771,17 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    fn compactor(
+    async fn compactor(
         &self,
         adapter: SelectableAdapter,
         persistence: Option<crate::session::SessionObserver>,
         owner_session: String,
     ) -> Result<crate::compaction::AutomaticCompactor, String> {
-        let prepare = self.base_depth == 0
-            && persistence.is_some()
-            && !self
-                .hooks
-                .as_ref()
-                .is_some_and(|hooks| hooks.intercepts_compaction());
+        let hooks_compaction = match &self.hooks {
+            Some(hooks) => hooks.intercepts_compaction().await?,
+            None => false,
+        };
+        let prepare = self.base_depth == 0 && persistence.is_some() && !hooks_compaction;
         let compactor_session = if persistence.is_some() {
             format!("compaction-{}", crate::session::new_id())
         } else {
@@ -1542,6 +1541,7 @@ impl Runtime {
                     Some(opened.observer.clone()),
                     session_id.clone(),
                 )
+                .await
                 .map_err(|error| {
                     record_runtime_failure(
                         &session_id,
@@ -1742,6 +1742,7 @@ impl Runtime {
         let recorded = crate::session::TransientTranscript::new(transcript.clone());
         let compactor = self
             .compactor(self.adapter.clone(), None, session.clone())
+            .await
             .map_err(LoopError::InvalidState)?
             .mirroring(recorded.clone());
         let subagents = self
@@ -1966,6 +1967,7 @@ impl Runtime {
                 Some(opened.observer.clone()),
                 session_id.clone(),
             )
+            .await
             .map_err(AcpRuntimeError::Loop)?;
         let prompt_cache_key = crate::tools::subagent::prompt_cache_key(&session_id);
         let subagents = self
