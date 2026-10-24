@@ -40,7 +40,6 @@ const CONFIG_FILE: &str = "hooks.json";
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
     sdk: Arc<agenthooksprotocol::Hooks>,
-    intercepts_model_response: bool,
     injections: injection::Injections,
     messages: messages::Routes,
     turn_events: turn::TurnQueues,
@@ -49,9 +48,17 @@ pub struct Hooks {
 
 impl Hooks {
     /// Compaction hooks have observable effects and cannot run speculatively.
-    pub(crate) fn intercepts_compaction(&self) -> bool {
-        self.sdk.subscribes(EventType::ContextCompactBefore)
-            || self.sdk.subscribes(EventType::ContextCompactAfter)
+    pub(crate) async fn intercepts_compaction(&self) -> Result<bool, String> {
+        self.sdk
+            .initialize()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(self.sdk.subscribes(EventType::ContextCompactBefore)
+            || self.sdk.subscribes(EventType::ContextCompactAfter))
+    }
+
+    fn intercepts_model_response(&self) -> bool {
+        self.sdk.intercepts(EventType::ModelResponseAfter)
     }
 
     /// Loads `~/.agents/hooks.json`, then `<root>/.agents/hooks.json`. Project
@@ -82,10 +89,8 @@ impl Hooks {
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
-        let intercepts_model_response = sdk.intercepts(EventType::ModelResponseAfter);
         Ok(Self {
             sdk: Arc::new(sdk),
-            intercepts_model_response,
             injections: injection::Injections::default(),
             messages: messages::Routes::default(),
             turn_events: turn::TurnQueues::default(),
@@ -341,6 +346,10 @@ fn options() -> Result<HooksOptions, String> {
         capabilities,
     );
     options.backend.inherit_environment = true;
+    // A user-configured hook is trusted to receive event bodies and choose its
+    // upload destinations, credential bindings, and header forwarding policy.
+    // Discovery does not expand Kit's host event/effect grants.
+    options.authorize_configuration = Some(Arc::new(|_, _| Ok(true)));
     Ok(options)
 }
 

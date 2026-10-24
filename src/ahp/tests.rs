@@ -656,14 +656,14 @@ async fn tool_after_empty_replacement_removes_output() {
 #[test]
 fn only_response_interceptors_require_buffering() {
     let (response_hooks, _) = hooks(vec![intercept(&["model.response.after"])]);
-    assert!(response_hooks.intercepts_model_response);
+    assert!(response_hooks.intercepts_model_response());
     for subscriptions in [
         vec![observe(&["model.response.after"])],
         vec![intercept(&["tool.before"])],
         vec![intercept(&["model.request.before"])],
     ] {
         let (hooks, _) = hooks(subscriptions);
-        assert!(!hooks.intercepts_model_response);
+        assert!(!hooks.intercepts_model_response());
     }
 }
 
@@ -1279,6 +1279,10 @@ impl ModelSession for ToolRoundModel {
         let mut assistant = Item::text(ItemKind::Assistant, "");
         assistant.parts = vec![Part::ToolCall(call.clone())];
         if self.0 {
+            events.push_back(ModelTurnEvent::Delta(agentkit_core::Delta::AppendText {
+                part_id: agentkit_core::PartId::new("preview"),
+                chunk: "unapproved preview".into(),
+            }));
             // A superseded provider response is retried within this model turn.
             events.push_back(ModelTurnEvent::ToolCall(agentkit_core::ToolCallPart::new(
                 "discarded-call",
@@ -2049,4 +2053,100 @@ async fn child_identity_is_session_local_through_the_hook_lifecycle() {
             }
         }
     }
+}
+
+/// A real HTTP backend whose subscriptions are absent from client registration.
+async fn discovered_http_hooks(
+    subscriptions: Vec<Value>,
+) -> (Arc<Hooks>, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, extract::State, routing::post};
+    let app = Router::new().route("/hooks", post(
+        |State(subscriptions): State<Vec<Value>>, Json(request): Json<Value>| async move {
+            let result = if request["method"] == "hooks/configuration" {
+                json!({"protocolVersion":"draft", "configuration":{"subscriptions":subscriptions}})
+            } else {
+                json!({"protocolVersion":"draft", "effects":[
+                    {"type":"modify", "target":"response", "operation":"replace", "value":[]}
+                ]})
+            };
+            Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
+        }
+    )).with_state(subscriptions);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/hooks", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let registration = serde_json::from_value(json!({
+        "protocolVersion":"draft", "hooks":[{
+            "id":"dev.kit.discovery", "transport":{"type":"http", "url":endpoint}
+        }]
+    }))
+    .unwrap();
+    let mut options = options().unwrap();
+    options.backend.allow_loopback_http = true;
+    (Arc::new(Hooks::new(registration, options).unwrap()), server)
+}
+
+#[tokio::test]
+async fn discovered_compaction_subscriptions_disable_speculative_preparation() {
+    for event in ["context.compact.before", "context.compact.after"] {
+        let (hooks, server) = discovered_http_hooks(vec![observe(&[event])]).await;
+        assert!(hooks.intercepts_compaction().await.unwrap());
+        hooks.sdk.shutdown().await.unwrap();
+        server.abort();
+    }
+    let (hooks, server) = discovered_http_hooks(vec![observe(&["model.response.after"])]).await;
+    assert!(!hooks.intercepts_compaction().await.unwrap());
+    hooks.sdk.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn discovered_response_interceptor_with_upload_config_withholds_previews_and_tool_calls() {
+    let mut subscription = intercept(&["model.response.after"]);
+    // No upload is needed for this small response, but admitting the declaration
+    // still requires explicit host authorization of the server's upload policy.
+    subscription["upload"] = json!({
+        "endpoint":"https://uploads.example.test/content", "timeoutMs":1000, "maxBytes":1024
+    });
+    let (hooks, server) = discovered_http_hooks(vec![subscription]).await;
+    let adapter = HookedAdapter::new(
+        ToolRoundModel(true),
+        Some(hooks.clone()),
+        SessionStartInputTrigger::Startup,
+    );
+    let mut session = adapter
+        .start_session(SessionConfig::new("discovered"))
+        .await
+        .unwrap();
+    let mut turn = session
+        .begin_turn(
+            TurnRequest {
+                session_id: SessionId::new("discovered"),
+                turn_id: TurnId::new("turn"),
+                transcript: vec![],
+                available_tools: vec![],
+                cache: None,
+                metadata: MetadataMap::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let mut finished = false;
+    while let Some(event) = turn.next_event(None).await.unwrap() {
+        match event {
+            ModelTurnEvent::Delta(_) | ModelTurnEvent::ToolCall(_) => {
+                panic!("unapproved preview escaped")
+            }
+            ModelTurnEvent::Finished(result) => {
+                assert!(result.output_items.is_empty());
+                assert_eq!(result.finish_reason, FinishReason::Completed);
+                finished = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(finished);
+    hooks.sdk.shutdown().await.unwrap();
+    server.abort();
 }
