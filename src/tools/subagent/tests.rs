@@ -2352,6 +2352,51 @@ async fn shutdown_closes_live_children_without_deleting_history() {
 }
 
 #[tokio::test]
+async fn shutdown_closes_children_concurrently_and_keeps_cleanup_owned() {
+    for cancel in [false, true] {
+        let scenario = MockAcpScenario::new(ScenarioOptions {
+            gate_close: true,
+            ..Default::default()
+        });
+        let first = scenario.create("first").await;
+        let second = scenario.create("second").await;
+        let manager = scenario.manager.clone();
+        let shutdown = tokio::spawn(async move { manager.shutdown().await });
+        // Neither close can finish until both requests have reached the backend.
+        // The timeout is only a deadlock watchdog, not an elapsed-time assertion.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let closes = logged_requests(&scenario.requests)
+                    .iter()
+                    .filter(|request| matches!(request, LoggedRequest::Close { .. }))
+                    .count();
+                if closes == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both children must receive close before either responds");
+        assert!(scenario.manager.lookup(&first).is_err());
+        assert!(scenario.manager.lookup(&second).is_err());
+        assert_eq!(
+            scenario.manager.capacity.available_permits(),
+            MAX_LIVE_SUBAGENTS - 2
+        );
+        if cancel {
+            shutdown.abort();
+            assert!(shutdown.await.unwrap_err().is_cancelled());
+            MockAcpScenario::release(&scenario.close_release);
+        } else {
+            MockAcpScenario::release(&scenario.close_release);
+            shutdown.await.unwrap().unwrap();
+        }
+        wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+    }
+}
+
+#[tokio::test]
 async fn shutdown_rejects_unsettled_startup_and_prevents_late_installation() {
     let scenario = MockAcpScenario::new(ScenarioOptions {
         gate_new: true,
