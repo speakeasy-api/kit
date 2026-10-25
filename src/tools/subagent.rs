@@ -1572,6 +1572,7 @@ impl Subagents {
         // retirement transitions reject late startup installation and preserve
         // permits until a child that failed to close actually exits.
         let mut failure = None;
+        let mut cleanups = Vec::new();
         for (id, state) in states {
             // Select the child and retire its state in one transition. Otherwise
             // startup could install between the empty-child check and retirement.
@@ -1629,14 +1630,19 @@ impl Subagents {
                 self.emit_event(event);
             }
             if let Some(cleanup) = cleanup {
-                let result = cleanup.await.unwrap_or_else(|error| {
-                    Err(ChildError::Failed(format!(
-                        "subagent shutdown cleanup task failed: {error}"
-                    )))
-                });
-                if let Err(error) = result {
-                    failure.get_or_insert(error);
-                }
+                cleanups.push(cleanup);
+            }
+        }
+        // All owned cleanup tasks run concurrently before waiting for results.
+        // Dropping these handles detaches, rather than cancels, child cleanup.
+        for cleanup in cleanups {
+            let result = cleanup.await.unwrap_or_else(|error| {
+                Err(ChildError::Failed(format!(
+                    "subagent shutdown cleanup task failed: {error}"
+                )))
+            });
+            if let Err(error) = result {
+                failure.get_or_insert(error);
             }
         }
         failure.map_or(Ok(()), Err)
