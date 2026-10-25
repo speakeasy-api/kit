@@ -573,7 +573,7 @@ fn resolve_blocking(
                 plugin.manifest().name
             ));
         }
-        validate_plugin_diagnostics(alias, &plugin)?;
+        log_plugin_diagnostics(alias, &plugin);
         if !plugin.mcp_servers().is_empty() {
             let data_dir = data_root.join(&plugin.manifest().name);
             fs::create_dir_all(&data_dir).map_err(|error| {
@@ -622,7 +622,6 @@ fn resolve_blocking(
                 root.display()
             )
         })?;
-        validate_plugin_diagnostics(&alias, &plugin)?;
         if plugin_semantic_key(&plugin) != expected {
             return Err(format!(
                 "plugin {alias:?} changed while its generation was being staged"
@@ -1321,7 +1320,6 @@ fn validate_skill_snapshot(
                 package.display()
             )
         })?;
-        validate_plugin_diagnostics(&index.to_string(), &plugin)?;
         if !plugin.skill_directories().is_empty() {
             package_roots.push(package.clone());
         }
@@ -1404,22 +1402,19 @@ fn require_skill_directories(directories: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_plugin_diagnostics(alias: &str, plugin: &AgentPlugin) -> Result<(), String> {
+fn log_plugin_diagnostics(alias: &str, plugin: &AgentPlugin) {
     for diagnostic in plugin.diagnostics() {
         if matches!(diagnostic.kind, PluginDiagnosticKind::UnknownManifestField) {
             continue;
         }
-        let path = diagnostic
-            .path
-            .as_deref()
-            .map(|path| format!(" at {}", path.display()))
-            .unwrap_or_default();
-        return Err(format!(
-            "plugin {alias} ({:?}){path}: {}",
-            diagnostic.kind, diagnostic.message
-        ));
+        tracing::warn!(
+            plugin = alias,
+            kind = ?diagnostic.kind,
+            path = ?diagnostic.path,
+            "{}",
+            diagnostic.message
+        );
     }
-    Ok(())
 }
 
 fn validate_alias(alias: &str) -> Result<(), String> {
@@ -4131,6 +4126,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nonconforming_skill_is_skipped_without_failing_plugin() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        let valid = package.join("skills/live-skill");
+        let invalid = package.join("skills/broken-skill");
+        fs::create_dir_all(&valid).unwrap();
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            valid.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Live skill.\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            invalid.join("SKILL.md"),
+            "---\nname: other-name\ndescription: Mismatched.\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+
+        let staged = runtime.stage().await.unwrap();
+
+        assert_eq!(staged.resolved.skills.len(), 1);
+        assert_eq!(staged.resolved.skills[0].body, "body");
+        assert_eq!(staged.resolved.skill_directories.len(), 1);
+        assert!(staged.resolved.skill_directories[0].ends_with("skills/live-skill"));
+    }
+
+    #[tokio::test]
     async fn live_runtime_stages_add_remove_and_retains_last_valid_generation() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("config.toml");
@@ -4176,11 +4215,7 @@ mod tests {
         let first_skill = runtime.snapshot().skill_directories[0].join("SKILL.md");
         assert!(fs::read_to_string(&first_skill).unwrap().contains("body"));
 
-        write!(
-            fs::File::create(package.join("mcp.json")).unwrap(),
-            "{{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json\",\"mcpServers\":{{}},\"extra\":true}}"
-        )
-        .unwrap();
+        fs::write(package.join("plugin.json"), "{").unwrap();
         fs::write(
             skill.join("SKILL.md"),
             "---\nname: live-skill\ndescription: Changed skill.\n---\nchanged body\n",
@@ -4197,7 +4232,7 @@ mod tests {
                 .contains("changed body")
         );
 
-        fs::remove_file(package.join("mcp.json")).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
         mcp.refresh().await.unwrap();
         assert_ne!(
             runtime.snapshot().skill_directories[0].join("SKILL.md"),
