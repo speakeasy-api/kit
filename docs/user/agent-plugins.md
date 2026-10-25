@@ -51,7 +51,7 @@ Kit does not run repository hooks or filters, fetch Git LFS content, or initiali
 
 ## Plugin MCP servers
 
-Kit supports the Agent Plugin `stdio` and `streamable-http` transports. The deprecated `sse` transport is not supported. Kit rejects a plugin generation containing an SSE declaration instead of publishing only part of that generation.
+Kit supports the Agent Plugin `stdio` and `streamable-http` transports. The deprecated `sse` transport is not supported. Kit skips an SSE declaration, or a declaration with an unsupported `cwd`, a `./` command outside the plugin root, or an invalid header, and still loads the plugin's other servers.
 
 For `stdio`, Kit materializes the validated portable declaration as follows:
 
@@ -69,7 +69,7 @@ The location follows the loaded Kit configuration directory, so a config loaded 
 
 Invoke plugin MCP tools through Kit's `tool` dispatcher, using names returned by `tool_search`. Exact `mcp_*` names are not direct compose callables.
 
-Supported MCP server names must be unique across plugins. If two plugins declare the same supported server name, startup fails and identifies both aliases. A same-named entry in configured, project-local, or command-line MCP JSON intentionally overrides the plugin server. Kit live-reloads every named file before `tool_search` and `auth`; changing an override replaces it, and removing it restores the next lower configured or plugin server without restarting Kit. An invalid file edit fails the current call and preserves the last valid combined configuration.
+If two plugins declare the same MCP server name, the plugin with the lexically first alias keeps it and later declarations are skipped. A skipped invalid declaration still reserves its name, so a later plugin cannot take the server over. A same-named entry in configured, project-local, or command-line MCP JSON intentionally overrides the plugin server. Kit live-reloads every named file before `tool_search` and `auth`; changing an override replaces it, and removing it restores the next lower configured or plugin server without restarting Kit. An invalid file edit fails the current call and preserves the last valid combined configuration.
 
 ## Cache and live reload behavior
 
@@ -91,7 +91,7 @@ The cache is local state protected by the permissions of `~/.kit`; it is not a s
 
 Resolution or package-validation failures stop startup. In a live session, Kit rereads the exact Kit config file used at startup and re-resolves path, archive, and Git sources before `tool_search`, `auth`, and each ACP v1 or v2 user-prompt boundary. Added, changed, and removed plugin MCP servers are settled before `tool_search` returns. Plugin skill additions, skill-content or resource-inventory changes, and removals are visible to the live `skill` tool; ACP sessions announce catalog changes at the next user-prompt boundary. Reload does not create an unsolicited model turn.
 
-If a live reload fails, fix the reported configuration or package error and retry the triggering tool call or prompt. The previous plugin MCP servers and skills remain active until a complete valid replacement is available. A package with a skipped or disabled skill or MCP component can reject the entire reload; do not assume the remaining components were installed.
+If a live reload fails, fix the reported configuration or package error and retry the triggering tool call or prompt. The previous plugin MCP servers and skills remain active until a complete valid replacement is available. Invalid skills, skills directories, `mcp.json` files, and MCP server declarations are skipped individually while the rest of the package loads. Package-validation failures, such as an invalid `plugin.json`, and plugin files or data directories that are not available on disk reject the reload and keep the previous generation.
 
 Skill collision precedence remains project skills, then user skills, then plugins in lexical alias order. Only immediate valid plugin skill directories approved by the package validator are exposed; nested `SKILL.md` files are not recursively added. Skill instructions and resource paths come from a read-only snapshot, so editing a package does not change an already loaded skill in place.
 

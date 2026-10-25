@@ -35,7 +35,7 @@ use agentkit_mcp::{
     McpServerConfig, McpServerId, McpServerManager, McpServerOptions, McpTransportBinding,
     StdioTransportConfig, StreamableHttpTransportConfig,
 };
-use agentkit_plugins::PluginMcpTransport;
+use agentkit_plugins::{PluginMcpServer, PluginMcpTransport};
 use agentkit_tools_core::{
     BasicToolExecutor, CatalogReader, Tool, ToolContext, ToolError, ToolExecutionOutcome,
     ToolExecutionScope, ToolExecutor, ToolName, ToolRequest, ToolResult, ToolSource, ToolSpec,
@@ -1309,38 +1309,64 @@ fn expand_plugin_value(value: &str, root: &str, data: &str) -> String {
     output
 }
 
-fn contained_plugin_path(path: PathBuf, root: &Path, context: &str) -> Result<PathBuf, String> {
+enum PluginServerError {
+    Invalid(String),
+    Unavailable(String),
+}
+
+impl PluginServerError {
+    fn from_io(error: &std::io::Error, message: String) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotADirectory => Self::Invalid(message),
+            _ => Self::Unavailable(message),
+        }
+    }
+}
+
+fn contained_plugin_path(
+    path: PathBuf,
+    root: &Path,
+    context: &str,
+) -> Result<PathBuf, PluginServerError> {
     let mut ancestor = path.clone();
     let mut suffix = Vec::new();
     loop {
         match crate::resilient_fs::symlink_metadata(&ancestor) {
             Ok(_) => break,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = ancestor
-                    .file_name()
-                    .ok_or_else(|| format!("plugin MCP {context} path has no existing ancestor"))?;
+                let component = ancestor.file_name().ok_or_else(|| {
+                    PluginServerError::Invalid(format!(
+                        "plugin MCP {context} path has no existing ancestor"
+                    ))
+                })?;
                 suffix.push(component.to_os_string());
                 ancestor.pop();
             }
             Err(error) => {
-                return Err(format!(
-                    "could not inspect plugin MCP {context} path {}: {error}",
-                    ancestor.display()
+                return Err(PluginServerError::from_io(
+                    &error,
+                    format!(
+                        "could not inspect plugin MCP {context} path {}: {error}",
+                        ancestor.display()
+                    ),
                 ));
             }
         }
     }
     let mut resolved = crate::resilient_fs::canonicalize(&ancestor).map_err(|error| {
-        format!(
-            "could not resolve plugin MCP {context} path {}: {error}",
-            ancestor.display()
+        PluginServerError::from_io(
+            &error,
+            format!(
+                "could not resolve plugin MCP {context} path {}: {error}",
+                ancestor.display()
+            ),
         )
     })?;
     if !resolved.starts_with(root) {
-        return Err(format!(
+        return Err(PluginServerError::Invalid(format!(
             "plugin MCP {context} path resolves outside {}",
             root.display()
-        ));
+        )));
     }
     for component in suffix.into_iter().rev() {
         resolved.push(component);
@@ -1358,150 +1384,179 @@ fn prepare_plugins(
         let root = plugin_text(&plugin.root, "root", &plugin.alias)?;
         let data = plugin_text(&plugin.data_dir, "data", &plugin.alias)?;
         for server in &plugin.servers {
-            if let Some(owner) = owners.insert(server.name.clone(), plugin.alias.clone()) {
-                return Err(format!(
-                    "MCP server {:?} is declared by both plugins {owner:?} and {:?}",
-                    server.name, plugin.alias
-                ));
+            if let Some(owner) = owners.get(&server.name) {
+                tracing::warn!(
+                    server = %server.name,
+                    plugin = %plugin.alias,
+                    owner = %owner,
+                    "skipping plugin MCP server already declared by another plugin"
+                );
+                continue;
             }
-            let description = format!("{} plugin MCP server", plugin.manifest_name);
-            let (binding, url, static_authorization) = match &server.transport {
-                PluginMcpTransport::Stdio {
-                    command,
-                    args,
-                    env,
-                    cwd,
-                } => {
-                    let command = if let Some(command) = command.strip_prefix("./") {
-                        let command = contained_plugin_path(
-                            plugin.root.join(command),
-                            &plugin.root,
-                            "command",
-                        )?;
-                        plugin_text(&command, "command", &plugin.alias)?
-                    } else {
-                        command.clone()
-                    };
-                    let mut transport = StdioTransportConfig::new(command);
-                    transport.args = args
-                        .iter()
-                        .map(|value| expand_plugin_value(value, &root, &data))
-                        .collect();
-                    transport.env = env
-                        .iter()
-                        .map(|(name, value)| {
-                            (name.clone(), expand_plugin_value(value, &root, &data))
-                        })
-                        .chain([
-                            ("PLUGIN_ROOT".to_owned(), root.clone()),
-                            ("PLUGIN_DATA".to_owned(), data.clone()),
-                        ])
-                        .collect();
-                    transport.cwd = match cwd.as_deref() {
-                        Some("${PLUGIN_ROOT}") => Some(plugin.root.clone()),
-                        Some("${PLUGIN_DATA}") => Some(plugin.data_dir.clone()),
-                        Some(cwd) if cwd.starts_with("${PLUGIN_ROOT}/") => {
-                            Some(contained_plugin_path(
-                                plugin.root.join(&cwd["${PLUGIN_ROOT}/".len()..]),
-                                &plugin.root,
-                                "cwd",
-                            )?)
-                        }
-                        Some(cwd) if cwd.starts_with("${PLUGIN_DATA}/") => {
-                            let directory = contained_plugin_path(
-                                plugin.data_dir.join(&cwd["${PLUGIN_DATA}/".len()..]),
-                                &plugin.data_dir,
-                                "data cwd",
-                            )?;
-                            crate::resilient_fs::create_dir_all(&directory).map_err(|error| {
-                                format!(
-                                    "could not create cwd for plugin {:?} MCP server {:?} at {}: {error}",
-                                    plugin.alias, server.name, directory.display()
-                                )
-                            })?;
-                            Some(crate::resilient_fs::canonicalize(&directory).map_err(|error| {
-                                format!(
-                                    "could not resolve cwd for plugin {:?} MCP server {:?}: {error}",
-                                    plugin.alias, server.name
-                                )
-                            })?)
-                        }
-                        Some(cwd) if cwd.starts_with("./") => Some(contained_plugin_path(
-                            plugin.root.join(&cwd[2..]),
-                            &plugin.root,
-                            "cwd",
-                        )?),
-                        Some(cwd) => {
-                            return Err(format!(
-                                "plugin {:?} MCP server {:?} has unsupported cwd {cwd:?}",
-                                plugin.alias, server.name
-                            ));
-                        }
-                        None => None,
-                    };
-                    crate::resilient_fs::global()
-                        .require_disk(&plugin.root)
-                        .map_err(|error| {
-                            format!("plugin MCP files are not available on disk: {error}")
-                        })?;
-                    crate::resilient_fs::global()
-                        .require_disk(&plugin.data_dir)
-                        .map_err(|error| {
-                            format!("plugin MCP data directory is not available on disk: {error}")
-                        })?;
-                    (McpTransportBinding::Stdio(transport), None, false)
+            owners.insert(server.name.clone(), plugin.alias.clone());
+            match prepare_plugin_server(plugin, server, &root, &data) {
+                Ok(server_prepared) => {
+                    entries.insert(
+                        server.name.clone(),
+                        server_prepared.record.fingerprint.clone(),
+                    );
+                    prepared.insert(server.name.clone(), server_prepared);
                 }
-                PluginMcpTransport::StreamableHttp { url, headers } => {
-                    let mut transport = StreamableHttpTransportConfig::new(url.clone());
-                    for (name, value) in headers {
-                        transport = transport
-                            .with_header(name.as_str(), value.as_str())
-                            .map_err(|error| {
-                                format!("invalid plugin MCP config for {}: {error}", server.name)
-                            })?;
-                    }
-                    (
-                        McpTransportBinding::StreamableHttp(transport),
-                        Some(url.clone()),
-                        headers
-                            .keys()
-                            .any(|name| name.eq_ignore_ascii_case("authorization")),
-                    )
-                }
-                PluginMcpTransport::Sse { .. } => {
-                    return Err(format!(
-                        "plugin {}: MCP server {:?} uses unsupported SSE transport",
-                        plugin.alias, server.name
-                    ));
-                }
-            };
-            let fingerprint = format!(
-                "plugin:v2:{:?}:{:?}:{:?}:{:?}:{binding:?}:{url:?}:{static_authorization}",
-                plugin.alias, plugin.manifest_name, plugin.root, plugin.data_dir
-            )
-            .into_bytes();
-            entries.insert(server.name.clone(), fingerprint.clone());
-            prepared.insert(
-                server.name.clone(),
-                PreparedServer {
-                    config: McpServerConfig::new(server.name.clone(), binding),
-                    record: ServerRecord {
-                        description,
-                        url,
-                        oauth: None,
-                        static_authorization,
-                        fingerprint,
-                        plugin_owned: true,
-                        catalog_stale: false,
-                        catalog_error: None,
-                        subscription: None,
-                        status: ServerStatus::Uninitialized,
-                    },
-                },
-            );
+                Err(PluginServerError::Invalid(error)) => tracing::warn!(
+                    server = %server.name,
+                    plugin = %plugin.alias,
+                    %error,
+                    "skipping plugin MCP server"
+                ),
+                Err(PluginServerError::Unavailable(error)) => return Err(error),
+            }
         }
     }
     Ok((prepared, entries))
+}
+
+fn prepare_plugin_server(
+    plugin: &crate::plugins::ResolvedPluginMcp,
+    server: &PluginMcpServer,
+    root: &str,
+    data: &str,
+) -> Result<PreparedServer, PluginServerError> {
+    let description = format!("{} plugin MCP server", plugin.manifest_name);
+    let (binding, url, static_authorization) = match &server.transport {
+        PluginMcpTransport::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
+            let command = if let Some(command) = command.strip_prefix("./") {
+                let command =
+                    contained_plugin_path(plugin.root.join(command), &plugin.root, "command")?;
+                plugin_text(&command, "command", &plugin.alias)
+                    .map_err(PluginServerError::Invalid)?
+            } else {
+                command.clone()
+            };
+            let mut transport = StdioTransportConfig::new(command);
+            transport.args = args
+                .iter()
+                .map(|value| expand_plugin_value(value, root, data))
+                .collect();
+            transport.env = env
+                .iter()
+                .map(|(name, value)| (name.clone(), expand_plugin_value(value, root, data)))
+                .chain([
+                    ("PLUGIN_ROOT".to_owned(), root.to_owned()),
+                    ("PLUGIN_DATA".to_owned(), data.to_owned()),
+                ])
+                .collect();
+            transport.cwd = match cwd.as_deref() {
+                Some("${PLUGIN_ROOT}") => Some(plugin.root.clone()),
+                Some("${PLUGIN_DATA}") => Some(plugin.data_dir.clone()),
+                Some(cwd) if cwd.starts_with("${PLUGIN_ROOT}/") => Some(contained_plugin_path(
+                    plugin.root.join(&cwd["${PLUGIN_ROOT}/".len()..]),
+                    &plugin.root,
+                    "cwd",
+                )?),
+                Some(cwd) if cwd.starts_with("${PLUGIN_DATA}/") => {
+                    let directory = contained_plugin_path(
+                        plugin.data_dir.join(&cwd["${PLUGIN_DATA}/".len()..]),
+                        &plugin.data_dir,
+                        "data cwd",
+                    )?;
+                    crate::resilient_fs::create_dir_all(&directory).map_err(|error| {
+                        PluginServerError::Unavailable(format!(
+                            "could not create cwd for plugin {:?} MCP server {:?} at {}: {error}",
+                            plugin.alias,
+                            server.name,
+                            directory.display()
+                        ))
+                    })?;
+                    Some(
+                        crate::resilient_fs::canonicalize(&directory).map_err(|error| {
+                            PluginServerError::Unavailable(format!(
+                                "could not resolve cwd for plugin {:?} MCP server {:?}: {error}",
+                                plugin.alias, server.name
+                            ))
+                        })?,
+                    )
+                }
+                Some(cwd) if cwd.starts_with("./") => Some(contained_plugin_path(
+                    plugin.root.join(&cwd[2..]),
+                    &plugin.root,
+                    "cwd",
+                )?),
+                Some(cwd) => {
+                    return Err(PluginServerError::Invalid(format!(
+                        "plugin {:?} MCP server {:?} has unsupported cwd {cwd:?}",
+                        plugin.alias, server.name
+                    )));
+                }
+                None => None,
+            };
+            crate::resilient_fs::global()
+                .require_disk(&plugin.root)
+                .map_err(|error| {
+                    PluginServerError::Unavailable(format!(
+                        "plugin MCP files are not available on disk: {error}"
+                    ))
+                })?;
+            crate::resilient_fs::global()
+                .require_disk(&plugin.data_dir)
+                .map_err(|error| {
+                    PluginServerError::Unavailable(format!(
+                        "plugin MCP data directory is not available on disk: {error}"
+                    ))
+                })?;
+            (McpTransportBinding::Stdio(transport), None, false)
+        }
+        PluginMcpTransport::StreamableHttp { url, headers } => {
+            let mut transport = StreamableHttpTransportConfig::new(url.clone());
+            for (name, value) in headers {
+                transport = transport
+                    .with_header(name.as_str(), value.as_str())
+                    .map_err(|error| {
+                        PluginServerError::Invalid(format!(
+                            "invalid plugin MCP config for {}: {error}",
+                            server.name
+                        ))
+                    })?;
+            }
+            (
+                McpTransportBinding::StreamableHttp(transport),
+                Some(url.clone()),
+                headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization")),
+            )
+        }
+        PluginMcpTransport::Sse { .. } => {
+            return Err(PluginServerError::Invalid(format!(
+                "plugin {}: MCP server {:?} uses unsupported SSE transport",
+                plugin.alias, server.name
+            )));
+        }
+    };
+    let fingerprint = format!(
+        "plugin:v2:{:?}:{:?}:{:?}:{:?}:{binding:?}:{url:?}:{static_authorization}",
+        plugin.alias, plugin.manifest_name, plugin.root, plugin.data_dir
+    )
+    .into_bytes();
+    Ok(PreparedServer {
+        config: McpServerConfig::new(server.name.clone(), binding),
+        record: ServerRecord {
+            description,
+            url,
+            oauth: None,
+            static_authorization,
+            fingerprint,
+            plugin_owned: true,
+            catalog_stale: false,
+            catalog_error: None,
+            subscription: None,
+            status: ServerStatus::Uninitialized,
+        },
+    })
 }
 
 async fn read_source(source: &ConfigSource) -> Result<Option<Vec<u8>>, String> {
@@ -7248,20 +7303,31 @@ mod tests {
     }
 
     #[test]
-    fn plugin_mcp_rejects_sse_without_partial_publication() {
+    fn plugin_mcp_skips_sse_and_keeps_sibling_servers() {
         let directory = tempfile::tempdir().unwrap();
         let plugin = plugin(
             "tools",
             directory.path(),
-            vec![PluginMcpServer {
-                name: "legacy".into(),
-                transport: PluginMcpTransport::Sse {
-                    url: "https://example.com/sse".into(),
-                    headers: Default::default(),
+            vec![
+                PluginMcpServer {
+                    name: "legacy".into(),
+                    transport: PluginMcpTransport::Sse {
+                        url: "https://example.com/sse".into(),
+                        headers: Default::default(),
+                    },
                 },
-            }],
+                PluginMcpServer {
+                    name: "remote".into(),
+                    transport: PluginMcpTransport::StreamableHttp {
+                        url: "https://example.com/mcp".into(),
+                        headers: Default::default(),
+                    },
+                },
+            ],
         );
-        assert!(prepare_plugins(&[plugin]).is_err());
+        let (prepared, entries) = prepare_plugins(&[plugin]).unwrap();
+        assert_eq!(prepared.keys().collect::<Vec<_>>(), ["remote"]);
+        assert_eq!(entries.keys().collect::<Vec<_>>(), ["remote"]);
     }
 
     #[test]
@@ -7314,7 +7380,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_plugin_mcp_names_are_rejected() {
+    fn duplicate_plugin_mcp_names_keep_first_plugin() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let server = || PluginMcpServer {
@@ -7324,17 +7390,107 @@ mod tests {
                 headers: Default::default(),
             },
         };
-        let error = match prepare_plugins(&[
+        let (prepared, _) = prepare_plugins(&[
             plugin("first", first.path(), vec![server()]),
             plugin("second", second.path(), vec![server()]),
-        ]) {
-            Ok(_) => panic!("duplicate plugin MCP names were accepted"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("both plugins \"first\" and \"second\""),
-            "{error}"
+        ])
+        .unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            prepared["shared"].record.description,
+            "first-manifest plugin MCP server"
         );
+    }
+
+    #[test]
+    fn invalid_first_plugin_mcp_declaration_keeps_name_reserved() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (prepared, entries) = prepare_plugins(&[
+            plugin(
+                "first",
+                first.path(),
+                vec![PluginMcpServer {
+                    name: "shared".into(),
+                    transport: PluginMcpTransport::Stdio {
+                        command: "server".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                        cwd: Some("/elsewhere".into()),
+                    },
+                }],
+            ),
+            plugin(
+                "second",
+                second.path(),
+                vec![PluginMcpServer {
+                    name: "shared".into(),
+                    transport: PluginMcpTransport::StreamableHttp {
+                        url: "https://example.com/mcp".into(),
+                        headers: Default::default(),
+                    },
+                }],
+            ),
+        ])
+        .unwrap();
+        assert!(!prepared.contains_key("shared"));
+        assert!(!entries.contains_key("shared"));
+    }
+
+    #[test]
+    fn plugin_mcp_skips_file_ancestor_paths_and_keeps_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("bin"), "not a directory").unwrap();
+        let stdio = |name: &str, command: &str, cwd: Option<&str>| PluginMcpServer {
+            name: name.into(),
+            transport: PluginMcpTransport::Stdio {
+                command: command.into(),
+                args: Vec::new(),
+                env: Default::default(),
+                cwd: cwd.map(Into::into),
+            },
+        };
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![
+                stdio("bad-cwd", "server", Some("${PLUGIN_ROOT}/bin/work")),
+                stdio("bad-command", "./bin/run", None),
+                PluginMcpServer {
+                    name: "sibling".into(),
+                    transport: PluginMcpTransport::StreamableHttp {
+                        url: "https://example.com/mcp".into(),
+                        headers: Default::default(),
+                    },
+                },
+            ],
+        );
+        let (prepared, _) = prepare_plugins(&[plugin]).unwrap();
+        assert_eq!(prepared.keys().collect::<Vec<_>>(), ["sibling"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_plugin_mcp_data_cwd_fails_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "local".into(),
+                transport: PluginMcpTransport::Stdio {
+                    command: "server".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    cwd: Some("${PLUGIN_DATA}/work".into()),
+                },
+            }],
+        );
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plugin.data_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = prepare_plugins(std::slice::from_ref(&plugin));
+        std::fs::set_permissions(&plugin.data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
     }
 
     #[tokio::test]

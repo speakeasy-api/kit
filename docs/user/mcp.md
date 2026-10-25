@@ -76,7 +76,7 @@ Files are not the only installation route. An Agent Plugin can contribute MCP se
 
 ## Agent Plugin MCP configuration
 
-Validated Agent Plugins can contribute `stdio` and `streamable-http` servers. Deprecated `sse` servers are skipped with a stderr diagnostic naming the plugin and server. Supported server names must be unique across plugins; a collision stops startup and identifies both plugin aliases.
+Validated Agent Plugins can contribute `stdio` and `streamable-http` servers. Deprecated `sse` servers and other invalid plugin server declarations are skipped, and the plugin's remaining servers still load. When plugins collide on a server name, the lexically first plugin alias keeps the server and later declarations are skipped.
 
 Plugin stdio declarations use the canonical plugin package as `PLUGIN_ROOT` and a persistent `<Kit-config-directory>/plugin-data/<plugin-manifest-name>` directory as `PLUGIN_DATA`. Kit injects both environment variables and replaces every occurrence of `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` in stdio arguments and plugin-supplied environment values. A `./` command is resolved beneath the plugin root. An omitted `cwd` leaves the transport default unchanged and inherits Kit's working directory; `./...` is plugin-root-relative; and `${PLUGIN_ROOT}` or `${PLUGIN_DATA}`, optionally with a validated contained suffix, selects that directory. Kit creates missing data-rooted working directories. These stdio placeholders are not expanded in streamable HTTP URLs or headers.
 
@@ -382,8 +382,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 - **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional; creating it takes effect on the next `tool_search` or `auth` call.
 - **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
-- **`MCP server ... is declared by both plugins ...`**: rename one plugin server or disable one of the colliding plugins. Explicit-file entries may override plugin servers, but plugin/plugin collisions are errors.
-- **Plugin SSE skip diagnostic**: migrate that declaration to `streamable-http`; SSE is deprecated and Kit intentionally leaves that server unavailable.
+- **Plugin server missing**: an SSE declaration, an unsupported `cwd`, a `./` command outside the plugin root, or a name already declared by a lexically earlier plugin alias leaves that server unavailable. Migrate SSE to `streamable-http` and fix or rename the declaration.
 - **MCP server status `error`**: Kit tolerates initialization failures—startup continues and the per-server diagnostic is included in `tool_search`. Run a failing stdio command directly to check that it exists and speaks MCP over stdio; for HTTP, check DNS, HTTPS, proxy/firewall access, authentication settings, headers, and the endpoint URL. The connection timeout is 20 seconds.
 
 ### OAuth and authentication errors
