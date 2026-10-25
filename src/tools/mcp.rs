@@ -1314,6 +1314,15 @@ enum PluginServerError {
     Unavailable(String),
 }
 
+impl PluginServerError {
+    fn from_io(error: &std::io::Error, message: String) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotADirectory => Self::Invalid(message),
+            _ => Self::Unavailable(message),
+        }
+    }
+}
+
 fn contained_plugin_path(
     path: PathBuf,
     root: &Path,
@@ -1334,18 +1343,24 @@ fn contained_plugin_path(
                 ancestor.pop();
             }
             Err(error) => {
-                return Err(PluginServerError::Unavailable(format!(
-                    "could not inspect plugin MCP {context} path {}: {error}",
-                    ancestor.display()
-                )));
+                return Err(PluginServerError::from_io(
+                    &error,
+                    format!(
+                        "could not inspect plugin MCP {context} path {}: {error}",
+                        ancestor.display()
+                    ),
+                ));
             }
         }
     }
     let mut resolved = crate::resilient_fs::canonicalize(&ancestor).map_err(|error| {
-        PluginServerError::Unavailable(format!(
-            "could not resolve plugin MCP {context} path {}: {error}",
-            ancestor.display()
-        ))
+        PluginServerError::from_io(
+            &error,
+            format!(
+                "could not resolve plugin MCP {context} path {}: {error}",
+                ancestor.display()
+            ),
+        )
     })?;
     if !resolved.starts_with(root) {
         return Err(PluginServerError::Invalid(format!(
@@ -7423,9 +7438,42 @@ mod tests {
     }
 
     #[test]
+    fn plugin_mcp_skips_file_ancestor_paths_and_keeps_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("bin"), "not a directory").unwrap();
+        let stdio = |name: &str, command: &str, cwd: Option<&str>| PluginMcpServer {
+            name: name.into(),
+            transport: PluginMcpTransport::Stdio {
+                command: command.into(),
+                args: Vec::new(),
+                env: Default::default(),
+                cwd: cwd.map(Into::into),
+            },
+        };
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![
+                stdio("bad-cwd", "server", Some("${PLUGIN_ROOT}/bin/work")),
+                stdio("bad-command", "./bin/run", None),
+                PluginMcpServer {
+                    name: "sibling".into(),
+                    transport: PluginMcpTransport::StreamableHttp {
+                        url: "https://example.com/mcp".into(),
+                        headers: Default::default(),
+                    },
+                },
+            ],
+        );
+        let (prepared, _) = prepare_plugins(&[plugin]).unwrap();
+        assert_eq!(prepared.keys().collect::<Vec<_>>(), ["sibling"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unavailable_plugin_mcp_data_cwd_fails_preparation() {
         let directory = tempfile::tempdir().unwrap();
-        let mut plugin = plugin(
+        let plugin = plugin(
             "tools",
             directory.path(),
             vec![PluginMcpServer {
@@ -7438,10 +7486,11 @@ mod tests {
                 },
             }],
         );
-        let blocked = plugin.root.join("blocked");
-        std::fs::write(&blocked, "").unwrap();
-        plugin.data_dir = blocked;
-        assert!(prepare_plugins(&[plugin]).is_err());
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plugin.data_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = prepare_plugins(std::slice::from_ref(&plugin));
+        std::fs::set_permissions(&plugin.data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
     }
 
     #[tokio::test]
