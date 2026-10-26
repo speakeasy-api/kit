@@ -185,7 +185,7 @@ pub(super) fn submission_error(error: &agent_client_protocol::Error) -> String {
     {
         "Message acceptance is unknown; it was not retried. Review the recovered transcript before submitting again.".into()
     } else {
-        format!("message was not accepted: {}", error.message)
+        format!("message was not accepted: {}", super::error_detail(error))
     }
 }
 
@@ -248,6 +248,22 @@ mod tests {
         let queued = notification(bad, &ingress, &route).unwrap();
         assert!(
             matches!(queued.update, Update::GatewayRecovery(Event { marker: Marker {kind: Kind::Failed, ..}, updates, .. }) if updates.is_empty())
+        );
+    }
+    #[test]
+    fn submission_error_preserves_internal_error_detail() {
+        let error = agent_client_protocol::util::internal_error("session is unavailable");
+        assert_eq!(
+            submission_error(&error),
+            "message was not accepted: session is unavailable"
+        );
+    }
+    #[test]
+    fn submission_error_falls_back_to_message() {
+        let error = agent_client_protocol::Error::internal_error();
+        assert_eq!(
+            submission_error(&error),
+            "message was not accepted: Internal error"
         );
     }
     #[test]
