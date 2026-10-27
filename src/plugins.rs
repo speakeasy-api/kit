@@ -237,6 +237,18 @@ impl SourcePlan {
 }
 
 impl PluginRuntime {
+    /// Resolve a private plugin generation for another workspace without
+    /// changing this runtime's published generation or reload coordination.
+    pub(crate) async fn for_workspace(&self, root: &Path) -> Result<Self, String> {
+        Self::load(
+            self.inner.config_path.clone(),
+            root.to_path_buf(),
+            self.inner.cache_root.clone(),
+            self.inner.data_root.clone(),
+        )
+        .await
+    }
+
     pub async fn load(
         config_path: PathBuf,
         runtime_root: PathBuf,
@@ -4167,6 +4179,59 @@ mod tests {
         assert_eq!(staged.resolved.skills[0].body, "body");
         assert_eq!(staged.resolved.skill_directories.len(), 1);
         assert!(staged.resolved.skill_directories[0].ends_with("skills/live-skill"));
+    }
+
+    #[tokio::test]
+    async fn workspace_runtime_resolves_relative_plugins_independently() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for (root, body) in [
+            (launch.path(), "launch skill"),
+            (workspace.path(), "workspace skill"),
+        ] {
+            let package = root.join("plugin");
+            let skill = package.join("skills/local");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: local\ndescription: Local skill.\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        let config = launch.path().join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.local]\nsource = 'path'\npath = 'plugin'\n",
+        )
+        .unwrap();
+        let base = PluginRuntime::load(
+            config,
+            launch.path().to_path_buf(),
+            launch.path().join("cache"),
+            launch.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let selected = base.for_workspace(workspace.path()).await.unwrap();
+        assert_eq!(base.snapshot().skills[0].body.trim(), "launch skill");
+        assert_eq!(selected.snapshot().skills[0].body.trim(), "workspace skill");
+        assert_ne!(
+            base.snapshot().package_roots,
+            selected.snapshot().package_roots
+        );
+        fs::write(
+            workspace.path().join("plugin/skills/local/SKILL.md"),
+            "---\nname: local\ndescription: Local skill.\n---\nupdated workspace skill\n",
+        )
+        .unwrap();
+        let staged = selected.stage().await.unwrap();
+        selected.publish(staged);
+        assert_eq!(
+            selected.snapshot().skills[0].body.trim(),
+            "updated workspace skill"
+        );
+        assert_eq!(base.snapshot().skills[0].body.trim(), "launch skill");
     }
 
     #[tokio::test]

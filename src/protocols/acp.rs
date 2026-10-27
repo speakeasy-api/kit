@@ -1598,6 +1598,7 @@ impl Server {
         connection: ConnectionTo<Client>,
     ) -> Result<NewSessionResponse, AcpRuntimeError> {
         // session/new retains the configured-or-generated selection semantics.
+        Runtime::workspace_root(&request.cwd)?;
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
@@ -1626,21 +1627,15 @@ impl Server {
         &self,
         request: ListSessionsRequest,
     ) -> Result<ListSessionsResponse, ListSessionsError> {
-        let cwd = self.runtime.root().to_path_buf();
         let offset = request
             .cursor
             .as_deref()
             .map(parse_session_list_cursor)
             .transpose()?
             .unwrap_or(0);
-        if request
-            .cwd
-            .as_ref()
-            .is_some_and(|requested| requested != &cwd)
-        {
-            return Ok(ListSessionsResponse::new(Vec::new()));
-        }
-        let root = self.runtime.root().to_path_buf();
+        let cwd = Runtime::workspace_root(request.cwd.as_deref().unwrap_or(self.runtime.root()))
+            .map_err(ListSessionsError::Runtime)?;
+        let root = cwd.clone();
         let catalog = tokio::task::spawn_blocking(move || crate::session::catalog(&root))
             .await
             .map_err(|error| {
@@ -1750,13 +1745,14 @@ impl Server {
             mcp_servers,
         } = setup;
         // Validate path serialization before admission or any binding/actor effects.
-        let cwd_metadata =
-            serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
         serde_json::to_value(&additional_directories)
             .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
-        let additional_directories = self
-            .runtime
-            .additional_directories(&additional_directories)?;
+        let runtime = self.runtime.for_workspace(&cwd).await?;
+        let cwd = runtime.root().to_path_buf();
+        let cwd_metadata =
+            serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        let additional_directories = runtime.additional_directories(&additional_directories)?;
         let directories_metadata = serde_json::to_value(&additional_directories)
             .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
         // Reject exhaustion before admission or any binding, driver, or actor effects.
@@ -1770,7 +1766,7 @@ impl Server {
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
         // Client overlays own their manager, catalog, reload state, and event routes.
-        let mcp = self.runtime.session_mcp(mcp_servers, &cwd).await?;
+        let mcp = runtime.session_mcp(mcp_servers, &cwd).await?;
         let mcp_events = mcp
             .subscribe(session_id.to_string())
             .map_err(AcpRuntimeError::Loop)?;
@@ -1811,7 +1807,7 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
-        .with_hook_messages(self.runtime.hooks());
+        .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
             ask_user: None,
             cwd,
@@ -1820,8 +1816,7 @@ impl Server {
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
         };
-        let driver = match self
-            .runtime
+        let driver = match runtime
             .start_acp_driver_with_mcp(context, &mut claim, forked, mcp)
             .await
         {
@@ -1856,7 +1851,7 @@ impl Server {
             subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
-            runtime: Arc::clone(&self.runtime),
+            runtime: Arc::clone(&runtime),
             integration: Arc::clone(&self.integration),
             binding,
             driver: driver.driver,
@@ -7505,6 +7500,186 @@ pub(super) mod tests {
                 delivery == "success"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_request_cwd_isolates_durable_sessions_and_preserves_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let workspace_c = tempfile::tempdir().unwrap();
+        let a = std::fs::canonicalize(root.path()).unwrap();
+        let b = std::fs::canonicalize(workspace_b.path()).unwrap();
+        let c = std::fs::canonicalize(workspace_c.path()).unwrap();
+        std::fs::write(a.join("AGENTS.md"), "workspace-a-only-instructions").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "workspace-b-only-instructions").unwrap();
+        std::fs::write(c.join("AGENTS.md"), "workspace-c-only-instructions").unwrap();
+        let selected_id = crate::session::new_id();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::with_session_provider_and_credentials(
+            &a,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            crate::runtime::SessionRequest {
+                id: selected_id.clone(),
+                resume: false,
+                force: false,
+            },
+            credentials,
+        )
+        .unwrap();
+        let runtime = Runtime::with_lazy_mcp_initialization(runtime).unwrap();
+        let runtime = Runtime::with_mcp_sources(
+            runtime,
+            None,
+            None,
+            Vec::new(),
+            false,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime.clone(), agent_transport));
+        let client = agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                for invalid in [
+                    a.join("missing"),
+                    PathBuf::from("relative-workspace"),
+                    a.join("AGENTS.md"),
+                ] {
+                    connection
+                        .send_request(NewSessionRequest::new(invalid))
+                        .block_task()
+                        .await
+                        .expect_err("invalid cwd must fail before consuming session selection");
+                }
+                // Workspace preparation can fail after reserving the configured
+                // identity. The failed attempt must restore that reservation.
+                std::fs::write(b.join(".mcp.json"), "not valid JSON").unwrap();
+                connection
+                    .send_request(NewSessionRequest::new(b.clone()))
+                    .block_task()
+                    .await
+                    .expect_err("invalid workspace MCP must reject attachment");
+                assert!(crate::session::catalog(&b).unwrap().is_empty());
+                std::fs::remove_file(b.join(".mcp.json")).unwrap();
+                let first = connection
+                    .send_request(NewSessionRequest::new(b.clone()))
+                    .block_task()
+                    .await?;
+                assert_eq!(first.session_id.to_string(), selected_id);
+                let (second, third) = tokio::join!(
+                    async {
+                        connection
+                            .send_request(NewSessionRequest::new(b.clone()))
+                            .block_task()
+                            .await
+                    },
+                    async {
+                        connection
+                            .send_request(NewSessionRequest::new(c.clone()))
+                            .block_task()
+                            .await
+                    },
+                );
+                let second = second?;
+                let third = third?;
+                assert_ne!(first.session_id, second.session_id);
+                assert_ne!(second.session_id, third.session_id);
+                assert_ne!(first.session_id, third.session_id);
+                assert_eq!(runtime.root(), a);
+                for id in [&first.session_id, &second.session_id, &third.session_id] {
+                    connection
+                        .send_request(CloseSessionRequest::new(id.clone()))
+                        .block_task()
+                        .await?;
+                }
+                assert!(crate::session::catalog(&a).unwrap().is_empty());
+                let b_catalog = crate::session::catalog(&b).unwrap();
+                let c_catalog = crate::session::catalog(&c).unwrap();
+                assert_eq!(b_catalog.len(), 2);
+                assert_eq!(c_catalog.len(), 1);
+                assert!(
+                    b_catalog
+                        .iter()
+                        .any(|entry| entry.id == first.session_id.to_string())
+                );
+                assert!(
+                    b_catalog
+                        .iter()
+                        .any(|entry| entry.id == second.session_id.to_string())
+                );
+                assert_eq!(c_catalog[0].id, third.session_id.to_string());
+                for (workspace, id, expected, absent) in [
+                    (
+                        &b,
+                        &first.session_id,
+                        "workspace-b-only-instructions",
+                        "workspace-c-only-instructions",
+                    ),
+                    (
+                        &b,
+                        &second.session_id,
+                        "workspace-b-only-instructions",
+                        "workspace-c-only-instructions",
+                    ),
+                    (
+                        &c,
+                        &third.session_id,
+                        "workspace-c-only-instructions",
+                        "workspace-b-only-instructions",
+                    ),
+                ] {
+                    let items = crate::session::load(workspace, &id.to_string()).unwrap();
+                    let transcript = serde_json::to_string(&items).unwrap();
+                    assert!(transcript.contains(expected));
+                    assert!(!transcript.contains(absent));
+                    assert!(!transcript.contains("workspace-a-only-instructions"));
+                    assert!(crate::session::load(&a, &id.to_string()).is_err());
+                }
+                connection
+                    .send_request(LoadSessionRequest::new(first.session_id.clone(), b.clone()))
+                    .block_task()
+                    .await?;
+                let fork = connection
+                    .send_request(ForkSessionRequest::new(first.session_id.clone(), b.clone()))
+                    .block_task()
+                    .await?;
+                assert_ne!(fork.session_id, first.session_id);
+                connection
+                    .send_request(CloseSessionRequest::new(fork.session_id.clone()))
+                    .block_task()
+                    .await?;
+                let fork_items = crate::session::load(&b, &fork.session_id.to_string()).unwrap();
+                assert!(
+                    serde_json::to_string(&fork_items)
+                        .unwrap()
+                        .contains("workspace-b-only-instructions")
+                );
+                assert!(crate::session::load(&a, &fork.session_id.to_string()).is_err());
+                connection
+                    .send_request(CloseSessionRequest::new(first.session_id))
+                    .block_task()
+                    .await?;
+                assert_eq!(runtime.root(), a);
+                Ok(())
+            });
+        let result = timeout(Duration::from_secs(30), client).await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("workspace lifecycle client timed out")
+            .unwrap();
     }
 
     #[tokio::test]
