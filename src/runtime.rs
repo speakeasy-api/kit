@@ -61,6 +61,85 @@ mod test_support {
     use super::*;
 
     #[tokio::test]
+    async fn workspace_runtime_preserves_launch_relative_child_credentials() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            launch.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Filesystem("credentials".into()),
+        )
+        .unwrap();
+        let selected = runtime.for_workspace(workspace.path()).await.unwrap();
+        let child = selected
+            .subagents
+            .child_config()
+            .with_root(selected.root().to_path_buf());
+        assert_eq!(child.root, selected.root());
+        assert_eq!(
+            child.credential_storage.directory(),
+            Some(runtime.root().join("credentials").as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_runtime_preserves_settings_and_discovers_local_skills() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let skill = workspace.path().join(".agents/skills/workspace-only");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: workspace-only\ndescription: A workspace-only skill.\n---\nWorkspace instructions.\n").unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            launch.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join(".agents/hooks.json"),
+            r#"{"protocolVersion":"draft","hooks":[{"id":"dev.kit.workspace-test","transport":{"type":"stdio","command":"missing-workspace-hook","lifecycle":"per_event"},"subscriptions":[{"events":["session.start"],"mode":"observe","content":{"default":"body"}}]}]}"#,
+        )
+        .unwrap();
+        let runtime = Runtime::with_hooks(runtime).unwrap();
+        assert!(runtime.hooks.is_none());
+        let runtime = Runtime::with_ask_user(runtime, false).unwrap();
+        let runtime = Runtime::with_depth(runtime, 2).unwrap();
+        let selected = runtime.for_workspace(workspace.path()).await.unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        assert_eq!(selected.root(), root);
+        assert_eq!(selected.subagents.child_config().root, root);
+        assert_eq!(selected.provider, runtime.provider);
+        assert_eq!(selected.model, runtime.model);
+        assert_eq!(selected.base_depth, 2);
+        assert!(!selected.ask_user_enabled);
+        assert!(selected.hooks.is_some());
+        assert_eq!(
+            runtime.root(),
+            std::fs::canonicalize(launch.path()).unwrap()
+        );
+        assert!(
+            selected
+                .current_skills()
+                .await
+                .unwrap()
+                .skills
+                .iter()
+                .any(|skill| skill.name == "workspace-only")
+        );
+        assert!(
+            !runtime
+                .current_skills()
+                .await
+                .unwrap()
+                .skills
+                .iter()
+                .any(|skill| skill.name == "workspace-only")
+        );
+    }
+
+    #[tokio::test]
     async fn storage_bridge_relays_external_cancellation_and_reasserts_for_new_generations() {
         let external = CancellationController::new();
         let controller = CancellationController::new();
@@ -527,6 +606,7 @@ pub struct Runtime {
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
     hooks: Option<Arc<crate::ahp::Hooks>>,
+    hooks_enabled: bool,
     compaction: crate::compaction::policy::CompactionConfig,
 }
 
@@ -646,6 +726,7 @@ impl Runtime {
             skill_package_roots: Vec::new(),
             skill_directories: Vec::new(),
             hooks: None,
+            hooks_enabled: false,
             compaction: Default::default(),
         }))
     }
@@ -824,6 +905,7 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure agent hooks after runtime was shared".to_string())?;
         runtime.hooks = crate::ahp::Hooks::load(&runtime.root);
+        runtime.hooks_enabled = true;
         Ok(Arc::new(runtime))
     }
 
@@ -1235,6 +1317,88 @@ impl Runtime {
             }
         }
         Ok(directories)
+    }
+
+    /// ACP requests select a workspace, not a new process working directory.
+    /// The server retains selection/rollback ownership; this private runtime
+    /// owns all workspace-sensitive services used by the attached actor.
+    pub(crate) async fn for_workspace(
+        self: &Arc<Self>,
+        cwd: &Path,
+    ) -> Result<Arc<Self>, AcpRuntimeError> {
+        let root = Self::workspace_root(cwd)?;
+        if root == self.root {
+            return Ok(Arc::clone(self));
+        }
+        let plugins = match &self.plugin_runtime {
+            Some(plugins) => Some(
+                plugins
+                    .for_workspace(&root)
+                    .await
+                    .map_err(AcpRuntimeError::Loop)?,
+            ),
+            None => None,
+        };
+        let mcp = self
+            .mcp
+            .for_workspace(&root, plugins.clone())
+            .await
+            .map_err(AcpRuntimeError::Loop)?;
+        let runtime = Self {
+            ask_user_enabled: self.ask_user_enabled,
+            eval: self.eval.clone(),
+            root: root.clone(),
+            adapter: self.adapter.clone(),
+            provider: self.provider,
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort,
+            credential_storage: self.credential_storage.clone(),
+            openrouter_api_key: self.openrouter_api_key.clone(),
+            ambient_openrouter_api_key: self.ambient_openrouter_api_key,
+            telemetry: self.telemetry,
+            base_depth: self.base_depth,
+            subagents: Subagents::new(self.subagents.child_config().with_root(root.clone())),
+            session: Mutex::new(SessionSelection::default()),
+            mcp,
+            eager_mcp_initialization: self.eager_mcp_initialization,
+            plugin_runtime: None,
+            dynamic_skill_tool: None,
+            skills: build_skill_tools(&root, &self.skill_package_roots, &self.skill_directories),
+            skill_package_roots: self.skill_package_roots.clone(),
+            skill_directories: self.skill_directories.clone(),
+            hooks: if self.hooks_enabled {
+                crate::ahp::Hooks::load(&root)
+            } else {
+                None
+            },
+            hooks_enabled: self.hooks_enabled,
+            compaction: self.compaction,
+        };
+        // Dynamic plugin catalogs must use the newly resolved workspace roots.
+        Self::with_plugin_runtime(Arc::new(runtime), plugins).map_err(AcpRuntimeError::Loop)
+    }
+
+    pub(crate) fn workspace_root(cwd: &Path) -> Result<PathBuf, AcpRuntimeError> {
+        if cwd.to_str().is_none() {
+            return Err(AcpRuntimeError::Sdk(
+                "session cwd is not valid UTF-8".into(),
+            ));
+        }
+        if !cwd.is_absolute() {
+            return Err(AcpRuntimeError::Loop("session cwd must be absolute".into()));
+        }
+        let root = crate::resilient_fs::canonicalize(cwd)
+            .map_err(|error| AcpRuntimeError::Loop(format!("invalid session cwd: {error}")))?;
+        if !crate::resilient_fs::best_effort_global()
+            .metadata(&root)
+            .map_err(|error| AcpRuntimeError::Loop(format!("invalid session cwd: {error}")))?
+            .is_dir()
+        {
+            return Err(AcpRuntimeError::Loop(
+                "session cwd must be a directory".into(),
+            ));
+        }
+        Ok(root)
     }
 
     pub(crate) async fn session_mcp(

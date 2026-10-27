@@ -642,6 +642,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    cwd: PathBuf,
     mcp: crate::tools::mcp::McpRuntime,
     activity: SessionActivity,
     subagents: Option<crate::tools::Subagents>,
@@ -930,6 +931,7 @@ impl Server {
         request: wire::NewSessionRequest,
         connection: V2ConnectionTo<Client>,
     ) -> Result<(wire::NewSessionResponse, oneshot::Sender<()>), AcpRuntimeError> {
+        Runtime::workspace_root(&request.cwd.0)?;
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
@@ -977,15 +979,13 @@ impl Server {
                 ));
             }
         };
+        let root = Runtime::workspace_root(&request.cwd.0)?;
         let claim = self
             .runtime
             .claim_session_load(&request.session_id.to_string())?;
         if !claim.is_configured()
-            && !crate::session::belongs_to_workspace(
-                self.runtime.root(),
-                &request.session_id.to_string(),
-            )
-            .map_err(AcpRuntimeError::Loop)?
+            && !crate::session::belongs_to_workspace(&root, &request.session_id.to_string())
+                .map_err(AcpRuntimeError::Loop)?
         {
             return Err(AcpRuntimeError::SessionNotFound(
                 request.session_id.to_string(),
@@ -1020,21 +1020,21 @@ impl Server {
         &self,
         request: wire::ListSessionsRequest,
     ) -> Result<wire::ListSessionsResponse, ListSessionsError> {
-        let cwd = self.runtime.root().to_path_buf();
         let offset = request
             .cursor
             .as_ref()
             .map(|cursor| parse_cursor(cursor.as_ref()))
             .transpose()?
             .unwrap_or(0);
-        if request
-            .cwd
-            .as_ref()
-            .is_some_and(|requested| requested.0 != cwd)
-        {
-            return Ok(wire::ListSessionsResponse::new(Vec::new()));
-        }
-        let root = self.runtime.root().to_path_buf();
+        let cwd = Runtime::workspace_root(
+            request
+                .cwd
+                .as_ref()
+                .map(|path| path.0.as_path())
+                .unwrap_or(self.runtime.root()),
+        )
+        .map_err(ListSessionsError::Runtime)?;
+        let root = cwd.clone();
         let catalog = tokio::task::spawn_blocking(move || crate::session::catalog(&root))
             .await
             .map_err(|error| {
@@ -1064,9 +1064,9 @@ impl Server {
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
-        let additional_directories = self
-            .runtime
-            .additional_directories(&additional_directories)?;
+        let runtime = self.runtime.for_workspace(&cwd).await?;
+        let cwd = runtime.root().to_path_buf();
+        let additional_directories = runtime.additional_directories(&additional_directories)?;
         // Reject exhaustion before admission or any binding, driver, or actor effects.
         let token = self.registry.next_token()?;
         let mut admission = self
@@ -1075,7 +1075,7 @@ impl Server {
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
         let servers = client_mcp_servers(mcp_servers)?;
-        let mcp = self.runtime.isolated_session_mcp(servers, &cwd).await?;
+        let mcp = runtime.isolated_session_mcp(servers, &cwd).await?;
         let mcp_events = mcp
             .subscribe(session_id.to_string())
             .map_err(AcpRuntimeError::Loop)?;
@@ -1099,7 +1099,7 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
-        .with_hook_messages(self.runtime.hooks());
+        .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
             ask_user,
             cwd,
@@ -1108,8 +1108,7 @@ impl Server {
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
         };
-        let driver = self
-            .runtime
+        let driver = runtime
             .start_acp_driver_with_mcp(context, &mut claim, None, mcp.clone())
             .await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
@@ -1132,7 +1131,7 @@ impl Server {
             subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
-            runtime: Arc::clone(&self.runtime),
+            runtime: Arc::clone(&runtime),
             integration: Arc::clone(&self.integration),
             handle: handle.clone(),
             busy: Arc::clone(&busy),
@@ -1209,6 +1208,7 @@ impl Server {
                 completed: completion,
                 session_id: session_id.clone(),
                 session: SessionHandle {
+                    cwd: runtime.root().to_path_buf(),
                     mcp,
                     activity,
                     subagents: Some(driver.subagents),
@@ -1288,18 +1288,17 @@ impl Server {
         let servers = client_mcp_servers(request.mcp_servers)?;
         // Clone the owner under the map guard; reconciliation and backend waits
         // must never hold the session registry lock or block its actor mailbox.
-        let mcp = {
+        let (mcp, cwd) = {
             let sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| AcpRuntimeError::ClientClosed)?;
-            sessions
+            let session = sessions
                 .get(&request.session_id)
-                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?
-                .mcp
-                .clone()
+                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+            (session.mcp.clone(), session.cwd.clone())
         };
-        mcp.update_session_servers(servers, self.runtime.root())
+        mcp.update_session_servers(servers, &cwd)
             .await
             .map_err(AcpRuntimeError::Loop)?;
         Ok(UpdateMcpResponse {})
@@ -5393,6 +5392,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             id.clone(),
             SessionHandle {
+                cwd: server.runtime.root().to_path_buf(),
                 mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
                 subagents: None,
@@ -5485,6 +5485,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             id.clone(),
             SessionHandle {
+                cwd: server.runtime.root().to_path_buf(),
                 mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
                 subagents: None,
@@ -5555,6 +5556,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                cwd: server.runtime.root().to_path_buf(),
                 mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
                 subagents: None,
@@ -5706,6 +5708,7 @@ mod tests {
                 completed: completion,
                 session_id,
                 session: SessionHandle {
+                    cwd: server.runtime.root().to_path_buf(),
                     mcp: server.runtime.mcp_for_test().clone(),
                     activity: SessionActivity::new(|_| Ok(())),
                     subagents: None,
@@ -6071,6 +6074,7 @@ mod tests {
                     id.clone(),
                     SessionHandle {
                         activity: SessionActivity::new(|_| Ok(())),
+                        cwd: server.runtime.root().to_path_buf(),
                         mcp: server.runtime.mcp_for_test().clone(),
                         integration,
                         busy: Arc::new(AtomicBool::new(false)),
@@ -6228,6 +6232,7 @@ mod tests {
                     completed: completion,
                     session_id: published_session_id,
                     session: SessionHandle {
+                        cwd: publisher_server.runtime.root().to_path_buf(),
                         mcp: publisher_server.runtime.mcp_for_test().clone(),
                         activity: SessionActivity::new(|_| Ok(())),
                         subagents: None,
@@ -6559,6 +6564,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_request_cwd_isolates_durable_sessions_and_preserves_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let workspace_c = tempfile::tempdir().unwrap();
+        let a = std::fs::canonicalize(root.path()).unwrap();
+        let b = std::fs::canonicalize(workspace_b.path()).unwrap();
+        let c = std::fs::canonicalize(workspace_c.path()).unwrap();
+        std::fs::write(a.join("AGENTS.md"), "workspace-a-only-instructions").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "workspace-b-only-instructions").unwrap();
+        std::fs::write(c.join("AGENTS.md"), "workspace-c-only-instructions").unwrap();
+        let selected_id = crate::session::new_id();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::with_session_provider_and_credentials(
+            &a,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            crate::runtime::SessionRequest {
+                id: selected_id.clone(),
+                resume: false,
+                force: false,
+            },
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime.clone(), SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let client = agent_client_protocol::Client.v2().connect_with(
+            client_transport,
+            async move |connection| {
+                connection
+                    .send_request(terminal_auth_initialize_request())
+                    .block_task()
+                    .await?;
+                for invalid in [
+                    a.join("missing"),
+                    PathBuf::from("relative-workspace"),
+                    a.join("AGENTS.md"),
+                ] {
+                    connection
+                        .send_request(wire::NewSessionRequest::new(invalid))
+                        .block_task()
+                        .await
+                        .expect_err("invalid cwd must fail before consuming session selection");
+                }
+                let first = connection
+                    .send_request(wire::NewSessionRequest::new(b.clone()))
+                    .block_task()
+                    .await?;
+                assert_eq!(first.session_id.to_string(), selected_id);
+                let (second, third) = tokio::join!(
+                    async {
+                        connection
+                            .send_request(wire::NewSessionRequest::new(b.clone()))
+                            .block_task()
+                            .await
+                    },
+                    async {
+                        connection
+                            .send_request(wire::NewSessionRequest::new(c.clone()))
+                            .block_task()
+                            .await
+                    },
+                );
+                let second = second?;
+                let third = third?;
+                assert_ne!(first.session_id, second.session_id);
+                assert_ne!(second.session_id, third.session_id);
+                assert_ne!(first.session_id, third.session_id);
+                assert_eq!(runtime.root(), a);
+                for id in [&first.session_id, &second.session_id, &third.session_id] {
+                    connection
+                        .send_request(wire::CloseSessionRequest::new(id.clone()))
+                        .block_task()
+                        .await?;
+                }
+                assert!(crate::session::catalog(&a).unwrap().is_empty());
+                let b_catalog = crate::session::catalog(&b).unwrap();
+                let c_catalog = crate::session::catalog(&c).unwrap();
+                assert_eq!(b_catalog.len(), 2);
+                assert_eq!(c_catalog.len(), 1);
+                assert!(
+                    b_catalog
+                        .iter()
+                        .any(|entry| entry.id == first.session_id.to_string())
+                );
+                assert!(
+                    b_catalog
+                        .iter()
+                        .any(|entry| entry.id == second.session_id.to_string())
+                );
+                assert_eq!(c_catalog[0].id, third.session_id.to_string());
+                for (workspace, id, expected, absent) in [
+                    (
+                        &b,
+                        &first.session_id,
+                        "workspace-b-only-instructions",
+                        "workspace-c-only-instructions",
+                    ),
+                    (
+                        &b,
+                        &second.session_id,
+                        "workspace-b-only-instructions",
+                        "workspace-c-only-instructions",
+                    ),
+                    (
+                        &c,
+                        &third.session_id,
+                        "workspace-c-only-instructions",
+                        "workspace-b-only-instructions",
+                    ),
+                ] {
+                    let items = crate::session::load(workspace, &id.to_string()).unwrap();
+                    let transcript = serde_json::to_string(&items).unwrap();
+                    assert!(transcript.contains(expected));
+                    assert!(!transcript.contains(absent));
+                    assert!(!transcript.contains("workspace-a-only-instructions"));
+                    assert!(crate::session::load(&a, &id.to_string()).is_err());
+                }
+                connection
+                    .send_request(wire::ResumeSessionRequest::new(
+                        first.session_id.clone(),
+                        b.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+
+                connection
+                    .send_request(wire::CloseSessionRequest::new(first.session_id))
+                    .block_task()
+                    .await?;
+                assert_eq!(runtime.root(), a);
+                Ok(())
+            },
+        );
+        let result = timeout(Duration::from_secs(30), client).await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("workspace lifecycle client timed out")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn v2_client_mcp_servers_are_honored_by_new_and_resume() {
         let root = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
@@ -6704,6 +6854,103 @@ mod tests {
         server.abort();
         let _ = server.await;
         result.expect("MCP lifecycle client timed out").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_update_mcp_executes_stdio_in_attached_workspace() {
+        use agentkit_tools_core::{AllowAllPermissions, OwnedToolContext, Tool, ToolRequest};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let workspace_c = tempfile::tempdir().unwrap();
+        let b = workspace_b.path().canonicalize().unwrap();
+        let c = workspace_c.path().canonicalize().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let state = Arc::new(Server::new(runtime.clone(), SessionRegistry::new()));
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let client = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .v2()
+                .connect_to(client_transport)
+                .await
+        });
+        let agent = agent_client_protocol::Agent.v2().connect_with(agent_transport, async move |connection| {
+            let mut sessions = Vec::new();
+            for cwd in [&b, &c] {
+                let (response, activation) = state.new_session(
+                    wire::NewSessionRequest::new(cwd.clone()), connection.clone(),
+                ).await.unwrap();
+                activation.send(()).unwrap();
+                sessions.push(response.session_id);
+            }
+            // A real JSON-RPC subprocess records its working directory at startup.
+            let script = r#"
+import json, os, sys
+with open(sys.argv[1], 'w') as marker:
+    marker.write(os.getcwd())
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'server/discover':
+        response = {'error': {'code': -32601, 'message': 'Legacy fixture'}}
+    elif method == 'initialize':
+        response = {'result': {'protocolVersion': '2025-11-25', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'cwd-fixture', 'version': '1'}}}
+    else:
+        response = {'result': {'tools': []}}
+    print(json.dumps(dict(jsonrpc='2.0', id=request['id'], **response)), flush=True)
+"#;
+            for (id, cwd) in sessions.iter().zip([&b, &c]) {
+                let marker = cwd.join("mcp-cwd.txt");
+                state.update_mcp(UpdateMcpRequest {
+                    session_id: id.clone(),
+                    mcp_servers: vec![wire::McpServer::Stdio(
+                        wire::McpServerStdio::new("cwd-fixture", PathBuf::from("/usr/bin/env"))
+                            .args(vec!["python3".into(), "-u".into(), "-c".into(), script.into(), marker.to_str().unwrap().into()]),
+                    )],
+                    meta: None,
+                }).await.unwrap();
+                // Clone under the session map guard, then run discovery without it.
+                let mcp = { state.sessions.lock().unwrap().get(id).unwrap().mcp.clone() };
+                let search = crate::tools::mcp::ToolSearch::new(mcp, cwd.clone());
+                let context = OwnedToolContext {
+                    session_id: SessionId::new(id.to_string()),
+                    turn_id: agentkit_core::TurnId::new("turn"),
+                    metadata: MetadataMap::new(),
+                    permissions: Arc::new(AllowAllPermissions),
+                    resources: Arc::new(()),
+                    cancellation: None,
+                    execution_scope: None,
+                    approved_request: None,
+                };
+                let result = search.invoke(
+                    ToolRequest::new("discovery", "tool_search", json!({"query": "mcp"}), id.to_string(), "turn"),
+                    &mut context.borrowed(),
+                ).await.unwrap();
+                assert!(!result.result.is_error);
+                assert_eq!(std::fs::read_to_string(marker).unwrap(), cwd.to_str().unwrap());
+            }
+            assert_eq!(std::fs::read_to_string(b.join("mcp-cwd.txt")).unwrap(), b.to_str().unwrap());
+            assert_eq!(runtime.root(), root.path().canonicalize().unwrap());
+            for id in sessions {
+                state.close(wire::CloseSessionRequest::new(id)).await.unwrap();
+            }
+            Ok(())
+        });
+        let result = timeout(Duration::from_secs(30), agent).await;
+        client.abort();
+        let _ = client.await;
+        result.expect("MCP cwd client timed out").unwrap();
     }
 
     #[test]

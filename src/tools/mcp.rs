@@ -1909,6 +1909,60 @@ impl McpRuntime {
         )
     }
 
+    /// Rebuild workspace sources privately. Only immutable configuration is
+    /// copied; managers, subscriptions, authentication operations and reload
+    /// coordination belong to the new runtime.
+    pub(crate) async fn for_workspace(
+        &self,
+        cwd: &Path,
+        plugin_source: Option<crate::plugins::PluginRuntime>,
+    ) -> Result<Self, String> {
+        self.ensure_healthy()?;
+        let (sources, plugins, plugin_entries) = {
+            let state = self.inner.reload.lock().await;
+            self.ensure_healthy()?;
+            (
+                state
+                    .sources
+                    .iter()
+                    .map(|state| {
+                        let source = &state.source;
+                        if !source.required && source.session_bytes.is_none() {
+                            ConfigSource::optional_project(cwd.join(".mcp.json"), cwd.to_path_buf())
+                        } else {
+                            source.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                state.plugins.clone(),
+                state.plugin_entries.clone(),
+            )
+        };
+        let (plugins, plugin_entries) = if let Some(plugins) = &plugin_source {
+            let snapshot = plugins.snapshot();
+            tokio::task::spawn_blocking(move || prepare_plugins(&snapshot.mcp_plugins))
+                .await
+                .map_err(|error| error.to_string())??
+        } else {
+            (plugins, plugin_entries)
+        };
+        let mut states = Vec::with_capacity(sources.len());
+        for source in sources {
+            states.push(SourceState {
+                raw: read_source(&source).await?,
+                source,
+            });
+        }
+        build_runtime(
+            states,
+            plugins,
+            plugin_entries,
+            plugin_source,
+            self.inner.interactive_oauth_enabled,
+            self.inner.credential_storage.clone(),
+        )
+    }
+
     fn ensure_healthy(&self) -> Result<(), String> {
         if self.inner.healthy.load(Ordering::Acquire) {
             Ok(())
@@ -7569,6 +7623,62 @@ mod tests {
             "env": [{"name": "SESSION_SECRET", "value": "memory-only-secret"}]
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspace_runtime_reloads_its_own_project_sources() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let configured = launch.path().join("configured.json");
+        std::fs::write(
+            &configured,
+            r#"{"mcpServers":{"configured":{"command":"missing-configured"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            launch.path().join(".mcp.json"),
+            r#"{"mcpServers":{"launch":{"command":"missing-launch"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join(".mcp.json"),
+            r#"{"mcpServers":{"workspace":{"command":"missing-workspace"}}}"#,
+        )
+        .unwrap();
+        let base = super::connect_with_initialization(
+            vec![
+                ConfigSource::required(configured),
+                ConfigSource::optional_project(
+                    launch.path().join(".mcp.json"),
+                    launch.path().to_path_buf(),
+                ),
+            ],
+            &[],
+            false,
+            CredentialStorage::Memory,
+            false,
+        )
+        .await
+        .unwrap();
+        let session = base.for_workspace(workspace.path(), None).await.unwrap();
+        {
+            let servers = session.inner.servers.read().await;
+            assert!(servers.contains_key("configured"));
+            assert!(servers.contains_key("workspace"));
+            assert!(!servers.contains_key("launch"));
+        }
+        {
+            let state = session.inner.reload.lock().await;
+            assert_eq!(
+                state.sources[1].source.default_stdio_cwd.as_deref(),
+                Some(workspace.path())
+            );
+        }
+        std::fs::write(workspace.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        session.reload_config().await.unwrap();
+        assert!(!session.inner.servers.read().await.contains_key("workspace"));
+        assert!(base.inner.servers.read().await.contains_key("launch"));
+        assert!(!base.inner.servers.read().await.contains_key("workspace"));
     }
 
     #[tokio::test]
