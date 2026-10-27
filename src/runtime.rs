@@ -61,6 +61,29 @@ mod test_support {
     use super::*;
 
     #[tokio::test]
+    async fn workspace_runtime_preserves_launch_relative_child_credentials() {
+        let launch = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            launch.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Filesystem("credentials".into()),
+        )
+        .unwrap();
+        let selected = runtime.for_workspace(workspace.path()).await.unwrap();
+        let child = selected
+            .subagents
+            .child_config()
+            .with_root(selected.root().to_path_buf());
+        assert_eq!(child.root, selected.root());
+        assert_eq!(
+            child.credential_storage.directory(),
+            Some(runtime.root().join("credentials").as_path())
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_runtime_preserves_settings_and_discovers_local_skills() {
         let launch = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1334,10 +1357,7 @@ impl Runtime {
             ambient_openrouter_api_key: self.ambient_openrouter_api_key,
             telemetry: self.telemetry,
             base_depth: self.base_depth,
-            subagents: Subagents::new(ChildConfig {
-                root: root.clone(),
-                ..self.subagents.child_config()
-            }),
+            subagents: Subagents::new(self.subagents.child_config().with_root(root.clone())),
             session: Mutex::new(SessionSelection::default()),
             mcp,
             eager_mcp_initialization: self.eager_mcp_initialization,
