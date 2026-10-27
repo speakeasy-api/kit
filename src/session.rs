@@ -5336,7 +5336,10 @@ mod tests {
             discover_workspace_ids(&disk, &root, storage.path(), true).unwrap(),
             ["moving"]
         );
-        std::fs::write(&path, record(Some(&other))).unwrap();
+        // Use the production replacement path: rapid same-length in-place writes
+        // can share mtime and ctime on filesystems with coarse timestamp resolution.
+        disk.replace_private(&path, record(Some(&other)).as_bytes())
+            .unwrap();
         assert!(
             discover_workspace_ids(&disk, &root, storage.path(), true)
                 .unwrap()
