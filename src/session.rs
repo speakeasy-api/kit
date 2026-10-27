@@ -68,6 +68,91 @@ struct SessionMetadata {
     display_name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptFingerprint {
+    len: u64,
+    modified: SystemTime,
+    device: u64,
+    inode: u64,
+    changed: i64,
+    changed_nsec: i64,
+}
+
+// Includes absent candidates: creation and deletion invalidate the cached authority.
+// Older single-file cache shapes miss and rebuild from the transcripts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogFingerprint {
+    candidates: [Option<TranscriptFingerprint>; 3],
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedWorkspaceBinding {
+    fingerprint: TranscriptFingerprint,
+    #[serde(deserialize_with = "Option::deserialize")]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedCatalog {
+    fingerprint: CatalogFingerprint,
+    workspace: PathBuf,
+    entry: CatalogEntry,
+}
+
+// Unix inode + ctime catches same-sized replacement and preserved-mtime edits.
+// This is a freshness hint, not an integrity boundary for local files.
+fn catalog_fingerprint(
+    filesystem: &Fs,
+    root: &Path,
+    global: &Path,
+    directory: &Path,
+    id: &str,
+) -> Option<CatalogFingerprint> {
+    let paths = [
+        transcript_path(directory, id),
+        transcript_path(global, id),
+        legacy_transcript(root, id),
+    ];
+    let mut candidates = [None, None, None];
+    for (candidate, path) in candidates.iter_mut().zip(paths) {
+        match filesystem.metadata(&path) {
+            Ok(metadata) => *candidate = Some(fingerprint_from_metadata(&metadata)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(CatalogFingerprint { candidates })
+}
+
+fn transcript_fingerprint(filesystem: &Fs, path: &Path) -> Option<TranscriptFingerprint> {
+    fingerprint_from_metadata(&filesystem.metadata(path).ok()?)
+}
+
+fn fingerprint_from_metadata(metadata: &fs::Metadata) -> Option<TranscriptFingerprint> {
+    let disk = metadata.disk_metadata()?; // Never cache pending resilient-Fs images.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(TranscriptFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            device: disk.dev(),
+            inode: disk.ino(),
+            changed: disk.ctime(),
+            changed_nsec: disk.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = disk;
+        None
+    }
+}
+
 /// A loaded transcript together with the observer that owns its mutation lock.
 pub struct OpenSession {
     pub transcript: Vec<Item>,
@@ -77,7 +162,8 @@ pub struct OpenSession {
 }
 
 /// Read-only metadata for one durable session in a workspace.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
     pub id: String,
     /// User-defined display name, falling back to a generated title.
@@ -1739,20 +1825,21 @@ fn catalog_for_workspace(
     root: &Path,
     global_directory: &Path,
 ) -> Result<Vec<CatalogEntry>, String> {
-    catalog_for_workspace_with(fs::best_effort_global(), root, global_directory)
+    catalog_for_workspace_with(fs::best_effort_global(), root, global_directory, true)
 }
 
 /// Read a disk catalog using an isolated filesystem with no pending writes.
 /// Startup may abandon this read without sharing locks with storage recovery.
 #[cfg(feature = "tui")]
 pub(crate) fn catalog_with(filesystem: &Fs, root: &Path) -> Result<Vec<CatalogEntry>, String> {
-    catalog_for_workspace_with(filesystem, root, &default_directory()?)
+    catalog_for_workspace_with(filesystem, root, &default_directory()?, false)
 }
 
 fn catalog_for_workspace_with(
     filesystem: &Fs,
     root: &Path,
     global_directory: &Path,
+    backfill: bool,
 ) -> Result<Vec<CatalogEntry>, String> {
     let root = filesystem.canonicalize(root).map_err(|error| {
         format!(
@@ -1770,9 +1857,20 @@ fn catalog_for_workspace_with(
             root.display()
         ));
     }
-    let ids = list_ids_for_workspace_with(filesystem, &root, global_directory)?;
+    let ids = discover_workspace_ids(filesystem, &root, global_directory, backfill)?;
     let mut entries = Vec::with_capacity(ids.len());
+    let directory = workspace_storage_directory(global_directory, &root);
     for id in ids {
+        let fingerprint = catalog_fingerprint(filesystem, &root, global_directory, &directory, &id);
+        if let Some(mut entry) =
+            cached_catalog(filesystem, &directory, &root, &id, fingerprint.as_ref())
+        {
+            if !entry.is_subagent {
+                entry.title = read_display_name_with(filesystem, &directory, &id).or(entry.title);
+                entries.push(entry);
+            }
+            continue;
+        }
         // Discovery is best-effort per transcript: a damaged file or one caught
         // mid-append must not hide every other session in the workspace.
         let Ok(Some(authority)) =
@@ -1780,10 +1878,7 @@ fn catalog_for_workspace_with(
         else {
             continue;
         };
-        if catalog_is_subagent(&authority.historical_items, &authority.items) {
-            continue;
-        }
-        let is_subagent = false;
+        let is_subagent = catalog_is_subagent(&authority.historical_items, &authority.items);
         let (title, preview) = catalog_text(&authority.historical_items, &authority.items);
         let item_updated = authority
             .items
@@ -1802,10 +1897,8 @@ fn catalog_for_workspace_with(
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
-        let directory = workspace_storage_directory(global_directory, &root);
-        let title = read_display_name_with(filesystem, &directory, &id).or(title);
-        entries.push(CatalogEntry {
-            id,
+        let mut entry = CatalogEntry {
+            id: id.clone(),
             title,
             preview,
             is_subagent,
@@ -1814,7 +1907,23 @@ fn catalog_for_workspace_with(
                 &authority.items,
             ),
             updated_at: item_updated.max(file_updated),
-        });
+        };
+        // Isolated startup readers remain read-only.
+        if backfill && let Some(fingerprint) = fingerprint {
+            backfill_catalog(
+                filesystem,
+                &root,
+                global_directory,
+                &directory,
+                &id,
+                fingerprint,
+                &entry,
+            );
+        }
+        if !entry.is_subagent {
+            entry.title = read_display_name_with(filesystem, &directory, &id).or(entry.title);
+            entries.push(entry);
+        }
     }
     entries.sort_by(|left, right| {
         right
@@ -1823,6 +1932,80 @@ fn catalog_for_workspace_with(
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(entries)
+}
+
+fn cached_catalog(
+    filesystem: &Fs,
+    directory: &Path,
+    root: &Path,
+    id: &str,
+    fingerprint: Option<&CatalogFingerprint>,
+) -> Option<CatalogEntry> {
+    let fingerprint = fingerprint?;
+    let cache: CachedCatalog =
+        serde_json::from_slice(&filesystem.read(catalog_metadata_path(directory, id)).ok()?)
+            .ok()?;
+    if &cache.fingerprint != fingerprint || cache.workspace != root || cache.entry.id != id {
+        return None;
+    }
+    let entry = cache.entry;
+    if !entry
+        .additional_directories
+        .iter()
+        .all(|path| valid_catalog_directory(path))
+    {
+        return None;
+    }
+    if entry
+        .title
+        .as_ref()
+        .is_some_and(|text| normalize_catalog_text(text) != *text || text.chars().count() > 81)
+        || entry
+            .preview
+            .as_ref()
+            .is_some_and(|text| normalize_catalog_text(text) != *text || text.chars().count() > 161)
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+fn backfill_catalog(
+    filesystem: &Fs,
+    root: &Path,
+    global: &Path,
+    directory: &Path,
+    id: &str,
+    fingerprint: CatalogFingerprint,
+    entry: &CatalogEntry,
+) {
+    if catalog_fingerprint(filesystem, root, global, directory, id).as_ref() != Some(&fingerprint) {
+        return;
+    }
+    let cache = CachedCatalog {
+        fingerprint,
+        workspace: root.to_path_buf(),
+        entry: entry.clone(),
+    };
+    if let Ok(output) = serde_json::to_vec(&cache)
+        && filesystem.create_dir_all(directory).is_ok()
+    {
+        let _ = filesystem.replace_private(catalog_metadata_path(directory, id), &output);
+    }
+}
+
+// Cache publication must never replace authoritative display-name metadata.
+// Independent processes and deferred resilient-Fs writes can publish in either
+// order; a stale cache is harmless because readers validate its fingerprint.
+fn catalog_metadata_path(directory: &Path, id: &str) -> PathBuf {
+    directory.join(format!("{id}.catalog.metadata.json"))
+}
+
+fn valid_catalog_directory(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 fn catalog_additional_directories(
@@ -1839,14 +2022,7 @@ fn catalog_additional_directories(
         .rev()
         .find_map(|item| item.metadata.get("acp.additional_directories"))
         .and_then(|value| serde_json::from_value::<Vec<PathBuf>>(value.clone()).ok())
-        .filter(|paths| {
-            paths.iter().all(|path| {
-                path.is_absolute()
-                    && !path
-                        .components()
-                        .any(|component| matches!(component, std::path::Component::ParentDir))
-            })
-        })
+        .filter(|paths| paths.iter().all(|path| valid_catalog_directory(path)))
         .unwrap_or_default()
 }
 
@@ -1992,10 +2168,20 @@ fn civil_date(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+#[cfg(test)]
 fn list_ids_for_workspace_with(
     filesystem: &Fs,
     root: &Path,
     global_directory: &Path,
+) -> Result<Vec<String>, String> {
+    discover_workspace_ids(filesystem, root, global_directory, true)
+}
+
+fn discover_workspace_ids(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+    backfill: bool,
 ) -> Result<Vec<String>, String> {
     let scoped_directory = workspace_storage_directory(global_directory, root);
     let legacy_directory = workspace_directory(root);
@@ -2003,10 +2189,7 @@ fn list_ids_for_workspace_with(
     ids.extend(list_ids_in_with(filesystem, &scoped_directory)?);
     for id in list_ids_in_with(filesystem, global_directory)? {
         let path = transcript_path(global_directory, &id);
-        let workspace = filesystem
-            .read(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| transcript_workspace_bytes(&path, &id, &bytes));
+        let workspace = cached_workspace_binding(filesystem, &path, &id, backfill);
         if matches!(workspace, Ok(Some(stored)) if stored == root) {
             ids.push(id);
         }
@@ -2016,6 +2199,42 @@ fn list_ids_for_workspace_with(
     ids.sort();
     ids.dedup();
     Ok(ids)
+}
+
+// Global discovery metadata includes unbound results. A negative result in one
+// workspace must not hide a session belonging to another workspace.
+fn cached_workspace_binding(
+    filesystem: &Fs,
+    path: &Path,
+    id: &str,
+    backfill: bool,
+) -> Result<Option<PathBuf>, String> {
+    let metadata_path = path.with_extension("workspace.metadata.json");
+    let cached = filesystem
+        .read(&metadata_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CachedWorkspaceBinding>(&bytes).ok());
+    let fingerprint = transcript_fingerprint(filesystem, path);
+    if let Some(cache) = cached
+        && Some(&cache.fingerprint) == fingerprint.as_ref()
+    {
+        return Ok(cache.workspace);
+    }
+    let bytes = filesystem.read(path).map_err(|error| error.to_string())?;
+    let workspace = transcript_workspace_bytes(path, id, &bytes)?;
+    if backfill
+        && let Some(fingerprint) = fingerprint
+        && transcript_fingerprint(filesystem, path).as_ref() == Some(&fingerprint)
+    {
+        let cache = CachedWorkspaceBinding {
+            fingerprint,
+            workspace: workspace.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&cache) {
+            let _ = filesystem.replace_private(metadata_path, &bytes);
+        }
+    }
+    Ok(workspace)
 }
 
 pub(crate) fn belongs_to_workspace(root: &Path, session_id: &str) -> Result<bool, String> {
@@ -4987,6 +5206,442 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn catalog_warm_legacy_discovery_and_redirects_need_no_transcript_reads() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = canonical_workspace(root.path());
+        let other = canonical_workspace(other.path());
+        let disk = Fs::new(Arc::new(fs::DiskBackend));
+        let denied = Fs::new(Arc::new(TranscriptOpenFaults {
+            deny_transcript_read: true,
+            write_failure: Arc::new(AtomicU64::new(0)),
+        }));
+        for (id, workspace) in [
+            ("bound", Some(&root)),
+            ("other", Some(&other)),
+            ("unbound", None),
+        ] {
+            let record = serde_json::json!({
+                "schema_version": SCHEMA_VERSION, "session_id": id,
+                "generation": 1, "workspace_root": workspace,
+                "item": Item::text(ItemKind::User, id),
+            });
+            std::fs::write(
+                super::transcript_path(storage.path(), id),
+                format!("{record}\n"),
+            )
+            .unwrap();
+        }
+        let first = catalog_for_workspace_with(&disk, &root, storage.path(), true).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, "bound");
+        assert_eq!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false).unwrap(),
+            first
+        );
+        // Test the negative cache directly: an ignored read error would also make
+        // a catalog empty, but cannot produce this successful unbound result.
+        assert_eq!(
+            cached_workspace_binding(
+                &denied,
+                &super::transcript_path(storage.path(), "unbound"),
+                "unbound",
+                false
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            cached_workspace_binding(
+                &denied,
+                &super::transcript_path(storage.path(), "other"),
+                "other",
+                false
+            )
+            .unwrap(),
+            Some(other.clone())
+        );
+        let second = catalog_for_workspace_with(&disk, &other, storage.path(), true).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, "other");
+        assert_eq!(
+            catalog_for_workspace_with(&denied, &other, storage.path(), false).unwrap(),
+            second
+        );
+        // Migration leaves a legacy redirect alongside the scoped authority.
+        drop(open_in(&root, storage.path(), "bound", true, false, Vec::new()).unwrap());
+        assert!(matches!(
+            read_records_direct(&super::transcript_path(storage.path(), "bound"), "bound").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+        let migrated = catalog_for_workspace_with(&disk, &root, storage.path(), true).unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false).unwrap(),
+            migrated
+        );
+        // Malformed discovery metadata must replay rather than suppress membership.
+        std::fs::write(
+            super::transcript_path(storage.path(), "bound")
+                .with_extension("workspace.metadata.json"),
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_for_workspace_with(&disk, &root, storage.path(), true).unwrap(),
+            migrated
+        );
+        assert_eq!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false).unwrap(),
+            migrated
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_binding_cache_tracks_membership_changes_and_malformed_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = canonical_workspace(root.path());
+        let other = canonical_workspace(other.path());
+        let disk = Fs::new(Arc::new(fs::DiskBackend));
+        let path = super::transcript_path(storage.path(), "moving");
+        let cache_path = path.with_extension("workspace.metadata.json");
+        let record = |workspace: Option<&Path>| {
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION, "session_id": "moving",
+                "generation": 1, "workspace_root": workspace,
+                "item": Item::text(ItemKind::User, "Moving"),
+            })
+            .to_string()
+                + "\n"
+        };
+        assert!(
+            discover_workspace_ids(&disk, &root, storage.path(), true)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&path, record(None)).unwrap();
+        assert!(
+            discover_workspace_ids(&disk, &root, storage.path(), true)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&path, record(Some(&root))).unwrap();
+        assert_eq!(
+            discover_workspace_ids(&disk, &root, storage.path(), true).unwrap(),
+            ["moving"]
+        );
+        // Use the production replacement path: rapid same-length in-place writes
+        // can share mtime and ctime on filesystems with coarse timestamp resolution.
+        disk.replace_private(&path, record(Some(&other)).as_bytes())
+            .unwrap();
+        assert!(
+            discover_workspace_ids(&disk, &root, storage.path(), true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            discover_workspace_ids(&disk, &other, storage.path(), true).unwrap(),
+            ["moving"]
+        );
+        // Even with a valid fingerprint, missing binding is malformed, not unbound.
+        let mut malformed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        malformed.as_object_mut().unwrap().remove("workspace");
+        std::fs::write(&cache_path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert_eq!(
+            discover_workspace_ids(&disk, &other, storage.path(), true).unwrap(),
+            ["moving"]
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            discover_workspace_ids(&disk, &other, storage.path(), true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_cache_invalidates_new_deleted_and_conflicting_candidates() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root = canonical_workspace(root.path());
+        drop(
+            open_in(
+                &root,
+                storage.path(),
+                "cached",
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "Original")],
+            )
+            .unwrap(),
+        );
+        let disk = Fs::new(Arc::new(fs::DiskBackend));
+        let denied = Fs::new(Arc::new(TranscriptOpenFaults {
+            deny_transcript_read: true,
+            write_failure: Arc::new(AtomicU64::new(0)),
+        }));
+        let first = catalog_for_workspace_with(&disk, &root, storage.path(), true).unwrap();
+        let scoped = super::transcript_path(
+            &workspace_storage_directory(storage.path(), &root),
+            "cached",
+        );
+        let local = legacy_transcript(&root, "cached");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::copy(&scoped, &local).unwrap();
+        assert!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            catalog_for_workspace_with(&disk, &root, storage.path(), true).unwrap(),
+            first
+        );
+        assert_eq!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false).unwrap(),
+            first
+        );
+        let record = serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "session_id": "cached",
+            "generation": 1, "workspace_root": root,
+            "item": Item::text(ItemKind::User, "Conflicting"),
+        });
+        std::fs::write(&local, format!("{record}\n")).unwrap();
+        assert!(
+            catalog_for_workspace_with(&disk, &root, storage.path(), true)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_file(&local).unwrap();
+        assert!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            catalog_for_workspace_with(&disk, &root, storage.path(), true).unwrap(),
+            first
+        );
+        assert_eq!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false).unwrap(),
+            first
+        );
+        std::fs::remove_file(scoped).unwrap();
+        assert!(
+            catalog_for_workspace_with(&denied, &root, storage.path(), false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn catalog_cache_roundtrip_staleness_and_rename() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "cached",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Original")],
+        )
+        .unwrap();
+        drop(opened);
+        let directory =
+            workspace_storage_directory(storage.path(), &canonical_workspace(root.path()));
+        let path = metadata_path(&directory, "cached");
+        fs::write(&path, br#"{"display_name":"Custom"}"#).unwrap();
+        let first = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(first[0].title.as_deref(), Some("Custom"));
+        let cache_path = catalog_metadata_path(&directory, "cached");
+        let _: CachedCatalog = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#"{"display_name":"Custom"}"#);
+        assert_eq!(
+            first,
+            catalog_for_workspace(root.path(), storage.path()).unwrap()
+        );
+        let opened = open_in(root.path(), storage.path(), "cached", true, false, vec![]).unwrap();
+        write(
+            &opened.observer,
+            &Item::text(ItemKind::Assistant, "New activity")
+                .with_created_at(Timestamp(first[0].updated_at + 1000)),
+        );
+        drop(opened);
+        let next = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert!(next[0].updated_at > first[0].updated_at);
+        set_display_name_in(root.path(), storage.path(), "cached", Some("Renamed")).unwrap();
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Renamed")
+        );
+        // The former single-file fingerprint shape is a cache miss, never an
+        // artifact migration that could skip legacy conflict validation.
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        old["fingerprint"] = old["fingerprint"]["candidates"][0].clone();
+        fs::write(&cache_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Renamed")
+        );
+        let rebuilt: CachedCatalog =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert!(rebuilt.fingerprint.candidates[0].is_some());
+        let renamed_metadata = fs::read(&path).unwrap();
+        fs::write(&cache_path, br#"{"broken":true}"#).unwrap();
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Renamed")
+        );
+        assert_eq!(fs::read(&path).unwrap(), renamed_metadata);
+        for (field, value) in [
+            ("title", serde_json::json!("unsafe\u{1b}text")),
+            ("additional_directories", serde_json::json!(["relative"])),
+            ("id", serde_json::json!("wrong-session")),
+        ] {
+            let mut cache: serde_json::Value =
+                serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+            cache["entry"][field] = value;
+            fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+            assert_eq!(
+                catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                    .title
+                    .as_deref(),
+                Some("Renamed")
+            );
+            let repaired: CachedCatalog =
+                serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+            assert_eq!(repaired.entry.id, "cached");
+            assert_eq!(repaired.entry.title.as_deref(), Some("Original"));
+            assert!(repaired.entry.additional_directories.is_empty());
+        }
+        let transcript = super::transcript_path(&directory, "cached");
+        let before = std::fs::metadata(&transcript).unwrap();
+        fs::replace_private(&transcript, &vec![b'x'; before.len() as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        assert!(
+            catalog_for_workspace(root.path(), storage.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn catalog_cache_publication_cannot_clobber_prepared_rename() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        drop(
+            open_in(
+                root.path(),
+                storage.path(),
+                "cached",
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "Generated")],
+            )
+            .unwrap(),
+        );
+        let root = canonical_workspace(root.path());
+        let directory = workspace_storage_directory(storage.path(), &root);
+        let first = catalog_for_workspace(&root, storage.path()).unwrap();
+        let fingerprint = catalog_fingerprint(
+            fs::best_effort_global(),
+            &root,
+            storage.path(),
+            &directory,
+            "cached",
+        )
+        .unwrap();
+        // Independent services model cross-process publication: no revision
+        // fence or shared mutex can hide a collision between their writes.
+        let renamer = Fs::new(Arc::new(fs::DiskBackend));
+        let prepared =
+            prepare_display_name_in(&renamer, &root, storage.path(), "cached", Some("Chosen"))
+                .unwrap();
+        backfill_catalog(
+            fs::best_effort_global(),
+            &root,
+            storage.path(),
+            &directory,
+            "cached",
+            fingerprint.clone(),
+            &first[0],
+        );
+        prepared.commit().unwrap();
+        let name_bytes = fs::read(metadata_path(&directory, "cached")).unwrap();
+        backfill_catalog(
+            fs::best_effort_global(),
+            &root,
+            storage.path(),
+            &directory,
+            "cached",
+            fingerprint,
+            &first[0],
+        );
+        assert_eq!(
+            fs::read(metadata_path(&directory, "cached")).unwrap(),
+            name_bytes
+        );
+        assert_eq!(
+            catalog_for_workspace(&root, storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Chosen")
+        );
+    }
+
+    #[test]
+    fn catalog_cache_rejects_new_legacy_candidate() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        drop(
+            open_in(
+                root.path(),
+                storage.path(),
+                "cached",
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "Original")],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path())
+                .unwrap()
+                .len(),
+            1
+        );
+        let local = legacy_transcript(root.path(), "cached");
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        fs::write(local, b"corrupt alternative\n").unwrap();
+        assert!(
+            catalog_for_workspace(root.path(), storage.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn catalog_is_workspace_filtered_newest_first_and_extracts_display_text() {
         let storage = tempfile::tempdir().unwrap();
@@ -5173,6 +5828,12 @@ mod tests {
         assert!(ids.contains(&"malformed"));
         assert!(!ids.contains(&"subagent"));
         drop((legacy, top_level, malformed, subagent));
+        let warm = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(
+            warm,
+            catalog_for_workspace(root.path(), storage.path()).unwrap()
+        );
+        assert!(warm.iter().all(|entry| entry.id != "subagent"));
     }
 
     #[test]

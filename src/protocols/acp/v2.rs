@@ -739,6 +739,7 @@ struct Server {
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
     sessions: Mutex<HashMap<wire::SessionId, SessionHandle>>,
+    catalog_pages: crate::protocols::acp::session_pagination::CatalogPages,
     file_search: Arc<Mutex<Option<crate::file_search::WorkspaceFileSearchState>>>,
 }
 
@@ -766,6 +767,7 @@ impl Server {
             integration: Arc::new(AcpIntegration::default()),
             registry,
             sessions: Mutex::new(HashMap::new()),
+            catalog_pages: crate::protocols::acp::session_pagination::CatalogPages::default(),
             file_search: Arc::new(Mutex::new(None)),
         }
     }
@@ -1020,12 +1022,12 @@ impl Server {
         &self,
         request: wire::ListSessionsRequest,
     ) -> Result<wire::ListSessionsResponse, ListSessionsError> {
-        let offset = request
+        let cursor = request
             .cursor
             .as_ref()
-            .map(|cursor| parse_cursor(cursor.as_ref()))
-            .transpose()?
-            .unwrap_or(0);
+            .map(|cursor| crate::protocols::acp::session_pagination::Cursor::parse(cursor.as_ref()))
+            .transpose()
+            .map_err(|_| ListSessionsError::InvalidCursor)?;
         let cwd = Runtime::workspace_root(
             request
                 .cwd
@@ -1033,26 +1035,42 @@ impl Server {
                 .map(|path| path.0.as_path())
                 .unwrap_or(self.runtime.root()),
         )
-        .map_err(ListSessionsError::Runtime)?;
-        let root = cwd.clone();
-        let catalog = tokio::task::spawn_blocking(move || crate::session::catalog(&root))
-            .await
-            .map_err(|error| {
-                ListSessionsError::Runtime(AcpRuntimeError::Loop(format!(
-                    "session catalog worker failed: {error}"
-                )))
-            })?
-            .map_err(|error| ListSessionsError::Runtime(AcpRuntimeError::Loop(error)))?;
-        if offset > catalog.len() {
-            return Err(ListSessionsError::InvalidCursor);
+        .map_err(|error| {
+            if cursor.is_some() {
+                ListSessionsError::InvalidCursor
+            } else {
+                ListSessionsError::Runtime(error)
+            }
+        })?;
+        let page = if let Some(cursor) = cursor {
+            self.catalog_pages.resume(&cwd, cursor, PAGE_SIZE)
+        } else {
+            let root = cwd.clone();
+            let catalog = tokio::task::spawn_blocking(move || crate::session::catalog(&root))
+                .await
+                .map_err(|error| {
+                    ListSessionsError::Runtime(AcpRuntimeError::Loop(format!(
+                        "session catalog worker failed: {error}"
+                    )))
+                })?
+                .map_err(|error| ListSessionsError::Runtime(AcpRuntimeError::Loop(error)))?;
+            self.catalog_pages.start(cwd.clone(), catalog, PAGE_SIZE)
         }
-        let end = catalog.len().min(offset + PAGE_SIZE);
-        let sessions = catalog[offset..end]
+        .map_err(|error| match error {
+            crate::protocols::acp::session_pagination::Error::InvalidCursor => {
+                ListSessionsError::InvalidCursor
+            }
+            crate::protocols::acp::session_pagination::Error::Unavailable => {
+                ListSessionsError::Runtime(AcpRuntimeError::Loop(
+                    "session catalog snapshot unavailable".into(),
+                ))
+            }
+        })?;
+        let sessions = page.entries[page.range]
             .iter()
             .map(|entry| catalog_session_info(entry, &cwd))
             .collect();
-        let next =
-            (end < catalog.len()).then(|| wire::SessionListCursor::new(format!("offset:{end}")));
+        let next = page.next.map(wire::SessionListCursor::new);
         Ok(wire::ListSessionsResponse::new(sessions).next_cursor(next))
     }
 
@@ -2446,13 +2464,6 @@ fn catalog_session_info(entry: &crate::session::CatalogEntry, cwd: &Path) -> wir
         )]));
     }
     info
-}
-
-fn parse_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
-    cursor
-        .strip_prefix("offset:")
-        .and_then(|value| value.parse().ok())
-        .ok_or(ListSessionsError::InvalidCursor)
 }
 
 fn transcript_replay(
@@ -7542,11 +7553,77 @@ for line in sys.stdin:
         assert_eq!(encoded["_meta"]["dev.kit.subagent"], true);
     }
 
+    #[tokio::test]
+    async fn session_list_continuation_keeps_catalog_snapshot_after_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let server = Server::new(runtime, SessionRegistry::new());
+        for _ in 0..=PAGE_SIZE {
+            drop(
+                crate::session::open(
+                    root.path(),
+                    &crate::session::new_id(),
+                    false,
+                    false,
+                    vec![Item::text(ItemKind::User, "original")],
+                )
+                .unwrap(),
+            );
+        }
+        let first = server
+            .list_sessions(wire::ListSessionsRequest::new())
+            .await
+            .unwrap();
+        assert_eq!(first.sessions.len(), PAGE_SIZE);
+        let cursor = first.next_cursor.unwrap();
+        let expected = crate::session::catalog(root.path()).unwrap();
+        let added = crate::session::new_id();
+        drop(
+            crate::session::open(
+                root.path(),
+                &added,
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "added after first page")],
+            )
+            .unwrap(),
+        );
+        let second = server
+            .list_sessions(wire::ListSessionsRequest::new().cursor(cursor.clone()))
+            .await
+            .unwrap();
+        assert_eq!(second.sessions.len(), 1);
+        assert_eq!(
+            second.sessions[0].session_id.to_string(),
+            expected[PAGE_SIZE].id
+        );
+        assert!(second.next_cursor.is_none());
+        let fresh = server
+            .list_sessions(wire::ListSessionsRequest::new())
+            .await
+            .unwrap();
+        let fresh_end = server
+            .list_sessions(wire::ListSessionsRequest::new().cursor(fresh.next_cursor.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(fresh_end.sessions.len(), 2);
+        let other = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            server
+                .list_sessions(
+                    wire::ListSessionsRequest::new()
+                        .cwd(other.path().to_path_buf())
+                        .cursor(cursor)
+                )
+                .await,
+            Err(ListSessionsError::InvalidCursor)
+        ));
+    }
     #[test]
-    fn cursors_parse_offsets_and_reject_malformed_values() {
-        assert_eq!(parse_cursor("offset:100").unwrap(), 100);
-        assert!(parse_cursor("100").is_err());
-        assert!(parse_cursor("offset:nope").is_err());
+    fn cursors_reject_legacy_offsets_and_malformed_values() {
+        assert!(crate::protocols::acp::session_pagination::Cursor::parse("offset:100").is_err());
+        assert!(crate::protocols::acp::session_pagination::Cursor::parse("100").is_err());
+        assert!(crate::protocols::acp::session_pagination::Cursor::parse("offset:nope").is_err());
         assert_eq!(
             list_sessions_error(ListSessionsError::InvalidCursor).code,
             agent_client_protocol::ErrorCode::InvalidParams
