@@ -132,10 +132,11 @@ enum GitSourceRevision<'a> {
     Planned(&'a PlannedGitRevision),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SourceFingerprint {
     candidate: blake3::Hash,
     resolved: blake3::Hash,
+    remote_revisions: BTreeMap<(String, Option<String>), PlannedGitRevision>,
 }
 
 #[derive(Clone)]
@@ -146,6 +147,7 @@ struct PlannedPathSource {
 
 #[derive(Clone)]
 struct SourcePlan {
+    remote_revisions: BTreeMap<(String, Option<String>), PlannedGitRevision>,
     candidate_fingerprint: blake3::Hash,
     path_sources: BTreeMap<String, PlannedPathSource>,
     git_revisions: BTreeMap<String, PlannedGitRevision>,
@@ -232,6 +234,7 @@ impl SourcePlan {
         Ok(SourceFingerprint {
             candidate: self.candidate_fingerprint,
             resolved: fingerprint.finalize(),
+            remote_revisions: self.remote_revisions.clone(),
         })
     }
 }
@@ -328,9 +331,22 @@ impl PluginRuntime {
             .await
     }
 
+    pub(crate) async fn stage_for_poll(&self) -> Result<StagedPlugins, String> {
+        self.stage_with_policy(Arc::new(SystemGitRunner::default()), false)
+            .await
+    }
+
     async fn stage_with_git_runner(
         &self,
         runner: Arc<dyn GitRunner + Send>,
+    ) -> Result<StagedPlugins, String> {
+        self.stage_with_policy(runner, true).await
+    }
+
+    async fn stage_with_policy(
+        &self,
+        runner: Arc<dyn GitRunner + Send>,
+        refresh_remote: bool,
     ) -> Result<StagedPlugins, String> {
         let contents = match crate::config_files::read_to_string(&self.inner.config_path) {
             Ok(contents) => contents,
@@ -355,13 +371,20 @@ impl PluginRuntime {
                 .plugins
         };
         cleanup_runtime_skill_generations(&self.inner.skill_cache_root, &self.snapshot());
+        let mut published = self.published();
+        if refresh_remote {
+            // Clear only this private planning snapshot, not published state.
+            if let Some(fingerprint) = &mut published.source_fingerprint {
+                fingerprint.remote_revisions.clear();
+            }
+        }
         stage_with_skill_cache(
             &configs,
             &self.inner.runtime_root,
             &self.inner.cache_root,
             &self.inner.skill_cache_root,
             &self.inner.data_root,
-            self.published(),
+            published,
             runner,
         )
         .await
@@ -383,6 +406,7 @@ impl PluginRuntime {
         };
         let unchanged = published
             .source_fingerprint
+            .as_ref()
             .is_some_and(|current| current.resolved == staged.source_fingerprint.resolved)
             && Arc::ptr_eq(&published.resolved, &staged.resolved);
         if !unchanged {
@@ -485,11 +509,21 @@ async fn stage_with_skill_cache(
     let skill_cache_root = skill_cache_root.to_path_buf();
     let data_root = data_root.to_path_buf();
     let staged = tokio::task::spawn_blocking(move || -> Result<BlockingStage, String> {
-        let source_plan = source_plan(&configs, &runtime_root, &cache_root, runner.as_ref())?;
-        if let Some(source_fingerprint) = published
+        // Polls still inspect every local source and config entry, but reuse
+        // verified remote revisions. Invocation always probes mutable refs.
+        let cached = published.source_fingerprint.as_ref();
+        let source_plan = source_plan_with_cached_revisions(
+            &configs,
+            &runtime_root,
+            &cache_root,
+            runner.as_ref(),
+            cached.map(|fingerprint| &fingerprint.remote_revisions),
+        )?;
+        if let Some(mut source_fingerprint) = published
             .source_fingerprint
             .filter(|fingerprint| fingerprint.candidate == source_plan.candidate_fingerprint)
         {
+            source_fingerprint.remote_revisions = source_plan.remote_revisions;
             return Ok(BlockingStage::Reused {
                 resolved: published.resolved,
                 source_fingerprint,
@@ -1462,12 +1496,24 @@ fn hash_fingerprint_field(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
+#[cfg(test)]
 fn source_plan(
     configs: &BTreeMap<String, PluginConfig>,
     runtime_root: &Path,
     cache_root: &Path,
     runner: &dyn GitRunner,
 ) -> Result<SourcePlan, String> {
+    source_plan_with_cached_revisions(configs, runtime_root, cache_root, runner, None)
+}
+
+fn source_plan_with_cached_revisions(
+    configs: &BTreeMap<String, PluginConfig>,
+    runtime_root: &Path,
+    cache_root: &Path,
+    runner: &dyn GitRunner,
+    cached: Option<&BTreeMap<(String, Option<String>), PlannedGitRevision>>,
+) -> Result<SourcePlan, String> {
+    let mut remote_revisions = BTreeMap::new();
     let mut fingerprint = blake3::Hasher::new();
     let mut path_sources = BTreeMap::new();
     let mut git_revisions = BTreeMap::new();
@@ -1524,20 +1570,26 @@ fn source_plan(
                 } else {
                     hash_fingerprint_field(&mut fingerprint, &[]);
                 }
-                let planned = match &revision {
-                    GitRevision::Commit(oid) => PlannedGitRevision {
-                        fetch_revision: revision.clone(),
-                        raw_oid: oid.clone(),
-                        commit_oid: oid.clone(),
-                    },
-                    GitRevision::Ref(_) | GitRevision::DefaultBranch => probe_git_revision(
-                        OsStr::new(url.as_str()),
-                        &sha256_text(url.as_str()),
-                        &revision,
-                        cache_root,
-                        runner,
-                    )?,
+                let key = (url.as_str().to_owned(), rev.clone());
+                let planned = if let Some(planned) = cached.and_then(|cached| cached.get(&key)) {
+                    planned.clone()
+                } else {
+                    match &revision {
+                        GitRevision::Commit(oid) => PlannedGitRevision {
+                            fetch_revision: revision.clone(),
+                            raw_oid: oid.clone(),
+                            commit_oid: oid.clone(),
+                        },
+                        GitRevision::Ref(_) | GitRevision::DefaultBranch => probe_git_revision(
+                            OsStr::new(url.as_str()),
+                            &sha256_text(url.as_str()),
+                            &revision,
+                            cache_root,
+                            runner,
+                        )?,
+                    }
                 };
+                remote_revisions.insert(key, planned.clone());
                 fingerprint.update(&[1]);
                 hash_fingerprint_field(&mut fingerprint, planned.raw_oid.as_bytes());
                 hash_fingerprint_field(&mut fingerprint, planned.commit_oid.as_bytes());
@@ -1546,6 +1598,7 @@ fn source_plan(
         }
     }
     Ok(SourcePlan {
+        remote_revisions,
         candidate_fingerprint: fingerprint.finalize(),
         path_sources,
         git_revisions,
@@ -4492,7 +4545,7 @@ mod tests {
         )
         .unwrap();
         let runtime = PluginRuntime::new(
-            config,
+            config.clone(),
             directory.path().to_path_buf(),
             directory.path().join("cache"),
             directory.path().join("data"),
@@ -4501,7 +4554,7 @@ mod tests {
 
         let first = runtime.stage_with_git_runner(runner.clone()).await.unwrap();
         assert_eq!(first.resolved.skills[0].body, "first");
-        let first_fingerprint = first.source_fingerprint;
+        let first_fingerprint = first.source_fingerprint.clone();
         runtime.publish(first);
         let published = runtime.snapshot();
         let unchanged = runtime.stage_with_git_runner(runner.clone()).await.unwrap();
@@ -4524,6 +4577,74 @@ mod tests {
         if rev.is_some() {
             repository.git(&["tag", "-f", "-a", "stable", "-m", "second tag"]);
         }
+        // An idle poll works even with an unavailable Git backend. It must
+        // retain the last verified revision instead of probing the moved ref.
+        let polled = runtime
+            .stage_with_policy(Arc::new(TimeoutRunner), false)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&published, &polled.resolved));
+        runtime.publish(polled);
+
+        // Local plugin additions/removals remain live alongside remote sources.
+        let local = directory.path().join("local");
+        fs::create_dir_all(local.join("skills/local")).unwrap();
+        fs::write(
+            local.join("plugin.json"),
+            MANIFEST.replace("test-plugin", "local-plugin"),
+        )
+        .unwrap();
+        fs::write(
+            local.join("skills/local/SKILL.md"),
+            "---\nname: local\ndescription: Local.\n---\nlocal body\n",
+        )
+        .unwrap();
+        let original_config = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!(
+                "{original_config}\n[plugins.local]\nsource = 'path'\npath = '{}'\n",
+                local.display()
+            ),
+        )
+        .unwrap();
+        let added = runtime
+            .stage_with_policy(runner.clone(), false)
+            .await
+            .unwrap();
+        assert!(
+            added
+                .resolved
+                .skills
+                .iter()
+                .any(|skill| skill.name == "local")
+        );
+        assert!(
+            added
+                .resolved
+                .skills
+                .iter()
+                .any(|skill| skill.body == "first")
+        );
+        runtime.publish(added);
+        fs::write(&config, &original_config).unwrap();
+        let removed = runtime
+            .stage_with_policy(runner.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(removed.resolved.skills.len(), 1);
+        assert_eq!(removed.resolved.skills[0].body, "first");
+        runtime.publish(removed);
+        let published = runtime.snapshot();
+
+        // A failed fresh probe cannot overwrite the last verified generation.
+        assert!(
+            runtime
+                .stage_with_git_runner(Arc::new(TimeoutRunner))
+                .await
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&published, &runtime.snapshot()));
         // The config is unchanged: only the remote mutable revision moved.
         let changed = runtime.stage_with_git_runner(runner.clone()).await.unwrap();
         assert_ne!(
@@ -4539,7 +4660,7 @@ mod tests {
         assert!(Arc::ptr_eq(&published, &runtime.snapshot()));
         assert_eq!(published.skills[0].body, "first");
 
-        let second_fingerprint = changed.source_fingerprint;
+        let second_fingerprint = changed.source_fingerprint.clone();
         runtime.publish(changed);
         let republished = runtime.snapshot();
         assert!(!Arc::ptr_eq(&published, &republished));

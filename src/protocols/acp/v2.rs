@@ -102,12 +102,25 @@ const PAGE_SIZE: usize = 100;
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_THOUGHT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn available_commands_update(session_id: wire::SessionId) -> wire::UpdateSessionNotification {
+fn available_commands_update(
+    session_id: wire::SessionId,
+    commands: Vec<(String, String)>,
+) -> wire::UpdateSessionNotification {
     wire::UpdateSessionNotification::new(
         session_id,
-        wire::SessionUpdate::AvailableCommandsUpdate(wire::AvailableCommandsUpdate::new(vec![
-            wire::AvailableCommand::new("compact", "Compact the session context"),
-        ])),
+        wire::SessionUpdate::AvailableCommandsUpdate(wire::AvailableCommandsUpdate::new(
+            commands
+                .into_iter()
+                .map(|(name, description)| {
+                    let input = (name != "compact").then(|| {
+                        wire::AvailableCommandInput::Text(wire::TextCommandInput::new(
+                            "Optional arguments",
+                        ))
+                    });
+                    wire::AvailableCommand::new(name, description).input(input)
+                })
+                .collect(),
+        )),
     )
 }
 
@@ -1178,7 +1191,15 @@ impl Server {
         let actor_task = tokio::spawn(async move {
             let _guard = guard;
             if activated.await.is_ok() {
-                session_actor(actor).await;
+                let sink = actor.sink.clone();
+                let runtime = Arc::clone(&actor.runtime);
+                let session_id = actor.session_id.clone();
+                let actor = std::pin::pin!(session_actor(actor));
+                let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
+                    let _ = sink.update(available_commands_update(session_id.clone(), commands));
+                }));
+                // Dropping the losing future stops polling with its session.
+                let _ = select(actor, polling).await;
             }
         });
         let interrupt_handle = handle.clone();
@@ -1911,6 +1932,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     };
     background_jobs.begin_turn();
     let prepared = integration.prompt_to_items(&request).and_then(|mut items| {
+        skill_catalog::expand_items(&current.skills, &mut items);
         let message_id = identity::stamp_user(&mut items);
         skill_catalog
             .submit(&current.skills, items, |items| {
@@ -2779,10 +2801,9 @@ pub(crate) fn component(
                     cx.spawn(async move {
                         match state.new_session(request, connection.clone()).await {
                             Ok((response, activation)) => {
-                                let session_id = response.session_id.clone();
                                 responder.respond(response)?;
                                 let _ = activation.send(());
-                                connection.send_notification(available_commands_update(session_id))
+                                Ok(())
                             }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
@@ -2816,7 +2837,6 @@ pub(crate) fn component(
                 async move |request: wire::ResumeSessionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    let session_id = request.session_id.clone();
                     cx.spawn(async move {
                         match state.resume_session(request, connection.clone()).await {
                             Ok((response, replay, activation)) => {
@@ -2825,7 +2845,7 @@ pub(crate) fn component(
                                 }
                                 responder.respond(response)?;
                                 let _ = activation.send(());
-                                connection.send_notification(available_commands_update(session_id))
+                                Ok(())
                             }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
@@ -5365,8 +5385,14 @@ mod tests {
     }
 
     #[test]
-    fn available_commands_advertises_only_compact() {
-        let notification = available_commands_update(wire::SessionId::new("session"));
+    fn available_commands_advertises_skills_with_optional_arguments() {
+        let notification = available_commands_update(
+            wire::SessionId::new("session"),
+            vec![
+                ("compact".into(), "Compact the session context".into()),
+                ("review".into(), "Review changes".into()),
+            ],
+        );
         let wire::SessionUpdate::AvailableCommandsUpdate(update) = notification.update else {
             panic!("expected available commands update");
         };
@@ -5376,8 +5402,15 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
-            ["compact"]
+            ["compact", "review"]
         );
+        assert!(update.available_commands[0].input.is_none());
+        assert_eq!(update.available_commands[1].description, "Review changes");
+        let Some(wire::AvailableCommandInput::Text(input)) = &update.available_commands[1].input
+        else {
+            panic!("expected text argument hint");
+        };
+        assert_eq!(input.hint, "Optional arguments");
     }
 
     #[tokio::test]
