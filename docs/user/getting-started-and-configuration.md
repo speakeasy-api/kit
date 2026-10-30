@@ -466,7 +466,7 @@ The `skill` entry in `compose` initially discloses only valid skill names and de
 
 In the TUI or an ACP client, enter `/name` to load a skill by name. Append optional task details, for example `/release-notes focus on user-facing fixes`. Kit loads the latest skill instructions when you invoke the command. Skill commands that collide with `/compact` or Kit’s local commands (`/voice`, `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, `/login`, and `/usage`) are hidden; use the `skill` tool to load those skills instead. Unknown or removed skill commands are sent as ordinary prompts; Kit does not reuse their old instructions.
 
-Kit checks for skill catalog changes every five seconds in live sessions. To change the interval, set `skill_poll_interval_seconds` in `~/.kit/config.toml`:
+Kit checks for skill catalog changes every five seconds in live sessions, including additions and removals in local path plugins. Polling reuses previously resolved Git plugin revisions rather than contacting their remotes on every interval. Invoke a skill or send a prompt to refresh mutable Git revisions; newly configured Git sources are resolved when discovered. To change the polling interval, set `skill_poll_interval_seconds` in `~/.kit/config.toml`:
 
 ```toml
 skill_poll_interval_seconds = 5

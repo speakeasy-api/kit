@@ -2266,6 +2266,10 @@ impl McpRuntime {
         self.reload_config().await
     }
 
+    pub(crate) async fn refresh_for_skill_poll(&self) -> Result<(), String> {
+        self.reload_config_with_policy(None, false).await
+    }
+
     /// Add or update submitted request-scoped servers, retaining omitted servers.
     /// An empty batch is a no-op; host and plugin names cannot be updated.
     /// Invalid configuration leaves the published generation unchanged. Affected
@@ -2291,6 +2295,14 @@ impl McpRuntime {
         &self,
         session_source: Option<ConfigSource>,
     ) -> Result<(), String> {
+        self.reload_config_with_policy(session_source, true).await
+    }
+
+    async fn reload_config_with_policy(
+        &self,
+        session_source: Option<ConfigSource>,
+        refresh_remote: bool,
+    ) -> Result<(), String> {
         self.ensure_healthy()?;
         let permit = Arc::clone(&self.inner.reload_flight)
             .acquire_owned()
@@ -2305,7 +2317,7 @@ impl McpRuntime {
             // inputs but before that reload publishes.
             let _permit = permit;
             let result = runtime
-                .reload_config_inner(session_source)
+                .reload_config_inner_with_policy(session_source, refresh_remote)
                 .await
                 .map_err(crate::plugins::bounded_diagnostic);
             runtime
@@ -2319,9 +2331,19 @@ impl McpRuntime {
         .map_err(|error| format!("MCP config reload task failed: {error}"))?
     }
 
+    #[cfg(test)]
     async fn reload_config_inner(
         &self,
         session_source: Option<ConfigSource>,
+    ) -> Result<(), String> {
+        self.reload_config_inner_with_policy(session_source, true)
+            .await
+    }
+
+    async fn reload_config_inner_with_policy(
+        &self,
+        session_source: Option<ConfigSource>,
+        refresh_remote: bool,
     ) -> Result<(), String> {
         loop {
             // Snapshot the published generation, then perform all config reads,
@@ -2343,7 +2365,11 @@ impl McpRuntime {
                 )
             };
             let staged_plugins = match &plugin_source {
-                Some(source) => Some(source.stage().await?),
+                Some(source) => Some(if refresh_remote {
+                    source.stage().await?
+                } else {
+                    source.stage_for_poll().await?
+                }),
                 None => None,
             };
             let (plugin_prepared, plugin_entries) = match &staged_plugins {

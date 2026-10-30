@@ -1653,21 +1653,25 @@ impl Runtime {
         {
             return Ok(skills.clone());
         }
-        let current = self.scan_skills().await?;
+        let current = self.scan_skills(false).await?;
         *cache = Some((tokio::time::Instant::now(), current.skills.clone()));
         Ok(current.skills)
     }
 
     pub(crate) async fn current_skills(&self) -> Result<CurrentSkills, String> {
         let mut cache = self.skill_scan.lock().await;
-        let current = self.scan_skills().await?;
+        let current = self.scan_skills(true).await?;
         *cache = Some((tokio::time::Instant::now(), current.skills.clone()));
         Ok(current)
     }
 
-    async fn scan_skills(&self) -> Result<CurrentSkills, String> {
+    async fn scan_skills(&self, refresh_remote: bool) -> Result<CurrentSkills, String> {
         if self.plugin_runtime.is_some() {
-            self.mcp.refresh().await?;
+            if refresh_remote {
+                self.mcp.refresh().await?;
+            } else {
+                self.mcp.refresh_for_skill_poll().await?;
+            }
         }
         let _generation = match &self.plugin_runtime {
             Some(plugins) => Some(plugins.generation_lease().await),

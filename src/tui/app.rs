@@ -2387,7 +2387,6 @@ impl App {
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
                     self.available_commands = commands;
-                    self.command_completion_dismissed = None;
                     self.sync_command_completion();
                 }
             }
@@ -7991,6 +7990,28 @@ mod tests {
         let mut app = app();
         app.paste("/ses");
         app.handle_key(press(KeyCode::Esc));
+        app.last_key = None;
+
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected the dismissed input to be submitted unchanged");
+        };
+        assert_eq!(prompt.text, "/ses");
+    }
+
+    #[test]
+    fn catalog_update_preserves_dismissed_slash_command() {
+        let mut app = app();
+        app.start_session("one".into());
+        app.paste("/ses");
+        assert!(!app.command_completions().is_empty());
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.command_completions().is_empty());
+
+        app.apply(Update::AvailableCommands {
+            session_id: "one".into(),
+            commands: vec!["session-review".into()],
+        });
+        assert!(app.command_completions().is_empty());
         app.last_key = None;
 
         let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
