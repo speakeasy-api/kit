@@ -334,6 +334,8 @@ struct AgentRoster: Equatable {
             usageByID.removeAll()
             return
         }
+        for (id, parentID) in source.parentsByID { parentsByID[id] = parentID }
+        removeCleanedDescendants()
         steerableGenerations.removeAll()
         for (id, streamed) in source.rowsByID {
             guard !cleanedIDs.contains(id) else { continue }
@@ -367,6 +369,9 @@ struct AgentRoster: Equatable {
     }
 
     mutating func applyStreamed(row: AgentRosterRow, canSteer: Bool) {
+        if let parentID = row.parentID { parentsByID[row.id] = parentID }
+        removeCleanedDescendants()
+        guard !cleanedIDs.contains(row.id) else { return }
         rowsByID[row.id] = row
         if canSteer { steerableGenerations[row.id] = row.generation }
         else { steerableGenerations.removeValue(forKey: row.id) }
@@ -386,6 +391,26 @@ struct AgentRoster: Equatable {
     }
     private var versions: [String: Version] = [:]
     private var cleanedIDs: Set<String> = []
+    // Keep ownership independently of visible rows: cleanup can precede the
+    // first announcement, and a removed parent can acquire late descendants.
+    private var parentsByID: [String: String] = [:]
+    private var cleanedAncestors: Set<String> = []
+
+    private mutating func removeCleanedDescendants() {
+        guard !cleanedAncestors.isEmpty else { return }
+        while true {
+            let before = cleanedIDs.count
+            for (id, parentID) in parentsByID {
+                if cleanedAncestors.contains(parentID) || cleanedIDs.contains(parentID) {
+                    cleanedIDs.insert(id)
+                }
+            }
+            if cleanedIDs.count == before { break }
+        }
+        rowsByID = rowsByID.filter { !cleanedIDs.contains($0.key) }
+        usageByID = usageByID.filter { !cleanedIDs.contains($0.key) }
+        steerableGenerations = steerableGenerations.filter { !cleanedIDs.contains($0.key) }
+    }
 
     var nextFailedRemovalExpiryMS: UInt64? {
         rowsByID.values.compactMap { row in
@@ -443,7 +468,10 @@ struct AgentRoster: Equatable {
     mutating func apply(event: [String: Any], nowMS: UInt64) -> Bool {
         switch event["event"] as? String {
         case "subagent_state_changed":
-            guard let row = Self.parseRow(event), !cleanedIDs.contains(row.id) else { return false }
+            guard let row = Self.parseRow(event) else { return false }
+            if let parentID = row.parentID { parentsByID[row.id] = parentID }
+            removeCleanedDescendants()
+            guard !cleanedIDs.contains(row.id) else { return false }
             let incoming = Version(generation: row.generation, statusRank: row.status.rank)
             if let current = versions[row.id], incoming <= current { return false }
             versions[row.id] = incoming
@@ -481,18 +509,8 @@ struct AgentRoster: Equatable {
             return true
         case "subagent_descendants_removed":
             guard let ancestorID = event["ancestor_id"] as? String else { return false }
-            var removed: Set<String> = []
-            while true {
-                let before = removed.count
-                for row in rowsByID.values where row.id != ancestorID {
-                    if row.parentID == ancestorID || row.parentID.map(removed.contains) == true { removed.insert(row.id) }
-                }
-                if removed.count == before { break }
-            }
-            rowsByID = rowsByID.filter { !removed.contains($0.key) }
-            usageByID = usageByID.filter { !removed.contains($0.key) }
-            steerableGenerations = steerableGenerations.filter { !removed.contains($0.key) }
-            cleanedIDs.formUnion(removed)
+            cleanedAncestors.insert(ancestorID)
+            removeCleanedDescendants()
             return true
         default: return false
         }

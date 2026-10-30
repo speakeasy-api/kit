@@ -392,8 +392,46 @@ final class AgentRosterTests: XCTestCase {
         XCTAssertEqual(Set(roster.rowsByID.keys), ["parent"])
         XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
         XCTAssertFalse(roster.apply(event: event(id: "nested", name: "Late", status: "working", generation: 99), nowMS: 101))
+        stream.receive(root: "root", session: "nested", update: streamed("unseen"))
         roster.syncStreamed(stream.roster)
         XCTAssertEqual(Set(roster.rowsByID.keys), ["parent"])
+        XCTAssertFalse(roster.apply(event: event(id: "unseen", name: "Late", status: "working", generation: 99), nowMS: 102))
+    }
+
+    @MainActor
+    func testCleanupBeforeFirstAnnouncementFencesUnseenDescendants() {
+        let stream = DesktopChildSessions()
+        var roster = AgentRoster()
+        XCTAssertTrue(roster.apply(event: ["event": "subagent_descendants_removed", "ancestor_id": "parent"], nowMS: 100))
+        stream.receive(root: "root", session: "root", update: streamed("parent"))
+        stream.receive(root: "root", session: "parent", update: streamed("child"))
+        stream.receive(root: "root", session: "child", update: streamed("grandchild"))
+        stream.receive(root: "root", session: "root", update: streamed("peer"))
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(Set(roster.rowsByID.keys), ["parent", "peer"])
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+        XCTAssertFalse(roster.apply(event: event(id: "grandchild", name: "Late", status: "working", generation: 99), nowMS: 101))
+
+        // Live roster cleanup must not discard retained child transcripts.
+        XCTAssertTrue(stream.receive(root: "root", session: "grandchild", update: [
+            "sessionUpdate": "agent_message_chunk", "content": ["type": "text", "text": "late output"]
+        ]))
+        XCTAssertEqual(stream.history["grandchild"]?.count, 1)
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(Set(roster.rowsByID.keys), ["parent", "peer"])
+    }
+
+    func testCleanupRetainsOwnershipAfterParentRowDisappears() {
+        var roster = AgentRoster()
+        _ = roster.apply(event: event(id: "child", name: "Child", status: "removed", outcome: "success", parentID: "parent", finished: 100), nowMS: 100)
+        XCTAssertNil(roster.rowsByID["child"])
+        _ = roster.apply(event: ["event": "subagent_descendants_removed", "ancestor_id": "parent"], nowMS: 101)
+        XCTAssertFalse(roster.apply(event: event(id: "unseen", name: "Unseen", status: "working", parentID: "child"), nowMS: 102))
+        roster.invalidateLiveState()
+        XCTAssertFalse(roster.apply(event: event(id: "later", name: "Later", status: "working", parentID: "unseen"), nowMS: 103))
+        XCTAssertTrue(roster.rowsByID.isEmpty)
+        roster.reset()
+        XCTAssertTrue(roster.apply(event: event(id: "child", name: "Child", status: "working", parentID: "parent"), nowMS: 104))
     }
 
     @MainActor
