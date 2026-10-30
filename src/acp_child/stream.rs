@@ -257,7 +257,22 @@ impl Stream {
                 }
             }
             if serde_json::to_writer(Limit(FRAME_BYTES), &snapshot).is_ok() {
+                // V1 has no child-addressed state_update. Publish a minimal
+                // parent-addressed association patch as well as retaining it,
+                // before the raw v2 update. This is a known ownership edge.
+                let association_owner = state.nodes[position].0.clone();
+                let mut patch = match serde_json::to_value(SessionUpdate::SubagentUpdate(
+                    acp::SubagentUpdate::new(owner.to_owned()),
+                )) {
+                    Ok(patch) => patch,
+                    Err(_) => return,
+                };
+                patch["state"] = snapshot["state"].clone();
+                if let Some(steering) = state.steering.get(owner) {
+                    patch["_meta"] = steering.meta();
+                }
                 state.nodes[position].1 = snapshot;
+                Self::publish(state, &association_owner, patch);
             }
         }
         // State snapshots are replayed from `nodes`; replaying an older
@@ -614,11 +629,20 @@ impl Routes {
                         message = message.recipient_session_id(acp::SessionId::from(parent));
                     }
                 }
-                if !chunk
-                    && let Ok(content) =
-                        serde_json::from_value::<Vec<acp::ContentBlock>>(update["content"].clone())
-                {
-                    message = message.content(content);
+                if !chunk {
+                    match update.get("content") {
+                        None => {}
+                        Some(Value::Null) => {
+                            message.content = agent_client_protocol::schema::MaybeUndefined::Null;
+                        }
+                        Some(content) => {
+                            if let Ok(content) =
+                                serde_json::from_value::<Vec<acp::ContentBlock>>(content.clone())
+                            {
+                                message = message.content(content);
+                            }
+                        }
+                    }
                 }
                 if announce
                     && let Ok(message) =
@@ -1086,6 +1110,124 @@ mod tests {
                 association.1["state"]
             );
         }
+    }
+
+    #[test]
+    fn directed_message_views_preserve_omission_null_and_replacement_content() {
+        for kind in ["agent_message", "user_message"] {
+            let transcripts = super::super::transcript::Transcripts::default();
+            transcripts
+                .stream
+                .announce("child", "worker", "task", SubagentStatus::Working, 1);
+            transcripts.start("child", 1);
+            let mut rx = transcripts.stream.subscribe("parent".into(), false);
+            rx.try_recv().unwrap();
+            let routes = Routes::default();
+            routes.register("remote", "child", 1, transcripts.get("child", 1).unwrap());
+            let mut views: HashMap<String, super::super::messages::Messages> = HashMap::new();
+            let updates = [
+                (
+                    json!({"sessionUpdate":kind,"messageId":"m","content":[{"type":"text","text":"old"}]}),
+                    "old",
+                ),
+                (json!({"sessionUpdate":kind,"messageId":"m"}), "old"),
+                (
+                    json!({"sessionUpdate":kind,"messageId":"m","content":null}),
+                    "",
+                ),
+                (
+                    json!({"sessionUpdate":format!("{kind}_chunk"),"messageId":"m","content":{"type":"text","text":"new"}}),
+                    "new",
+                ),
+                (
+                    json!({"sessionUpdate":kind,"messageId":"m","content":[{"type":"text","text":"replacement"}]}),
+                    "replacement",
+                ),
+            ];
+            for (native, expected) in updates {
+                let content = native.get("content").cloned();
+                let chunk = native["sessionUpdate"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("_chunk");
+                routes.forward("remote", native);
+                while let Ok((owner, mut event)) = rx.try_recv() {
+                    let decoded: acp::SessionUpdate =
+                        serde_json::from_value(event.clone()).unwrap();
+                    match decoded {
+                        acp::SessionUpdate::SessionMessage(_) => {
+                            if !chunk {
+                                assert_eq!(event.get("content"), content.as_ref());
+                            }
+                            event["sessionUpdate"] = Value::String("agent_message".into());
+                        }
+                        acp::SessionUpdate::SessionMessageChunk(_) => {
+                            event["sessionUpdate"] = Value::String("agent_message_chunk".into());
+                        }
+                        _ => panic!("expected a directed message"),
+                    }
+                    // Exercise the actual native text reducer for each view;
+                    // only the envelope discriminator differs from its API.
+                    let update = super::super::messages::parse(&event).unwrap().unwrap();
+                    views.entry(owner).or_default().record(update);
+                }
+                assert_eq!(views["parent"].clone().finish(), expected);
+                assert_eq!(views["child"].clone().finish(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn live_descendant_state_has_parent_addressed_v1_association_patch() {
+        let stream = Stream::default();
+        let mut rx = stream.subscribe("root".into(), false);
+        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.forward("child", json!({"sessionUpdate":"subagent_update","sessionId":"grandchild","state":{"state":"running"}}));
+        stream.forward(
+            "grandchild",
+            json!({"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}),
+        );
+        let mut associations = Vec::new();
+        let mut raw_states = Vec::new();
+        while let Ok((owner, update)) = rx.try_recv() {
+            if update["sessionUpdate"] == "state_update" {
+                assert_eq!(
+                    associations.len(),
+                    3,
+                    "ownership and state patch precede raw state"
+                );
+                raw_states.push((owner, update));
+                continue;
+            }
+            // Decode with the actual v1 SDK API. The server's private projection
+            // passes subagent_update through unchanged and drops raw state_update.
+            let notification: acp::SessionNotification = serde_json::from_value(json!({
+                "sessionId":owner, "update":update,
+            }))
+            .unwrap();
+            if let acp::SessionUpdate::SubagentUpdate(association) = notification.update {
+                associations.push((notification.session_id.to_string(), association));
+            }
+        }
+        assert_eq!(associations.len(), 3);
+        assert_eq!(associations[0].0, "root");
+        assert_eq!(associations[0].1.session_id.to_string(), "child");
+        assert_eq!(associations[1].0, "child");
+        assert_eq!(associations[1].1.session_id.to_string(), "grandchild");
+        assert_eq!(associations[2].0, "child");
+        assert_eq!(associations[2].1.session_id.to_string(), "grandchild");
+        assert!(matches!(
+            associations[2].1.state,
+            agent_client_protocol::schema::MaybeUndefined::Value(acp::StateUpdate::Idle(_))
+        ));
+        assert_eq!(raw_states.len(), 1);
+        assert_eq!(raw_states[0].0, "grandchild");
+        let mut replay = stream.subscribe("root".into(), false);
+        replay.try_recv().unwrap();
+        assert_eq!(
+            replay.try_recv().unwrap().1["state"],
+            json!({"state":"idle","stopReason":"end_turn"})
+        );
     }
 
     #[test]

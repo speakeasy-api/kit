@@ -39,7 +39,9 @@ impl App {
             return;
         }
         self.ensure_child_view(&session);
-        if let wire::SessionUpdate::StateUpdate(state) = &notification.update
+        let retired = self.child_roster_retired(&session);
+        if !retired
+            && let wire::SessionUpdate::StateUpdate(state) = &notification.update
             && let Some(row) = self.agents.get_mut(&session)
         {
             row.status = work_status(Some(state));
@@ -49,7 +51,7 @@ impl App {
             let (generation, status) = (row.generation, row.status);
             self.child_lifecycle(&session, generation, status);
         }
-        if let Some(row) = self.agents.get_mut(&session) {
+        if !retired && let Some(row) = self.agents.get_mut(&session) {
             match &notification.update {
                 wire::SessionUpdate::ToolCallUpdate(tool) => {
                     row.activity.apply(crate::events::SubagentActivity::Tool {
@@ -98,16 +100,49 @@ impl App {
             _ => {
                 for update in super::super::translate(notification).1 {
                     // Reporting child commands never authorizes child input.
-                    if !matches!(update, Update::AvailableCommands { .. }) {
+                    if !matches!(update, Update::AvailableCommands { .. })
+                        && !(retired && matches!(update, Update::State(_)))
+                    {
                         view.app.apply(update);
                     }
                 }
             }
         }
-        if let Some(row) = self.agents.get_mut(&session) {
+        if !retired && let Some(row) = self.agents.get_mut(&session) {
             row.usage = view.app.usage;
             row.cost = view.app.cost.clone();
         }
+    }
+
+    /// Runtime retirement wins over independently delivered ACP activity.
+    /// Associations remain available for retained history, not roster revival.
+    fn child_roster_retired(&self, id: &str) -> bool {
+        if self.cleaned_agent_ids.contains(id)
+            || self
+                .agent_versions
+                .get(id)
+                .is_some_and(|(_, rank)| *rank == agent_status_rank(SubagentStatus::Removed))
+        {
+            return true;
+        }
+        // Ownership is immutable and cycle-free. Walk retained associations so
+        // cleanup also covers descendants announced after the cleanup event.
+        let mut ancestor = self
+            .child_sessions
+            .get(id)
+            .map(|association| association.parent.as_str());
+        while let Some(parent) = ancestor {
+            if self.cleaned_agent_ids.contains(parent)
+                || self.cleaned_agent_ancestors.contains(parent)
+            {
+                return true;
+            }
+            ancestor = self
+                .child_sessions
+                .get(parent)
+                .map(|association| association.parent.as_str());
+        }
+        false
     }
 
     fn upsert_child(&mut self, root: &str, parent: &str, update: wire::SubagentUpdate) {
@@ -171,6 +206,14 @@ impl App {
         );
         patch_meta(&mut snapshot.meta, update.meta);
         let state = snapshot.state.value().cloned();
+        let title = snapshot.title.value().cloned();
+        let description = snapshot.description.value().cloned();
+        if self.child_roster_retired(&id) {
+            if let Some(view) = self.child_views.get_mut(&id) {
+                view.disable("Child removed; retained transcript is read-only");
+            }
+            return;
+        }
         let row = self.agents.entry(id.clone()).or_insert_with(|| AgentRow {
             id: id.clone(),
             name: id.clone(),
@@ -191,12 +234,8 @@ impl App {
             activity: AgentActivity::default(),
             focus_can_steer: false,
         });
-        row.name = snapshot
-            .title
-            .value()
-            .cloned()
-            .unwrap_or_else(|| id.clone());
-        row.task = snapshot.description.value().cloned().unwrap_or_default();
+        row.name = title.unwrap_or_else(|| id.clone());
+        row.task = description.unwrap_or_default();
         if state_changed {
             row.status = work_status(state.as_ref());
             if row.status != SubagentStatus::Working {
@@ -719,6 +758,137 @@ mod tests {
         announce(&mut app, "root", "child");
         app.focus_child("child".into());
         assert!(!app.child_views["child"].can_steer);
+    }
+
+    fn runtime_state(
+        app: &mut App,
+        id: &str,
+        generation: u64,
+        status: SubagentStatus,
+        outcome: Option<GenerationOutcome>,
+    ) {
+        app.apply(Update::Runtime(RuntimeEvent::SessionStarted {
+            session_id: "root".into(),
+        }));
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentStateChanged {
+                id: id.into(),
+                name: id.into(),
+                status,
+                outcome,
+                generation,
+                task: "task".into(),
+                parent_id: None,
+                parent_name: None,
+                harness: "acp.kit".into(),
+                vendor: HarnessVendor::Kit,
+                model: None,
+                created_at_unix_ms: 100,
+                generation_started_at_unix_ms: 100,
+                generation_finished_at_unix_ms: (status == SubagentStatus::Removed)
+                    .then_some(10_000),
+            },
+            10_000,
+        );
+    }
+
+    #[test]
+    fn retirement_wins_in_either_stream_order_without_dropping_retained_history() {
+        for runtime_first in [false, true] {
+            let mut app = app();
+            announce(&mut app, "root", "child");
+            runtime_state(&mut app, "child", 1, SubagentStatus::Working, None);
+            chunk(&mut app, "child", "retained answer");
+            let unknown = json!({"sessionUpdate":"subagent_update", "sessionId":"child", "state":{"state":"unknown"}});
+            if runtime_first {
+                runtime_state(&mut app, "child", 1, SubagentStatus::Removed, None);
+                send(&mut app, "root", unknown);
+            } else {
+                send(&mut app, "root", unknown);
+                runtime_state(&mut app, "child", 1, SubagentStatus::Removed, None);
+            }
+            // Repeated removal is already fenced by the recorded terminal rank.
+            runtime_state(&mut app, "child", 1, SubagentStatus::Removed, None);
+            assert!(!app.agents.contains_key("child"));
+            assert!(app.child_sessions.contains_key("child"));
+            app.focus_child("child".into());
+            assert_eq!(app.child_focus.as_deref(), Some("child"));
+            assert!(
+                matches!(&app.child_views["child"].app.blocks[0], Block::Agent(text) if text == "retained answer")
+            );
+            assert!(!app.child_views["child"].can_steer);
+            // Late transcript content remains observable, without a roster row.
+            chunk(&mut app, "child", " tail");
+            assert!(!app.agents.contains_key("child"));
+            assert!(
+                matches!(&app.child_views["child"].app.blocks[0], Block::Agent(text) if text == "retained answer tail")
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_updates_do_not_overwrite_a_retained_failed_runtime_row() {
+        let mut app = app();
+        announce(&mut app, "root", "child");
+        runtime_state(&mut app, "child", 1, SubagentStatus::Working, None);
+        chunk(&mut app, "child", "answer");
+        runtime_state(
+            &mut app,
+            "child",
+            1,
+            SubagentStatus::Removed,
+            Some(GenerationOutcome::Failed),
+        );
+        let failed = app.agents["child"].clone();
+        send(
+            &mut app,
+            "root",
+            json!({"sessionUpdate":"subagent_update", "sessionId":"child", "title":"late", "state":{"state":"unknown"}}),
+        );
+        send(
+            &mut app,
+            "child",
+            json!({"sessionUpdate":"state_update", "state":"running"}),
+        );
+        assert_eq!(app.agents["child"], failed);
+        assert!(app.child_views["child"].app.phase == Phase::Idle);
+        // Only a newer runtime lifecycle can clear the terminal version fence.
+        runtime_state(&mut app, "child", 2, SubagentStatus::Working, None);
+        announce(&mut app, "root", "child");
+        assert_eq!(app.agents["child"].generation, 2);
+        assert_eq!(app.agents["child"].status, SubagentStatus::Working);
+    }
+
+    #[test]
+    fn descendant_cleanup_fences_known_and_late_announced_descendants() {
+        for cleanup_first in [false, true] {
+            let mut app = app();
+            announce(&mut app, "root", "parent");
+            announce(&mut app, "parent", "nested");
+            chunk(&mut app, "nested", "history");
+            app.apply(Update::Runtime(RuntimeEvent::SessionStarted {
+                session_id: "root".into(),
+            }));
+            if cleanup_first {
+                app.apply(Update::Runtime(RuntimeEvent::SubagentDescendantsRemoved {
+                    ancestor_id: "parent".into(),
+                }));
+                announce(&mut app, "parent", "nested");
+            } else {
+                announce(&mut app, "parent", "nested");
+                app.apply(Update::Runtime(RuntimeEvent::SubagentDescendantsRemoved {
+                    ancestor_id: "parent".into(),
+                }));
+            }
+            announce(&mut app, "nested", "late-grandchild");
+            announce(&mut app, "parent", "late-child");
+            assert!(!app.agents.contains_key("nested"));
+            assert!(!app.agents.contains_key("late-grandchild"));
+            assert!(!app.agents.contains_key("late-child"));
+            assert!(app.agents.contains_key("parent"));
+            assert!(app.child_views.contains_key("nested"));
+            assert!(!app.child_views["nested"].can_steer);
+        }
     }
 
     #[test]

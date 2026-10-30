@@ -11,6 +11,9 @@ use tokio::sync::broadcast;
 /// Foreground state is already folded into the parent association by runtime.
 /// Other v2-only terminal, plan-operation, and tool-content updates have no
 /// lossless v1 representation; omit those rather than terminate forwarding.
+/// Reasoning chunks retain their native category. Whole-thought replacement
+/// upserts cannot be represented losslessly in v1, so omit them instead of
+/// exposing reasoning as an ordinary answer or duplicating streamed thoughts.
 pub(super) fn v1_update(mut update: Value) -> Option<agentkit_acp::SessionUpdate> {
     let kind = update
         .get("sessionUpdate")
@@ -22,11 +25,10 @@ pub(super) fn v1_update(mut update: Value) -> Option<agentkit_acp::SessionUpdate
         | "terminal_output_chunk"
         | "plan_update"
         | "plan_removed"
-        | "tool_call_content_chunk" => return None,
-        "user_message" | "agent_message" | "agent_thought" => Some("session_message"),
-        "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk"
-            if update.get("messageId").is_some() =>
-        {
+        | "tool_call_content_chunk"
+        | "agent_thought" => return None,
+        "user_message" | "agent_message" => Some("session_message"),
+        "user_message_chunk" | "agent_message_chunk" if update.get("messageId").is_some() => {
             Some("session_message_chunk")
         }
         _ => None,
@@ -153,6 +155,39 @@ mod tests {
             legacy
         );
         assert!(v1_update(json!({"sessionUpdate":"session_message_chunk"})).is_none());
+    }
+
+    #[test]
+    fn v1_projection_preserves_reasoning_chunks_and_omits_whole_thoughts() {
+        for message_id in [None, Some("thought-1")] {
+            let mut thought = json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "reasoning"},
+            });
+            if let Some(message_id) = message_id {
+                thought["messageId"] = message_id.into();
+            }
+            let projected = v1_update(thought.clone()).unwrap();
+            assert!(matches!(
+                projected,
+                agentkit_acp::SessionUpdate::AgentThoughtChunk(_)
+            ));
+            assert_eq!(serde_json::to_value(projected).unwrap(), thought);
+        }
+        for content in [
+            json!([{"type":"text", "text":"complete reasoning"}]),
+            Value::Null,
+        ] {
+            assert!(
+                v1_update(json!({
+                    "sessionUpdate": "agent_thought", "messageId": "thought-1", "content": content,
+                }))
+                .is_none()
+            );
+        }
+        assert!(
+            v1_update(json!({"sessionUpdate":"agent_thought", "messageId":"thought-1"})).is_none()
+        );
     }
 
     #[tokio::test]

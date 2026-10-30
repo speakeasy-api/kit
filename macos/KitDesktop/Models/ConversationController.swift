@@ -145,6 +145,7 @@ final class ConversationController: ObservableObject {
         guard isReady, !shuttingDown, shouldPresentAgentRoster,
               let row = agentRoster.rowsByID[id], row.generation == generation else { return false }
         return row.status == .working && row.parentID == nil
+            && agentRoster.canSteer(id: id, generation: generation)
             && client.childSessions.roster.canSteer(id: id, generation: generation)
     }
 
@@ -646,10 +647,9 @@ final class ConversationController: ObservableObject {
             return
         }
         guard runtimeTransportAvailable != false, runtimeSessionID == expectedRuntimeSessionID else { return }
-        if ["subagent_state_changed", "subagent_capabilities", "subagent_descendants_removed"].contains(kind),
-           !client.childSessions.roster.rowsByID.isEmpty { return }
         var roster = agentRoster
         if roster.apply(event: event, nowMS: Self.nowMilliseconds()) {
+            if !client.childSessions.roster.rowsByID.isEmpty { roster.syncStreamed(client.childSessions.roster) }
             agentRoster = roster
             scheduleRosterPrune()
             return

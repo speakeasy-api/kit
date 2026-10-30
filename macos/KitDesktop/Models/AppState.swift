@@ -325,8 +325,44 @@ struct AgentRoster: Equatable {
     private var steerableGenerations: [String: UInt64] = [:]
 
     mutating func syncStreamed(_ source: AgentRoster) {
-        rowsByID = source.rowsByID
-        steerableGenerations = source.steerableGenerations
+        // The ACP stream owns associations and steering grants. Runtime events
+        // retain richer lifecycle metadata, including removal tombstones that
+        // must survive later ACP "unknown" state snapshots and content updates.
+        guard !source.rowsByID.isEmpty else {
+            rowsByID.removeAll()
+            steerableGenerations.removeAll()
+            usageByID.removeAll()
+            return
+        }
+        steerableGenerations.removeAll()
+        for (id, streamed) in source.rowsByID {
+            guard !cleanedIDs.contains(id) else { continue }
+            if let version = versions[id],
+               version.generation > streamed.generation
+                || (version.generation == streamed.generation && version.statusRank == SubagentStatus.removed.rank) {
+                continue
+            }
+            let runtime = rowsByID[id]
+            let sameGeneration = runtime?.generation == streamed.generation
+            let runtimeStatus = versions[id].flatMap { version -> SubagentStatus? in
+                guard version.generation == streamed.generation, version.statusRank > streamed.status.rank else { return nil }
+                return runtime?.status
+            }
+            let status = runtimeStatus ?? streamed.status
+            rowsByID[id] = AgentRosterRow(
+                id: id, name: streamed.name, status: status,
+                outcome: sameGeneration ? runtime?.outcome : nil,
+                generation: streamed.generation, task: streamed.task,
+                parentID: streamed.parentID, parentName: runtime?.parentID == streamed.parentID ? runtime?.parentName : nil,
+                harness: runtime?.harness ?? streamed.harness, model: runtime?.model ?? streamed.model,
+                createdAtMS: runtime?.createdAtMS ?? streamed.createdAtMS,
+                generationStartedAtMS: sameGeneration ? (runtime?.generationStartedAtMS ?? streamed.generationStartedAtMS) : streamed.generationStartedAtMS,
+                generationFinishedAtMS: sameGeneration ? runtime?.generationFinishedAtMS : streamed.generationFinishedAtMS
+            )
+            if status == .working, streamed.parentID == nil, source.canSteer(id: id, generation: streamed.generation) {
+                steerableGenerations[id] = streamed.generation
+            }
+        }
         usageByID = usageByID.filter { rowsByID[$0.key] != nil }
     }
 
