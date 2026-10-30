@@ -126,6 +126,75 @@ enum DesktopContentBlock: Codable, Equatable {
     }
 }
 
+struct DesktopDirectedMessage: Equatable {
+    let sessionID: String
+    let messageID: String
+    let title: String
+    let text: String
+    let partial: Bool
+}
+
+// Ephemeral ACP patch state, bounded independently of either transcript view.
+// The enclosing notification supplies scope; payload IDs cannot change it.
+struct DesktopSessionMessages {
+    private struct Key: Hashable {
+        let session: String
+        let message: String
+    }
+    private struct Message {
+        var sender: String?
+        var recipient: String?
+        var text = ""
+        var partial = false
+    }
+    private var messages: [Key: Message] = [:]
+    private var order: [Key] = []
+    static let maximumMessages = 500
+    static let maximumTextCharacters = 16_384
+
+    mutating func apply(_ value: JSONValue, session: String) -> DesktopDirectedMessage? {
+        guard case .object(let fields) = value,
+              case .string(let kind) = fields["sessionUpdate"],
+              kind == "session_message" || kind == "session_message_chunk",
+              case .string(let id) = fields["messageId"] else { return nil }
+        let key = Key(session: session, message: id)
+        if messages[key] == nil { order.append(key) }
+        var message = messages[key] ?? Message()
+        if kind == "session_message" {
+            // Omitted fields preserve state; explicit null clears it.
+            if let sender = fields["senderSessionId"] {
+                if case .string(let id) = sender { message.sender = id }
+                else if sender == .null { message.sender = nil }
+            }
+            if let recipient = fields["recipientSessionId"] {
+                if case .string(let id) = recipient { message.recipient = id }
+                else if recipient == .null { message.recipient = nil }
+            }
+        }
+        func text(_ block: JSONValue) -> String {
+            if case .object(let content) = block, case .string(let text) = content["text"] { return text }
+            return "[Non-text session content]"
+        }
+        if let content = fields["content"] {
+            if kind == "session_message_chunk" { message.text += text(content) }
+            else if case .array(let blocks) = content { message.text = blocks.map(text).joined() }
+            else if content == .null { message.text = "" }
+        }
+        if message.text.count > Self.maximumTextCharacters {
+            message.partial = true
+            message.text = String(message.text.prefix(Self.maximumTextCharacters))
+        }
+        messages[key] = message
+        if order.count > Self.maximumMessages { messages.removeValue(forKey: order.removeFirst()) }
+        let title: String
+        if message.sender == session { title = "To " + (message.recipient ?? "session") }
+        else if let sender = message.sender { title = "From " + sender }
+        else { title = "Session message" }
+        return DesktopDirectedMessage(sessionID: session, messageID: id, title: String(title.prefix(300)),
+                                      text: message.text, partial: message.partial)
+    }
+}
+
 struct DesktopMessageUpdate: Equatable {
     var messageId: String
     var content: [DesktopContentBlock]
@@ -206,6 +275,7 @@ struct DesktopTurnState: Codable, Equatable {
 }
 
 enum DesktopUpdate: Equatable {
+    case sessionMessage(DesktopDirectedMessage)
     case userMessage(DesktopMessageUpdate), agentMessage(DesktopMessageUpdate), agentThought(DesktopMessageUpdate)
     case toolCall(DesktopToolUpdate), toolCallUpdate(DesktopToolUpdate), toolCallContent(id: String, content: JSONValue)
     case plan(DesktopPlanContent), planRemoved(id: String), usage(DesktopUsageUpdate), tokenUsage(DesktopTokenUsage)

@@ -324,6 +324,18 @@ struct AgentRoster: Equatable {
     private(set) var usageByID: [String: DesktopUsageUpdate] = [:]
     private var steerableGenerations: [String: UInt64] = [:]
 
+    mutating func syncStreamed(_ source: AgentRoster) {
+        rowsByID = source.rowsByID
+        steerableGenerations = source.steerableGenerations
+        usageByID = usageByID.filter { rowsByID[$0.key] != nil }
+    }
+
+    mutating func applyStreamed(row: AgentRosterRow, canSteer: Bool) {
+        rowsByID[row.id] = row
+        if canSteer { steerableGenerations[row.id] = row.generation }
+        else { steerableGenerations.removeValue(forKey: row.id) }
+    }
+
     func canSteer(id: String, generation: UInt64) -> Bool {
         steerableGenerations[id] == generation
     }

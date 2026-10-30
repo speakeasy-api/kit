@@ -1,22 +1,10 @@
 import Foundation
+import CoreFoundation
 import Combine
 
-struct SubagentTranscriptPage: Decodable {
-    let updates: [JSONValue]
-    let nextCursor: UInt64
-    let generation: UInt64
-    let caughtUp: Bool
-    enum CodingKeys: String, CodingKey {
-        case updates, generation
-        case nextCursor = "next_cursor"
-        case caughtUp = "caught_up"
-    }
-}
-
-// The same boundary serves the live ACP connection and protocol fixtures.
+// Child observations are connection-local ACP notifications, never transcript RPCs.
 protocol FocusedSubagentTransport: AnyObject {
-    func readSubagentTranscript(id: String, generation: UInt64, cursor: UInt64,
-                               completion: @escaping (Result<SubagentTranscriptPage, Error>) -> Void)
+    var childSessions: DesktopChildSessions { get }
     func steerSubagent(id: String, generation: UInt64, prompt: String,
                       completion: @escaping (Result<[String: Any], Error>) -> Void)
 }
@@ -39,7 +27,6 @@ final class FocusedSubagentController: ObservableObject {
     @Published private(set) var steering = false
     @Published private(set) var canSteer = false
     @Published var draft = ""
-    private(set) var cursor: UInt64 = 0
     private(set) var generation: UInt64 = 0
     private let transport: FocusedSubagentTransport
     private var childID = ""
@@ -47,8 +34,8 @@ final class FocusedSubagentController: ObservableObject {
     private var active = false
     private var capability = false
     private var readEnabled = false
-    private var pendingRead = false
-    private var poll: Task<Void, Never>?
+    private var sessionMessages = DesktopSessionMessages()
+    private var observation: AnyCancellable?
 
     init(transport: FocusedSubagentTransport) { self.transport = transport }
 
@@ -56,20 +43,19 @@ final class FocusedSubagentController: ObservableObject {
         stop()
         childID = row.id
         generation = row.generation
-        cursor = 0
         entries = []
-        partial = false
+        sessionMessages = DesktopSessionMessages()
+        partial = true // ACP reconnects can replay only a bounded tail.
         active = row.status == .working
         capability = canSteer
-        readEnabled = row.parentID == nil
-        self.canSteer = active && capability && readEnabled
-        guard readEnabled else {
-            notice = "Descendant transcript inspection is not supported."
-            return
+        readEnabled = true
+        self.canSteer = active && capability && row.parentID == nil
+        for value in transport.childSessions.history[row.id] ?? [] { apply(value) }
+        observation = transport.childSessions.updates.sink { [weak self] id, value in
+            guard let self, self.readEnabled, id == self.childID else { return }
+            self.apply(value)
         }
-        loading = true
-        notice = "Loading child transcript…"
-        readNext()
+        refreshNotice()
     }
 
     func update(_ row: AgentRosterRow?, canSteer: Bool) {
@@ -80,25 +66,16 @@ final class FocusedSubagentController: ObservableObject {
         }
         guard row.generation >= generation else { return }
         if row.generation != generation { focus(row, canSteer: canSteer); return }
-        let wasActive = active
         active = row.status == .working
         capability = canSteer
-        self.canSteer = active && capability && readEnabled
+        self.canSteer = active && capability && readEnabled && row.parentID == nil
         if !loading { refreshNotice() }
-        if active && !wasActive && readEnabled {
-            // A caught-up startup page is not the end of this generation.
-            poll?.cancel()
-            poll = nil
-            readNext()
-        }
     }
 
     func stop() {
         epoch = UUID()
-        poll?.cancel()
-        poll = nil
+        observation = nil
         readEnabled = false
-        pendingRead = false
         loading = false
         steering = false
         canSteer = false
@@ -128,44 +105,6 @@ final class FocusedSubagentController: ObservableObject {
         }
     }
 
-    private func readNext() {
-        guard readEnabled, !pendingRead else { return }
-        pendingRead = true
-        let token = epoch
-        let requestedCursor = cursor
-        let requestedGeneration = generation
-        transport.readSubagentTranscript(id: childID, generation: generation, cursor: cursor) { [weak self] result in
-            guard let self, self.epoch == token, self.cursor == requestedCursor,
-                  self.generation == requestedGeneration, self.readEnabled else { return }
-            self.pendingRead = false
-            switch result {
-            case .failure(let error):
-                self.stop()
-                self.notice = "Transcript unavailable: \(error.localizedDescription). Reopen to retry."
-            case .success(let page):
-                guard page.generation == requestedGeneration, page.nextCursor >= requestedCursor,
-                      page.updates.isEmpty || page.nextCursor > requestedCursor else {
-                    self.stop()
-                    self.notice = "Transcript generation or cursor changed. Reopen to resync."
-                    return
-                }
-                for value in page.updates.prefix(2048) { self.apply(value) }
-                if page.updates.count > 2048 { self.partial = true }
-                self.cursor = page.nextCursor
-                if page.caughtUp { self.loading = false }
-                self.refreshNotice()
-                // Drain idle transcripts once, then stop polling. Empty writer pages back off too.
-                if !self.active && page.caughtUp { return }
-                let delay: UInt64 = page.caughtUp || page.nextCursor == requestedCursor ? 500_000_000 : 10_000_000
-                self.poll = Task { [weak self] in
-                    do { try await Task.sleep(nanoseconds: delay) } catch { return }
-                    guard let self, self.epoch == token else { return }
-                    self.readNext()
-                }
-            }
-        }
-    }
-
     private func refreshNotice() {
         if steering { notice = "Sending steer to child…" }
         else if loading { notice = "Loading child transcript…" }
@@ -176,6 +115,11 @@ final class FocusedSubagentController: ObservableObject {
 
     private func apply(_ value: JSONValue) {
         do {
+            if let message = sessionMessages.apply(value, session: childID) {
+                partial = partial || message.partial
+                put(id: "session:" + message.messageID, title: message.title, text: message.text)
+                return
+            }
             let update = try DesktopUpdate(wire: value)
             switch update {
             case .userMessage(let message): appendMessage(message, role: "You")
@@ -241,5 +185,86 @@ final class FocusedSubagentController: ObservableObject {
     private func renderJSON(_ value: JSONValue) -> String {
         guard let data = try? JSONEncoder().encode(value), let text = String(data: data, encoding: .utf8) else { return "" }
         return text
+    }
+}
+
+// Main-queue confined, ephemeral state. Ownership must be announced parent-first.
+final class DesktopChildSessions {
+    let updates = PassthroughSubject<(String, JSONValue), Never>()
+    private(set) var roster = AgentRoster()
+    private(set) var history: [String: [JSONValue]] = [:]
+    private var owners: [String: String] = [:]
+    private var snapshots: [String: [String: Any]] = [:]
+    private var retained: [(String, Int)] = []
+    private var bytes = 0
+
+    func reset() {
+        roster.reset()
+        history.removeAll()
+        owners.removeAll()
+        snapshots.removeAll()
+        retained.removeAll()
+        bytes = 0
+    }
+
+    @discardableResult
+    func receive(root: String, session: String, update: [String: Any]) -> Bool {
+        guard session == root || owners[session] != nil,
+              let data = try? JSONSerialization.data(withJSONObject: update), data.count <= 64 * 1024 else { return false }
+        if update["sessionUpdate"] as? String == "subagent_update" {
+            guard let id = update["sessionId"] as? String, !id.isEmpty, id != root, id != session,
+                  owners[id] == nil || owners[id] == session,
+                  owners[id] != nil || owners.count < 1024 else { return false }
+            let old = roster.rowsByID[id]
+            let meta = update["_meta"] as? [String: Any]
+            let grant = meta?["kit/subagent/steer"] as? [String: Any]
+            let generation = (grant?["generation"] as? NSNumber).flatMap { number -> UInt64? in
+                guard CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue >= 0,
+                      number.stringValue == String(number.uint64Value) else { return nil }
+                return number.uint64Value
+            }
+            if let generation, let old, generation < old.generation { return false }
+            owners[id] = session
+            var snapshot = snapshots[id] ?? [:]
+            for key in ["title", "description", "state"] where update[key] != nil { snapshot[key] = update[key] }
+            snapshots[id] = snapshot
+            let state = (snapshot["state"] as? [String: Any])?["state"] as? String
+            let status: SubagentStatus = state == "running" || state == "requires_action" ? .working : (state == nil ? .starting : .idle)
+            let currentGeneration = generation ?? old?.generation ?? 0
+            var canSteer = roster.canSteer(id: id, generation: currentGeneration)
+            if old?.generation != currentGeneration || status != .working { canSteer = false }
+            if update["_meta"] is NSNull || meta?["kit/subagent/steer"] != nil {
+                let permission = grant?["canSteer"] as? NSNumber
+                canSteer = generation != nil && permission.map {
+                    CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue
+                } == true
+            }
+            canSteer = canSteer && session == root && status == .working
+            let row = AgentRosterRow(id: id, name: snapshot["title"] as? String ?? id, status: status,
+                outcome: nil, generation: currentGeneration, task: snapshot["description"] as? String ?? "",
+                parentID: session == root ? nil : session, parentName: nil, harness: "", model: nil,
+                createdAtMS: 0, generationStartedAtMS: 0, generationFinishedAtMS: nil)
+            roster.applyStreamed(row: row, canSteer: canSteer)
+            return true
+        }
+        guard session != root, let wire = try? JSONDecoder().decode(JSONValue.self, from: data) else { return false }
+        if update["sessionUpdate"] as? String == "state_update", let owner = owners[session] {
+            var state = update
+            state.removeValue(forKey: "sessionUpdate")
+            // State changes revoke grants; running alone cannot restore them.
+            _ = receive(root: root, session: owner, update: [
+                "sessionUpdate": "subagent_update", "sessionId": session, "state": state
+            ])
+        }
+        history[session, default: []].append(wire)
+        retained.append((session, data.count))
+        bytes += data.count
+        while retained.count > 512 || bytes > 4 * 1024 * 1024 {
+            let (owner, size) = retained.removeFirst()
+            history[owner]?.removeFirst()
+            bytes -= size
+        }
+        updates.send((session, wire))
+        return true
     }
 }

@@ -7,23 +7,30 @@ use serde::{Serialize, Serializer, ser::SerializeMap};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::Write,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
+#[cfg(test)]
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+};
 const QUEUE: usize = 256;
 const FRAME_BYTES: usize = 1024 * 1024;
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
 const PAGE_UPDATES: usize = 64;
+#[cfg(test)]
 const PAGE_BYTES: u64 = 256 * 1024;
 
 #[derive(Default)]
 pub(crate) struct Transcripts {
     generations: Mutex<HashMap<String, (u64, Transcript)>>,
+    pub(crate) stream: Arc<super::stream::Stream>,
 }
 impl Transcripts {
     pub(crate) fn start(&self, id: &str, generation: u64) {
@@ -37,7 +44,8 @@ impl Transcripts {
             }
         }
         // One disk log survives all prompt generations of this child session.
-        let transcript = Transcript::start();
+        let mut transcript = Transcript::start();
+        transcript.stream = Some(self.stream.clone());
         let Ok(mut generations) = self.generations.lock() else {
             return;
         };
@@ -65,6 +73,7 @@ impl Transcripts {
 pub(crate) struct Transcript {
     sender: mpsc::SyncSender<Vec<u8>>,
     shared: Arc<Shared>,
+    stream: Option<Arc<super::stream::Stream>>,
 }
 #[derive(Default)]
 struct Shared {
@@ -94,6 +103,7 @@ impl Drop for Shared {
             });
     }
 }
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Page {
     pub updates: Vec<Value>,
@@ -152,8 +162,34 @@ impl Transcript {
         {
             shared.failed.store(true, Ordering::Release);
         }
-        Self { sender, shared }
+        Self {
+            sender,
+            shared,
+            stream: None,
+        }
     }
+    pub(crate) fn stream_capabilities(&self, owner: &str, generation: u64, supported: bool) {
+        if let Some(stream) = &self.stream {
+            stream.capabilities(owner, generation, supported);
+        }
+    }
+
+    pub(crate) fn stream_parent(&self, owner: &str) -> Option<String> {
+        self.stream.as_ref()?.parent(owner)
+    }
+
+    pub(crate) fn directed(&self, owner: &str, update: Value) {
+        if let Some(stream) = &self.stream {
+            stream.directed(owner, update);
+        }
+    }
+
+    pub(crate) fn forward(&self, owner: &str, update: Value) {
+        if let Some(stream) = &self.stream {
+            stream.forward(owner, update);
+        }
+    }
+
     /// Release the writer thread after all admitted records, retaining only disk
     /// history for later focus. Repeated terminal roster events are harmless.
     pub(crate) fn finish(&self) {
@@ -169,33 +205,29 @@ impl Transcript {
         }
     }
 
-    /// ACP prompt acceptance has no native user-message ID, even in v2. Keep
-    /// submitted input distinct from all reported updates; never guess matches.
+    /// Delegation is a session-directed message, never a synthetic human turn.
     pub(crate) fn record_submitted_prompt(
         &self,
         owner: &str,
         generation: u64,
         content: &[super::ContentBlock],
     ) {
-        self.record(&Value::Object(serde_json::Map::from_iter([
-            ("sessionUpdate".into(), Value::String("kit_transcript_partial".into())),
-            ("reason".into(), Value::String("Submitted prompt is shown separately. ACP does not identify its echo; reported user messages are preserved and may repeat that prompt".into())),
-        ])));
-        for content in content {
-            let Ok(content) = serde_json::to_value(content) else {
-                self.fail();
-                continue;
-            };
-            let update = Value::Object(serde_json::Map::from_iter([
-                (
-                    "sessionUpdate".into(),
-                    Value::String("user_message_chunk".into()),
-                ),
-                ("content".into(), content),
-            ]));
-            if let Some(update) = super::inspection_event(owner, generation, update) {
-                self.record(&update);
-            }
+        use agent_client_protocol::schema::v1::{SessionMessage, SessionUpdate};
+        let mut message = SessionMessage::new(format!(
+            "kit-delegation-{generation}-{}",
+            crate::session::new_id()
+        ))
+        .recipient_session_id(agent_client_protocol::schema::v1::SessionId::from(
+            owner.to_owned(),
+        ))
+        .content(content.to_vec());
+        if let Some(parent) = self.stream.as_ref().and_then(|stream| stream.parent(owner)) {
+            message = message
+                .sender_session_id(agent_client_protocol::schema::v1::SessionId::from(parent));
+        }
+        if let Ok(update) = serde_json::to_value(SessionUpdate::SessionMessage(message)) {
+            self.directed(owner, update.clone());
+            self.record(&update);
         }
     }
 
@@ -302,6 +334,7 @@ impl Transcript {
             self.shared.pending.fetch_sub(1, Ordering::Release);
         }
     }
+    #[cfg(test)]
     pub(crate) async fn read(&self, cursor: u64) -> Result<Page, String> {
         let shared = self.shared.clone();
         tokio::task::spawn_blocking(move || shared.read(cursor))
@@ -368,6 +401,7 @@ impl Write for BoundedRecord {
     }
 }
 
+#[cfg(test)]
 impl Shared {
     fn read(&self, cursor: u64) -> Result<Page, String> {
         let unavailable =
@@ -674,30 +708,22 @@ mod tests {
         }
         route.record_inspection(json!({"sessionUpdate":"user_message", "messageId":"steer-accepted", "content":[{"type":"text","text":"hello"}]}));
         let history = drain(&transcript, 0).await;
-        assert_eq!(history.updates.len(), 5);
+        assert_eq!(history.updates.len(), 4);
+        assert_eq!(history.updates[0]["sessionUpdate"], "session_message");
+        assert_eq!(history.updates[0]["recipientSessionId"], "child");
+        assert_eq!(history.updates[0]["content"][0]["text"], "hello");
+        assert_eq!(history.updates[1]["content"]["text"], "hel");
+        assert_eq!(history.updates[2]["content"]["text"], "lo");
         assert_eq!(
-            history.updates[0]["sessionUpdate"],
-            "kit_transcript_partial"
-        );
-        assert!(
-            history.updates[0]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("echo")
-        );
-        assert_eq!(history.updates[1]["content"]["text"], "hello");
-        assert_eq!(history.updates[2]["content"]["text"], "hel");
-        assert_eq!(history.updates[3]["content"]["text"], "lo");
-        assert_eq!(
-            history.updates[2]["messageId"],
-            history.updates[3]["messageId"]
-        );
-        assert_ne!(
             history.updates[1]["messageId"],
             history.updates[2]["messageId"]
         );
-        assert_eq!(history.updates[4]["messageId"], "steer-accepted");
-        assert_eq!(history.updates[4]["content"][0]["text"], "hello");
+        assert_ne!(
+            history.updates[0]["messageId"],
+            history.updates[1]["messageId"]
+        );
+        assert_eq!(history.updates[3]["messageId"], "steer-accepted");
+        assert_eq!(history.updates[3]["content"][0]["text"], "hello");
     }
 
     #[tokio::test]
@@ -771,6 +797,7 @@ mod tests {
             let transcript = Transcript {
                 sender,
                 shared: Arc::default(),
+                stream: None,
             };
             if disconnected {
                 drop(receiver);

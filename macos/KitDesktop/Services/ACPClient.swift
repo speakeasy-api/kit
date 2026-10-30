@@ -33,6 +33,8 @@ final class ACPClient {
         var environment: [String: String] = [:]
     }
 
+    let childSessions = DesktopChildSessions()
+    var onChildUpdate: (() -> Void)?
     var onUpdate: ((DesktopUpdate) -> Void)?
     var onRuntimeEvent: ((Dictionary) -> Void)?
     var onDiagnostic: ((String) -> Void)?
@@ -64,6 +66,7 @@ final class ACPClient {
     private var exitStatus: Int32?
     private var stdoutClosed = false
     private var stderrClosed = false
+    private var sessionMessages = DesktopSessionMessages()
     private var pendingChunk: DesktopUpdate?
     private var closeCompletions: [() -> Void] = []
     private var chunkFlush: DispatchWorkItem?
@@ -163,16 +166,6 @@ final class ACPClient {
         }
     }
 
-    func readSubagentTranscript(id: String, generation: UInt64, cursor: UInt64,
-                                completion: @escaping (Result<SubagentTranscriptPage, Error>) -> Void) {
-        subagentRequest(method: "kit/subagent/transcript/read", id: id, generation: generation,
-                        fields: ["cursor": cursor]) { result in
-            completion(result.flatMap { payload in
-                Result { try Self.decode(SubagentTranscriptPage.self, from: payload) }
-            })
-        }
-    }
-
     func steerSubagent(id: String, generation: UInt64, prompt: String,
                        completion: @escaping (Result<Dictionary, Error>) -> Void) {
         subagentRequest(method: "kit/subagent/steer", id: id, generation: generation,
@@ -240,6 +233,8 @@ final class ACPClient {
             )
         } catch {
             exited = true
+        sessionMessages = DesktopSessionMessages()
+        DispatchQueue.main.async { self.childSessions.reset(); self.onChildUpdate?() }
             complete(completion, with: .failure(error))
             return
         }
@@ -499,14 +494,23 @@ final class ACPClient {
     private func handleLocked(_ message: RPCEnvelope) {
         if let method = message.method {
             if method == "session/update", let params = message.params, let update = params["update"] as? Dictionary {
-                guard let routed = params["sessionId"] as? String, routed == sessionID else {
-                    DispatchQueue.main.async { self.onDiagnostic?("Ignored ACP update for another session") }
+                guard let routed = params["sessionId"] as? String, let root = sessionID else { return }
+                if routed != root || update["sessionUpdate"] as? String == "subagent_update" {
+                    DispatchQueue.main.async {
+                        if self.childSessions.receive(root: root, session: routed, update: update) {
+                            self.onChildUpdate?()
+                        }
+                    }
                     return
                 }
                 do {
                     let data = try JSONSerialization.data(withJSONObject: update)
+                    if ["session_message", "session_message_chunk"].contains(update["sessionUpdate"] as? String ?? ""),
+                       data.count > 64 * 1024 { return }
                     let wire = try JSONDecoder().decode(JSONValue.self, from: data)
-                    let decoded = try DesktopUpdate(wire: wire)
+                    let decoded: DesktopUpdate
+                    if let message = sessionMessages.apply(wire, session: routed) { decoded = .sessionMessage(message) }
+                    else { decoded = try DesktopUpdate(wire: wire) }
                     if case .unknown(let kind) = decoded {
                         DispatchQueue.main.async { self.onDiagnostic?("Ignored unsupported desktop update: \(kind)") }
                     } else { enqueueUpdateLocked(decoded) }
@@ -702,6 +706,7 @@ final class ACPClient {
     private func finalizeExitLocked(_ status: Int32) {
         guard !exited, stdoutClosed, stderrClosed else { return }
         exited = true
+        DispatchQueue.main.async { self.childSessions.reset(); self.onChildUpdate?() }
         exitSource?.cancel(); exitSource = nil
         flushChunkLocked()
         failPendingLocked(ACPClientError.process("Kit exited with status \(status)"))

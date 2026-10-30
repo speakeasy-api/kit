@@ -23,6 +23,7 @@ mod recovery;
 mod scheduler;
 mod source;
 mod startup;
+mod subagent_sessions;
 
 pub use startup::pick_session;
 mod theme;
@@ -1693,7 +1694,7 @@ async fn run_client(
                 }
                 let current = notification_session.lock().ok().map(|route| route.clone());
                 for update in current.as_ref().map_or_else(Vec::new, |route| {
-                    translate_for_session(notification, &route.id)
+                    subagent_sessions::translate(notification, &route.id)
                 }) {
                     let queued = if matches!(update, Update::AvailableCommands { .. }) {
                         QueuedUpdate::global(update)
@@ -2050,7 +2051,6 @@ async fn run_client(
 
                     Voice(crate::voice::VoiceEvent),
                     StorageShutdown,
-                    ChildTranscript(Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>),
                     Terminal(Option<std::io::Result<Event>>),
                     ModelSwitch(ModelSwitchCompletion),
                     Background(Option<BackgroundCompletion>),
@@ -2067,7 +2067,6 @@ async fn run_client(
                 let mut pending_update = None;
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
-                let mut child_read: Option<ChildTranscriptRead> = None;
                 let mut usage: Option<tokio::sync::oneshot::Receiver<Result<String, String>>> = None;
                 let mut priority = scheduler::Priority::default();
                 let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
@@ -2080,33 +2079,8 @@ async fn run_client(
                         app.gateway_blocked = true;
                         if let Some(pending) = clipboard_pastes.pending.as_mut() { pending.submit = false; }
                         submit_after_paste = false;
-                        child_read = None;
                         app.child_focus = None;
                     }
-                    let target = app.child_read_target().map(|target| (session_id.to_string(), target));
-                    if child_read.as_ref().is_some_and(|read| Some(&read.target) != target.as_ref()) {
-                        // Dropping the future cancels the local request and frees its page.
-                        child_read = None;
-                    }
-                    if child_read.is_none() && let Some(target) = target {
-                        let backoff = app.child_views[&target.1.0].read_backoff;
-                        let request = crate::protocols::acp::ReadSubagentTranscriptRequest {
-                            session_id: target.0.clone().into(),
-                            id: target.1.0.clone(), generation: target.1.1, cursor: target.1.3,
-                        };
-                        let connection = connection.clone();
-                        child_read = Some(ChildTranscriptRead {
-                            target,
-                            future: Box::pin(async move {
-                                if backoff { tokio::time::sleep(Duration::from_millis(150)).await; }
-                                match tokio::time::timeout(HANDSHAKE, connection.send_request(request).block_task()).await {
-                                    Ok(result) => result.map_err(|error| error.message.to_string()),
-                                    Err(_) => Err("child transcript read timed out".into()),
-                                }
-                            }),
-                        });
-                    }
-
                     // Reconcile after every prior event, including failures in
                     // result/observe, before accepting any next user input.
                     voice.notify_state(&connection, &session_id);
@@ -2143,7 +2117,7 @@ async fn run_client(
                             }
                             // Only background sources rotate. A ready paced frame
                             // is rendered by its branch, after the input check.
-                            let sources = 9;
+                            let sources = 8;
                             for offset in 0..sources {
                                 let branch = (next_priority + offset) % sources;
                                 let ready = match branch {
@@ -2163,11 +2137,8 @@ async fn run_client(
                                     4 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
 
                                     5 => voice.poll(cx).map(SessionEvent::Voice),
-                                    8 => usage.as_mut().map_or(Poll::Pending, |task| {
+                                    7 => usage.as_mut().map_or(Poll::Pending, |task| {
                                         std::pin::Pin::new(task).poll(cx).map(SessionEvent::Usage)
-                                    }),
-                                    7 => child_read.as_mut().map_or(Poll::Pending, |read| {
-                                        read.future.as_mut().poll(cx).map(SessionEvent::ChildTranscript)
                                     }),
                                     6 if frame_deadline.is_some() => frame.as_mut().poll(cx).map(|()| SessionEvent::Frame),
                                     _ => Poll::Pending,
@@ -2196,13 +2167,6 @@ async fn run_client(
                             match result.map_err(|error| error.to_string()).and_then(|result| result) {
                                 Ok(output) => app.note(output),
                                 Err(error) => app.note(format!("usage: {error}")),
-                            }
-                        }
-                        SessionEvent::ChildTranscript(result) => {
-                            if let Some(read) = child_read.take()
-                                && read.target.0 == session_id.to_string()
-                                && (!is_remote || recovery_available(&recovery_ingress, &transition_session, &app)) {
-                                finish_child_transcript(&mut app, &mut frames, &read.target.1, result);
                             }
                         }
                         SessionEvent::Voice(event) => match event {
@@ -3173,31 +3137,6 @@ async fn died(
 /// Encodes exact source text for the terminal clipboard.
 fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
-}
-
-/// One cancellable page request, scoped to the root session and focus epoch.
-struct ChildTranscriptRead {
-    target: (String, (String, u64, u64, u64)),
-    future: std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>,
-                > + Send,
-        >,
-    >,
-}
-
-/// Apply only the current focus epoch and schedule its visible page or notice.
-fn finish_child_transcript(
-    app: &mut App,
-    frames: &mut scheduler::Frames,
-    target: &(String, u64, u64, u64),
-    result: Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>,
-) {
-    if app.child_read_target().as_ref() == Some(target) {
-        app.child_read_finished(target, result);
-        frames.invalidate();
-    }
 }
 
 /// Child steering never enters the root prompt path. Its completion is scoped
@@ -5568,7 +5507,7 @@ mod tests {
         for reason in [
             wire::StopReason::EndTurn,
             wire::StopReason::Cancelled,
-            wire::StopReason::Other("custom".into()),
+            wire::StopReason::Other(wire::OtherStopReason::new("custom", Default::default())),
         ] {
             let idle = UpdateSessionNotification::new(
                 "session",
@@ -9170,56 +9109,5 @@ mod scheduler_event_tests {
         ));
         assert!(frames.urgent());
         assert!(frames.ready(now));
-    }
-
-    #[test]
-    fn current_child_pages_and_errors_invalidate_but_stale_reads_do_not() {
-        use crate::events::{HarnessVendor, RuntimeEvent, SubagentStatus};
-        use crate::protocols::acp::ReadSubagentTranscriptResponse;
-        let mut app = app();
-        app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
-            id: "child".into(),
-            name: "child".into(),
-            status: SubagentStatus::Working,
-            outcome: None,
-            generation: 1,
-            task: "task".into(),
-            parent_id: None,
-            parent_name: None,
-            harness: "acp.kit".into(),
-            vendor: HarnessVendor::Kit,
-            model: None,
-            created_at_unix_ms: 1,
-            generation_started_at_unix_ms: 1,
-            generation_finished_at_unix_ms: None,
-        }));
-        app.focus_child("child".into());
-        let target = app.child_read_target().unwrap();
-        let now = tokio::time::Instant::now();
-        let mut frames = scheduler::Frames::new(now);
-        frames.drawn(now);
-        finish_child_transcript(
-            &mut app,
-            &mut frames,
-            &target,
-            Ok(ReadSubagentTranscriptResponse {
-                generation: 1,
-                next_cursor: 1,
-                caught_up: true,
-                updates: vec![
-                    serde_json::json!({"sessionUpdate": "agent_message_chunk", "messageId": "message", "content": {"type": "text", "text": "child output"}}),
-                ],
-            }),
-        );
-        assert!(frames.deadline().is_some());
-        assert!(!frames.urgent());
-        assert_eq!(app.child_read_target().unwrap().3, 1);
-        frames.drawn(now);
-        finish_child_transcript(&mut app, &mut frames, &target, Err("stale".into()));
-        assert_eq!(frames.deadline(), None);
-        let target = app.child_read_target().unwrap();
-        finish_child_transcript(&mut app, &mut frames, &target, Err("read failed".into()));
-        assert!(frames.deadline().is_some());
-        assert!(app.child_views["child"].notice.contains("read failed"));
     }
 }
