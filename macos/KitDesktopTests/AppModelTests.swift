@@ -435,6 +435,24 @@ final class AgentRosterTests: XCTestCase {
     }
 
     @MainActor
+    func testControllerRetainsRejectedChildOwnershipForLateGrandchildren() {
+        let client = ACPClient()
+        let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: "/tmp", client: client)
+        controller.prepareRuntimeSession("root")
+        controller.applyRuntime(["event": "session_started", "session_id": "root"])
+        controller.applyRuntime(["event": "subagent_descendants_removed", "ancestor_id": "parent"])
+        controller.applyRuntime(event(id: "child", name: "Child", status: "working", parentID: "parent"))
+        XCTAssertNil(controller.agentRoster.rowsByID["child"])
+        controller.applyRuntime(event(id: "grandchild", name: "Grandchild", status: "working", parentID: "child"))
+        XCTAssertNil(controller.agentRoster.rowsByID["grandchild"])
+        controller.applyRuntime(event(id: "great-grandchild", name: "Great-grandchild", status: "working", parentID: "grandchild"))
+        XCTAssertTrue(controller.agentRoster.rowsByID.isEmpty)
+        controller.applyRuntime(event(id: "peer", name: "Peer", status: "working"))
+        XCTAssertEqual(Set(controller.agentRoster.rowsByID.keys), ["peer"])
+        XCTAssertTrue(client.childSessions.roster.rowsByID.isEmpty)
+    }
+
+    @MainActor
     func testControllerMergesRuntimeLifecycleAfterStreamedAssociation() {
         let client = ACPClient()
         let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: "/tmp", client: client)

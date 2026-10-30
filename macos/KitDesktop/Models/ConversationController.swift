@@ -648,7 +648,10 @@ final class ConversationController: ObservableObject {
         }
         guard runtimeTransportAvailable != false, runtimeSessionID == expectedRuntimeSessionID else { return }
         var roster = agentRoster
-        if roster.apply(event: event, nowMS: Self.nowMilliseconds()) {
+        let applied = roster.apply(event: event, nowMS: Self.nowMilliseconds())
+        // Rejected rows can still teach us ownership needed to fence later
+        // descendants. Persist that metadata even when no row was admitted.
+        if applied || roster != agentRoster {
             if !client.childSessions.roster.rowsByID.isEmpty { roster.syncStreamed(client.childSessions.roster) }
             agentRoster = roster
             scheduleRosterPrune()
