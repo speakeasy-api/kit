@@ -4589,7 +4589,11 @@ mod tests {
         // Local plugin additions/removals remain live alongside remote sources.
         let local = directory.path().join("local");
         fs::create_dir_all(local.join("skills/local")).unwrap();
-        fs::write(local.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            local.join("plugin.json"),
+            MANIFEST.replace("test-plugin", "local-plugin"),
+        )
+        .unwrap();
         fs::write(
             local.join("skills/local/SKILL.md"),
             "---\nname: local\ndescription: Local.\n---\nlocal body\n",
