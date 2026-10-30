@@ -58,6 +58,7 @@ mod activity;
 pub(crate) mod model_switch;
 mod session_pagination;
 mod skill_catalog;
+mod subagents;
 pub(crate) mod tool_projection;
 pub mod v2;
 
@@ -448,25 +449,6 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-/// Bounded polling of runtime-owned disk history. Cursor zero starts replay;
-/// next_cursor is an opaque byte offset. Reuse it to transition into live reads.
-#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
-#[request(method = "kit/subagent/transcript/read", response = ReadSubagentTranscriptResponse)]
-pub(crate) struct ReadSubagentTranscriptRequest {
-    pub session_id: agentkit_acp::SessionId,
-    pub id: String,
-    pub generation: u64,
-    pub cursor: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
-pub(crate) struct ReadSubagentTranscriptResponse {
-    pub updates: Vec<serde_json::Value>,
-    pub next_cursor: u64,
-    pub generation: u64,
-    pub caught_up: bool,
 }
 
 /// Generation-checked steering of one live direct subagent.
@@ -1238,6 +1220,7 @@ async fn logout_authentication(
 }
 
 struct SessionSetup {
+    replay_history: bool,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     mcp_servers: Vec<agentkit_acp::McpServer>,
@@ -1463,6 +1446,8 @@ impl Drop for SessionPublicationRollback<'_> {
 }
 
 struct Server {
+    // Connection-local snapshot. Only initialize writes; a new connection starts disabled.
+    subagent_updates: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -1487,6 +1472,7 @@ impl Server {
 
     fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
+            subagent_updates: AtomicBool::new(false),
             runtime,
             integration: Arc::new(integration),
             registry,
@@ -1595,6 +1581,10 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+        self.subagent_updates.store(
+            request.client_capabilities.subagents.is_some(),
+            Ordering::Release,
+        );
         let logout_authentication = self.runtime.supports_logout_authentication();
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
             .agent_capabilities(capabilities(logout_authentication))
@@ -1619,6 +1609,7 @@ impl Server {
         let attached = self
             .attach_session(
                 SessionSetup {
+                    replay_history: false,
                     cwd: request.cwd,
                     additional_directories: request.additional_directories,
                     mcp_servers: request.mcp_servers,
@@ -1706,6 +1697,7 @@ impl Server {
         let attached = self
             .attach_session(
                 SessionSetup {
+                    replay_history: true,
                     cwd: request.cwd,
                     additional_directories: request.additional_directories,
                     mcp_servers: request.mcp_servers,
@@ -1746,6 +1738,7 @@ impl Server {
         let attached = self
             .attach_session(
                 SessionSetup {
+                    replay_history: false,
                     cwd: request.cwd,
                     additional_directories: request.additional_directories,
                     mcp_servers: request.mcp_servers,
@@ -1773,6 +1766,7 @@ impl Server {
         commit: impl FnOnce(crate::runtime::SessionClaim) -> Result<C, AcpRuntimeError> + Send,
     ) -> Result<AttachedSession<C>, AcpRuntimeError> {
         let SessionSetup {
+            replay_history,
             cwd,
             additional_directories,
             mcp_servers,
@@ -1907,13 +1901,28 @@ impl Server {
             token,
             completed,
         };
+        let subagent_updates = self.subagent_updates.load(Ordering::Acquire).then(|| {
+            driver
+                .subagents
+                .subscribe_updates(session_id.to_string(), replay_history)
+        });
         let actor_task = tokio::spawn(async move {
             let _shutdown_bridge = shutdown_bridge;
             let _guard = guard;
             if activated.await.is_ok() {
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
-                let actor = std::pin::pin!(session_actor(actor));
+                let actor = std::pin::pin!(subagents::with_updates(
+                    session_actor(actor),
+                    subagent_updates,
+                    |session_id, update| {
+                        if let Some(update) = subagents::v1_update(update) {
+                            connection
+                                .send_notification(SessionNotification::new(session_id, update))?;
+                        }
+                        Ok(())
+                    },
+                ));
                 let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
                     let _ = connection
                         .send_notification(available_commands_update(session_id.clone(), commands));
@@ -2082,29 +2091,6 @@ impl Server {
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
-    }
-
-    async fn read_subagent_transcript(
-        &self,
-        request: ReadSubagentTranscriptRequest,
-    ) -> Result<ReadSubagentTranscriptResponse, AcpRuntimeError> {
-        let subagents = self
-            .sessions
-            .lock()
-            .map_err(|_| AcpRuntimeError::ClientClosed)?
-            .get(&request.session_id.to_string().into())
-            .and_then(|session| session.subagents.clone())
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        let page = subagents
-            .read_transcript(&request.id, request.generation, request.cursor)
-            .await
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
-        Ok(ReadSubagentTranscriptResponse {
-            updates: page.updates,
-            next_cursor: page.next_cursor,
-            generation: request.generation,
-            caught_up: page.caught_up,
-        })
     }
 
     async fn steer_subagent(
@@ -3017,10 +3003,7 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
                 .with_v2(v2::component(Arc::clone(&runtime), registry.clone()))
         }))
     })
-    .with_options(agent_client_protocol_http::ServerOptions {
-        health_endpoint: false,
-        ..Default::default()
-    })
+    .with_options(agent_client_protocol_http::ServerOptions::default().with_health_endpoint(false))
     .into_router()
 }
 
@@ -3198,24 +3181,6 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |request: ReadSubagentTranscriptRequest, responder, cx| {
-                    let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(
-                            state
-                                .read_subagent_transcript(request)
-                                .await
-                                .map_err(sdk_error),
-                        )
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let state = Arc::clone(&state);
                 async move |request: SteerSubagentRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -3315,6 +3280,10 @@ fn fork_parent_context(
 
 fn capabilities(logout_authentication: bool) -> agentkit_acp::AgentCapabilities {
     let capabilities = agentkit_acp::AgentCapabilities::new()
+        .meta(Map::from_iter([(
+            "kit/subagent/steer".into(),
+            serde_json::json!({}),
+        )]))
         .load_session(true)
         .prompt_capabilities(
             PromptCapabilities::new()
@@ -3377,97 +3346,54 @@ async fn drain_client_messages(
 )]
 pub(crate) mod test_support {
     use super::*;
-    use agentkit_task_manager::TaskManager as _;
 
-    /// Exercises the real request type and handler over ACP, with an actual
-    /// child's runtime-owned manager supplied by the subprocess regression test.
+    /// Exercises the replacement notification envelope over a real ACP connection
+    /// with the child's actual runtime-owned transcript supplied by its regression test.
     pub(crate) async fn assert_transcript_route(
-        root: &std::path::Path,
+        _root: &std::path::Path,
         manager: crate::tools::Subagents,
         child: String,
         generation: u64,
     ) {
-        let server = Arc::new(Server::new(
-            Runtime::new(root, "test-model").unwrap(),
-            AcpIntegration::builder()
-                .name("transcript-route-test")
-                .approval_resolver(AutoDenyResolver)
-                .build()
-                .unwrap(),
-            SessionRegistry::new(),
-        ));
-        for (id, subagents) in [("owner", manager.clone()), ("other", manager.fresh())] {
-            server.sessions.lock().unwrap().insert(
-                agentkit_acp::SessionId::new(id),
-                SessionHandle {
-                    subagents: Some(subagents),
-                    voice_state: Default::default(),
-                    token: 1,
-                    commands: mpsc::channel(1).0,
-                    background_jobs: BackgroundJobs::default(),
-                    structured_completion: false,
-                    tasks: agentkit_task_manager::AsyncTaskManager::new().handle(),
-                },
-            );
-        }
-        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
-        let service = agent_client_protocol::Agent.builder().on_receive_request(
-            {
-                let server = server.clone();
-                async move |request: ReadSubagentTranscriptRequest, responder, _cx| {
-                    responder.respond_with_result(
-                        server
-                            .read_subagent_transcript(request)
-                            .await
-                            .map_err(sdk_error),
-                    )
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        );
-        let actor = tokio::spawn(service.connect_to(agent_transport));
-        agent_client_protocol::Client
+        let page = manager
+            .read_transcript(&child, generation, 0)
+            .await
+            .unwrap();
+        assert!(!page.updates.is_empty());
+        let (agent_transport, client_transport) = agent_client_protocol::Channel::duplex();
+        let (received, mut notifications) = mpsc::unbounded_channel();
+        let client = agent_client_protocol::Client
             .builder()
-            .connect_with(client_transport, async move |connection| {
-                let request = ReadSubagentTranscriptRequest {
-                    session_id: agentkit_acp::SessionId::new("owner"),
-                    id: child,
-                    generation,
-                    cursor: 0,
-                };
-                let page = connection
-                    .send_request(request.clone())
-                    .block_task()
-                    .await?;
-                assert_eq!(page.generation, generation);
-                assert!(!page.updates.is_empty());
-                assert!(page.next_cursor > 0);
-                for invalid in [
-                    ReadSubagentTranscriptRequest {
-                        session_id: agentkit_acp::SessionId::new("other"),
-                        ..request.clone()
-                    },
-                    ReadSubagentTranscriptRequest {
-                        session_id: agentkit_acp::SessionId::new("missing"),
-                        ..request.clone()
-                    },
-                    ReadSubagentTranscriptRequest {
-                        generation: generation + 1,
-                        ..request.clone()
-                    },
-                    ReadSubagentTranscriptRequest {
-                        cursor: u64::MAX,
-                        ..request
-                    },
-                ] {
-                    assert!(connection.send_request(invalid).block_task().await.is_err());
+            .on_receive_notification(
+                async move |update: SessionNotification, _cx| {
+                    received.send(update).unwrap();
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            );
+        let client_task = tokio::spawn(client.connect_to(client_transport));
+        agent_client_protocol::Agent
+            .builder()
+            .connect_with(agent_transport, async move |connection| {
+                connection.send_notification(SessionNotification::new(
+                    "parent",
+                    SessionUpdate::SubagentUpdate(agent_client_protocol::schema::v1::SubagentUpdate::new(child.clone())),
+                ))?;
+                for update in page.updates {
+                    if let Some(update) = subagents::v1_update(update) {
+                        connection.send_notification(SessionNotification::new(child.clone(), update))?;
+                    }
                 }
+                let association = notifications.recv().await.unwrap();
+                assert!(matches!(association.update, SessionUpdate::SubagentUpdate(update) if update.session_id.to_string() == child));
+                let content = notifications.recv().await.unwrap();
+                assert_eq!(content.session_id.to_string(), child);
                 Ok(())
             })
             .await
             .unwrap();
-        actor.abort();
-        let _ = actor.await;
+        client_task.abort();
+        let _ = client_task.await;
     }
 
     impl SessionRegistry {
@@ -3761,6 +3687,38 @@ pub(super) mod tests {
             !terminal_auth_methods(&client, |provider| { provider != ProviderKind::OpenRouter })
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn v1_subagent_capabilities_reset_on_initialize_and_new_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let create_server = || {
+            Server::new(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                AcpIntegration::builder()
+                    .name("subagent-test")
+                    .approval_resolver(AutoDenyResolver)
+                    .build()
+                    .unwrap(),
+                SessionRegistry::new(),
+            )
+        };
+        let server = create_server();
+        assert!(!server.subagent_updates.load(Ordering::Acquire));
+        for (capabilities, supported) in [
+            (json!({"subagents": {}}), true),
+            (json!({"subagents": null}), false),
+            (json!({"subagents": {}}), true),
+            (json!({}), false),
+        ] {
+            let request = serde_json::from_value(json!({
+                "protocolVersion":1, "clientCapabilities": capabilities,
+            }))
+            .unwrap();
+            server.initialize(request).await;
+            assert_eq!(server.subagent_updates.load(Ordering::Acquire), supported);
+        }
+        assert!(!create_server().subagent_updates.load(Ordering::Acquire));
     }
 
     #[test]
@@ -7411,6 +7369,10 @@ pub(super) mod tests {
             )
             .connect_with(client_transport, async move |connection| {
                 connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
                     .send_request(LoadSessionRequest::new(
                         "missing-session",
                         workspace.clone(),
@@ -7823,6 +7785,10 @@ pub(super) mod tests {
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
                 let unsupported = vec![McpServer::Http(McpServerHttp::new("kithub", ""))];
                 // Missing executables remain discoverable connection failures; they
                 // must not prevent attachment or leak into another session.

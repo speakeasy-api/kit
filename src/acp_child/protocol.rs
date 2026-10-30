@@ -68,10 +68,12 @@ fn initialize_params() -> Result<Value, Error> {
         v1::InitializeRequest::new(ProtocolVersion::V2)
             .client_info(v1::Implementation::new("kit", env!("CARGO_PKG_VERSION")))
             .client_capabilities(
-                v1::ClientCapabilities::new().session(
-                    v1::ClientSessionCapabilities::new()
-                        .compaction(v1::CompactionCapabilities::default()),
-                ),
+                v1::ClientCapabilities::new()
+                    .subagents(v1::SubagentCapabilities::default())
+                    .session(
+                        v1::ClientSessionCapabilities::new()
+                            .compaction(v1::CompactionCapabilities::default()),
+                    ),
             ),
     )?;
     let v2_params = serde_json::to_value(v2::InitializeRequest::new(
@@ -498,7 +500,12 @@ pub(super) fn completion(reason: Option<v2::StopReason>) -> Result<v1::PromptRes
         Some(v2::StopReason::MaxTurnRequests) => v1::StopReason::MaxTurnRequests,
         Some(v2::StopReason::Refusal) => v1::StopReason::Refusal,
         Some(v2::StopReason::Cancelled) => v1::StopReason::Cancelled,
-        Some(v2::StopReason::Other(reason)) if reason == "_error" => {
+        Some(v2::StopReason::Error(_)) => {
+            return Err(Error::into_internal_error(std::io::Error::other(
+                "nested agent turn failed",
+            )));
+        }
+        Some(v2::StopReason::Other(reason)) if reason.stop_reason == "_error" => {
             return Err(Error::into_internal_error(std::io::Error::other(
                 "nested agent turn failed",
             )));

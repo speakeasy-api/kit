@@ -1,5 +1,6 @@
 //! Ephemeral bridge recovery protocol. Admission fences precede FIFO application.
-use super::{ActiveSessionRoute, App, QueuedUpdate, Update, UpdateSessionNotification, translate};
+use super::UpdateSessionNotification;
+use super::{ActiveSessionRoute, App, QueuedUpdate, Update};
 use serde::Deserialize;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -92,14 +93,26 @@ pub(super) fn notification(
     ingress: &Arc<Mutex<Ingress>>,
     route: &Arc<Mutex<ActiveSessionRoute>>,
 ) -> Option<QueuedUpdate> {
-    let session = notification.session_id.to_string();
+    let addressed_session = notification.session_id.to_string();
     let mut size = Size(0);
     let sized = serde_json::to_writer(&mut size, &notification).is_ok();
     let marker = notification.meta.as_ref().and_then(|meta| meta.get(META));
     let parsed = marker.and_then(|marker| serde_json::from_value::<Marker>(marker.clone()).ok());
     let mut ingress = ingress.lock().ok()?;
     let mut route = route.lock().ok()?;
-    if ingress.session.as_ref().is_some_and(|id| id != &session) {
+    // Recovery is scoped to the attached root, while child events retain
+    // their original address for event-loop association validation. Only root
+    // notifications may alter recovery state.
+    let session = ingress
+        .session
+        .clone()
+        .or_else(|| (!route.id.is_empty()).then(|| route.id.clone()))
+        .unwrap_or_else(|| addressed_session.clone());
+    if addressed_session != session
+        && !parsed
+            .as_ref()
+            .is_some_and(|m| matches!(m.kind, Kind::Live | Kind::Replay))
+    {
         return None;
     }
     let mut marker = match parsed.filter(|marker| marker.epoch > 0) {
@@ -161,7 +174,7 @@ pub(super) fn notification(
     drop(route);
     drop(ingress);
     let updates = if matches!(marker.kind, Kind::Replay | Kind::Live) {
-        translate(notification).1
+        super::subagent_sessions::translate(notification, &session)
     } else {
         Vec::new()
     };
@@ -416,5 +429,50 @@ mod tests {
         assert!(!app.gateway_blocked);
         drop(completions);
         drop(workers);
+    }
+    #[test]
+    fn child_events_share_root_recovery_epoch_without_controlling_it() {
+        let route = route();
+        let ingress = Arc::new(Mutex::new(Ingress::for_session(Some("session".into()))));
+        let child = |kind, epoch| {
+            serde_json::json!({
+                "sessionId": "child", "update": {"sessionUpdate":"agent_message_chunk", "messageId":"m", "content":{"type":"text", "text":"hello"}},
+                "_meta": { META: {"kind": kind, "epoch": epoch} }
+            })
+        };
+        assert!(
+            notification(
+                serde_json::from_value(child("begin", 2)).unwrap(),
+                &ingress,
+                &route
+            )
+            .is_none()
+        );
+        assert!(
+            notification(
+                serde_json::from_value(child("live", 1)).unwrap(),
+                &ingress,
+                &route
+            )
+            .is_some()
+        );
+        notification(marked("begin", 2, state()), &ingress, &route).unwrap();
+        assert!(
+            notification(
+                serde_json::from_value(child("live", 1)).unwrap(),
+                &ingress,
+                &route
+            )
+            .is_none()
+        );
+        let replay = notification(
+            serde_json::from_value(child("replay", 2)).unwrap(),
+            &ingress,
+            &route,
+        )
+        .unwrap();
+        assert!(
+            matches!(replay.update, Update::GatewayRecovery(Event { session, updates, .. }) if session == "session" && matches!(updates.as_slice(), [Update::SubagentSession { .. }]))
+        );
     }
 }

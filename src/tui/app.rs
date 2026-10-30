@@ -14,6 +14,7 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
+use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::v2::{
     AuthMethodTerminal, StateUpdate, StopReason, ToolCallStatus, ToolKind,
 };
@@ -44,11 +45,16 @@ use super::{
 
 mod focus;
 mod recovery;
+mod subagent_sessions;
 pub use focus::ChildView;
 
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    SubagentSession {
+        root: String,
+        notification: Box<super::UpdateSessionNotification>,
+    },
     Elicitation(super::elicitation_requests::Pending),
     GatewayRecovery(crate::tui::recovery::Event),
     ChildSteerFinished {
@@ -155,7 +161,7 @@ pub enum Update {
     Usage {
         used: u64,
         size: u64,
-        cost: Option<agent_client_protocol::schema::v2::Cost>,
+        cost: MaybeUndefined<agent_client_protocol::schema::v2::Cost>,
     },
     /// The authoritative ACP v2 foreground lifecycle, preserved from the wire.
     State(StateUpdate),
@@ -859,7 +865,8 @@ pub struct App {
     pub(super) gateway_status: Option<String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
-    child_ui: HashMap<String, focus::ChildUiState>,
+    session_messages: HashMap<String, super::wire::SessionMessage>,
+    child_sessions: HashMap<String, subagent_sessions::Association>,
     pub child_views: HashMap<String, ChildView>,
     pub agents_selected: Option<String>,
     pub agents_keyboard_focus: bool,
@@ -1172,7 +1179,8 @@ impl App {
             gateway_status: None,
             gateway_candidate: None,
             child_focus: None,
-            child_ui: HashMap::new(),
+            session_messages: HashMap::new(),
+            child_sessions: HashMap::new(),
             child_views: HashMap::new(),
             agents_selected: None,
             agents_keyboard_focus: false,
@@ -2115,10 +2123,13 @@ impl App {
                 Some("turn stopped: maximum turn-request limit reached".into()),
             ),
             Some(StopReason::Refusal) => (false, Some("turn refused".into())),
-            Some(StopReason::Other(reason)) if reason == "_error" => {
+            Some(StopReason::Other(reason)) if reason.stop_reason == "_error" => {
                 (false, Some("turn failed".into()))
             }
-            Some(StopReason::Other(reason)) => (false, Some(format!("turn stopped: {reason}"))),
+            Some(StopReason::Error(_)) => (false, Some("turn failed".into())),
+            Some(StopReason::Other(reason)) => {
+                (false, Some(format!("turn stopped: {}", reason.stop_reason)))
+            }
             Some(_) => (false, Some("turn stopped for an unknown reason".into())),
             None => (false, Some("turn stopped without a reason".into())),
         };
@@ -2298,6 +2309,9 @@ impl App {
     fn apply_observed(&mut self, update: Update) {
         let at = self.observed_at();
         match update {
+            Update::SubagentSession { root, notification } => {
+                self.apply_subagent_session(&root, *notification)
+            }
             Update::Elicitation(pending) => {
                 self.elicitations
                     .retain(|pending| !pending.reply.is_closed());
@@ -2643,8 +2657,10 @@ impl App {
                 }
             }
             Update::Usage { used, size, cost } => {
-                if let Some(cost) = cost.filter(valid_cost) {
-                    self.cost = Some(cost);
+                match cost {
+                    MaybeUndefined::Value(cost) if valid_cost(&cost) => self.cost = Some(cost),
+                    MaybeUndefined::Null => self.cost = None,
+                    _ => {}
                 }
                 self.usage = Some(ContextUsage { used, size });
             }
@@ -2701,6 +2717,7 @@ impl App {
             return;
         }
         self.runtime_status_unavailable = true;
+        self.child_sessions.clear();
         for view in self.child_views.values_mut() {
             view.disable("Child connection unavailable; retained transcript is read-only");
         }
@@ -3220,8 +3237,9 @@ impl App {
         self.follow = true;
         self.focused_call_id = None;
         self.child_focus = None;
+        self.session_messages.clear();
+        self.child_sessions.clear();
         self.child_views.clear();
-        self.child_ui.clear();
         self.agents_selected = None;
         self.agents_keyboard_focus = false;
         self.child_back_area = Rect::default();
@@ -6688,8 +6706,17 @@ mod tests {
                 "turn stopped: maximum turn-request limit reached",
             ),
             (StopReason::Refusal, "turn refused"),
-            (StopReason::Other("_error".into()), "turn failed"),
-            (StopReason::Other("custom".into()), "turn stopped: custom"),
+            (
+                StopReason::Error(agent_client_protocol::schema::v2::ErrorStopReason::new()),
+                "turn failed",
+            ),
+            (
+                StopReason::Other(agent_client_protocol::schema::v2::OtherStopReason::new(
+                    "custom",
+                    Default::default(),
+                )),
+                "turn stopped: custom",
+            ),
         ] {
             let mut app = app();
             compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
@@ -10222,22 +10249,22 @@ mod tests {
 
     #[test]
     fn session_cost_reports_replace_totals_and_reset_with_session() {
-        use agent_client_protocol::schema::v2::Cost;
+        use agent_client_protocol::schema::{MaybeUndefined, v2::Cost};
         let mut app = app();
         assert!(app.cost.is_none());
         for amount in [0.0, 1.25, 1.25, 2.0] {
             app.apply(Update::Usage {
                 used: 1,
                 size: 2,
-                cost: Some(Cost::new(amount, "USD")),
+                cost: MaybeUndefined::Value(Cost::new(amount, "USD")),
             });
             assert_eq!(app.cost.as_ref().unwrap().amount, amount);
         }
         for cost in [
-            None,
-            Some(Cost::new(f64::NAN, "USD")),
-            Some(Cost::new(-1.0, "USD")),
-            Some(Cost::new(3.0, "bad")),
+            MaybeUndefined::Undefined,
+            MaybeUndefined::Value(Cost::new(f64::NAN, "USD")),
+            MaybeUndefined::Value(Cost::new(-1.0, "USD")),
+            MaybeUndefined::Value(Cost::new(3.0, "bad")),
         ] {
             app.apply(Update::Usage {
                 used: 2,

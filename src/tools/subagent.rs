@@ -510,6 +510,18 @@ impl Subagents {
         Self::new(config)
     }
 
+    /// Subscribe before starting work. Always announces retained ownership without
+    /// granting mutations from cached capabilities. `replay_history` additionally
+    /// emits a bounded event tail; false is suitable for no-replay resumes.
+    pub fn subscribe_updates(
+        &self,
+        parent_id: String,
+        replay_history: bool,
+    ) -> tokio::sync::broadcast::Receiver<(String, Value)> {
+        self.transcripts.stream.subscribe(parent_id, replay_history)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn read_transcript(
         &self,
         id: &str,
@@ -529,9 +541,14 @@ impl Subagents {
             id,
             generation,
             status,
+            name,
+            task,
             ..
         } = &event
         {
+            self.transcripts
+                .stream
+                .announce(id, name, task, *status, *generation);
             self.transcripts.start(id, *generation);
             if matches!(status, SubagentStatus::Removed)
                 && let Ok(transcript) = self.transcripts.get(id, *generation)
@@ -3171,13 +3188,18 @@ mod steer_tests {
                 }
                 tokio::task::yield_now().await;
             }
-            let user_texts: Vec<_> = history
+            let directed_texts: Vec<_> = history
                 .iter()
-                .filter(|update| update["sessionUpdate"] == "user_message_chunk")
-                .filter_map(|update| update["content"]["text"].as_str())
+                .filter(|update| {
+                    update["sessionUpdate"] == "session_message"
+                        && update["recipientSessionId"] == id.as_str()
+                })
+                .filter_map(|update| update["content"].as_array())
+                .flatten()
+                .filter_map(|content| content["text"].as_str())
                 .collect();
-            assert!(user_texts.contains(&"original turn"));
-            assert!(user_texts.contains(&"next turn"));
+            assert!(directed_texts.contains(&"original turn"));
+            assert!(directed_texts.contains(&"next turn"));
             assert!(
                 history
                     .iter()

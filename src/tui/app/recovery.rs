@@ -60,6 +60,7 @@ impl App {
                 });
                 self.gateway_epoch = marker.epoch;
                 self.gateway_blocked = true;
+                self.reset_child_associations();
                 self.elicitations.clear();
                 self.model_switch = None;
                 self.model_dialog = None;

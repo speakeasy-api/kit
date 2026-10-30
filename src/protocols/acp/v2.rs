@@ -117,7 +117,9 @@ fn available_commands_update(
                             "Optional arguments",
                         ))
                     });
-                    wire::AvailableCommand::new(name, description).input(input)
+                    wire::AvailableCommand::Command(
+                        wire::Command::new(name, description).input(input),
+                    )
                 })
                 .collect(),
         )),
@@ -745,6 +747,13 @@ struct PendingSessionPublication {
     session: SessionHandle,
 }
 
+struct SessionSetup {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<wire::McpServer>,
+    replay_history: bool,
+}
+
 struct Server {
     // Connection-local negotiated snapshot; only initialize writes it.
     form_elicitation: AtomicBool,
@@ -910,6 +919,10 @@ impl Server {
             .get_or_insert_with(Map::new)
             .insert("kit/session/status".into(), serde_json::json!({}));
         capabilities
+            .meta
+            .get_or_insert_with(Map::new)
+            .insert("kit/subagent/steer".into(), serde_json::json!({}));
+        capabilities
             .session
             .get_or_insert_with(wire::SessionCapabilities::new)
             .mcp = Some(
@@ -950,13 +963,16 @@ impl Server {
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
-                request.cwd.0,
-                request
-                    .additional_directories
-                    .into_iter()
-                    .map(|path| path.0)
-                    .collect(),
-                request.mcp_servers,
+                SessionSetup {
+                    cwd: request.cwd.0,
+                    additional_directories: request
+                        .additional_directories
+                        .into_iter()
+                        .map(|path| path.0)
+                        .collect(),
+                    mcp_servers: request.mcp_servers,
+                    replay_history: false,
+                },
                 connection,
                 claim,
             )
@@ -1008,13 +1024,16 @@ impl Server {
         }
         let attached = self
             .attach_session(
-                request.cwd.0,
-                request
-                    .additional_directories
-                    .into_iter()
-                    .map(|path| path.0)
-                    .collect(),
-                request.mcp_servers,
+                SessionSetup {
+                    cwd: request.cwd.0,
+                    additional_directories: request
+                        .additional_directories
+                        .into_iter()
+                        .map(|path| path.0)
+                        .collect(),
+                    mcp_servers: request.mcp_servers,
+                    replay_history: replay,
+                },
                 connection,
                 claim,
             )
@@ -1089,12 +1108,16 @@ impl Server {
 
     async fn attach_session(
         self: &Arc<Self>,
-        cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
-        mcp_servers: Vec<wire::McpServer>,
+        setup: SessionSetup,
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
+        let SessionSetup {
+            cwd,
+            additional_directories,
+            mcp_servers,
+            replay_history,
+        } = setup;
         let runtime = self.runtime.for_workspace(&cwd).await?;
         let cwd = runtime.root().to_path_buf();
         let additional_directories = runtime.additional_directories(&additional_directories)?;
@@ -1114,7 +1137,7 @@ impl Server {
         let ask_user = self.form_elicitation.load(Ordering::Acquire).then(|| {
             crate::tools::ask_user::AskUserTool::new(connection.clone(), session_id.clone())
         });
-        let sink = ResponseReplacementSink::new(ConnectionSink(connection));
+        let sink = ResponseReplacementSink::new(ConnectionSink(connection.clone()));
         let activity = native_activity(session_id.clone(), sink.clone());
         let binding =
             AcpSessionBinding::new(session_id.clone(), SessionId::new(claim.id()), sink.clone())
@@ -1188,13 +1211,27 @@ impl Server {
             token,
             completed,
         };
+        let subagent_updates = driver
+            .subagents
+            .subscribe_updates(session_id.to_string(), replay_history);
         let actor_task = tokio::spawn(async move {
             let _guard = guard;
             if activated.await.is_ok() {
                 let sink = actor.sink.clone();
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
-                let actor = std::pin::pin!(session_actor(actor));
+                let actor = std::pin::pin!(super::subagents::with_updates(
+                    session_actor(actor),
+                    Some(subagent_updates),
+                    |session_id, update| {
+                        if let Some(update) = super::subagents::v2_update(update) {
+                            connection.send_notification(wire::UpdateSessionNotification::new(
+                                session_id, update,
+                            ))?;
+                        }
+                        Ok(())
+                    },
+                ));
                 let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
                     let _ = sink.update(available_commands_update(session_id.clone(), commands));
                 }));
@@ -1446,29 +1483,6 @@ impl Server {
         })
         .await
         .map_err(|_| AcpRuntimeError::ClientClosed)?
-    }
-
-    async fn read_subagent_transcript(
-        &self,
-        request: super::ReadSubagentTranscriptRequest,
-    ) -> Result<super::ReadSubagentTranscriptResponse, AcpRuntimeError> {
-        let subagents = self
-            .sessions
-            .lock()
-            .map_err(|_| AcpRuntimeError::ClientClosed)?
-            .get(&request.session_id.to_string().into())
-            .and_then(|session| session.subagents.clone())
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        let page = subagents
-            .read_transcript(&request.id, request.generation, request.cursor)
-            .await
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
-        Ok(super::ReadSubagentTranscriptResponse {
-            updates: page.updates,
-            next_cursor: page.next_cursor,
-            generation: request.generation,
-            caught_up: page.caught_up,
-        })
     }
 
     async fn steer_subagent(
@@ -2356,12 +2370,15 @@ fn finish_reason_to_stop_reason(reason: &FinishReason) -> wire::StopReason {
         FinishReason::Cancelled => wire::StopReason::Cancelled,
         FinishReason::Blocked => wire::StopReason::Refusal,
         FinishReason::Error => error_stop_reason(),
-        FinishReason::Other(reason) => wire::StopReason::Other(reason.clone()),
+        FinishReason::Other(reason) => wire::StopReason::Other(wire::OtherStopReason::new(
+            reason.clone(),
+            Default::default(),
+        )),
     }
 }
 
 fn error_stop_reason() -> wire::StopReason {
-    wire::StopReason::Other("_error".into())
+    wire::StopReason::Error(wire::ErrorStopReason::new())
 }
 
 fn v2_config_options(
@@ -2736,11 +2753,11 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
     agent_client_protocol_http::AcpHttpServer::new(move || {
         v2_router(Arc::clone(&runtime), registry.clone())
     })
-    .with_options(agent_client_protocol_http::ServerOptions {
-        path: "/acp/v2".into(),
-        health_endpoint: false,
-        ..Default::default()
-    })
+    .with_options(
+        agent_client_protocol_http::ServerOptions::default()
+            .with_path("/acp/v2")
+            .with_health_endpoint(false),
+    )
     .into_router()
 }
 
@@ -2943,24 +2960,6 @@ pub(crate) fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |request: super::ReadSubagentTranscriptRequest, responder, cx| {
-                    let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(
-                            state
-                                .read_subagent_transcript(request)
-                                .await
-                                .map_err(sdk_error),
-                        )
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let state = Arc::clone(&state);
                 async move |request: super::SteerSubagentRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -3144,11 +3143,9 @@ mod tests {
             wire::ProtocolVersion::V2,
             wire::Implementation::new("test-client", "0"),
         )
-        .capabilities(
-            wire::ClientCapabilities::new().auth(
-                wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
-            ),
-        )
+        .capabilities(wire::ClientCapabilities::new().auth(
+            wire::ClientAuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+        ))
     }
 
     fn terminal_auth_method_ids(methods: &[wire::AuthMethod]) -> Vec<&str> {
@@ -3319,7 +3316,8 @@ mod tests {
         };
         assert_eq!(usage.used, 53_000);
         assert_eq!(usage.size, 272_000);
-        assert!(usage.cost.is_none());
+        assert!(usage.cost.is_undefined());
+        assert!(serde_json::to_value(usage).unwrap().get("cost").is_none());
     }
 
     #[test]
@@ -5400,17 +5398,28 @@ mod tests {
             update
                 .available_commands
                 .iter()
-                .map(|command| command.name.as_str())
+                .map(wire::AvailableCommand::name)
                 .collect::<Vec<_>>(),
             ["compact", "review"]
         );
-        assert!(update.available_commands[0].input.is_none());
-        assert_eq!(update.available_commands[1].description, "Review changes");
-        let Some(wire::AvailableCommandInput::Text(input)) = &update.available_commands[1].input
-        else {
+        let wire::AvailableCommand::Command(compact) = &update.available_commands[0] else {
+            panic!("expected native compact slash command");
+        };
+        let wire::AvailableCommand::Command(review) = &update.available_commands[1] else {
+            panic!("expected native review slash command");
+        };
+        assert!(compact.input.is_none());
+        assert_eq!(review.description, "Review changes");
+        let Some(wire::AvailableCommandInput::Text(input)) = &review.input else {
             panic!("expected text argument hint");
         };
         assert_eq!(input.hint, "Optional arguments");
+        let encoded = serde_json::to_value(&update).unwrap();
+        assert_eq!(encoded["availableCommands"][0]["type"], "command");
+        assert_eq!(encoded["availableCommands"][0]["name"], "compact");
+        assert!(encoded["availableCommands"][0].get("input").is_none());
+        assert_eq!(encoded["availableCommands"][1]["type"], "command");
+        assert_eq!(encoded["availableCommands"][1]["input"]["type"], "text");
     }
 
     #[tokio::test]
@@ -6594,7 +6603,7 @@ mod tests {
                         .expect_err("replacement must reject an unknown session");
                     assert_eq!(
                         i32::from(error.code),
-                        i32::from(wire::Error::resource_not_found(None).code)
+                        i32::from(wire::Error::resource_not_found().code)
                     );
                     assert_eq!(error.data, Some(json!({ "sessionId": "missing-session" })));
                     Ok(())
@@ -7114,8 +7123,9 @@ for line in sys.stdin:
             ))
             .unwrap();
         assert!(unsupported.auth_methods.is_empty());
-        let terminal_capabilities = wire::ClientCapabilities::new()
-            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()));
+        let terminal_capabilities = wire::ClientCapabilities::new().auth(
+            wire::ClientAuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+        );
         assert!(terminal_auth_methods(&terminal_capabilities, |_| false).is_empty());
         let methods = terminal_auth_methods(&terminal_capabilities, |provider| {
             provider != ProviderKind::OpenRouter
@@ -7547,11 +7557,14 @@ for line in sys.stdin:
         );
         assert_eq!(
             finish_reason_to_stop_reason(&FinishReason::Error),
-            wire::StopReason::Other("_error".into())
+            wire::StopReason::Error(wire::ErrorStopReason::new())
         );
         assert_eq!(
             finish_reason_to_stop_reason(&FinishReason::Other("provider-stop".into())),
-            wire::StopReason::Other("provider-stop".into())
+            wire::StopReason::Other(wire::OtherStopReason::new(
+                "provider-stop",
+                Default::default()
+            ))
         );
     }
 

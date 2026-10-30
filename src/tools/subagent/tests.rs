@@ -576,8 +576,14 @@ fn close_input_accepts_a_handle_subagent_id_or_background_call_id() {
 #[test]
 fn live_session_limit_is_120_per_manager() {
     let directory = tempfile::tempdir().unwrap();
-    let (manager, _, prior) = manager_with_disconnected_session(directory.path());
-    manager.sessions.lock().unwrap().remove(&prior.id);
+    let manager = manager_with_generic_harness(directory.path(), Vec::new());
+    // This tests a manager's local limit, not the invoking Kit process's shared
+    // delegation tree. Use a private real slot directory without changing env.
+    manager
+        .tree_slots
+        .path
+        .set(directory.path().join("slots"))
+        .unwrap();
     let permits = (0..MAX_LIVE_SUBAGENTS)
         .map(|_| manager.reserve().unwrap())
         .collect::<Vec<_>>();

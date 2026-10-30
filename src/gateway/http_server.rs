@@ -614,9 +614,16 @@ impl ConnectTo<agent_client_protocol::Client> for Connection {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> agent_client_protocol::Result<()> {
         let (channel, driver) = client.into_bounded_channel_and_future(ChannelLimits::default())?;
         let failure = channel.tx.failure();
-        // Channel's driver can return immediately while its endpoint remains
-        // live. Drive both to completion, rather than treating that as EOF.
-        let running = std::pin::pin!(futures_util::future::try_join(self.run(channel), driver));
+        // A direct channel has no driver. A transport driver can also finish
+        // while its endpoint remains live; neither case means channel EOF.
+        let drive = async move {
+            if let Some(driver) = driver {
+                driver.await
+            } else {
+                Ok(())
+            }
+        };
+        let running = std::pin::pin!(futures_util::future::try_join(self.run(channel), drive));
         match select(failure, running).await {
             Either::Left((error, _)) => Err(error),
             Either::Right((result, _)) => result.map(|_| ()),

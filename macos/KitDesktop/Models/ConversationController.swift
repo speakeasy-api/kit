@@ -94,7 +94,7 @@ final class ConversationController: ObservableObject {
     }
 
     var shouldPresentAgentRoster: Bool {
-        runtimeTransportAvailable != false && Self.shouldPresentAgentRoster(
+        !client.childSessions.roster.rowsByID.isEmpty || runtimeTransportAvailable != false && Self.shouldPresentAgentRoster(
             expectedSessionID: expectedRuntimeSessionID, runtimeSessionID: runtimeSessionID,
             transcriptIsEmpty: entries.isEmpty
         )
@@ -146,6 +146,7 @@ final class ConversationController: ObservableObject {
               let row = agentRoster.rowsByID[id], row.generation == generation else { return false }
         return row.status == .working && row.parentID == nil
             && agentRoster.canSteer(id: id, generation: generation)
+            && client.childSessions.roster.canSteer(id: id, generation: generation)
     }
 
     var onSessionReady: ((String, [ConfigOption]) -> Void)?
@@ -205,6 +206,10 @@ final class ConversationController: ObservableObject {
             guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
             if self.startupUpdates != nil { self.startupUpdates?.append(update) }
             else { self.apply(update) }
+        }
+        activeClient.onChildUpdate = { [weak self, weak activeClient] in
+            guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
+            self.agentRoster.syncStreamed(activeClient.childSessions.roster)
         }
         activeClient.onRuntimeEvent = { [weak self, weak activeClient] event in
             guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
@@ -424,6 +429,19 @@ final class ConversationController: ObservableObject {
 
     private func apply(_ update: DesktopUpdate) {
         switch update {
+        case .sessionMessage(let message):
+            let identity = MessageIdentity(role: "session:" + message.sessionID, id: message.messageID)
+            if let entryID = messageEntryIDs[identity], let index = transcriptIndex(for: entryID) {
+                changedTranscriptIndices.insert(index)
+                entries[index].title = message.title
+                entries[index].text = message.text
+                entries[index].formatted = nil
+                transcriptRevision += 1
+            } else {
+                let entry = TranscriptEntry(role: .status, title: message.title, text: message.text)
+                appendEntry(entry)
+                messageEntryIDs[identity] = entry.id
+            }
         case .userMessage(let message):
             finishActiveThought()
             applyMessage(message, role: .user)
@@ -630,7 +648,11 @@ final class ConversationController: ObservableObject {
         }
         guard runtimeTransportAvailable != false, runtimeSessionID == expectedRuntimeSessionID else { return }
         var roster = agentRoster
-        if roster.apply(event: event, nowMS: Self.nowMilliseconds()) {
+        let applied = roster.apply(event: event, nowMS: Self.nowMilliseconds())
+        // Rejected rows can still teach us ownership needed to fence later
+        // descendants. Persist that metadata even when no row was admitted.
+        if applied || roster != agentRoster {
+            if !client.childSessions.roster.rowsByID.isEmpty { roster.syncStreamed(client.childSessions.roster) }
             agentRoster = roster
             scheduleRosterPrune()
             return
@@ -1210,7 +1232,8 @@ final class ConversationController: ObservableObject {
         if !available {
             runtimeLeaseWorkItem?.cancel()
             runtimeLeaseWorkItem = nil
-            agentRoster.invalidateLiveState()
+            if client.childSessions.roster.rowsByID.isEmpty { agentRoster.invalidateLiveState() }
+            else { agentRoster.syncStreamed(client.childSessions.roster) }
             rosterPruneWorkItem?.cancel()
             // Tool status itself is ACP-authoritative. Only nested runtime child
             // observations become unknown when the diagnostic stream is lost.

@@ -16,6 +16,7 @@ use agent_client_protocol::{ByteStreams, UntypedMessage};
 
 mod messages;
 mod protocol;
+mod stream;
 pub(crate) mod transcript;
 use agentkit_acp::{
     CloseSessionRequest, ConfigOptionUpdate, ContentBlock, DeleteSessionRequest,
@@ -1493,6 +1494,8 @@ async fn run(
     let notification_routes = Arc::clone(&routes);
     let config_snapshots = Arc::new(ConfigSnapshots::default());
     let notification_configs = Arc::clone(&config_snapshots);
+    let stream_routes = Arc::new(stream::Routes::default());
+    let notification_stream_routes = Arc::clone(&stream_routes);
     let root = config.root.clone();
     let additional_directories = config.additional_directories.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
@@ -1510,6 +1513,7 @@ async fn run(
                     && let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
                     notification_configs.set(notification.session_id.clone(), update.config_options.clone())?;
                 }
+                notification_stream_routes.forward(&session_id.to_string(), params["update"].clone());
                 let route = notification_routes
                     .lock()
                     .ok()
@@ -1518,6 +1522,7 @@ async fn run(
                     return Ok(());
                 };
                 if let Some(state) = protocol::foreground(&params)? {
+                    route.record_inspection(params["update"].clone());
                     // Startup/replayed idle cannot settle a newly submitted turn.
                     route.idle.send_if_modified(|current| current.advance(state));
                     return Ok(());
@@ -1624,6 +1629,7 @@ async fn run(
                 let (idle, _) = watch::channel(protocol::Foreground::Waiting);
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
                     .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, output: Arc::clone(&replay_output), idle });
+                stream_routes.begin_resume(id.to_string());
                 let result = protocol::resume(&connection, version, id.clone(), root.clone(), additional_directories.clone()).await;
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
                 result
@@ -1710,7 +1716,7 @@ async fn run(
                         // Routes are installed/removed only by prompt tasks. Read under
                         // their lock, then release it before any protocol I/O. Injection
                         // never owns or changes the foreground output, gate, or idle state.
-                        let request = {
+                        let (request, submitted) = {
                             let routes = match routes.lock() {
                                 Ok(routes) => routes,
                                 Err(_) => {
@@ -1733,7 +1739,8 @@ async fn run(
                             // The SDK enqueue is synchronous and does not invoke route callbacks.
                             // Route removal/replacement cannot interleave admission and enqueue.
                             // Only receipt waiting is spawned, with no route guard alive.
-                            protocol::steer(&connection, steer.session_id, steer.content)
+                            let submitted = route.and_then(|route| route.transcript.clone().map(|transcript| (transcript, route.owner.clone(), route.generation, steer.content.clone())));
+                            (protocol::steer(&connection, steer.session_id, steer.content), submitted)
                         };
                         let auth_methods = auth_methods.clone();
                         tasks.spawn(async move {
@@ -1744,6 +1751,9 @@ async fn run(
                                 },
                                 Err(error) => Err(ChildError::Failed(child_request_error(error, &auth_methods))),
                             };
+                            if result.is_ok() && let Some((transcript, owner, generation, content)) = submitted {
+                                transcript.record_submitted_prompt(&owner, generation, &content);
+                            }
                             let _ = steer.reply.send(result);
                         });
                     }
@@ -1949,6 +1959,7 @@ async fn run(
                         });
                     }
                     Request::Prompt(prompt) => {
+                        let stream_routes = Arc::clone(&stream_routes);
                         let auth_methods = auth_methods.clone();
                         let connection = connection.clone();
                         let routes = Arc::clone(&routes);
@@ -1959,6 +1970,9 @@ async fn run(
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
                             let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
+                            if let Some(transcript) = &prompt.transcript {
+                                stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone());
+                            }
                             if let Ok(mut routes) = routes.lock() {
                                 routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, output: Arc::clone(&output), idle: idle_tx });
                             }
@@ -1967,6 +1981,7 @@ async fn run(
                                     id: prompt.owner.clone(), generation: prompt.generation, can_steer: supports_steer,
                                 });
                                 if let Some(transcript) = &prompt.transcript {
+                                    transcript.stream_capabilities(&prompt.owner, prompt.generation, supports_steer);
                                     transcript.record_submitted_prompt(&prompt.owner, prompt.generation, &prompt.content);
                                 }
                             }
@@ -4251,6 +4266,130 @@ for line in sys.stdin:
                     .count(),
                 2
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_nested_stream_survives_until_prompt_without_reannouncement() {
+        let script = r#"
+import json,sys
+version=int(sys.argv[1])
+def send(value):
+    print(json.dumps(value),flush=True)
+def update(session, value):
+    send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session,'update':value}})
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request:
+        continue
+    method=request['method']
+    result={}
+    if method == 'initialize':
+        if version == 1:
+            result={'protocolVersion':1,'agentCapabilities':{'loadSession':True,'sessionCapabilities':{'close':{}}}}
+        else:
+            result={'protocolVersion':2,'info':{'name':'resume-stream-test','version':'1'},'capabilities':{'session':{}}}
+    elif method in ('session/load','session/resume'):
+        update('saved',{'sessionUpdate':'subagent_update','sessionId':'nested','title':'retained child'})
+        update('nested',{'sessionUpdate':'agent_thought_chunk','content':{'type':'text','text':'resume thought'}})
+    elif method == 'session/prompt':
+        # Deliberately no second ownership announcement.
+        update('nested',{'sessionUpdate':'agent_thought_chunk','content':{'type':'text','text':'live thought'}})
+        if version == 1:
+            result={'stopReason':'end_turn'}
+        else:
+            result={'messageId':'accepted-prompt'}
+    send({'jsonrpc':'2.0','id':request['id'],'result':result})
+    if method == 'session/prompt' and version == 2:
+        update('saved',{'sessionUpdate':'state_update','state':'running'})
+        update('saved',{'sessionUpdate':'state_update','state':'idle','stopReason':'end_turn'})
+"#;
+        for version in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let profiles = BTreeMap::from([(
+                "resume".into(),
+                AcpHarnessProfile {
+                    command: "python3".into(),
+                    args: vec!["-c".into(), script.into(), version.to_string()],
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            )]);
+            let config = ChildConfig {
+                root: root.path().into(),
+                additional_directories: Vec::new(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses: AcpHarnesses::new(profiles).unwrap(),
+                default_harness: "acp.resume".into(),
+                parent_id: None,
+                parent_name: None,
+                tree_slots: None,
+                prompt_cache_key: None,
+            };
+            let (child, _) = tokio::time::timeout(
+                Duration::from_secs(5),
+                ChildSession::start_with_output(
+                    config,
+                    "acp.resume".into(),
+                    Some(("saved".into(), true)),
+                    None,
+                    1,
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // The owning runtime only attaches its transcript at prompt time.
+            let transcripts = transcript::Transcripts::default();
+            transcripts.stream.announce(
+                "child",
+                "worker",
+                "task",
+                crate::events::SubagentStatus::Working,
+                1,
+            );
+            transcripts.start("child", 1);
+            let mut rx = transcripts.stream.subscribe("parent".into(), false);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt_generation(
+                    "child".into(),
+                    1,
+                    "continue".into(),
+                    TurnCancellation::default(),
+                    Some(transcripts.get("child", 1).unwrap()),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut nested = None;
+            let mut thought_texts = Vec::new();
+            while let Ok((owner, event)) = rx.try_recv() {
+                if owner == "child" && event["sessionUpdate"] == "subagent_update" {
+                    assert!(
+                        nested.is_none(),
+                        "nested association must be announced once"
+                    );
+                    nested = event["sessionId"].as_str().map(str::to_owned);
+                }
+                if event["sessionUpdate"] == "agent_thought_chunk" {
+                    assert_eq!(Some(owner.as_str()), nested.as_deref());
+                    thought_texts.push(event["content"]["text"].as_str().unwrap().to_owned());
+                }
+            }
+            assert!(nested.is_some());
+            assert_eq!(thought_texts, ["resume thought", "live thought"]);
+            child.close().await.unwrap();
         }
     }
 

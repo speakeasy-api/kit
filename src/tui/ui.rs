@@ -6532,7 +6532,7 @@ mod tests {
         app.apply(Update::Usage {
             used: 1,
             size: 2,
-            cost: Some(Cost::new(0.0, "USD")),
+            cost: agent_client_protocol::schema::MaybeUndefined::Value(Cost::new(0.0, "USD")),
         });
         assert!(
             render(&mut app, 160, 24)
@@ -6544,7 +6544,7 @@ mod tests {
         app.apply(Update::Usage {
             used: 1,
             size: 2,
-            cost: Some(Cost::new(1.2345, "EUR")),
+            cost: agent_client_protocol::schema::MaybeUndefined::Value(Cost::new(1.2345, "EUR")),
         });
         assert!(
             render(&mut app, 160, 24)
@@ -6570,7 +6570,7 @@ mod tests {
         app.apply(Update::Usage {
             used: 1_360,
             size: 272_000,
-            cost: None,
+            cost: agent_client_protocol::schema::MaybeUndefined::Undefined,
         });
         app.session_id = Some("s-1770000000000-12345-0".into());
 

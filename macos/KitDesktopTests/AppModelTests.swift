@@ -328,6 +328,155 @@ final class AppModelTests: XCTestCase {
 }
 
 final class AgentRosterTests: XCTestCase {
+    @MainActor
+    func testStreamedSyncPreservesRuntimeMetadataAndSteeringAuthority() throws {
+        let stream = DesktopChildSessions()
+        stream.receive(root: "root", session: "root", update: streamed("child"))
+        var roster = AgentRoster()
+        roster.syncStreamed(stream.roster)
+        var working = event(id: "child", name: "Child", status: "working", created: 10, started: 20)
+        working["harness"] = "acp.claude"
+        working["model"] = "model-name"
+        XCTAssertTrue(roster.apply(event: working, nowMS: 30))
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(roster.rowsByID["child"]?.harness, "acp.claude")
+        XCTAssertEqual(roster.rowsByID["child"]?.model, "model-name")
+        XCTAssertEqual(roster.rowsByID["child"]?.createdAtMS, 10)
+        XCTAssertEqual(roster.rowsByID["child"]?.generationStartedAtMS, 20)
+        XCTAssertTrue(roster.canSteer(id: "child", generation: 1))
+
+        stream.receive(root: "root", session: "root", update: streamed("child", steer: false))
+        _ = roster.apply(event: ["event": "subagent_capabilities", "id": "child", "generation": 1, "can_steer": true], nowMS: 40)
+        roster.syncStreamed(stream.roster)
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+        XCTAssertTrue(roster.apply(event: event(id: "child", name: "Child", status: "idle", outcome: "failed", finished: 50), nowMS: 50))
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(roster.rowsByID["child"]?.status, .idle)
+        XCTAssertEqual(roster.rowsByID["child"]?.outcome, .failed)
+        XCTAssertEqual(roster.rowsByID["child"]?.generationFinishedAtMS, 50)
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+    }
+
+    @MainActor
+    func testStreamedSyncDoesNotResurrectRemovedOrExpiredFailedChildren() {
+        let stream = DesktopChildSessions()
+        stream.receive(root: "root", session: "root", update: streamed("done"))
+        stream.receive(root: "root", session: "root", update: streamed("failed"))
+        var roster = AgentRoster()
+        roster.syncStreamed(stream.roster)
+        _ = roster.apply(event: event(id: "done", name: "Done", status: "removed", outcome: "success", finished: 100), nowMS: 100)
+        _ = roster.apply(event: event(id: "failed", name: "Failed", status: "removed", outcome: "failed", finished: 100), nowMS: 100)
+        stream.receive(root: "root", session: "root", update: streamed("done", state: "unknown"))
+        stream.receive(root: "root", session: "root", update: streamed("failed", state: "unknown"))
+        roster.syncStreamed(stream.roster)
+        XCTAssertNil(roster.rowsByID["done"])
+        XCTAssertEqual(roster.rowsByID["failed"]?.status, .removed)
+        XCTAssertEqual(roster.rowsByID["failed"]?.outcome, .failed)
+        XCTAssertEqual(roster.nextFailedRemovalExpiryMS, 4_100)
+        XCTAssertEqual(roster.counts.total, 0)
+        XCTAssertTrue(roster.pruneExpired(at: 4_100))
+        roster.syncStreamed(stream.roster)
+        XCTAssertTrue(roster.rowsByID.isEmpty)
+    }
+
+    @MainActor
+    func testStreamedDescendantsStayRemovedAfterSynchronization() {
+        let stream = DesktopChildSessions()
+        stream.receive(root: "root", session: "root", update: streamed("parent"))
+        stream.receive(root: "root", session: "parent", update: streamed("child"))
+        stream.receive(root: "root", session: "child", update: streamed("nested"))
+        var roster = AgentRoster()
+        roster.syncStreamed(stream.roster)
+        XCTAssertTrue(roster.apply(event: ["event": "subagent_descendants_removed", "ancestor_id": "parent"], nowMS: 100))
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(Set(roster.rowsByID.keys), ["parent"])
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+        XCTAssertFalse(roster.apply(event: event(id: "nested", name: "Late", status: "working", generation: 99), nowMS: 101))
+        stream.receive(root: "root", session: "nested", update: streamed("unseen"))
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(Set(roster.rowsByID.keys), ["parent"])
+        XCTAssertFalse(roster.apply(event: event(id: "unseen", name: "Late", status: "working", generation: 99), nowMS: 102))
+    }
+
+    @MainActor
+    func testCleanupBeforeFirstAnnouncementFencesUnseenDescendants() {
+        let stream = DesktopChildSessions()
+        var roster = AgentRoster()
+        XCTAssertTrue(roster.apply(event: ["event": "subagent_descendants_removed", "ancestor_id": "parent"], nowMS: 100))
+        stream.receive(root: "root", session: "root", update: streamed("parent"))
+        stream.receive(root: "root", session: "parent", update: streamed("child"))
+        stream.receive(root: "root", session: "child", update: streamed("grandchild"))
+        stream.receive(root: "root", session: "root", update: streamed("peer"))
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(Set(roster.rowsByID.keys), ["parent", "peer"])
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+        XCTAssertFalse(roster.apply(event: event(id: "grandchild", name: "Late", status: "working", generation: 99), nowMS: 101))
+
+        // Live roster cleanup must not discard retained child transcripts.
+        XCTAssertTrue(stream.receive(root: "root", session: "grandchild", update: [
+            "sessionUpdate": "agent_message_chunk", "content": ["type": "text", "text": "late output"]
+        ]))
+        XCTAssertEqual(stream.history["grandchild"]?.count, 1)
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(Set(roster.rowsByID.keys), ["parent", "peer"])
+    }
+
+    func testCleanupRetainsOwnershipAfterParentRowDisappears() {
+        var roster = AgentRoster()
+        _ = roster.apply(event: event(id: "child", name: "Child", status: "removed", outcome: "success", parentID: "parent", finished: 100), nowMS: 100)
+        XCTAssertNil(roster.rowsByID["child"])
+        _ = roster.apply(event: ["event": "subagent_descendants_removed", "ancestor_id": "parent"], nowMS: 101)
+        XCTAssertFalse(roster.apply(event: event(id: "unseen", name: "Unseen", status: "working", parentID: "child"), nowMS: 102))
+        roster.invalidateLiveState()
+        XCTAssertFalse(roster.apply(event: event(id: "later", name: "Later", status: "working", parentID: "unseen"), nowMS: 103))
+        XCTAssertTrue(roster.rowsByID.isEmpty)
+        roster.reset()
+        XCTAssertTrue(roster.apply(event: event(id: "child", name: "Child", status: "working", parentID: "parent"), nowMS: 104))
+    }
+
+    @MainActor
+    func testControllerRetainsRejectedChildOwnershipForLateGrandchildren() {
+        let client = ACPClient()
+        let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: "/tmp", client: client)
+        controller.prepareRuntimeSession("root")
+        controller.applyRuntime(["event": "session_started", "session_id": "root"])
+        controller.applyRuntime(["event": "subagent_descendants_removed", "ancestor_id": "parent"])
+        controller.applyRuntime(event(id: "child", name: "Child", status: "working", parentID: "parent"))
+        XCTAssertNil(controller.agentRoster.rowsByID["child"])
+        controller.applyRuntime(event(id: "grandchild", name: "Grandchild", status: "working", parentID: "child"))
+        XCTAssertNil(controller.agentRoster.rowsByID["grandchild"])
+        controller.applyRuntime(event(id: "great-grandchild", name: "Great-grandchild", status: "working", parentID: "grandchild"))
+        XCTAssertTrue(controller.agentRoster.rowsByID.isEmpty)
+        controller.applyRuntime(event(id: "peer", name: "Peer", status: "working"))
+        XCTAssertEqual(Set(controller.agentRoster.rowsByID.keys), ["peer"])
+        XCTAssertTrue(client.childSessions.roster.rowsByID.isEmpty)
+    }
+
+    @MainActor
+    func testControllerMergesRuntimeLifecycleAfterStreamedAssociation() {
+        let client = ACPClient()
+        let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: "/tmp", client: client)
+        controller.prepareRuntimeSession("root")
+        controller.applyRuntime(["event": "session_started", "session_id": "root"])
+        client.childSessions.receive(root: "root", session: "root", update: streamed("child"))
+        var working = event(id: "child", name: "Child", status: "working")
+        working["model"] = "runtime-model"
+        controller.applyRuntime(working)
+        XCTAssertEqual(controller.agentRoster.rowsByID["child"]?.model, "runtime-model")
+        controller.applyRuntime(event(id: "child", name: "Child", status: "removed", outcome: "success", finished: 100))
+        XCTAssertNil(controller.agentRoster.rowsByID["child"])
+        client.childSessions.receive(root: "root", session: "root", update: streamed("child", state: "unknown"))
+        // Usage also synchronizes streamed observations without losing tombstones.
+        controller.applyRuntime(["event": "subagent_usage", "id": "child", "used": 1, "size": 100])
+        XCTAssertNil(controller.agentRoster.rowsByID["child"])
+        XCTAssertEqual(controller.agentRoster.counts.total, 0)
+    }
+
+    private func streamed(_ id: String, state: String = "running", steer: Bool = true) -> [String: Any] {
+        ["sessionUpdate": "subagent_update", "sessionId": id, "title": id, "state": ["state": state],
+         "_meta": ["kit/subagent/steer": ["generation": 1, "canSteer": steer]]]
+    }
+
     func testGenerationAwareLifecycleRejectsStaleAndDuplicateEvents() throws {
         var roster = AgentRoster()
         XCTAssertTrue(roster.apply(event: event(id: "a", name: "Scout", status: "starting", generation: 1), nowMS: 1_100))
@@ -368,6 +517,31 @@ final class AgentRosterTests: XCTestCase {
         XCTAssertEqual(Set(roster.rowsByID.keys), Set(["root", "peer"]))
         XCTAssertFalse(roster.apply(event: event(id: "grandchild", name: "Late", status: "working", generation: 99, parentID: "child"), nowMS: 300))
         XCTAssertNil(roster.rowsByID["grandchild"])
+    }
+
+    @MainActor
+    func testEmptyStreamBeforeHelperExitPreservesFailedRetirement() throws {
+        let stream = DesktopChildSessions()
+        stream.receive(root: "root", session: "root", update: streamed("child"))
+        var roster = AgentRoster()
+        roster.syncStreamed(stream.roster)
+        _ = roster.apply(event: event(id: "child", name: "Child", status: "working"), nowMS: 100)
+        XCTAssertTrue(roster.canSteer(id: "child", generation: 1))
+
+        // ACP exit clears streamed observations before retiring runtime rows.
+        stream.reset()
+        roster.syncStreamed(stream.roster)
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+        XCTAssertEqual(roster.rowsByID["child"]?.status, .working)
+        roster.retireActive(at: 200)
+        let retired = try XCTUnwrap(roster.rowsByID["child"])
+        XCTAssertEqual(retired.status, .removed)
+        XCTAssertEqual(retired.outcome, .failed)
+        XCTAssertEqual(retired.generationFinishedAtMS, 200)
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(roster.rowsByID["child"], retired)
+        roster.reset()
+        XCTAssertTrue(roster.rowsByID.isEmpty)
     }
 
     func testRemovalOutcomeAndRetirementMatchRosterSemantics() throws {
