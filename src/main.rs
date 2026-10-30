@@ -1316,7 +1316,16 @@ const CONFIG_MIGRATIONS: &[ConfigMigration] = &[
     ConfigMigration {
         apply: migrate_ask_user,
     },
+    ConfigMigration {
+        apply: migrate_skill_poll_interval,
+    },
 ];
+
+fn migrate_skill_poll_interval(config: &mut toml::Table) {
+    config
+        .entry("skill_poll_interval_seconds")
+        .or_insert(toml::Value::Integer(5));
+}
 
 fn migrate_ask_user(config: &mut toml::Table) {
     config
@@ -1374,6 +1383,7 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 #[derive(Debug, Default, Deserialize)]
 struct Config {
     ask_user: Option<bool>,
+    skill_poll_interval_seconds: Option<u64>,
     #[serde(default)]
     compaction: kit::compaction::policy::CompactionConfig,
     #[serde(default, deserialize_with = "deserialize_experimental_config")]
@@ -2312,6 +2322,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 config.inference_providers.clone(),
             )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
+            let runtime = kit::Runtime::with_skill_poll_interval(
+                runtime,
+                std::time::Duration::from_secs(config.skill_poll_interval_seconds.unwrap_or(5)),
+            )?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
@@ -2417,6 +2431,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 config.inference_providers.clone(),
             )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
+            let runtime = kit::Runtime::with_skill_poll_interval(
+                runtime,
+                std::time::Duration::from_secs(config.skill_poll_interval_seconds.unwrap_or(5)),
+            )?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
@@ -2497,6 +2515,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 config.inference_providers.clone(),
             )?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
+            let runtime = kit::Runtime::with_skill_poll_interval(
+                runtime,
+                std::time::Duration::from_secs(config.skill_poll_interval_seconds.unwrap_or(5)),
+            )?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_ask_user(runtime, config.ask_user.unwrap_or(true))?;
             let runtime = kit::Runtime::with_hooks(runtime)?;
@@ -2961,6 +2983,86 @@ mod tests {
             let text = format!("[experimental]\neval = {value}");
             assert!(toml::from_str::<Config>(&text).is_err());
         }
+    }
+
+    #[test]
+    fn config_skill_poll_interval_defaults_and_strict_integer() {
+        assert_eq!(
+            Config::default().skill_poll_interval_seconds.unwrap_or(5),
+            5
+        );
+        for (text, expected) in [
+            ("", 5),
+            ("skill_poll_interval_seconds = 5", 5),
+            ("skill_poll_interval_seconds = 0", 0),
+            ("skill_poll_interval_seconds = 60", 60),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.skill_poll_interval_seconds.unwrap_or(5), expected);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, text).unwrap();
+            assert_eq!(
+                Config::load(&path)
+                    .unwrap()
+                    .skill_poll_interval_seconds
+                    .unwrap_or(5),
+                expected
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            let migrated = super::migrate_config(toml::from_str(text).unwrap());
+            assert_eq!(
+                migrated["skill_poll_interval_seconds"].as_integer(),
+                Some(expected as i64)
+            );
+            assert_eq!(super::migrate_config(migrated.clone()), migrated);
+        }
+        for value in ["-1", "'5'", "5.0", "true", "[]", "{}"] {
+            let text = format!("skill_poll_interval_seconds = {value}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, &text).unwrap();
+            assert!(Config::load(&path).is_err(), "{text}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn config_skill_poll_interval_writer_preserves_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# preserved\nfuture = 'keep'\nskill_poll_interval_seconds = 0 # disabled\n",
+        )
+        .unwrap();
+        kit::config_editor::set(&path, "model", "'new'").unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("skill_poll_interval_seconds = 0 # disabled")
+        );
+        for seconds in [0, 5, 60] {
+            kit::config_editor::set(&path, "skill_poll_interval_seconds", &seconds.to_string())
+                .unwrap();
+            assert_eq!(
+                Config::load(&path).unwrap().skill_poll_interval_seconds,
+                Some(seconds)
+            );
+        }
+        kit::config_editor::unset(&path, "skill_poll_interval_seconds").unwrap();
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .skill_poll_interval_seconds
+                .unwrap_or(5),
+            5
+        );
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(!updated.contains("skill_poll_interval_seconds"));
+        assert!(updated.starts_with("# preserved\n"));
+        assert!(updated.contains("future = 'keep'"));
     }
 
     #[test]

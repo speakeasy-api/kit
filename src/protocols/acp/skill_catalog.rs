@@ -4,6 +4,114 @@ use agentkit_core::Item;
 use agentkit_tool_skills::Skill;
 use serde::Serialize;
 
+// Local TUI commands and the built-in compactor always take precedence.
+fn command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        && !matches!(
+            name,
+            "compact"
+                | "voice"
+                | "new"
+                | "resume"
+                | "sessions"
+                | "close"
+                | "model"
+                | "effort"
+                | "agents"
+                | "login"
+                | "usage"
+        )
+}
+
+pub(super) fn commands(skills: &[Skill]) -> Vec<(String, String)> {
+    let mut commands = skills
+        .iter()
+        .filter(|skill| command_name(&skill.name))
+        .map(|skill| (skill.name.clone(), skill.description.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    commands.insert(0, ("compact".into(), "Compact the session context".into()));
+    commands
+}
+
+pub(super) async fn poll_commands(
+    runtime: std::sync::Arc<crate::runtime::Runtime>,
+    mut publish: impl FnMut(Vec<(String, String)>),
+) {
+    let mut previous = None;
+    loop {
+        match runtime.polled_skills().await {
+            Ok(skills) => {
+                let current = commands(&skills);
+                if previous.as_ref() != Some(&current) {
+                    publish(current.clone());
+                    previous = Some(current);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not refresh skill commands");
+                if previous.is_none() {
+                    let fallback = commands(&[]);
+                    publish(fallback.clone());
+                    previous = Some(fallback);
+                }
+            }
+        }
+        let interval = runtime.skill_poll_interval();
+        if interval.is_zero() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Resolve only the leading user text, never embedded or quoted slash commands.
+/// Unknown/removed skills stay ordinary prompts, matching other unknown commands.
+pub(super) fn expand_items(skills: &[Skill], items: &mut [Item]) {
+    let Some(item) = items
+        .iter_mut()
+        .find(|item| item.kind == agentkit_core::ItemKind::User)
+    else {
+        return;
+    };
+    let Some(agentkit_core::Part::Text(text)) = item.parts.first_mut() else {
+        return;
+    };
+    let Some(command) = text.text.trim_start().strip_prefix('/') else {
+        return;
+    };
+    let end = command.find(char::is_whitespace).unwrap_or(command.len());
+    let name = &command[..end];
+    if !command_name(name) {
+        return;
+    }
+    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
+        return;
+    };
+    let args = command[end..].trim();
+    let mut expanded = format!(
+        "skill: {}\ndir: {}\n\n{}",
+        skill.name,
+        skill.base_dir.display(),
+        skill.body
+    );
+    if !skill.resources.is_empty() {
+        expanded.push_str("\n\nresources:\n");
+        for resource in &skill.resources {
+            expanded.push_str(&format!("  - {}\n", resource.display()));
+        }
+    }
+    if !args.is_empty() {
+        expanded.push_str("\n\nUser arguments:\n");
+        expanded.push_str(args);
+    }
+    text.text = expanded;
+}
+
 const MAX_NOTIFICATION_BYTES: usize = 2_048;
 const MAX_REPORTED_CHANGES: usize = 64;
 
@@ -265,6 +373,191 @@ mod tests {
             Some(Part::Text(TextPart { text, .. })) => Some(text),
             _ => None,
         }
+    }
+
+    #[test]
+    fn command_lists_ignore_body_edits_but_include_description_edits() {
+        let original = skill("review", "old body");
+        let mut edited = original.clone();
+        edited.body = "new instructions".into();
+        assert_eq!(
+            commands(std::slice::from_ref(&original)),
+            commands(std::slice::from_ref(&edited))
+        );
+        edited.description = "Updated description".into();
+        assert_ne!(commands(&[original]), commands(&[edited]));
+    }
+
+    #[test]
+    fn slash_commands_filter_collisions_and_expand_current_instructions() {
+        let mut current = skill("review", "Current instructions");
+        current.resources.push(current.base_dir.join("guide.md"));
+        let skills = vec![skill("compact", "wrong"), skill("new", "wrong"), current];
+        assert_eq!(
+            commands(&skills)
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["compact", "review"]
+        );
+        let mut items = vec![Item::text(ItemKind::User, "/review focus on tests")];
+        expand_items(&skills, &mut items);
+        let Part::Text(text) = &items[0].parts[0] else {
+            panic!("text")
+        };
+        assert_eq!(
+            text.text,
+            "skill: review\ndir: /skills/review\n\nCurrent instructions\n\nresources:\n  - /skills/review/guide.md\n\n\nUser arguments:\nfocus on tests"
+        );
+        for input in [
+            "/removed args",
+            "/compact",
+            "/new",
+            "Explain /review",
+            "/review-other",
+        ] {
+            let mut items = vec![Item::text(ItemKind::User, input)];
+            expand_items(&skills, &mut items);
+            let Part::Text(text) = &items[0].parts[0] else {
+                panic!("text")
+            };
+            assert_eq!(text.text, input);
+        }
+        let mut items = vec![Item::text(ItemKind::User, "/review")];
+        expand_items(&skills, &mut items);
+        let Part::Text(text) = &items[0].parts[0] else {
+            panic!("text")
+        };
+        assert!(!text.text.contains("User arguments:"));
+    }
+
+    fn write_skill(root: &std::path::Path, description: &str, body: &str) {
+        let directory = root.join(".agents/skills/live");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: live\ndescription: {description}\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_replaces_catalog_after_add_edit_remove_and_stops_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(poll_commands(runtime.clone(), move |commands| {
+            send.send(commands).unwrap();
+        }));
+        assert_eq!(receive.recv().await.unwrap(), commands(&[]));
+        write_skill(root.path(), "First description", "first body");
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let added = receive.recv().await.unwrap();
+        assert!(added.contains(&("live".into(), "First description".into())));
+        write_skill(root.path(), "Second description", "new body");
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let edited = receive.recv().await.unwrap();
+        assert!(edited.contains(&("live".into(), "Second description".into())));
+        let current = runtime.current_skills().await.unwrap();
+        let mut items = vec![Item::text(ItemKind::User, "/live")];
+        expand_items(&current.skills, &mut items);
+        let Part::Text(text) = &items[0].parts[0] else {
+            panic!("text")
+        };
+        assert!(text.text.contains("new body"));
+        drop(current);
+        std::fs::remove_dir_all(root.path().join(".agents/skills/live")).unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        assert_eq!(receive.recv().await.unwrap(), commands(&[]));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(receive.recv().await.is_none());
+        assert!(runtime.current_skills().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_polling_still_advertises_initial_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        write_skill(root.path(), "Initial description", "body");
+        let runtime = crate::runtime::Runtime::with_skill_poll_interval(
+            crate::runtime::Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(poll_commands(runtime, move |commands| {
+            send.send(commands).unwrap();
+        }));
+        assert!(
+            receive
+                .recv()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == "live")
+        );
+        write_skill(root.path(), "Changed description", "body");
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn disabled_polling_advertises_compact_when_initial_refresh_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_config = root.path().join("config.toml");
+        std::fs::write(&plugin_config, "").unwrap();
+        let plugins = crate::plugins::PluginRuntime::load(
+            plugin_config,
+            root.path().to_path_buf(),
+            root.path().join("cache"),
+            root.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let runtime = crate::runtime::Runtime::with_plugin_runtime(
+            crate::runtime::Runtime::with_skill_poll_interval(
+                crate::runtime::Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+            Some(plugins),
+        )
+        .unwrap();
+        let mcp_config = root.path().join("mcp.json");
+        std::fs::write(&mcp_config, "{\"mcpServers\":{}}").unwrap();
+        let runtime = crate::runtime::Runtime::with_mcp_config(
+            runtime,
+            Some(&mcp_config),
+            Vec::new(),
+            false,
+            crate::tools::mcp::CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        std::fs::write(&mcp_config, "invalid JSON").unwrap();
+        assert!(
+            runtime
+                .polled_skills()
+                .await
+                .unwrap_err()
+                .contains("invalid MCP config")
+        );
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(poll_commands(runtime, move |commands| {
+            send.send(commands).unwrap();
+        }));
+        let advertised = tokio::time::timeout(std::time::Duration::from_secs(10), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(advertised, commands(&[]));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[test]

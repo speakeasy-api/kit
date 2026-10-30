@@ -139,6 +139,147 @@ mod test_support {
         );
     }
 
+    #[test]
+    fn skill_poll_interval_rejects_overflow_and_accepts_disabled_polling() {
+        let root = tempfile::tempdir().unwrap();
+        let result = Runtime::with_skill_poll_interval(
+            Runtime::new(root.path(), "test-model").unwrap(),
+            Duration::MAX,
+        );
+        assert!(matches!(result, Err(error) if error == "skill polling interval is too large"));
+        let runtime = Runtime::with_skill_poll_interval(
+            Runtime::new(root.path(), "test-model").unwrap(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(runtime.skill_poll_interval(), Duration::ZERO);
+    }
+
+    fn write_cached_test_skill(root: &Path, body: &str) {
+        let directory = root.join(".agents/skills/cache-test");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: cache-test\ndescription: Cache test.\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    fn cached_test_skill_body(skills: &[Skill]) -> &str {
+        &skills
+            .iter()
+            .find(|skill| skill.name == "cache-test")
+            .unwrap()
+            .body
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn current_skills_refreshes_files_inside_poll_interval() {
+        let root = tempfile::tempdir().unwrap();
+        write_cached_test_skill(root.path(), "first body");
+        let runtime = Runtime::with_skill_poll_interval(
+            Runtime::new(root.path(), "test-model").unwrap(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let initial = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&initial).contains("first body"));
+        write_cached_test_skill(root.path(), "second body");
+        let current = runtime.current_skills().await.unwrap();
+        assert!(cached_test_skill_body(&current.skills).contains("second body"));
+        drop(current);
+        let polled = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&polled).contains("second body"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_skill_polling_reuses_initial_scan_but_allows_forced_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        write_cached_test_skill(root.path(), "first body");
+        let runtime = Runtime::with_skill_poll_interval(
+            Runtime::new(root.path(), "test-model").unwrap(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let initial = runtime.current_skills().await.unwrap();
+        assert!(cached_test_skill_body(&initial.skills).contains("first body"));
+        drop(initial);
+        write_cached_test_skill(root.path(), "second body");
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        let cached = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&cached).contains("first body"));
+        let refreshed = runtime.current_skills().await.unwrap();
+        assert!(cached_test_skill_body(&refreshed.skills).contains("second body"));
+        drop(refreshed);
+        let cached = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&cached).contains("second body"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polled_skills_reuses_snapshot_until_interval_expires() {
+        let root = tempfile::tempdir().unwrap();
+        write_cached_test_skill(root.path(), "first body");
+        let interval = Duration::from_secs(60);
+        let runtime = Runtime::with_skill_poll_interval(
+            Runtime::new(root.path(), "test-model").unwrap(),
+            interval,
+        )
+        .unwrap();
+        let initial = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&initial).contains("first body"));
+        write_cached_test_skill(root.path(), "second body");
+        let cached = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&cached).contains("first body"));
+        tokio::time::advance(interval).await;
+        let refreshed = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&refreshed).contains("second body"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_skill_scan_preserves_snapshot_and_releases_scan_gate() {
+        let root = tempfile::tempdir().unwrap();
+        write_cached_test_skill(root.path(), "first body");
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let plugins = crate::plugins::PluginRuntime::load(
+            config,
+            root.path().to_path_buf(),
+            root.path().join("cache"),
+            root.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let runtime = Runtime::with_plugin_runtime(
+            Runtime::with_skill_poll_interval(
+                Runtime::new(root.path(), "test-model").unwrap(),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+            Some(plugins.clone()),
+        )
+        .unwrap();
+        let initial = runtime.polled_skills().await.unwrap();
+        assert!(cached_test_skill_body(&initial).contains("first body"));
+        write_cached_test_skill(root.path(), "second body");
+        let writer = plugins.generation_writer().await;
+        {
+            let refresh = runtime.current_skills();
+            tokio::pin!(refresh);
+            assert!(futures_util::poll!(refresh.as_mut()).is_pending());
+        }
+        drop(writer);
+        let cached = tokio::time::timeout(Duration::from_secs(5), runtime.polled_skills())
+            .await
+            .expect("cancelled refresh must release the scan gate")
+            .unwrap();
+        assert!(cached_test_skill_body(&cached).contains("first body"));
+        let refreshed = tokio::time::timeout(Duration::from_secs(5), runtime.current_skills())
+            .await
+            .expect("refresh must recover after cancellation")
+            .unwrap();
+        assert!(cached_test_skill_body(&refreshed.skills).contains("second body"));
+    }
+
     #[tokio::test]
     async fn storage_bridge_relays_external_cancellation_and_reasserts_for_new_generations() {
         let external = CancellationController::new();
@@ -603,6 +744,8 @@ pub struct Runtime {
     plugin_runtime: Option<crate::plugins::PluginRuntime>,
     dynamic_skill_tool: Option<Arc<dyn Tool>>,
     skills: Arc<SkillRegistry>,
+    skill_poll_interval: Duration,
+    skill_scan: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<Skill>)>>,
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
     hooks: Option<Arc<crate::ahp::Hooks>>,
@@ -723,6 +866,8 @@ impl Runtime {
             plugin_runtime: None,
             dynamic_skill_tool: None,
             skills,
+            skill_poll_interval: Duration::from_secs(5),
+            skill_scan: tokio::sync::Mutex::new(None),
             skill_package_roots: Vec::new(),
             skill_directories: Vec::new(),
             hooks: None,
@@ -838,6 +983,24 @@ impl Runtime {
         let inner = Arc::get_mut(&mut runtime).ok_or("runtime already shared")?;
         inner.adapter = inner.adapter.clone().with_inference(instances);
         Ok(runtime)
+    }
+
+    pub fn with_skill_poll_interval(
+        runtime: Arc<Self>,
+        interval: Duration,
+    ) -> Result<Arc<Self>, String> {
+        if tokio::time::Instant::now().checked_add(interval).is_none() {
+            return Err("skill polling interval is too large".to_string());
+        }
+        let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
+            "could not configure skill polling after runtime was shared".to_string()
+        })?;
+        runtime.skill_poll_interval = interval;
+        Ok(Arc::new(runtime))
+    }
+
+    pub(crate) fn skill_poll_interval(&self) -> Duration {
+        self.skill_poll_interval
     }
 
     /// Configures compaction before publishing the runtime to any sessions.
@@ -1364,6 +1527,8 @@ impl Runtime {
             plugin_runtime: None,
             dynamic_skill_tool: None,
             skills: build_skill_tools(&root, &self.skill_package_roots, &self.skill_directories),
+            skill_poll_interval: self.skill_poll_interval,
+            skill_scan: tokio::sync::Mutex::new(None),
             skill_package_roots: self.skill_package_roots.clone(),
             skill_directories: self.skill_directories.clone(),
             hooks: if self.hooks_enabled {
@@ -1478,7 +1643,29 @@ impl Runtime {
         build_skill_tools(&self.root, &package_roots, &skill_directories)
     }
 
+    // The scan gate serializes prompt and polling refreshes. The complete cache is
+    // committed only after a successful scan; cancellation leaves the previous
+    // snapshot intact. No caller acquires this gate while holding a plugin lease.
+    pub(crate) async fn polled_skills(&self) -> Result<Vec<Skill>, String> {
+        let mut cache = self.skill_scan.lock().await;
+        if let Some((scanned, skills)) = &*cache
+            && (self.skill_poll_interval.is_zero() || scanned.elapsed() < self.skill_poll_interval)
+        {
+            return Ok(skills.clone());
+        }
+        let current = self.scan_skills().await?;
+        *cache = Some((tokio::time::Instant::now(), current.skills.clone()));
+        Ok(current.skills)
+    }
+
     pub(crate) async fn current_skills(&self) -> Result<CurrentSkills, String> {
+        let mut cache = self.skill_scan.lock().await;
+        let current = self.scan_skills().await?;
+        *cache = Some((tokio::time::Instant::now(), current.skills.clone()));
+        Ok(current)
+    }
+
+    async fn scan_skills(&self) -> Result<CurrentSkills, String> {
         if self.plugin_runtime.is_some() {
             self.mcp.refresh().await?;
         }

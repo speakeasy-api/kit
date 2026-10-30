@@ -293,6 +293,7 @@ model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
 capture_error_spans = false # optional local context in fatal error logs
+skill_poll_interval_seconds = 5 # 0 disables live skill catalog polling
 otel_endpoint = "http://localhost:4317"
 otel_protocol = "grpc" # grpc, http/protobuf, or http/json
 otel_capture_message_content = false
@@ -461,7 +462,17 @@ Review the change and run the smallest relevant checks.
 
 The `skill` entry in `compose` initially discloses only valid skill names and descriptions. When a task matches, the agent loads the skill before proceeding; the result contains the full Markdown body, skill directory, and paths to supporting resources. Project and user skill files are read with the Kit process's normal host permissions. Invalid or unreadable skills are omitted, and the same skill can be loaded repeatedly.
 
-Start a new session after adding or removing a skill so the agent sees the updated skill catalog.
+### Invoke a skill with a slash command
+
+In the TUI or an ACP client, enter `/name` to load a skill by name. Append optional task details, for example `/release-notes focus on user-facing fixes`. Kit loads the latest skill instructions when you invoke the command. Skill commands that collide with `/compact` or Kit’s local commands (`/voice`, `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, `/login`, and `/usage`) are hidden; use the `skill` tool to load those skills instead. Unknown or removed skill commands are sent as ordinary prompts; Kit does not reuse their old instructions.
+
+Kit checks for skill catalog changes every five seconds in live sessions. To change the interval, set `skill_poll_interval_seconds` in `~/.kit/config.toml`:
+
+```toml
+skill_poll_interval_seconds = 5
+```
+
+The value must be a non-negative integer number of seconds. Set it to `0` to disable polling after the initial skill catalog is sent; start or resume a session to refresh its command menu when polling is disabled. Skill invocation still reads current instructions. Polling applies only to live sessions, not one-shot prompts.
 
 ## Troubleshoot startup and configuration
 

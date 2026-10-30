@@ -177,12 +177,25 @@ fn terminal_auth_methods(
         .collect()
 }
 
-fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
+fn available_commands_update(
+    session_id: agentkit_acp::SessionId,
+    commands: Vec<(String, String)>,
+) -> SessionNotification {
     SessionNotification::new(
         session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
-            AvailableCommand::new("compact", "Compact the session context"),
-        ])),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+            commands
+                .into_iter()
+                .map(|(name, description)| {
+                    let input = (name != "compact").then(|| {
+                        agentkit_acp::AvailableCommandInput::Unstructured(
+                            agentkit_acp::UnstructuredCommandInput::new("Optional arguments"),
+                        )
+                    });
+                    AvailableCommand::new(name, description).input(input)
+                })
+                .collect(),
+        )),
     )
 }
 
@@ -1599,7 +1612,7 @@ impl Server {
         self: &Arc<Self>,
         request: NewSessionRequest,
         connection: ConnectionTo<Client>,
-    ) -> Result<NewSessionResponse, AcpRuntimeError> {
+    ) -> Result<(NewSessionResponse, oneshot::Sender<()>), AcpRuntimeError> {
         // session/new retains the configured-or-generated selection semantics.
         Runtime::workspace_root(&request.cwd)?;
         let claim = self.runtime.claim_session()?;
@@ -1622,8 +1635,10 @@ impl Server {
             activation,
             ..
         } = attached;
-        let _ = activation.send(());
-        Ok(NewSessionResponse::new(session_id).config_options(Some(config_options)))
+        Ok((
+            NewSessionResponse::new(session_id).config_options(Some(config_options)),
+            activation,
+        ))
     }
 
     async fn list_sessions(
@@ -1896,7 +1911,15 @@ impl Server {
             let _shutdown_bridge = shutdown_bridge;
             let _guard = guard;
             if activated.await.is_ok() {
-                session_actor(actor).await;
+                let runtime = Arc::clone(&actor.runtime);
+                let session_id = actor.session_id.clone();
+                let actor = std::pin::pin!(session_actor(actor));
+                let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
+                    let _ = connection
+                        .send_notification(available_commands_update(session_id.clone(), commands));
+                }));
+                // Dropping the losing future stops polling with its session.
+                let _ = select(actor, polling).await;
             }
         });
         let registered = RegisteredSession {
@@ -2740,7 +2763,8 @@ async fn drive_runtime_prompt<S: ModelSession>(
         .await
         .map_err(AcpRuntimeError::Loop)?;
     background_jobs.begin_turn();
-    let items = integration.input_port().prompt_to_items(&request)?;
+    let mut items = integration.input_port().prompt_to_items(&request)?;
+    skill_catalog::expand_items(&current.skills, &mut items);
     skill_catalog
         .submit(&current.skills, items, |items| {
             voice_monitor.submit(items, |items| driver.submit_input(items))
@@ -3050,16 +3074,14 @@ fn component(
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
                     cx.spawn(async move {
-                        let result = state.new_session(request, connection.clone()).await;
-                        let notification = result
-                            .as_ref()
-                            .ok()
-                            .map(|response| available_commands_update(response.session_id.clone()));
-                        responder.respond_with_result(result.map_err(sdk_error))?;
-                        if let Some(notification) = notification {
-                            connection.send_notification(notification)?;
+                        match state.new_session(request, connection.clone()).await {
+                            Ok((response, activation)) => {
+                                responder.respond(response)?;
+                                let _ = activation.send(());
+                                Ok(())
+                            }
+                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
-                        Ok(())
                     })?;
                     Ok(())
                 }
@@ -3072,7 +3094,6 @@ fn component(
                 async move |request: LoadSessionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    let session_id = request.session_id.clone();
                     cx.spawn(async move {
                         match state.load_session(request, connection.clone()).await {
                             Ok(prepared) => {
@@ -3083,7 +3104,7 @@ fn component(
                                 // Once success is reported, retain and activate the session even
                                 // if the optional post-response command update cannot be sent.
                                 let _ = prepared.activation.send(());
-                                connection.send_notification(available_commands_update(session_id))
+                                Ok(())
                             }
                             Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
@@ -3102,12 +3123,8 @@ fn component(
                     cx.spawn(async move {
                         match state.fork_session(request, connection.clone()).await {
                             Ok(prepared) => {
-                                if let Some(session_id) = prepared
-                                    .submit(|response| responder.respond_with_result(response))?
-                                {
-                                    connection
-                                        .send_notification(available_commands_update(session_id))?;
-                                }
+                                prepared
+                                    .submit(|response| responder.respond_with_result(response))?;
                                 Ok(())
                             }
                             Err(error) => responder.respond_with_result(Err(sdk_error(error))),
@@ -5387,8 +5404,14 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn available_commands_advertises_only_compact() {
-        let notification = available_commands_update(agentkit_acp::SessionId::new("session"));
+    fn available_commands_advertises_skills_with_optional_arguments() {
+        let notification = available_commands_update(
+            agentkit_acp::SessionId::new("session"),
+            vec![
+                ("compact".into(), "Compact the session context".into()),
+                ("review".into(), "Review changes".into()),
+            ],
+        );
         let SessionUpdate::AvailableCommandsUpdate(update) = notification.update else {
             panic!("expected available commands update");
         };
@@ -5398,8 +5421,16 @@ pub(super) mod tests {
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
-            ["compact"]
+            ["compact", "review"]
         );
+        assert!(update.available_commands[0].input.is_none());
+        assert_eq!(update.available_commands[1].description, "Review changes");
+        let Some(agentkit_acp::AvailableCommandInput::Unstructured(input)) =
+            &update.available_commands[1].input
+        else {
+            panic!("expected argument hint");
+        };
+        assert_eq!(input.hint, "Optional arguments");
     }
 
     #[test]
