@@ -328,12 +328,8 @@ struct AgentRoster: Equatable {
         // The ACP stream owns associations and steering grants. Runtime events
         // retain richer lifecycle metadata, including removal tombstones that
         // must survive later ACP "unknown" state snapshots and content updates.
-        guard !source.rowsByID.isEmpty else {
-            rowsByID.removeAll()
-            steerableGenerations.removeAll()
-            usageByID.removeAll()
-            return
-        }
+        // An empty stream can arrive before helper-exit retirement. Revoke
+        // grants below, but preserve lifecycle rows for failed-removal display.
         for (id, parentID) in source.parentsByID { parentsByID[id] = parentID }
         removeCleanedDescendants()
         steerableGenerations.removeAll()

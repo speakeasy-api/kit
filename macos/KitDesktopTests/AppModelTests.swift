@@ -501,6 +501,31 @@ final class AgentRosterTests: XCTestCase {
         XCTAssertNil(roster.rowsByID["grandchild"])
     }
 
+    @MainActor
+    func testEmptyStreamBeforeHelperExitPreservesFailedRetirement() throws {
+        let stream = DesktopChildSessions()
+        stream.receive(root: "root", session: "root", update: streamed("child"))
+        var roster = AgentRoster()
+        roster.syncStreamed(stream.roster)
+        _ = roster.apply(event: event(id: "child", name: "Child", status: "working"), nowMS: 100)
+        XCTAssertTrue(roster.canSteer(id: "child", generation: 1))
+
+        // ACP exit clears streamed observations before retiring runtime rows.
+        stream.reset()
+        roster.syncStreamed(stream.roster)
+        XCTAssertFalse(roster.canSteer(id: "child", generation: 1))
+        XCTAssertEqual(roster.rowsByID["child"]?.status, .working)
+        roster.retireActive(at: 200)
+        let retired = try XCTUnwrap(roster.rowsByID["child"])
+        XCTAssertEqual(retired.status, .removed)
+        XCTAssertEqual(retired.outcome, .failed)
+        XCTAssertEqual(retired.generationFinishedAtMS, 200)
+        roster.syncStreamed(stream.roster)
+        XCTAssertEqual(roster.rowsByID["child"], retired)
+        roster.reset()
+        XCTAssertTrue(roster.rowsByID.isEmpty)
+    }
+
     func testRemovalOutcomeAndRetirementMatchRosterSemantics() throws {
         var roster = AgentRoster()
         _ = roster.apply(event: event(id: "success", name: "Done", status: "idle", outcome: "success"), nowMS: 1_000)

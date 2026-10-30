@@ -269,7 +269,10 @@ impl App {
         {
             view.app.apply(Update::State(state));
         }
-        self.agents_visible = true;
+        if !self.agents_auto_opened {
+            self.agents_visible = true;
+            self.agents_auto_opened = true;
+        }
     }
 
     fn apply_session_message(&mut self, session: &str, update: wire::SessionUpdate) {
@@ -421,6 +424,29 @@ mod tests {
             json!({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": text}}),
         );
     }
+    #[test]
+    fn associations_auto_open_agents_only_once() {
+        let mut app = app();
+        assert!(!app.show_agents());
+
+        announce(&mut app, "root", "child");
+        assert!(app.show_agents());
+        assert!(app.agents_auto_opened);
+
+        app.toggle_agents();
+        assert!(!app.show_agents());
+        announce(&mut app, "root", "child");
+        assert!(!app.show_agents());
+        send(
+            &mut app,
+            "root",
+            json!({"sessionUpdate":"subagent_update", "sessionId":"child", "state":{"state":"idle"}}),
+        );
+        assert!(!app.show_agents());
+        announce(&mut app, "root", "another-child");
+        assert!(!app.show_agents());
+    }
+
     #[test]
     fn announcements_are_required_and_ownership_cannot_change() {
         let mut app = app();
