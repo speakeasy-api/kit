@@ -79,6 +79,8 @@ impl App {
             String::new(),
         );
         app.show_thoughts = self.show_thoughts;
+        app.cost = row.cost.clone();
+        app.usage = row.usage;
         app.phase = if active { Phase::Working } else { Phase::Idle };
         if let Some(state) = self
             .child_sessions

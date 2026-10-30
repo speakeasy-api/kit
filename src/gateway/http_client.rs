@@ -38,10 +38,8 @@ fn client(remote: &super::Remote) -> Result<BoundedHttpClient, Box<dyn std::erro
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .build()?;
-    Ok(
-        AcpHttpClient::with_endpoint_and_client(endpoint.as_str(), http)?
-            .with_limits(HttpClientLimits::default())?,
-    )
+    Ok(AcpHttpClient::from_http_client(endpoint.as_str(), http)?
+        .with_limits(HttpClientLimits::default())?)
 }
 
 fn rewrite(

@@ -892,8 +892,9 @@ fn client_capabilities(credential_storage: &CredentialStorage) -> wire::ClientCa
         wire::ElicitationCapabilities::new().form(wire::ElicitationFormCapabilities::new()),
     );
     if credential_storage.is_persistent() {
-        capabilities
-            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()))
+        capabilities.auth(
+            wire::ClientAuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+        )
     } else {
         capabilities
     }
@@ -4206,7 +4207,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             commands: update
                 .available_commands
                 .into_iter()
-                .map(|available| command::Command::new(available.name, available.description))
+                .map(|available| command::Command::new(available.name(), available.description()))
                 .collect(),
         }],
         SessionUpdate::ConfigOptionUpdate(update) => {
@@ -4621,6 +4622,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use agent_client_protocol::schema::MaybeUndefined;
     use agent_client_protocol::schema::v2::{
         AgentMessage, AgentThought, AuthMethod, AuthMethodTerminal, AvailableCommand,
         AvailableCommandsUpdate, ContentBlock, EnvVariable, IdleStateUpdate, RunningStateUpdate,
@@ -5437,7 +5439,40 @@ mod tests {
         ));
         assert_eq!(session, "session");
         assert!(
-            matches!(updates.as_slice(), [Update::Usage { used: 1, size: 2, cost: Some(actual) }] if actual == &cost)
+            matches!(updates.as_slice(), [Update::Usage { used: 1, size: 2, cost: MaybeUndefined::Value(actual) }] if actual == &cost)
+        );
+    }
+
+    #[test]
+    fn translates_usage_cost_omission_and_null_as_distinct_patches() {
+        use agent_client_protocol::schema::v2::UsageUpdate;
+        for cost in [MaybeUndefined::Undefined, MaybeUndefined::Null] {
+            let (_, updates) = translate(UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::UsageUpdate(UsageUpdate::new(1, 2).cost(cost.clone())),
+            ));
+            assert!(
+                matches!(updates.as_slice(), [Update::Usage { cost: actual, .. }] if actual == &cost)
+            );
+        }
+    }
+
+    #[test]
+    fn translates_future_available_command_metadata_through_native_accessors() {
+        let (_, updates) = translate(UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::Other(wire::OtherAvailableCommand::new(
+                    "_custom",
+                    "inspect",
+                    "Inspect context",
+                    Default::default(),
+                )),
+            ])),
+        ));
+        assert!(
+            matches!(updates.as_slice(), [Update::AvailableCommands { commands, .. }]
+            if commands.as_slice() == [command::Command::new("inspect", "Inspect context")])
         );
     }
 
@@ -5446,7 +5481,7 @@ mod tests {
         let (_, updates) = translate(UpdateSessionNotification::new(
             "session",
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
-                AvailableCommand::new("compact", "Compact context"),
+                AvailableCommand::Command(wire::Command::new("compact", "Compact context")),
             ])),
         ));
 

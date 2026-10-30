@@ -14,6 +14,7 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
+use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::v2::{
     AuthMethodTerminal, StateUpdate, StopReason, ToolCallStatus, ToolKind,
 };
@@ -160,7 +161,7 @@ pub enum Update {
     Usage {
         used: u64,
         size: u64,
-        cost: Option<agent_client_protocol::schema::v2::Cost>,
+        cost: MaybeUndefined<agent_client_protocol::schema::v2::Cost>,
     },
     /// The authoritative ACP v2 foreground lifecycle, preserved from the wire.
     State(StateUpdate),
@@ -2656,8 +2657,10 @@ impl App {
                 }
             }
             Update::Usage { used, size, cost } => {
-                if let Some(cost) = cost.filter(valid_cost) {
-                    self.cost = Some(cost);
+                match cost {
+                    MaybeUndefined::Value(cost) if valid_cost(&cost) => self.cost = Some(cost),
+                    MaybeUndefined::Null => self.cost = None,
+                    _ => {}
                 }
                 self.usage = Some(ContextUsage { used, size });
             }
@@ -10246,22 +10249,22 @@ mod tests {
 
     #[test]
     fn session_cost_reports_replace_totals_and_reset_with_session() {
-        use agent_client_protocol::schema::v2::Cost;
+        use agent_client_protocol::schema::{MaybeUndefined, v2::Cost};
         let mut app = app();
         assert!(app.cost.is_none());
         for amount in [0.0, 1.25, 1.25, 2.0] {
             app.apply(Update::Usage {
                 used: 1,
                 size: 2,
-                cost: Some(Cost::new(amount, "USD")),
+                cost: MaybeUndefined::Value(Cost::new(amount, "USD")),
             });
             assert_eq!(app.cost.as_ref().unwrap().amount, amount);
         }
         for cost in [
-            None,
-            Some(Cost::new(f64::NAN, "USD")),
-            Some(Cost::new(-1.0, "USD")),
-            Some(Cost::new(3.0, "bad")),
+            MaybeUndefined::Undefined,
+            MaybeUndefined::Value(Cost::new(f64::NAN, "USD")),
+            MaybeUndefined::Value(Cost::new(-1.0, "USD")),
+            MaybeUndefined::Value(Cost::new(3.0, "bad")),
         ] {
             app.apply(Update::Usage {
                 used: 2,

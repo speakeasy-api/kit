@@ -3003,10 +3003,7 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
                 .with_v2(v2::component(Arc::clone(&runtime), registry.clone()))
         }))
     })
-    .with_options(agent_client_protocol_http::ServerOptions {
-        health_endpoint: false,
-        ..Default::default()
-    })
+    .with_options(agent_client_protocol_http::ServerOptions::default().with_health_endpoint(false))
     .into_router()
 }
 
@@ -7372,6 +7369,10 @@ pub(super) mod tests {
             )
             .connect_with(client_transport, async move |connection| {
                 connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
                     .send_request(LoadSessionRequest::new(
                         "missing-session",
                         workspace.clone(),
@@ -7784,6 +7785,10 @@ pub(super) mod tests {
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
                 let unsupported = vec![McpServer::Http(McpServerHttp::new("kithub", ""))];
                 // Missing executables remain discoverable connection failures; they
                 // must not prevent attachment or leak into another session.

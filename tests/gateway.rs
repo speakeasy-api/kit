@@ -169,12 +169,11 @@ impl SdkClient {
             .default_headers(headers)
             .build()
             .unwrap();
-        let transport =
-            AcpHttpClient::with_endpoint_and_client(format!("{url}/acp/v2"), http).unwrap();
+        let transport = AcpHttpClient::from_http_client(format!("{url}/acp/v2"), http).unwrap();
         let (channel, future) = transport.into_channel_and_future();
         let mut client = Self {
             channel,
-            transport: tokio::spawn(future),
+            transport: tokio::spawn(future.expect("HTTP transport requires a connection driver")),
             updates: Vec::new(),
         };
         let response = client.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"standard-sdk-test","version":"0"},"capabilities":{}})).await;
@@ -1627,6 +1626,9 @@ async fn sdk_transport_loss_preserves_running_prompt_and_replays() {
         .await;
     assert!(response.get("error").is_none(), "{response}");
     assert_replayed_answer(&resumed.updates, "Completed after HTTP transport loss");
+    // Durable output can precede the actor's terminal state. Resume preserves
+    // that still-running work; wait for its lifecycle boundary before prompting.
+    resumed.wait_idle().await;
     resumed
         .start_prompt(3, id, "Healthy after transport loss")
         .await;

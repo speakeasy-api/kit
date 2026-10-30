@@ -82,8 +82,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "2.2.0"
-source = "git+https://github.com/danielkov/rust-sdk?rev=05d219b5cebc6980fec81ee64f62a4a655a47b84#05d219b5cebc6980fec81ee64f62a4a655a47b84"
+version = "3.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d2d255cb5d3afa4760084fbcaf87c7d214d316328546cd777d8736a8af6e368"
 dependencies = [
  "quote",
  "syn 3.0.4",
@@ -108,8 +109,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.11.0"
-source = "git+https://github.com/danielkov/agentkit?rev=562b81be3ce37f82682f2172fdc67a5719ffbb2f#562b81be3ce37f82682f2172fdc67a5719ffbb2f"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "965127f11f8e852bfd60ef89204fac57f1de01b6510c9fc0fee691ea8bb9a73a"
 dependencies = [
  "agentkit-acp-sdk",
  "agentkit-core",
@@ -125,8 +127,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp-http"
-version = "2.2.0"
-source = "git+https://github.com/danielkov/rust-sdk?rev=05d219b5cebc6980fec81ee64f62a4a655a47b84#05d219b5cebc6980fec81ee64f62a4a655a47b84"
+version = "3.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180e490f2e7a930daee151b41e7e10da01ea5ef9b2b3010dc6221790c4b545d0"
 dependencies = [
  "agentkit-acp-sdk",
  "async-stream",
@@ -146,8 +149,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp-schema"
-version = "1.9.1"
-source = "git+https://github.com/danielkov/agent-client-protocol?rev=66d51e46f0835a0d0848e9e2746ef8672c75e343#66d51e46f0835a0d0848e9e2746ef8672c75e343"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fceebccf753866b268d7375a9ef4904ea358019fefb16438b0146c8a56d0f6"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -156,30 +160,26 @@ dependencies = [
  "serde_json",
  "serde_with",
  "strum",
- "tracing",
 ]
 
 [[package]]
 name = "agentkit-acp-sdk"
-version = "2.2.0"
-source = "git+https://github.com/danielkov/rust-sdk?rev=05d219b5cebc6980fec81ee64f62a4a655a47b84#05d219b5cebc6980fec81ee64f62a4a655a47b84"
+version = "3.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34a98bcf96dbdcae3eec8a1a9f44b1c1862f1739f7f6a0e2a23fa515f2af84d3"
 dependencies = [
  "agent-client-protocol-derive",
  "agentkit-acp-schema",
- "async-io",
- "async-process",
  "blocking",
  "futures",
  "futures-concurrency",
+ "libc",
  "rustc-hash",
- "rustix 1.1.4",
- "schemars 1.2.2",
  "serde",
  "serde_json",
- "shell-words",
  "tracing",
  "uuid",
- "windows-sys 0.61.2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -204,7 +204,8 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit?rev=562b81be3ce37f82682f2172fdc67a5719ffbb2f#562b81be3ce37f82682f2172fdc67a5719ffbb2f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7193f4a771e30b61fbabecd90dba9a9bc16bdafc2cf717d086727871e9d0e3cf"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -242,7 +243,8 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit?rev=562b81be3ce37f82682f2172fdc67a5719ffbb2f#562b81be3ce37f82682f2172fdc67a5719ffbb2f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2110778950cdd87cc8ea3f0697c0551eb515ef23841b9c5d255a01974be17798"
 dependencies = [
  "futures-timer",
  "serde",
@@ -273,7 +275,8 @@ dependencies = [
 [[package]]
 name = "agentkit-loop"
 version = "0.11.0"
-source = "git+https://github.com/danielkov/agentkit?rev=562b81be3ce37f82682f2172fdc67a5719ffbb2f#562b81be3ce37f82682f2172fdc67a5719ffbb2f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e048d2be22aa27bf635b65b073cb2a396efca232200a4ba79b4f75d1513dcd"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -382,7 +385,8 @@ dependencies = [
 [[package]]
 name = "agentkit-task-manager"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit?rev=562b81be3ce37f82682f2172fdc67a5719ffbb2f#562b81be3ce37f82682f2172fdc67a5719ffbb2f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f893be1f3d14f060e141e6b50baa09338778f90764cc030295105e101d29c06"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -425,7 +429,8 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit?rev=562b81be3ce37f82682f2172fdc67a5719ffbb2f#562b81be3ce37f82682f2172fdc67a5719ffbb2f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10b9a8af3f09c79fc0707ea87dc377edd40bdf65db11e6ebfb50783f4e8e8ff3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -543,7 +548,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -554,7 +559,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -891,7 +896,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "axum-macros",
  "base64 0.22.1",
  "bytes",
  "form_urlencoded",
@@ -938,17 +942,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-macros"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aa268c23bfbbd2c4363b9cd302a4f504fb2a9dfe7e3451d66f35dd392e20aca"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1984,7 +1977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2599,7 +2592,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2994,9 +2987,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.104"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
+checksum = "ce57d20d1ea864ce2ac172ab472d409214f4fd359f0b2a2775abdf522e2af99e"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -3205,9 +3198,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libm"
@@ -4226,7 +4219,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4702,7 +4695,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4761,7 +4754,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5167,12 +5160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shell-words"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5271,7 +5258,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5475,7 +5462,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5981,7 +5968,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6145,9 +6132,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
+checksum = "aecb87a33d3b0c5e3b7aa46336eaf486cffafbd281b195e4c8b80d50df2351bf"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -6158,9 +6145,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.77"
+version = "0.4.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b7777d5cc23d0e91404e53ce2d5e8ec7acae3026b16233dba62cd3246457950"
+checksum = "6ef4c5d3d2cdf5c54f4231181768f5510842e350db025faf1f7163b1030ed928"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -6168,9 +6155,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
+checksum = "a690d511e3c1a8b3a55e33511e3c2c00c78415cd23650f32b808627f5696b9ed"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -6178,22 +6165,22 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
+checksum = "411e4887f0071ef2d2164a9d5fdf2d20efbef78fccd3a78b0c10a1dc5295e48a"
 dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
  "wasm-bindgen-shared",
 ]
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
+checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
 ]
@@ -6213,9 +6200,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.104"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
+checksum = "9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -6287,7 +6274,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

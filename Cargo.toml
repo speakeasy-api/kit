@@ -37,10 +37,10 @@ a2a-protocol-client = { version = "=0.14.1", default-features = false, features 
 a2a-protocol-server = { version = "=0.14.1", default-features = false }
 a2a-protocol-types = "=0.14.1"
 agenthooksprotocol = { version = "=0.10.1", default-features = false, features = ["reqwest", "tokio-process"] }
-agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0", features = ["unstable_session_fork", "unstable_session_inject", "unstable_subagents"] }
-agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.9.1", features = ["unstable_session_notices", "unstable_session_compaction"] }
-agent-client-protocol-http = { package = "agentkit-acp-http", version = "=2.2.0", default-features = false, features = ["server", "client"] }
-agentkit-acp = { version = "=0.11.0", features = ["unstable-inject"] }
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=3.6.0", features = ["stdio", "unstable_session_fork", "unstable_session_inject", "unstable_subagents"] }
+agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.14.0" }
+agent-client-protocol-http = { package = "agentkit-acp-http", version = "=3.6.0", default-features = false, features = ["server", "client"] }
+agentkit-acp = { version = "=0.12.0", features = ["unstable-inject"] }
 agentkit-adapter-completions = "=0.11.0"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
@@ -117,7 +117,7 @@ cubeb = { version = "=0.38.0", default-features = false, optional = true }
 cubeb-sys = { version = "=0.38.0", default-features = false, features = ["unittest-build"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.190"
+libc = "=0.2.189"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
@@ -142,15 +142,3 @@ todo = "deny"
 unimplemented = "deny"
 disallowed_methods = "deny"
 disallowed_macros = "deny"
-
-# Keep the ACP schema, SDK, HTTP transport, and agentkit types unified.
-[patch.crates-io]
-agentkit-acp-http = { git = "https://github.com/danielkov/rust-sdk", rev = "05d219b5cebc6980fec81ee64f62a4a655a47b84" }
-agentkit-acp-sdk = { git = "https://github.com/danielkov/rust-sdk", rev = "05d219b5cebc6980fec81ee64f62a4a655a47b84" }
-agentkit-acp-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "66d51e46f0835a0d0848e9e2746ef8672c75e343" }
-agentkit-acp = { git = "https://github.com/danielkov/agentkit", rev = "562b81be3ce37f82682f2172fdc67a5719ffbb2f" }
-agentkit-core = { git = "https://github.com/danielkov/agentkit", rev = "562b81be3ce37f82682f2172fdc67a5719ffbb2f" }
-agentkit-loop = { git = "https://github.com/danielkov/agentkit", rev = "562b81be3ce37f82682f2172fdc67a5719ffbb2f" }
-agentkit-tools-core = { git = "https://github.com/danielkov/agentkit", rev = "562b81be3ce37f82682f2172fdc67a5719ffbb2f" }
-agentkit-capabilities = { git = "https://github.com/danielkov/agentkit", rev = "562b81be3ce37f82682f2172fdc67a5719ffbb2f" }
-agentkit-task-manager = { git = "https://github.com/danielkov/agentkit", rev = "562b81be3ce37f82682f2172fdc67a5719ffbb2f" }

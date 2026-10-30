@@ -504,11 +504,11 @@ fn router(gateway: Arc<Gateway>) -> Result<Router, agent_client_protocol_http::S
         },
     )?
     .with_graceful_delete(Duration::from_secs(30))
-    .with_options(agent_client_protocol_http::ServerOptions {
-        path: "/acp/v2".into(),
-        health_endpoint: false,
-        ..Default::default()
-    })
+    .with_options(
+        agent_client_protocol_http::ServerOptions::default()
+            .with_path("/acp/v2")
+            .with_health_endpoint(false),
+    )
     .into_router();
     Ok(sdk
         .layer(middleware::from_fn_with_state(

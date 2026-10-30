@@ -39,6 +39,7 @@ impl App {
             return;
         }
         self.ensure_child_view(&session);
+        let usage_update = matches!(notification.update, wire::SessionUpdate::UsageUpdate(_));
         let retired = self.child_roster_retired(&session);
         if !retired
             && let wire::SessionUpdate::StateUpdate(state) = &notification.update
@@ -92,6 +93,11 @@ impl App {
         let Some(view) = self.child_views.get_mut(&session) else {
             return;
         };
+        if usage_update && let Some(row) = self.agents.get(&session) {
+            // Runtime diagnostics may have reported a newer prior cost than
+            // this view. An omitted native patch must preserve that value too.
+            view.app.cost = row.cost.clone();
+        }
         match notification.update {
             update @ (wire::SessionUpdate::SessionMessage(_)
             | wire::SessionUpdate::SessionMessageChunk(_)) => {
@@ -108,9 +114,17 @@ impl App {
                 }
             }
         }
-        if !retired && let Some(row) = self.agents.get_mut(&session) {
+        if !retired
+            && usage_update
+            && let Some(row) = self.agents.get_mut(&session)
+        {
             row.usage = view.app.usage;
             row.cost = view.app.cost.clone();
+            if let Some(cost) = &row.cost {
+                self.agent_costs.insert(session, cost.clone());
+            } else {
+                self.agent_costs.remove(&session);
+            }
         }
     }
 
@@ -914,6 +928,81 @@ mod tests {
             assert!(app.agents.contains_key("parent"));
             assert!(app.child_views.contains_key("nested"));
             assert!(!app.child_views["nested"].can_steer);
+        }
+    }
+
+    #[test]
+    fn native_usage_cost_patches_preserve_replace_and_clear_root_and_child_totals() {
+        for session in ["root", "child"] {
+            let mut app = app();
+            announce(&mut app, "root", "child");
+            for (patch, expected) in [
+                (Some(json!({"amount":1.25,"currency":"USD"})), Some(1.25)),
+                (None, Some(1.25)),
+                (Some(json!({"amount":2.0,"currency":"USD"})), Some(2.0)),
+                (Some(json!(null)), None),
+                (None, None),
+                (Some(json!({"amount":0.0,"currency":"USD"})), Some(0.0)),
+                (Some(json!({"amount":-1.0,"currency":"USD"})), Some(0.0)),
+            ] {
+                let mut update = json!({"sessionUpdate":"usage_update","used":7,"size":100});
+                if let Some(cost) = patch {
+                    update["cost"] = cost;
+                }
+                send(&mut app, session, update);
+                let view = if session == "root" {
+                    &app
+                } else {
+                    &app.child_views[session].app
+                };
+                assert_eq!(view.cost.as_ref().map(|cost| cost.amount), expected);
+                assert_eq!(view.usage, Some(ContextUsage { used: 7, size: 100 }));
+                if session == "child" {
+                    assert_eq!(
+                        app.agents[session].cost.as_ref().map(|cost| cost.amount),
+                        expected
+                    );
+                    assert_eq!(app.subagent_cost_totals().get("USD").copied(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_child_cost_preserves_runtime_report_before_or_after_view_creation() {
+        for view_first in [false, true] {
+            let mut app = app();
+            announce(&mut app, "root", "child");
+            if view_first {
+                chunk(&mut app, "child", "before");
+            }
+            runtime_state(&mut app, "child", 1, SubagentStatus::Working, None);
+            app.apply(Update::Runtime(RuntimeEvent::SubagentUsage {
+                id: "child".into(),
+                used: 1,
+                size: 10,
+                cost: Some(wire::Cost::new(3.0, "USD")),
+            }));
+            chunk(&mut app, "child", "after");
+            assert_eq!(app.agents["child"].cost.as_ref().unwrap().amount, 3.0);
+            send(
+                &mut app,
+                "child",
+                json!({"sessionUpdate":"usage_update","used":2,"size":10}),
+            );
+            assert_eq!(
+                app.child_views["child"].app.cost.as_ref().unwrap().amount,
+                3.0
+            );
+            assert_eq!(app.agents["child"].cost.as_ref().unwrap().amount, 3.0);
+            send(
+                &mut app,
+                "child",
+                json!({"sessionUpdate":"usage_update","used":3,"size":10,"cost":null}),
+            );
+            assert!(app.agents["child"].cost.is_none());
+            assert!(app.child_views["child"].app.cost.is_none());
+            assert!(app.subagent_cost_totals().is_empty());
         }
     }
 

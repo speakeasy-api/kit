@@ -117,7 +117,9 @@ fn available_commands_update(
                             "Optional arguments",
                         ))
                     });
-                    wire::AvailableCommand::new(name, description).input(input)
+                    wire::AvailableCommand::Command(
+                        wire::Command::new(name, description).input(input),
+                    )
                 })
                 .collect(),
         )),
@@ -2751,11 +2753,11 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
     agent_client_protocol_http::AcpHttpServer::new(move || {
         v2_router(Arc::clone(&runtime), registry.clone())
     })
-    .with_options(agent_client_protocol_http::ServerOptions {
-        path: "/acp/v2".into(),
-        health_endpoint: false,
-        ..Default::default()
-    })
+    .with_options(
+        agent_client_protocol_http::ServerOptions::default()
+            .with_path("/acp/v2")
+            .with_health_endpoint(false),
+    )
     .into_router()
 }
 
@@ -3141,11 +3143,9 @@ mod tests {
             wire::ProtocolVersion::V2,
             wire::Implementation::new("test-client", "0"),
         )
-        .capabilities(
-            wire::ClientCapabilities::new().auth(
-                wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
-            ),
-        )
+        .capabilities(wire::ClientCapabilities::new().auth(
+            wire::ClientAuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+        ))
     }
 
     fn terminal_auth_method_ids(methods: &[wire::AuthMethod]) -> Vec<&str> {
@@ -3316,7 +3316,8 @@ mod tests {
         };
         assert_eq!(usage.used, 53_000);
         assert_eq!(usage.size, 272_000);
-        assert!(usage.cost.is_none());
+        assert!(usage.cost.is_undefined());
+        assert!(serde_json::to_value(usage).unwrap().get("cost").is_none());
     }
 
     #[test]
@@ -5397,17 +5398,28 @@ mod tests {
             update
                 .available_commands
                 .iter()
-                .map(|command| command.name.as_str())
+                .map(wire::AvailableCommand::name)
                 .collect::<Vec<_>>(),
             ["compact", "review"]
         );
-        assert!(update.available_commands[0].input.is_none());
-        assert_eq!(update.available_commands[1].description, "Review changes");
-        let Some(wire::AvailableCommandInput::Text(input)) = &update.available_commands[1].input
-        else {
+        let wire::AvailableCommand::Command(compact) = &update.available_commands[0] else {
+            panic!("expected native compact slash command");
+        };
+        let wire::AvailableCommand::Command(review) = &update.available_commands[1] else {
+            panic!("expected native review slash command");
+        };
+        assert!(compact.input.is_none());
+        assert_eq!(review.description, "Review changes");
+        let Some(wire::AvailableCommandInput::Text(input)) = &review.input else {
             panic!("expected text argument hint");
         };
         assert_eq!(input.hint, "Optional arguments");
+        let encoded = serde_json::to_value(&update).unwrap();
+        assert_eq!(encoded["availableCommands"][0]["type"], "command");
+        assert_eq!(encoded["availableCommands"][0]["name"], "compact");
+        assert!(encoded["availableCommands"][0].get("input").is_none());
+        assert_eq!(encoded["availableCommands"][1]["type"], "command");
+        assert_eq!(encoded["availableCommands"][1]["input"]["type"], "text");
     }
 
     #[tokio::test]
@@ -6591,7 +6603,7 @@ mod tests {
                         .expect_err("replacement must reject an unknown session");
                     assert_eq!(
                         i32::from(error.code),
-                        i32::from(wire::Error::resource_not_found(None).code)
+                        i32::from(wire::Error::resource_not_found().code)
                     );
                     assert_eq!(error.data, Some(json!({ "sessionId": "missing-session" })));
                     Ok(())
@@ -7111,8 +7123,9 @@ for line in sys.stdin:
             ))
             .unwrap();
         assert!(unsupported.auth_methods.is_empty());
-        let terminal_capabilities = wire::ClientCapabilities::new()
-            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()));
+        let terminal_capabilities = wire::ClientCapabilities::new().auth(
+            wire::ClientAuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+        );
         assert!(terminal_auth_methods(&terminal_capabilities, |_| false).is_empty());
         let methods = terminal_auth_methods(&terminal_capabilities, |provider| {
             provider != ProviderKind::OpenRouter
