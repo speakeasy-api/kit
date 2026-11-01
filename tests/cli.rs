@@ -283,3 +283,43 @@ fn config_commands_report_disk_errors_and_preserve_missing_unsets() {
         assert!(path.is_dir());
     }
 }
+
+#[test]
+fn partial_subagent_config_starts_acp_and_can_be_repaired() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = home.path().join(".kit/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let source = "[acp.claude]\ncommand = 'true'\n[subagent.harnesses.\"acp.claude\".models]\nfable = 'example-model'\n";
+    fs::write(&path, source).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .current_dir(root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["acp", "--credential-store", "memory"]);
+    assert!(output.status.success(), "{output:?}");
+    let warning = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        warning.contains("subagent.harness is missing; using built-in acp.kit"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("kit config set subagent.harness acp.kit"),
+        "{warning}"
+    );
+    assert!(warning.contains(path.to_str().unwrap()), "{warning}");
+    assert!(
+        output.stdout.is_empty(),
+        "warnings must not corrupt ACP stdout"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    let repair = run(&["config", "set", "subagent.harness", "acp.claude"]);
+    assert!(repair.status.success(), "{repair:?}");
+    let output = run(&["acp", "--credential-store", "memory"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("subagent.harness is missing"));
+}

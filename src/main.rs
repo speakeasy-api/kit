@@ -1331,7 +1331,21 @@ const CONFIG_MIGRATIONS: &[ConfigMigration] = &[
     ConfigMigration {
         apply: migrate_skill_poll_interval,
     },
+    ConfigMigration {
+        apply: migrate_subagent_harness,
+    },
 ];
+
+fn migrate_subagent_harness(config: &mut toml::Table) {
+    if let Some(subagent) = config
+        .get_mut("subagent")
+        .and_then(toml::Value::as_table_mut)
+    {
+        subagent
+            .entry("harness")
+            .or_insert_with(|| toml::Value::String(kit::BUILTIN_HARNESS.into()));
+    }
+}
 
 fn migrate_skill_poll_interval(config: &mut toml::Table) {
     config
@@ -1484,9 +1498,16 @@ impl Config {
                 ));
             }
         };
-        let parsed = toml::from_str(&contents)
+        let mut missing_subagent_harness = false;
+        let parsed = toml::from_str::<toml::Table>(&contents)
             .map_err(|error| format!("could not parse TOML: {error}"))
-            .map(migrate_config)
+            .map(|config| {
+                missing_subagent_harness = config
+                    .get("subagent")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|subagent| !subagent.contains_key("harness"));
+                migrate_config(config)
+            })
             .and_then(|config| {
                 if config
                     .get("subagent")
@@ -1507,6 +1528,13 @@ impl Config {
                 format!("invalid config {}: {error}", path.display()),
             )
         })?;
+        if missing_subagent_harness {
+            eprintln!(
+                "Warning: {}: subagent.harness is missing; using built-in {}. Set your preferred harness with `kit config set subagent.harness acp.kit` (or another configured ACP harness).",
+                path.display(),
+                kit::BUILTIN_HARNESS,
+            );
+        }
         config.config_dir = config_dir;
         config.config_path = Some(config_path);
         Ok(config)
@@ -3385,6 +3413,69 @@ mod tests {
         fs::write(&target, "invalid TOML [").unwrap();
         assert!(Config::load(&link).is_err());
         assert!(config.plugin_runtime(directory.path()).await.is_err());
+    }
+
+    #[test]
+    fn partial_subagent_config_defaults_without_rewriting_or_losing_policies() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let source = "[acp.claude]\ncommand = 'true'\n[subagent.harnesses.\"acp.claude\".models]\nfable = 'example-model'\n";
+        fs::write(&path, source).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.harnesses().unwrap().1, kit::BUILTIN_HARNESS);
+        assert_eq!(
+            config.subagent.unwrap().harnesses["acp.claude"].models["fable"],
+            "example-model"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        let table: toml::Table = toml::from_str(source).unwrap();
+        let migrated = super::migrate_config(table);
+        assert_eq!(super::migrate_config(migrated.clone()), migrated);
+
+        kit::config_editor::set(&path, "subagent.harness", "acp.claude").unwrap();
+        let repaired = Config::load(&path).unwrap();
+        assert_eq!(repaired.harnesses().unwrap().1, "acp.claude");
+        assert_eq!(
+            repaired.subagent.unwrap().harnesses["acp.claude"].models["fable"],
+            "example-model"
+        );
+        kit::config_editor::unset(&path, "subagent.harness").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().harnesses().unwrap().1,
+            kit::BUILTIN_HARNESS
+        );
+        fs::write(&path, "[subagent]\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().harnesses().unwrap().1,
+            kit::BUILTIN_HARNESS
+        );
+    }
+
+    #[test]
+    fn partial_subagent_config_preserves_malformed_config_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for source in [
+            "subagent = 42",
+            "[subagent]\nharness = 42",
+            "[subagent]\nharnesses = 42",
+            "[subagent]\nnames = ['Scout']",
+            "[subagent.harnesses.\"acp.kit\".models]\nfable = 42",
+            "model = 42\n[subagent]",
+            "[acp.claude]\ncommand = 42\n[subagent]",
+            "[subagent",
+        ] {
+            fs::write(&path, source).unwrap();
+            assert_eq!(
+                Config::load(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{source}"
+            );
+        }
+        fs::write(&path, "[subagent]\nharness = 'acp.missing'").unwrap();
+        assert!(Config::load(&path).unwrap().harnesses().is_err());
+        fs::write(&path, "[subagent.harnesses.\"acp.kit\"]\nallow_model_overrides = ['sonnet']\nmodels = {review = 'opus'}").unwrap();
+        assert!(Config::load(&path).unwrap().harnesses().is_err());
     }
 
     #[test]
