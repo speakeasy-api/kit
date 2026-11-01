@@ -1,5 +1,11 @@
 //! Projects the foreground compactor lifecycle, never speculative preparation.
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods
+)]
 mod tests;
 use std::sync::{
     Arc,
