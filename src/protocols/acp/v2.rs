@@ -19,7 +19,7 @@ use agentkit_acp::{
 };
 use agentkit_core::{
     CancellationController, Delta, FinishReason, Item, ItemKind, Part, PartId, PartKind, SessionId,
-    ToolOutput, Usage,
+    ToolOutput,
 };
 use agentkit_loop::{
     AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
@@ -3562,7 +3562,7 @@ mod tests {
     use serde_json::json;
 
     use agent_client_protocol::schema::MaybeUndefined;
-    use agentkit_core::{DataRef, MetadataMap, Modality, TurnCancellation};
+    use agentkit_core::{DataRef, MetadataMap, Modality, TurnCancellation, Usage};
     use agentkit_loop::{
         Agent, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest, TurnResult,
