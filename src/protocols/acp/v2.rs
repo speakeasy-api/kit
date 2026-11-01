@@ -473,6 +473,7 @@ struct ResponseReplacementObserver<S> {
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
+    compaction: super::compaction_projection::Projection,
     activity: SessionActivity,
     session_id: wire::SessionId,
 }
@@ -500,6 +501,7 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
         activity: SessionActivity,
     ) -> Self {
         Self {
+            compaction: super::compaction_projection::Projection::default(),
             hook_messages: None,
             inner,
             sink,
@@ -553,6 +555,20 @@ where
     S: AcpSessionUpdateSink + Clone,
 {
     fn handle_event(&self, event: ObservedEvent) {
+        for update in self.compaction.observe(&event.event) {
+            // Compaction's wire contract is identical in v1 and v2.
+            let update = serde_json::to_value(update).and_then(serde_json::from_value);
+            match update {
+                Ok(update) => {
+                    if let Err(error) = self.sink.inner.update(
+                        wire::UpdateSessionNotification::new(self.session_id.clone(), update),
+                    ) {
+                        tracing::debug!(%error, "failed to queue compaction update");
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "failed to convert compaction update"),
+            }
+        }
         if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
             self.activity.tool_projection.get_or_init(|| {
                 let sink = self.sink.clone();
@@ -2832,8 +2848,12 @@ fn transcript_replay(
                     .filter_map(replay_content)
                     .collect::<Vec<_>>();
                 if !content.is_empty() {
-                    replay.push(wire::SessionUpdate::AgentMessage(
-                        wire::AgentMessage::new(message_id("compaction")).content(content),
+                    replay.push(wire::SessionUpdate::CompactionUpdate(
+                        wire::CompactionUpdate::new(
+                            format!("{session_id}-replay-{item_index}-compaction"),
+                            wire::CompactionStatus::Completed,
+                        )
+                        .summary(content),
                     ));
                 }
             }
@@ -7911,11 +7931,11 @@ for line in sys.stdin:
         let [notification] = replay.as_slice() else {
             panic!("only the tagged summary should be replayed");
         };
-        let wire::SessionUpdate::AgentMessage(message) = &notification.update else {
-            panic!("compaction summaries replay as agent messages, not notices");
+        let wire::SessionUpdate::CompactionUpdate(message) = &notification.update else {
+            panic!("compaction summaries replay as compaction updates");
         };
         assert!(matches!(
-            &message.content,
+            &message.summary,
             MaybeUndefined::Value(content)
                 if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "summary")
         ));

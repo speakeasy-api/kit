@@ -55,6 +55,7 @@ use tokio::{
 use tracing::Instrument as _;
 
 mod activity;
+mod compaction_projection;
 pub(crate) mod model_switch;
 mod session_info;
 mod session_pagination;
@@ -233,9 +234,29 @@ fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<SessionUpd
 fn transcript_replay(
     session_id: &agentkit_acp::SessionId,
     transcript: &[Item],
+    compaction: bool,
 ) -> Vec<SessionNotification> {
     let mut replay = Vec::new();
-    for item in transcript {
+    for (index, item) in transcript.iter().enumerate() {
+        if compaction && crate::compaction::is_compaction_summary(item) {
+            let summary = item
+                .parts
+                .iter()
+                .filter_map(user_replay_content)
+                .map(|chunk| chunk.content)
+                .collect::<Vec<_>>();
+            replay.push(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::CompactionUpdate(
+                    agent_client_protocol::schema::v1::CompactionUpdate::new(
+                        format!("{session_id}-replay-{index}-compaction"),
+                        agent_client_protocol::schema::v1::CompactionStatus::Completed,
+                    )
+                    .summary(summary),
+                ),
+            ));
+            continue;
+        }
         for part in &item.parts {
             let update = match item.kind {
                 ItemKind::User => user_replay_content(part).map(SessionUpdate::UserMessageChunk),
@@ -1296,6 +1317,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
+    compaction: Option<compaction_projection::Projection>,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
@@ -1311,12 +1333,18 @@ impl ResponseInterruptionNoticeObserver {
         activity: activity::SessionActivity,
     ) -> Self {
         Self {
+            compaction: None,
             hook_messages: None,
             activity,
             inner,
             client,
             session_id,
         }
+    }
+
+    fn with_compaction(mut self, enabled: bool) -> Self {
+        self.compaction = enabled.then(compaction_projection::Projection::default);
+        self
     }
 
     fn with_hook_messages(mut self, hooks: Option<&crate::ahp::Hooks>) -> Self {
@@ -1342,6 +1370,16 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
+        if let Some(compaction) = &self.compaction {
+            for update in compaction.observe(&event.event) {
+                if let Err(error) = self
+                    .client
+                    .notify_session(SessionNotification::new(self.session_id.clone(), update))
+                {
+                    tracing::debug!(%error, "failed to queue compaction update");
+                }
+            }
+        }
         if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
             self.activity.tool_projection.get_or_init(|| {
                 let client = self.client.clone();
@@ -1450,6 +1488,7 @@ struct Server {
     // Connection-local snapshot. Only initialize writes; a new connection starts disabled.
     subagent_updates: AtomicBool,
     form_elicitation: AtomicBool,
+    compaction_updates: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -1476,6 +1515,7 @@ impl Server {
         Self {
             subagent_updates: AtomicBool::new(false),
             form_elicitation: AtomicBool::new(false),
+            compaction_updates: AtomicBool::new(false),
             runtime,
             integration: Arc::new(integration),
             registry,
@@ -1584,6 +1624,14 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+        self.compaction_updates.store(
+            request
+                .client_capabilities
+                .session
+                .as_ref()
+                .is_some_and(|session| session.compaction.is_some()),
+            Ordering::Release,
+        );
         self.subagent_updates.store(
             request.client_capabilities.subagents.is_some(),
             Ordering::Release,
@@ -1719,7 +1767,11 @@ impl Server {
                 crate::runtime::SessionClaim::commit,
             )
             .await?;
-        let replay = transcript_replay(&attached.session_id, &attached.canonical_transcript);
+        let replay = transcript_replay(
+            &attached.session_id,
+            &attached.canonical_transcript,
+            self.compaction_updates.load(Ordering::Acquire),
+        );
         Ok(PreparedLoad {
             response: LoadSessionResponse::new().config_options(Some(attached.config_options)),
             replay,
@@ -1845,6 +1897,7 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
+        .with_compaction(self.compaction_updates.load(Ordering::Acquire))
         .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
             ask_user: self.form_elicitation.load(Ordering::Acquire).then(|| {
@@ -3819,6 +3872,38 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn v1_compaction_capabilities_reset_on_initialize_and_new_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let create_server = || {
+            Server::new(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                AcpIntegration::builder()
+                    .name("compaction-test")
+                    .approval_resolver(AutoDenyResolver)
+                    .build()
+                    .unwrap(),
+                SessionRegistry::new(),
+            )
+        };
+        let server = create_server();
+        assert!(!server.compaction_updates.load(Ordering::Acquire));
+        for (capabilities, supported) in [
+            (json!({"session": {"compaction": {}}}), true),
+            (json!({"session": {"compaction": null}}), false),
+            (json!({"session": {"compaction": {}}}), true),
+            (json!({}), false),
+        ] {
+            let request = serde_json::from_value(json!({
+                "protocolVersion":1, "clientCapabilities": capabilities,
+            }))
+            .unwrap();
+            server.initialize(request).await;
+            assert_eq!(server.compaction_updates.load(Ordering::Acquire), supported);
+        }
+        assert!(!create_server().compaction_updates.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn v1_form_capabilities_reset_on_initialize_and_new_connections() {
         let root = tempfile::tempdir().unwrap();
         let create_server = || {
@@ -5530,6 +5615,7 @@ pub(super) mod tests {
         let replay = transcript_replay(
             &agentkit_acp::SessionId::new("session"),
             &[Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
+            false,
         );
         assert_eq!(replay.len(), 2);
         assert!(
@@ -5622,10 +5708,11 @@ pub(super) mod tests {
             Item::notification("notification"),
         ];
 
-        let updates = transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript)
-            .into_iter()
-            .map(|notification| notification.update)
-            .collect::<Vec<_>>();
+        let updates =
+            transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, false)
+                .into_iter()
+                .map(|notification| notification.update)
+                .collect::<Vec<_>>();
 
         assert_eq!(updates.len(), 7);
         assert!(matches!(
@@ -5676,7 +5763,15 @@ pub(super) mod tests {
             Item::text(ItemKind::Developer, "canonical checkpoint").with_metadata(metadata),
         ];
 
-        let replay = transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript);
+        let supported =
+            transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, true);
+        assert_eq!(supported.len(), 1);
+        assert!(
+            matches!(&supported[0].update, SessionUpdate::CompactionUpdate(update)
+            if update.status == agent_client_protocol::schema::v1::CompactionStatus::Completed)
+        );
+        let replay =
+            transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, false);
         assert_eq!(replay.len(), 1);
         assert!(matches!(
             &replay[0].update,
@@ -5775,6 +5870,66 @@ pub(super) mod tests {
             }),
             "the finalization flush must include the terminal inner-tool card"
         );
+    }
+
+    #[test]
+    fn compaction_notifications_require_capability_and_never_emit_agent_messages() {
+        for supported in [false, true] {
+            let integration = AcpIntegration::builder()
+                .name("compaction-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap();
+            let session_id = agentkit_acp::SessionId::new("compaction-test");
+            let (client, mut messages) = AcpClientHandle::channel();
+            let observer = ResponseInterruptionNoticeObserver::new(
+                integration,
+                client,
+                session_id.clone(),
+                legacy_activity(session_id, |_| Ok(())),
+            )
+            .with_compaction(supported);
+            let loop_id = AgentkitSessionId::new("compaction-test");
+            let mut metadata = MetadataMap::new();
+            metadata.insert("summary".into(), "checkpoint".into());
+            for event in [
+                AgentEvent::MutationStarted {
+                    session_id: loop_id.clone(),
+                    turn_id: None,
+                    mutator: "automatic-compaction".into(),
+                    point: agentkit_loop::MutationPoint::AfterTurnEnded,
+                },
+                AgentEvent::MutationFinished {
+                    session_id: loop_id.clone(),
+                    turn_id: None,
+                    mutator: "automatic-compaction".into(),
+                    dirty: true,
+                    metadata,
+                },
+            ] {
+                observer.handle_event(ObservedEvent {
+                    session_id: Arc::new(loop_id.clone()),
+                    event,
+                });
+            }
+            let mut updates = Vec::new();
+            while let Ok(AcpClientMessage::SessionNotification(notification)) = messages.try_recv()
+            {
+                updates.push(notification.update);
+            }
+            if supported {
+                assert!(matches!(
+                    updates.as_slice(),
+                    [
+                        SessionUpdate::CompactionUpdate(_),
+                        SessionUpdate::CompactionSummaryChunk(_),
+                        SessionUpdate::CompactionUpdate(_)
+                    ]
+                ));
+            } else {
+                assert!(updates.is_empty());
+            }
+        }
     }
 
     #[tokio::test]
