@@ -92,7 +92,11 @@ fn tracestate(value: &str) -> Option<TraceState> {
     }
     let mut pairs = Vec::new();
     for member in value.split(',') {
-        let (key, value) = member.trim_matches([' ', '\t']).split_once('=')?;
+        let member = member.trim_matches([' ', '\t']);
+        if member.is_empty() {
+            continue;
+        }
+        let (key, value) = member.split_once('=')?;
         let valid_segment = |s: &str| {
             !s.is_empty()
                 && s.bytes()
@@ -343,6 +347,15 @@ pub(crate) mod tests {
         for span in spans {
             assert!(!format!("{:?}", span.attributes).contains("private"));
         }
+    }
+
+    #[test]
+    fn tracestate_preserves_entries_around_empty_members() {
+        assert_eq!(
+            tracestate("vendor=ok, ,\t,other=value,").unwrap().header(),
+            "vendor=ok,other=value"
+        );
+        assert!(tracestate(" , \t,").unwrap().header().is_empty());
     }
 
     #[test]

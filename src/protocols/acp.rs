@@ -8089,3 +8089,6 @@ pub(super) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod subscription_tests;

@@ -413,9 +413,14 @@ the byte budget, Kit emits a structured truncation entry instead of partial cont
 the arrays remain valid JSON and truncation does not split UTF-8. Capture applies to
 main agents, ACP sessions, nested in-process agents, and compaction summarizer prompts
 and outputs. Kit forwards all resolved values, including an explicit false, to its
-TUI server and nested `acp.kit` children. Kit's OTLP subscriber exports only AgentKit
-loop and MCP semantic targets; dependency spans and source location, thread, tracing
-target, and span busy/idle metadata are omitted. For example:
+TUI server and nested `acp.kit` children. Kit's OTLP subscriber exports AgentKit
+loop and MCP semantic spans, ACP request spans (`acp.request`), and Kit operation
+spans (`kit.operation`). Other dependency spans and source location, thread, tracing
+target, and span busy/idle metadata are omitted. ACP clients can supply W3C
+`traceparent`, `tracestate`, and `baggage` in request `_meta` to associate work with
+their trace. Invalid context is ignored. Baggage stays in request-local telemetry
+context; Kit does not copy it or other arbitrary metadata into exported span attributes.
+For example:
 
 ```sh
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 kit prompt "Summarize this project"
