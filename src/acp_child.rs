@@ -487,6 +487,22 @@ impl std::fmt::Display for ChildError {
     }
 }
 
+// Parse the raw v2 shape before v1 normalization collapses null and omission.
+// The same shape accepts v1 usage values while retaining explicit v2 retractions.
+pub(crate) fn subagent_usage(owner: &str, update: &Value) -> Option<crate::events::RuntimeEvent> {
+    if owner.is_empty() || update["sessionUpdate"] != "usage_update" {
+        return None;
+    }
+    let usage: agent_client_protocol::schema::v2::UsageUpdate =
+        serde_json::from_value(update.clone()).ok()?;
+    Some(crate::events::RuntimeEvent::SubagentUsage {
+        id: owner.to_owned(),
+        used: usage.used,
+        size: usage.size,
+        cost: usage.cost,
+    })
+}
+
 fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActivity> {
     use crate::events::SubagentActivity;
     use agent_client_protocol::schema::MaybeUndefined;
@@ -1589,15 +1605,8 @@ async fn run(
                         id: route.owner.clone(), activity,
                     });
                 }
-                if !route.owner.is_empty() && let SessionUpdate::UsageUpdate(usage) = &notification.update {
-                    crate::events::emit(&crate::events::RuntimeEvent::SubagentUsage {
-                        id: route.owner.clone(),
-                        used: usage.used,
-                        size: usage.size,
-                        cost: usage.cost.as_ref().map(|cost| {
-                            agent_client_protocol::schema::v2::Cost::new(cost.amount, cost.currency.clone())
-                        }),
-                    });
+                if let Some(usage) = subagent_usage(&route.owner, &params["update"]) {
+                    crate::events::emit(&usage);
                 }
                 if !tool_update && let Ok(mut output) = route.output.lock() {
                     output.record(notification.update);

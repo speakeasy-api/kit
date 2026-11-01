@@ -4769,9 +4769,9 @@ mod tests {
                 id: id.into(),
                 used: 1,
                 size: 2,
-                cost: Some(agent_client_protocol::schema::v2::Cost::new(
-                    amount, currency,
-                )),
+                cost: agent_client_protocol::schema::MaybeUndefined::Value(
+                    agent_client_protocol::schema::v2::Cost::new(amount, currency),
+                ),
             }));
         }
         let mut terminal = Terminal::new(TestBackend::new(100, 9)).expect("terminal");

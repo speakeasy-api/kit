@@ -969,6 +969,50 @@ mod tests {
     }
 
     #[test]
+    fn subagent_cost_runtime_retractions_clear_existing_native_child_view() {
+        let mut app = app();
+        announce(&mut app, "root", "child");
+        chunk(&mut app, "child", "before");
+        runtime_state(&mut app, "child", 1, SubagentStatus::Working, None);
+        send(
+            &mut app,
+            "child",
+            json!({"sessionUpdate":"usage_update","used":1,"size":10,
+            "cost":{"amount":7.0,"currency":"USD"}}),
+        );
+        assert_eq!(
+            app.child_views["child"].app.cost.as_ref().unwrap().amount,
+            7.0
+        );
+        for (cost, expected) in [
+            (Some(json!({"amount":5.0,"currency":"USD"})), Some(5.0)),
+            (None, Some(5.0)),
+            (Some(Value::Null), None),
+        ] {
+            let mut update = json!({"sessionUpdate":"usage_update","used":2,"size":10});
+            if let Some(cost) = cost {
+                update["cost"] = cost;
+            }
+            app.apply(Update::Runtime(
+                crate::acp_child::subagent_usage("child", &update).unwrap(),
+            ));
+            assert_eq!(
+                app.child_views["child"]
+                    .app
+                    .cost
+                    .as_ref()
+                    .map(|cost| cost.amount),
+                expected
+            );
+            assert_eq!(
+                app.agents["child"].cost.as_ref().map(|cost| cost.amount),
+                expected
+            );
+            assert_eq!(app.subagent_cost_totals().get("USD").copied(), expected);
+        }
+    }
+
+    #[test]
     fn omitted_child_cost_preserves_runtime_report_before_or_after_view_creation() {
         for view_first in [false, true] {
             let mut app = app();
@@ -981,7 +1025,9 @@ mod tests {
                 id: "child".into(),
                 used: 1,
                 size: 10,
-                cost: Some(wire::Cost::new(3.0, "USD")),
+                cost: agent_client_protocol::schema::MaybeUndefined::Value(wire::Cost::new(
+                    3.0, "USD",
+                )),
             }));
             chunk(&mut app, "child", "after");
             assert_eq!(app.agents["child"].cost.as_ref().unwrap().amount, 3.0);
