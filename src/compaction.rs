@@ -1217,7 +1217,9 @@ impl AutomaticCompactor {
                     "replaced_items".into(),
                     (before.saturating_sub(compacted.len()) as u64).into(),
                 );
-                if let Some(summary) = compacted.iter().find(|item| is_compaction_summary(item)) {
+                if let Some(summary) = compacted.iter().find(|item| is_compaction_summary(item))
+                    && !cursor.contains(summary)
+                {
                     let text = summary
                         .parts
                         .iter()
@@ -2629,6 +2631,59 @@ mod tests {
             item_text(result.transcript.last().unwrap()),
             Some("recent answer")
         );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_does_not_republish_a_retained_summary() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(COMPACTION_SUMMARY_METADATA_KEY.into(), true.into());
+        let history = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::Developer, "previous checkpoint").with_metadata(metadata),
+            Item::text(ItemKind::Assistant, "recent answer"),
+        ];
+        let compactor = AutomaticCompactor {
+            inner: StrategyCompactor::new(
+                |transcript: &[Item], _| {
+                    transcript
+                        .last()
+                        .and_then(manual_message)
+                        .map(|_| CompactionReason::Manual)
+                },
+                CompactionPipeline::new().with_strategy(SummarizeForContinuation {
+                    recent_tokens: usize::MAX,
+                }),
+            )
+            .with_backend(FixedBackend),
+            persistence: None,
+            mirror: None,
+            policy: CompactionConfig::default(),
+            preparation: None,
+        };
+        let mut driver = Agent::builder()
+            .model(NoModelTurn)
+            .transcript(history.clone())
+            .input(vec![Item::text(ItemKind::User, MANUAL_COMMAND)])
+            .mutator(compactor)
+            .observer(CapturedEvents(send))
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("retained-checkpoint"))
+            .await
+            .unwrap();
+        driver.next().await.unwrap();
+        assert_eq!(driver.snapshot().transcript, history);
+        let terminal = receive
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::MutationFinished { metadata, .. } => Some(metadata),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(!terminal[0].contains_key("summary"));
+        assert!(!terminal[0].contains_key("error"));
     }
 
     #[tokio::test]

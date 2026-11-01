@@ -58,6 +58,16 @@ fn summary_is_appended_once_then_completed_without_replacement() {
 }
 
 #[test]
+fn completion_without_a_new_summary_emits_no_chunk() {
+    let projection = Projection::default();
+    projection.observe(&started());
+    let updates = projection.observe(&finished(MetadataMap::new()));
+    assert!(
+        matches!(updates.as_slice(), [SessionUpdate::CompactionUpdate(update)] if update.status == CompactionStatus::Completed && update.summary.is_undefined())
+    );
+}
+
+#[test]
 fn failure_and_cancellation_do_not_publish_summaries() {
     for cancelled in [false, true] {
         let projection = Projection::default();
