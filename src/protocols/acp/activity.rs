@@ -29,6 +29,7 @@ pub(crate) struct Transition {
     pub reason: FinishReason,
     pub error: Option<String>,
     pub usage: Option<TokenUsage>,
+    pub(super) session_usage: super::usage::SessionUsage,
 }
 
 #[derive(Default)]
@@ -41,6 +42,8 @@ struct Activity {
     executing: bool,
     completed_usage: Option<TokenUsage>,
     request_usage: Option<TokenUsage>,
+    session_usage: super::usage::SessionUsage,
+    request_cost: Option<agentkit_core::CostUsage>,
 }
 
 /// Session-owned lifecycle instrument shared by the actor and its observer.
@@ -80,10 +83,51 @@ impl SessionActivity {
         if state.state == State::Unavailable {
             return;
         }
+        let cost = state.request_cost.take();
+        state.session_usage.cost.add(cost);
         let tokens = state.request_usage.take();
         if let (Some(current), Some(tokens)) = (&mut state.current, tokens) {
             super::usage::accumulate(&mut current.usage, tokens);
         }
+    }
+
+    // Transcripts do not retain monetary usage. Never label post-resume spend
+    // as the total for a session whose earlier spend cannot be reconstructed.
+    pub(super) fn invalidate_session_cost(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.session_usage.cost = super::usage::SessionCost::Invalid;
+        }
+    }
+
+    pub(super) fn record_cost(&self, usage: &agentkit_core::Usage) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state != State::Unavailable && state.current.is_some() {
+            state.session_usage.update_context(usage);
+            if let Some(cost) = &usage.cost {
+                state.request_cost = Some(cost.clone());
+            }
+        }
+    }
+
+    pub(super) fn record_compaction_cost(&self, cost: Option<agentkit_core::CostUsage>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state != State::Unavailable && state.current.is_some() {
+            state.session_usage.cost.add(cost);
+        }
+    }
+
+    pub(super) fn session_usage(&self) -> Option<super::usage::SessionUsage> {
+        let state = self.state.lock().ok()?;
+        if state.state == State::Unavailable {
+            return None;
+        }
+        let mut usage = state.session_usage.clone();
+        usage.cost.add(state.request_cost.clone());
+        Some(usage)
     }
 
     pub(super) fn record_usage(&self, tokens: TokenUsage) {
@@ -190,6 +234,7 @@ impl SessionActivity {
             reason: FinishReason::Completed,
             error: None,
             usage: None,
+            session_usage: super::usage::SessionUsage::default(),
         };
         state.completed_usage = None;
         state.current = Some(transition.clone());
@@ -231,6 +276,7 @@ impl SessionActivity {
                         reason: FinishReason::Completed,
                         error: None,
                         usage: None,
+                        session_usage: super::usage::SessionUsage::default(),
                     };
                     state.completed_usage = None;
                     state.current = Some(transition.clone());
@@ -245,6 +291,11 @@ impl SessionActivity {
             }
             AgentEvent::ResponseAttemptSuperseded => {
                 state.request_usage = None;
+                if state.request_cost.take().is_some()
+                    && matches!(state.session_usage.cost, super::usage::SessionCost::Unknown)
+                {
+                    state.session_usage.cost = super::usage::SessionCost::Cleared;
+                }
                 None
             }
             AgentEvent::TurnFinished(result) if state.state != State::Idle => {
@@ -293,11 +344,15 @@ impl SessionActivity {
         }
         state.origin = ExecutionOrigin::Prompt;
         state.state = State::Idle;
+        let cost = state.request_cost.take();
+        state.session_usage.cost.add(cost);
+        let session_usage = state.session_usage.clone();
         let request_usage = state.request_usage.take();
         let terminal = state.current.take().map(|mut terminal| {
             if let Some(tokens) = request_usage {
                 super::usage::accumulate(&mut terminal.usage, tokens);
             }
+            terminal.session_usage = session_usage;
             terminal.active = false;
             if let Some(reason) = reason {
                 terminal.reason = reason;

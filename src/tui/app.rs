@@ -2926,11 +2926,26 @@ impl App {
                 size,
                 cost,
             } => {
-                if let Some(cost) = cost.filter(valid_cost) {
-                    self.agent_costs.insert(id.clone(), cost.clone());
-                    if let Some(row) = self.agents.get_mut(&id) {
-                        row.cost = Some(cost);
+                match cost {
+                    MaybeUndefined::Value(cost) if valid_cost(&cost) => {
+                        self.agent_costs.insert(id.clone(), cost.clone());
+                        if let Some(view) = self.child_views.get_mut(&id) {
+                            view.app.cost = Some(cost.clone());
+                        }
+                        if let Some(row) = self.agents.get_mut(&id) {
+                            row.cost = Some(cost);
+                        }
                     }
+                    MaybeUndefined::Null => {
+                        self.agent_costs.remove(&id);
+                        if let Some(view) = self.child_views.get_mut(&id) {
+                            view.app.cost = None;
+                        }
+                        if let Some(row) = self.agents.get_mut(&id) {
+                            row.cost = None;
+                        }
+                    }
+                    _ => {}
                 }
                 if let Some(row) = self.agents.get_mut(&id) {
                     row.usage = Some(ContextUsage { used, size });
@@ -10282,6 +10297,52 @@ mod tests {
     }
 
     #[test]
+    fn subagent_cost_bridge_preserves_omission_and_clears_explicit_null() {
+        use serde_json::json;
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "child",
+                "Child",
+                crate::events::SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 2, None),
+            ),
+            10,
+        );
+        for (cost, expected) in [
+            (Some(json!({"amount": 7.0, "currency": "USD"})), Some(7.0)),
+            (None, Some(7.0)),
+            (Some(serde_json::Value::Null), None),
+        ] {
+            let mut update = json!({"sessionUpdate":"usage_update","used":1,"size":100});
+            if let Some(cost) = cost {
+                update["cost"] = cost;
+            }
+            let event = crate::acp_child::subagent_usage("child", &update).unwrap();
+            // Exercise the stderr transport encoding, not just an in-memory event.
+            let line = format!(
+                "{}{}",
+                crate::events::EVENT_MARKER,
+                serde_json::to_string(&event).unwrap()
+            );
+            let parsed = crate::events::parse(&line).unwrap();
+            app.apply_runtime_at(parsed, 11);
+            assert_eq!(
+                app.agent_costs.get("child").map(|cost| cost.amount),
+                expected
+            );
+            assert_eq!(
+                app.agents["child"].cost.as_ref().map(|cost| cost.amount),
+                expected
+            );
+            assert_eq!(app.subagent_cost_totals().get("USD").copied(), expected);
+        }
+    }
+
+    #[test]
     fn subagent_cost_totals_include_nested_and_removed_sessions_by_currency() {
         use crate::events::SubagentStatus;
         use agent_client_protocol::schema::v2::Cost;
@@ -10317,7 +10378,9 @@ mod tests {
                     id: id.into(),
                     used: 1,
                     size: 2,
-                    cost: Some(Cost::new(amount, currency)),
+                    cost: agent_client_protocol::schema::MaybeUndefined::Value(Cost::new(
+                        amount, currency,
+                    )),
                 },
                 11,
             );
@@ -10327,7 +10390,7 @@ mod tests {
                 id: "scout".into(),
                 used: 2,
                 size: 3,
-                cost: None,
+                cost: agent_client_protocol::schema::MaybeUndefined::Undefined,
             },
             12,
         );
@@ -10385,7 +10448,7 @@ mod tests {
                 id: "scout".into(),
                 used: 1,
                 size: 2,
-                cost: None,
+                cost: agent_client_protocol::schema::MaybeUndefined::Undefined,
             },
             10,
         );
@@ -10408,7 +10471,7 @@ mod tests {
                 id: "scout".into(),
                 used: 40_000,
                 size: 200_000,
-                cost: None,
+                cost: agent_client_protocol::schema::MaybeUndefined::Undefined,
             },
             11,
         );

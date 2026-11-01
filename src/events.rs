@@ -57,8 +57,12 @@ pub enum RuntimeEvent {
         id: String,
         used: u64,
         size: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost: Option<agent_client_protocol::schema::v2::Cost>,
+        #[serde(
+            default,
+            skip_serializing_if = "agent_client_protocol::schema::MaybeUndefined::is_undefined"
+        )]
+        cost:
+            agent_client_protocol::schema::MaybeUndefined<agent_client_protocol::schema::v2::Cost>,
     },
     /// Steering support advertised by the child's negotiated ACP connection.
     SubagentCapabilities {
@@ -196,7 +200,11 @@ pub fn parse(line: &str) -> Option<RuntimeEvent> {
     if body.len() > 64 * 1024 {
         return None;
     }
-    serde_json::from_str(body).ok()
+    // Normalize JSON numbers before serde's internally tagged enum buffer.
+    // With arbitrary-precision JSON enabled, direct decoding buffers decimal
+    // costs as private number maps rather than values accepted by f64.
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    serde_json::from_value(value).ok()
 }
 
 /// Milliseconds since the Unix epoch, saturating at zero on a broken clock.
@@ -363,7 +371,7 @@ mod tests {
             id: "s-child".into(),
             used: 12_345,
             size: 200_000,
-            cost: None,
+            cost: agent_client_protocol::schema::MaybeUndefined::Undefined,
         };
         let json = serde_json::to_value(&usage).unwrap();
         assert_eq!(json["event"], "subagent_usage");
@@ -382,7 +390,13 @@ mod tests {
         current["cost"] = json!({"amount": 1.25, "currency": "USD"});
         let event: RuntimeEvent = serde_json::from_value(current.clone()).unwrap();
         assert!(event.forward_from_child());
-        assert_eq!(serde_json::to_value(event).unwrap(), current);
+        assert_eq!(serde_json::to_value(&event).unwrap(), current);
+        let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+        assert_eq!(parse(&line), Some(event));
+        let mut cleared = current.clone();
+        cleared["cost"] = serde_json::Value::Null;
+        let event: RuntimeEvent = serde_json::from_value(cleared.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), cleared);
         current["cost"]["amount"] = json!("invalid");
         assert!(serde_json::from_value::<RuntimeEvent>(current).is_err());
     }

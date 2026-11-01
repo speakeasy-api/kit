@@ -19,7 +19,7 @@ use agentkit_acp::{
 };
 use agentkit_core::{
     CancellationController, Delta, FinishReason, Item, ItemKind, Part, PartId, PartKind, SessionId,
-    ToolOutput, Usage,
+    ToolOutput,
 };
 use agentkit_loop::{
     AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
@@ -439,6 +439,14 @@ fn native_activity<S: AcpSessionUpdateSink + 'static>(
         let state = if transition.active {
             wire::StateUpdate::Running(wire::RunningStateUpdate::new())
         } else {
+            if let Some(update) = transition.session_usage.v2()
+                && let Err(error) = sink.update(wire::UpdateSessionNotification::new(
+                    session_id.clone(),
+                    wire::SessionUpdate::UsageUpdate(update),
+                ))
+            {
+                tracing::debug!(%error, "failed to queue final ACP v2 usage update");
+            }
             wire::StateUpdate::Idle(
                 wire::IdleStateUpdate::new()
                     .stop_reason(finish_reason_to_stop_reason(&transition.reason))
@@ -480,21 +488,6 @@ struct ResponseReplacementObserver<S> {
     compaction: super::compaction_projection::Projection,
     activity: SessionActivity,
     session_id: wire::SessionId,
-}
-
-fn usage_update(usage: &Usage) -> Option<wire::UsageUpdate> {
-    let tokens = usage.tokens.as_ref()?;
-    let used = tokens.input_tokens.checked_add(tokens.output_tokens)?;
-    let size = [
-        "context_window",
-        "context_window_tokens",
-        "model.context_window",
-        "model.context_length",
-        "openrouter.context_length",
-    ]
-    .iter()
-    .find_map(|key| usage.metadata.get(*key).and_then(|value| value.as_u64()))?;
-    Some(wire::UsageUpdate::new(used, size))
 }
 
 impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
@@ -593,7 +586,10 @@ where
         }
         self.activity.observe(&event.event);
         if let AgentEvent::UsageUpdated(usage) = &event.event {
-            let Some(update) = usage_update(usage) else {
+            // Context projection also supports observers used without a model adapter.
+            let mut snapshot = self.activity.session_usage().unwrap_or_default();
+            snapshot.update_context(usage);
+            let Some(update) = snapshot.v2() else {
                 return;
             };
             let notification = wire::UpdateSessionNotification::new(
@@ -1246,6 +1242,9 @@ impl Server {
         });
         let sink = ResponseReplacementSink::new(ConnectionSink(connection.clone()));
         let activity = native_activity(session_id.clone(), sink.clone());
+        if claim.is_resuming() {
+            activity.invalidate_session_cost();
+        }
         let binding =
             AcpSessionBinding::new(session_id.clone(), SessionId::new(claim.id()), sink.clone())
                 .cancellation(cancellation);
@@ -3563,7 +3562,7 @@ mod tests {
     use serde_json::json;
 
     use agent_client_protocol::schema::MaybeUndefined;
-    use agentkit_core::{DataRef, MetadataMap, Modality, TurnCancellation};
+    use agentkit_core::{DataRef, MetadataMap, Modality, TurnCancellation, Usage};
     use agentkit_loop::{
         Agent, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest, TurnResult,
@@ -3791,6 +3790,135 @@ mod tests {
         assert_eq!(usage.size, 272_000);
         assert!(usage.cost.is_undefined());
         assert!(serde_json::to_value(usage).unwrap().get("cost").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_cost_terminal_publication_clears_superseded_amount() {
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("cost-session");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let observer = ResponseReplacementObserver::new(
+            AcpIntegration::default(),
+            sink,
+            session_id,
+            activity.clone(),
+        );
+        let emit = |event| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(SessionId::new("cost-loop")),
+                event,
+            })
+        };
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    emit(AgentEvent::TurnStarted {
+                        session_id: SessionId::new("cost-loop"),
+                        turn_id: agentkit_core::TurnId::new("cost-turn"),
+                    });
+                    activity.begin_request();
+                    let usage = Usage::new(agentkit_core::TokenUsage::new(10, 2))
+                        .with_cost(agentkit_core::CostUsage::new(2.0, "USD"))
+                        .with_metadata(MetadataMap::from([("context_window".into(), json!(1000))]));
+                    activity.record_cost(&usage);
+                    emit(AgentEvent::UsageUpdated(usage));
+                    emit(AgentEvent::ResponseAttemptSuperseded);
+                    activity.begin_request();
+                    let usage = Usage::new(agentkit_core::TokenUsage::new(20, 4));
+                    activity.record_cost(&usage);
+                    emit(AgentEvent::UsageUpdated(usage));
+                    Ok(())
+                },
+                |_| None,
+            )
+            .await
+            .unwrap();
+        let updates = recording.updates.lock().unwrap();
+        let costs: Vec<_> = updates
+            .iter()
+            .filter_map(|update| {
+                let wire::SessionUpdate::UsageUpdate(usage) = &update.update else {
+                    return None;
+                };
+                Some(serde_json::to_value(usage).unwrap())
+            })
+            .collect();
+        assert_eq!(costs[0]["cost"]["amount"], 2.0);
+        assert_eq!(
+            costs.last().unwrap().get("cost"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(matches!(
+            updates.last().unwrap().update,
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_cost_restored_session_never_reports_partial_total() {
+        let recording = RecordingSink::default();
+        let activity = native_activity(wire::SessionId::new("restored-cost"), recording.clone());
+        activity.invalidate_session_cost();
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    activity.observe(&AgentEvent::TurnStarted {
+                        session_id: SessionId::new("restored-cost"),
+                        turn_id: agentkit_core::TurnId::new("turn"),
+                    });
+                    activity.begin_request();
+                    activity.record_cost(
+                        &Usage::new(agentkit_core::TokenUsage::new(10, 2))
+                            .with_cost(agentkit_core::CostUsage::new(2.0, "USD"))
+                            .with_metadata(MetadataMap::from([(
+                                "context_window".into(),
+                                json!(1000),
+                            )])),
+                    );
+                    Ok(())
+                },
+                |_| None,
+            )
+            .await
+            .unwrap();
+        let updates = recording.updates.lock().unwrap();
+        let usage = updates
+            .iter()
+            .find_map(|update| match &update.update {
+                wire::SessionUpdate::UsageUpdate(usage) => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(usage).unwrap().get("cost"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn usage_update_preserves_reported_cost() {
+        for (amount, currency) in [(0.125, "USD"), (0.0, "EUR")] {
+            let usage = Usage::new(agentkit_core::TokenUsage::new(50, 3))
+                .with_cost(agentkit_core::CostUsage::new(amount, currency))
+                .with_metadata(MetadataMap::from([(
+                    "context_window".into(),
+                    json!(272_000),
+                )]));
+            let mut snapshot = super::super::usage::SessionUsage::default();
+            snapshot.update_context(&usage);
+            snapshot.cost.add(usage.cost.clone());
+            let update = snapshot.v2().expect("known context window");
+            let value = serde_json::to_value(update).unwrap();
+            assert_eq!(
+                value["cost"],
+                json!({"amount": amount, "currency": currency})
+            );
+            assert_eq!(value["used"], 53);
+            assert_eq!(value["size"], 272_000);
+        }
     }
 
     #[test]

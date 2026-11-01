@@ -299,6 +299,29 @@ mod test_support {
     }
 
     #[test]
+    fn session_cost_resume_provenance_follows_claim_not_attachment_method() {
+        let root = tempfile::tempdir().unwrap();
+        for resume in [false, true] {
+            let runtime = Runtime::with_session(
+                root.path(),
+                "gpt-5.4",
+                SessionRequest {
+                    id: "cost-session".into(),
+                    resume,
+                    force: false,
+                },
+            )
+            .unwrap();
+            let configured = runtime.claim_session().unwrap();
+            assert_eq!(configured.is_resuming(), resume);
+            let generated = runtime.claim_session().unwrap();
+            assert!(!generated.is_resuming());
+            let loaded = runtime.claim_session_load("another-session").unwrap();
+            assert!(loaded.is_resuming());
+        }
+    }
+
+    #[test]
     fn fork_deferral_retains_transcript_until_the_transferred_observer_is_dropped() {
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
@@ -574,6 +597,10 @@ pub(crate) struct SessionClaim {
 impl SessionClaim {
     pub(crate) fn id(&self) -> &str {
         &self.request.id
+    }
+
+    pub(crate) fn is_resuming(&self) -> bool {
+        self.request.resume
     }
 
     pub(crate) fn is_configured(&self) -> bool {
