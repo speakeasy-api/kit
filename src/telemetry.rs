@@ -1,6 +1,7 @@
 //! Independent opt-in local error context and OpenTelemetry trace export.
 
 pub(crate) mod error_spans;
+pub(crate) mod incoming;
 
 use agentkit_loop::{MessageCapture, TelemetryConfig};
 use opentelemetry::trace::TracerProvider as _;
@@ -271,6 +272,8 @@ fn exported_targets() -> Targets {
     Targets::new()
         .with_target("agentkit_loop", LevelFilter::INFO)
         .with_target("agentkit_mcp", LevelFilter::INFO)
+        .with_target(incoming::TARGET, LevelFilter::INFO)
+        .with_target("kit::telemetry::error_spans", LevelFilter::INFO)
 }
 
 fn build_exporter(
@@ -732,12 +735,15 @@ mod tests {
 
     #[test]
     fn exporter_allows_semantic_targets_and_rejects_dependencies() {
-        let targets: Vec<_> = exported_targets().into_iter().collect();
+        let mut targets: Vec<_> = exported_targets().into_iter().collect();
+        targets.sort();
         assert_eq!(
             targets,
             vec![
                 ("agentkit_loop".to_string(), LevelFilter::INFO),
                 ("agentkit_mcp".to_string(), LevelFilter::INFO),
+                ("kit::telemetry::error_spans".to_string(), LevelFilter::INFO),
+                ("kit::telemetry::incoming".to_string(), LevelFilter::INFO),
             ]
         );
     }

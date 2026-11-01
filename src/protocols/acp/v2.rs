@@ -1678,6 +1678,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         match event {
             Either::Left(command) => match command {
                 Some(Command::Prompt(command)) => {
+                    let span = crate::telemetry::incoming::operation(command.request.meta.as_ref());
                     let result = prepare_prompt(
                         TurnContext {
                             session_id: &session_id,
@@ -1697,7 +1698,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &mut driver,
                         command,
                     )
-                    .instrument(crate::telemetry::error_spans::operation("acp"))
+                    .instrument(span)
                     .await;
                     busy.store(false, Ordering::Release);
                     if let Err(error) = result {
@@ -1709,6 +1710,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     reply,
                     cancellation_generation,
                 }) => {
+                    let span = crate::telemetry::incoming::operation(request.meta.as_ref());
                     let result = async {
                         if handle
                             .cancellation_handle()
@@ -1772,6 +1774,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         }
                         set_v2_config(&adapter, &catalog, request).map_err(sdk_error)
                     }
+                    .instrument(span)
                     .await;
                     let _ = reply.send(result);
                 }
@@ -2782,7 +2785,12 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::InitializeRequest, responder, _cx| {
-                    responder.respond_with_result(state.initialize(request).map_err(sdk_error))
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+                    async {
+                        responder.respond_with_result(state.initialize(request).map_err(sdk_error))
+                    }
+                    .instrument(span)
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2791,7 +2799,10 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::LoginAuthRequest, responder, _cx| {
-                    responder.respond_with_result(state.login(request))
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+                    async { responder.respond_with_result(state.login(request)) }
+                        .instrument(span)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2800,10 +2811,15 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |_request: wire::LogoutAuthRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(_request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(state.logout().await.map_err(sdk_error))
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder.respond_with_result(state.logout().await.map_err(sdk_error))
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -2813,18 +2829,23 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::NewSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
-                        match state.new_session(request, connection.clone()).await {
-                            Ok((response, activation)) => {
-                                responder.respond(response)?;
-                                let _ = activation.send(());
-                                Ok(())
+                    cx.spawn(
+                        async move {
+                            match state.new_session(request, connection.clone()).await {
+                                Ok((response, activation)) => {
+                                    responder.respond(response)?;
+                                    let _ = activation.send(());
+                                    Ok(())
+                                }
+                                Err(error) => responder.respond_with_error(sdk_error(error)),
                             }
-                            Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -2834,15 +2855,20 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::ListSessionsRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(
-                            state
-                                .list_sessions(request)
-                                .await
-                                .map_err(list_sessions_error),
-                        )
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder.respond_with_result(
+                                state
+                                    .list_sessions(request)
+                                    .await
+                                    .map_err(list_sessions_error),
+                            )
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -2852,21 +2878,26 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::ResumeSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
-                        match state.resume_session(request, connection.clone()).await {
-                            Ok((response, replay, activation)) => {
-                                for update in replay {
-                                    connection.send_notification(update)?;
+                    cx.spawn(
+                        async move {
+                            match state.resume_session(request, connection.clone()).await {
+                                Ok((response, replay, activation)) => {
+                                    for update in replay {
+                                        connection.send_notification(update)?;
+                                    }
+                                    responder.respond(response)?;
+                                    let _ = activation.send(());
+                                    Ok(())
                                 }
-                                responder.respond(response)?;
-                                let _ = activation.send(());
-                                Ok(())
+                                Err(error) => responder.respond_with_error(sdk_error(error)),
                             }
-                            Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -2876,17 +2907,22 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::PromptRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        match state.prepare_prompt(request).await {
-                            Ok((start, message_id)) => {
-                                responder.respond(wire::PromptResponse::new(message_id))?;
-                                let _ = start.send(());
-                                Ok(())
+                    cx.spawn(
+                        async move {
+                            match state.prepare_prompt(request).await {
+                                Ok((start, message_id)) => {
+                                    responder.respond(wire::PromptResponse::new(message_id))?;
+                                    let _ = start.send(());
+                                    Ok(())
+                                }
+                                Err(error) => responder.respond_with_error(sdk_error(error)),
                             }
-                            Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -2896,10 +2932,15 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::SetSessionConfigOptionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(state.set_config(request).await)
-                    })?;
+                    cx.spawn(
+                            async move {
+                                responder.respond_with_result(state.set_config(request).await)
+                            }
+                            .instrument(span),
+                        )?;
                     Ok(())
                 }
             },
@@ -2911,10 +2952,13 @@ pub(crate) fn component(
                 async move |request: wire::InjectSessionRequest,
                             responder: Responder<wire::InjectSessionResponse>,
                             cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let integration = Arc::clone(&integration);
-                    cx.spawn(async move {
-                        integration.handle_inject_request(request, responder).await
-                    })?;
+                    cx.spawn(
+                        async move { integration.handle_inject_request(request, responder).await }
+                            .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -2924,7 +2968,12 @@ pub(crate) fn component(
             {
                 let integration = Arc::clone(&state.integration);
                 async move |request: wire::RevokeInjectSessionRequest, responder, _cx| {
-                    responder.respond_with_result(integration.revoke_inject(request).await)
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+                    async {
+                        responder.respond_with_result(integration.revoke_inject(request).await)
+                    }
+                    .instrument(span)
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2933,10 +2982,15 @@ pub(crate) fn component(
             {
                 let integration = Arc::clone(&state.integration);
                 async move |request: wire::ReplaceInjectSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let integration = Arc::clone(&integration);
-                    cx.spawn(async move {
-                        responder.respond_with_result(integration.replace_inject(request).await)
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder.respond_with_result(integration.replace_inject(request).await)
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3001,11 +3055,17 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: UpdateMcpRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder
-                            .respond_with_result(state.update_mcp(request).await.map_err(sdk_error))
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder.respond_with_result(
+                                state.update_mcp(request).await.map_err(sdk_error),
+                            )
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3052,10 +3112,16 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::CloseSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(state.close(request).await.map_err(sdk_error))
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder
+                                .respond_with_result(state.close(request).await.map_err(sdk_error))
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
