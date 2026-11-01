@@ -56,6 +56,7 @@ use tracing::Instrument as _;
 
 mod activity;
 pub(crate) mod model_switch;
+mod plan;
 mod session_info;
 mod session_pagination;
 mod skill_catalog;
@@ -2211,6 +2212,22 @@ struct SessionActor<S: ModelSession> {
 }
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
+    let client = actor.client.clone();
+    let session_id = actor.session_id.clone();
+    plan::scope(
+        move |plan| {
+            if let Err(error) =
+                client.notify_session(SessionNotification::new(session_id.clone(), plan.v1()))
+            {
+                tracing::debug!(%error, "failed to queue ACP v1 task plan");
+            }
+        },
+        session_actor_inner(actor),
+    )
+    .await;
+}
+
+async fn session_actor_inner<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
         client,
         subagents,
@@ -2253,6 +2270,9 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 }),
             }
         }; // Drop the owning futures before handlers reborrow receivers/driver.
+        if let Either::Right(Either::Right(Some(task))) = &event {
+            plan::observe(task);
+        }
         match event {
             Either::Left(command) => match command {
                 Some(Command::Prompt { request, reply }) => {
@@ -2639,6 +2659,9 @@ pub(super) async fn settle_background_jobs(
                 Either::Right((event, _pending)) => Either::Right(event),
             }
         };
+        if let Either::Right(Some(task)) = &event {
+            plan::observe(task);
+        }
         match event {
             Either::Left(()) => {}
             Either::Right(event) => match event {
@@ -6359,16 +6382,31 @@ pub(super) mod tests {
             .await
             .unwrap();
 
+        let (plans_tx, mut plans_rx) = mpsc::unbounded_channel();
         assert!(
             timeout(
                 Duration::from_secs(1),
-                settle_background_jobs(&tasks, &jobs)
+                plan::scope(
+                    move |plan| {
+                        let _ = plans_tx.send(plan.v1());
+                    },
+                    settle_background_jobs(&tasks, &jobs)
+                )
             )
             .await
             .expect("failed background terminal did not settle")
             .unwrap()
         );
         assert!(tasks.list_running().await.is_empty());
+        let mut plans = Vec::new();
+        while let Ok(SessionUpdate::Plan(plan)) = plans_rx.try_recv() {
+            plans.push(plan);
+        }
+        assert!(plans.iter().any(|plan| plan.entries.iter().any(|entry| {
+            entry.content == "fast-failure"
+                && entry.status == agentkit_acp::PlanEntryStatus::InProgress
+        })));
+        assert!(plans.last().unwrap().entries.is_empty());
     }
 
     #[tokio::test]
@@ -7019,9 +7057,13 @@ pub(super) mod tests {
             completed[0].kind,
             agentkit_task_manager::TaskKind::Background
         );
+        let mut task_plans = Vec::new();
         let notification = timeout(Duration::from_secs(1), async {
             loop {
                 let notification = updates_rx.recv().await.expect("update stream closed");
+                if let SessionUpdate::Plan(plan) = &notification.update {
+                    task_plans.push(plan.clone());
+                }
                 if let agentkit_acp::SessionUpdate::AgentMessageChunk(chunk) = &notification.update
                     && let agentkit_acp::ContentBlock::Text(text) = &chunk.content
                     && text.text == "autonomous background completion"
@@ -7033,6 +7075,23 @@ pub(super) mod tests {
         .await
         .expect("completion did not produce an unsolicited agent update");
         assert_eq!(notification.session_id.to_string(), "s-actor-session");
+        assert!(
+            task_plans
+                .iter()
+                .any(|plan| plan.entries.iter().any(|entry| {
+                    entry.content == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && entry.status == agentkit_acp::PlanEntryStatus::InProgress
+                }))
+        );
+        assert!(
+            task_plans
+                .iter()
+                .any(|plan| plan.entries.iter().any(|entry| {
+                    entry.content == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && entry.priority == agentkit_acp::PlanEntryPriority::Low
+                        && entry.status == agentkit_acp::PlanEntryStatus::Completed
+                }))
+        );
         assert!(observed_handoff.load(Ordering::SeqCst));
         let started = turn_states_rx.recv().await.expect("missing turn start");
         let ended = turn_states_rx.recv().await.expect("missing turn end");
