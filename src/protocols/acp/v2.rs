@@ -1181,6 +1181,7 @@ impl Server {
         let (tx, rx) = mpsc::channel(8);
         let busy = Arc::new(AtomicBool::new(false));
         let voice_state = crate::runtime::voice_state::VoiceState::default();
+        let metadata_observer = driver.adapter.session_observer();
         let actor = SessionActor {
             subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
@@ -1232,11 +1233,18 @@ impl Server {
                         Ok(())
                     },
                 ));
+                let info =
+                    std::pin::pin!(super::session_info::poll(metadata_observer, |metadata| {
+                        sink.update(wire::UpdateSessionNotification::new(
+                            session_id.clone(),
+                            metadata.v2(),
+                        ))
+                    },));
                 let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
                     let _ = sink.update(available_commands_update(session_id.clone(), commands));
                 }));
                 // Dropping the losing future stops polling with its session.
-                let _ = select(actor, polling).await;
+                let _ = select(actor, select(polling, info)).await;
             }
         });
         let interrupt_handle = handle.clone();
@@ -4020,6 +4028,21 @@ mod tests {
             notification.update,
             wire::SessionUpdate::AvailableCommandsUpdate(_)
         ));
+
+        let metadata = receive_wire(&mut client, "session metadata notification").await;
+        assert_eq!(metadata["method"], "session/update");
+        assert_eq!(
+            metadata["params"]["sessionId"],
+            response.session_id.to_string()
+        );
+        let update = &metadata["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "session_info_update");
+        let entry = crate::session::catalog(root.path()).unwrap().pop().unwrap();
+        assert_eq!(
+            update["title"],
+            serde_json::to_value(entry.title.clone()).unwrap()
+        );
+        assert_eq!(update["updatedAt"], entry.updated_at_rfc3339());
 
         // Closing requires the actual session actor to process and acknowledge a command.
         send_wire(

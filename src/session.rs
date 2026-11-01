@@ -184,16 +184,54 @@ impl CatalogEntry {
     }
 }
 
+/// Writer-maintained activity for an attached session, including subagents.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveSessionInfo {
+    pub title: Option<String>,
+    pub updated_at: u64,
+}
+
+impl LiveSessionInfo {
+    pub(crate) fn updated_at_rfc3339(&self) -> String {
+        timestamp_rfc3339(self.updated_at)
+    }
+
+    fn from_items(historical: &[Vec<Item>], current: &[Item]) -> Self {
+        Self {
+            title: catalog_text(historical, current).0,
+            updated_at: current
+                .iter()
+                .filter_map(|item| item.created_at)
+                .map(|timestamp| timestamp.0)
+                .filter(|timestamp| *timestamp <= MAX_RFC3339_MILLIS)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+}
+
 // The writer serializes generation, open-file identity, and its ownership lease.
 // No guard crosses an await. Backend I/O and replaced file/lease destruction can
 // unwind after external effects, so poison is isolation, never recovery. The
 // infallible observer skips persistence; result-bearing callers get an error.
+// While persistence is enabled, metadata describes the committed file generation.
+// Both constructors seed it from the already-loaded authority. Initial items,
+// normal append callbacks, replacement callbacks, child and reasoning records
+// all go through write_record: prepare before I/O, publish after successful sync.
+// Failed/disabled writes retain the previous summary; poisoned writers expose
+// neither it nor further writes. Recovery copies the same bytes and changes no
+// summary. Creation/publication only changes ownership, never transcript items;
+// metadata reads reject unpublished creation and shared scope loss, and never
+// reconstruct storage. Shared scope validity is rechecked after metadata I/O.
+// All summary values have inert drops; no callback or await separates generation
+// and summary assignment. Best-effort accepted buffering is not a disk guarantee.
 #[derive(Clone)]
 pub struct SessionObserver(Arc<Mutex<Writer>>);
 
 struct Writer {
     session_id: String,
     generation: u64,
+    metadata: LiveSessionInfo,
     path: PathBuf,
     workspace_root: PathBuf,
     // None permanently disables this writer; there is no session retry queue.
@@ -576,6 +614,10 @@ fn open_with_initial_timestamps_in(
                 break (sources, authority);
             }
         };
+        let metadata = authority
+            .as_ref()
+            .map(|a| LiveSessionInfo::from_items(&a.historical_items, &a.items))
+            .unwrap_or_default();
         let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
         let children = authority
             .as_ref()
@@ -596,6 +638,7 @@ fn open_with_initial_timestamps_in(
         let writer = Writer {
             session_id: session_id.into(),
             generation: 0,
+            metadata,
             path,
             workspace_root,
             file: None,
@@ -645,6 +688,10 @@ fn open_with_initial_timestamps_in(
             break (sources, authority);
         }
     };
+    let metadata = authority
+        .as_ref()
+        .map(|a| LiveSessionInfo::from_items(&a.historical_items, &a.items))
+        .unwrap_or_default();
     let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
     let children = authority
         .as_ref()
@@ -740,6 +787,7 @@ fn open_with_initial_timestamps_in(
     let writer = Writer {
         session_id: session_id.into(),
         generation,
+        metadata,
         path,
         workspace_root,
         file,
@@ -806,6 +854,63 @@ fn finish_open(
 }
 
 impl SessionObserver {
+    /// Reads only the writer summary, display-name sidecar, and file metadata.
+    /// Does not discover sessions or parse transcripts, including for subagents.
+    pub(crate) fn metadata(&self) -> Result<LiveSessionInfo, String> {
+        let writer = self
+            .0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?;
+        if writer
+            .publication
+            .as_ref()
+            .is_some_and(|published| !published.load(Ordering::Acquire))
+        {
+            return Err("session creation is awaiting publication".into());
+        }
+        writer.check_ownership()?;
+        if let Some(error) = &writer.persistence_error {
+            return Err(format!("session transcript is not durable: {error}"));
+        }
+        if writer.file.is_none() {
+            return Err("session transcript persistence was disabled".into());
+        }
+        let filesystem = fs::best_effort_global();
+        // The loss domain is shared by other writers: our file can remain Some
+        // after another session abandons accepted buffered records. Never call
+        // ensure_lock here, because a metadata poll must not reconstruct history.
+        let check_scope = || {
+            if matches!(
+                filesystem.best_effort_status(),
+                Some(fs::BestEffortStatus::Dropped | fs::BestEffortStatus::Poisoned)
+            ) {
+                Err("session transcript persistence scope was lost".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        check_scope()?;
+        let mut metadata = writer.metadata.clone();
+        if let Some(directory) = writer.path.parent() {
+            metadata.title = read_display_name_with(filesystem, directory, &writer.session_id)
+                .or(metadata.title);
+        }
+        let file_updated = filesystem
+            .metadata(&writer.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        metadata.updated_at = metadata.updated_at.max(file_updated);
+        // Sidecar/metadata I/O can itself discover loss, and another writer can
+        // abandon the domain during these reads. The final status check is the
+        // read's linearization point; subsequent loss invalidates future reads.
+        writer.check_ownership()?;
+        check_scope()?;
+        Ok(metadata)
+    }
+
     /// Require all accepted transcript records to reach disk before close succeeds.
     /// The writer lock excludes append/replace and lease transitions during this
     /// barrier. Poison isolates the writer; no guard crosses an await or callback.
@@ -1084,6 +1189,27 @@ impl Writer {
     }
 
     fn write_record(&mut self, record: Record, generation: u64) -> Result<(), String> {
+        // Prepare all allocating summary work before the append. Publish only
+        // with the committed generation; failure/disabled storage keeps the old
+        // summary. Replacement retains historical title but resets item time.
+        let metadata = if let Some(items) = &record.replacement {
+            let mut next = LiveSessionInfo::from_items(&[], items);
+            next.title = self.metadata.title.clone().or(next.title);
+            next
+        } else if let Some(item) = &record.item {
+            let mut next = self.metadata.clone();
+            if next.title.is_none() {
+                next.title = catalog_text(&[], std::slice::from_ref(item)).0;
+            }
+            if let Some(timestamp) = item.created_at
+                && timestamp.0 <= MAX_RFC3339_MILLIS
+            {
+                next.updated_at = next.updated_at.max(timestamp.0);
+            }
+            next
+        } else {
+            self.metadata.clone()
+        };
         // Encode before touching the append-only file, so serialization
         // failures can never leave a partial JSON record behind.
         let mut encoded = serde_json::to_vec(&record)
@@ -1104,6 +1230,7 @@ impl Writer {
             return Ok(());
         }
         self.generation = generation;
+        self.metadata = metadata;
         Ok(())
     }
 
@@ -6173,6 +6300,113 @@ mod tests {
     }
 
     #[test]
+    fn live_metadata_tracks_appends_replacement_history_and_custom_names() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "live",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        assert_eq!(opened.observer.metadata().unwrap().title, None);
+        let item = Item::text(ItemKind::User, "Original title\nsecond line")
+            .with_created_at(Timestamp(4_000_000_000_000));
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("live"),
+            item: &item,
+        });
+        let appended = opened.observer.metadata().unwrap();
+        assert_eq!(appended.title.as_deref(), Some("Original title"));
+        assert_eq!(appended.updated_at, 4_000_000_000_000);
+        assert_eq!(
+            appended.updated_at_rfc3339(),
+            timestamp_rfc3339(appended.updated_at)
+        );
+        assert!(opened.observer.replace(&[]).is_err());
+        assert_eq!(opened.observer.metadata().unwrap(), appended);
+        opened
+            .observer
+            .replace(&[
+                Item::text(ItemKind::User, "Retained prompt")
+                    .with_created_at(Timestamp(3_000_000_000_000)),
+                Item::text(ItemKind::Assistant, "invalid future timestamp")
+                    .with_created_at(Timestamp(u64::MAX)),
+            ])
+            .unwrap();
+        let replaced = opened.observer.metadata().unwrap();
+        assert_eq!(replaced.title, appended.title);
+        assert_eq!(replaced.updated_at, 3_000_000_000_000);
+        for name in [Some("Custom title"), None] {
+            set_display_name_in(root.path(), storage.path(), "live", name).unwrap();
+            let live = opened.observer.metadata().unwrap();
+            assert_eq!(
+                live.title.as_deref(),
+                Some(name.unwrap_or("Original title"))
+            );
+            let listed = catalog_for_workspace(root.path(), storage.path()).unwrap();
+            assert_eq!(live.title, listed[0].title);
+            assert_eq!(live.updated_at, listed[0].updated_at);
+        }
+        drop(opened);
+        let resumed = open_in(root.path(), storage.path(), "live", true, false, vec![]).unwrap();
+        assert_eq!(resumed.observer.metadata().unwrap(), replaced);
+        // Current item timestamps can disappear entirely after compaction; mtime
+        // still supplies activity, without retaining the previous future value.
+        resumed
+            .observer
+            .replace(&[Item::text(ItemKind::System, "summary")])
+            .unwrap();
+        let live = resumed.observer.metadata().unwrap();
+        let listed = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(live.updated_at, listed[0].updated_at);
+        assert!(live.updated_at > 0 && live.updated_at < replaced.updated_at);
+        assert_eq!(live.title.as_deref(), Some("Original title"));
+    }
+
+    #[test]
+    fn live_metadata_includes_attached_subagents_excluded_from_catalog() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut system = Item::text(ItemKind::System, "subagent system");
+        system.metadata.insert(
+            SESSION_ORIGIN_METADATA_KEY.into(),
+            serde_json::Value::String(SUBAGENT_SESSION_ORIGIN.into()),
+        );
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "child",
+            false,
+            false,
+            vec![system, Item::text(ItemKind::User, "Child task")],
+        )
+        .unwrap();
+        assert!(
+            catalog_for_workspace(root.path(), storage.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            opened.observer.metadata().unwrap().title.as_deref(),
+            Some("Child task")
+        );
+        // Listing and rename intentionally hide children; attachment metadata
+        // remains available through the owning writer across later appends.
+        write(
+            &opened.observer,
+            &Item::text(ItemKind::Assistant, "Child reply"),
+        );
+        assert_eq!(
+            opened.observer.metadata().unwrap().title.as_deref(),
+            Some("Child task")
+        );
+    }
+
+    #[test]
     fn catalog_title_survives_transcript_replacement() {
         let storage = tempfile::tempdir().unwrap();
         let roots = tempfile::tempdir().unwrap();
@@ -6751,6 +6985,7 @@ mod tests {
             vec![Item::text(ItemKind::System, "system")],
         )
         .unwrap();
+        let original_metadata = opened.observer.0.lock().unwrap().metadata.clone();
         let id = agentkit_core::SessionId::new("abc");
         opened.observer.on_transcript_event(TranscriptEvent {
             session_id: &id,
@@ -6758,6 +6993,17 @@ mod tests {
         });
         assert!(!opened.observer.0.is_poisoned());
         assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
+        assert_eq!(
+            opened.observer.0.lock().unwrap().metadata,
+            original_metadata
+        );
+        assert!(
+            opened
+                .observer
+                .metadata()
+                .unwrap_err()
+                .contains("not durable")
+        );
         let item = Item::text(ItemKind::User, "accepted").with_created_at(Timestamp(123));
         opened.observer.on_transcript_event(TranscriptEvent {
             session_id: &id,
@@ -7196,6 +7442,56 @@ mod tests {
     }
 
     #[test]
+    fn live_metadata_rejects_shared_scope_loss_before_its_next_write() {
+        if isolated_process("live_metadata_rejects_shared_scope_loss_before_its_next_write") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let idle = open(
+            root.path(),
+            "idle",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Idle session")],
+        )
+        .unwrap();
+        let failing = open(
+            root.path(),
+            "failing",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let before = idle.observer.metadata().unwrap();
+        assert_eq!(before.title.as_deref(), Some("Idle session"));
+        let generation = idle.observer.0.lock().unwrap().generation;
+        {
+            let mut writer = failing.observer.0.lock().unwrap();
+            // Reject a real append boundary in B; A remains idle throughout.
+            writer.file = Some(File::open(&writer.path).unwrap());
+        }
+        failing
+            .observer
+            .replace(&[Item::text(ItemKind::User, "lost")])
+            .unwrap();
+        assert_eq!(
+            fs::best_effort_global().best_effort_status(),
+            Some(fs::BestEffortStatus::Dropped)
+        );
+        assert!(
+            idle.observer
+                .metadata()
+                .unwrap_err()
+                .contains("scope was lost")
+        );
+        let writer = idle.observer.0.lock().unwrap();
+        assert!(writer.file.is_some(), "idle writer has not run ensure_lock");
+        assert_eq!(writer.generation, generation);
+        assert_eq!(writer.metadata.title, before.title);
+    }
+
+    #[test]
     fn failed_write_disables_persistence_without_stopping_observer_or_creation() {
         if isolated_process(
             "failed_write_disables_persistence_without_stopping_observer_or_creation",
@@ -7223,6 +7519,7 @@ mod tests {
             writer.path.clone()
         };
         let original = fs::read(&path).unwrap();
+        let original_metadata = opened.observer.metadata().unwrap();
         let item = Item::text(ItemKind::User, "not persisted").with_created_at(Timestamp(123));
         opened
             .observer
@@ -7240,6 +7537,11 @@ mod tests {
         });
         assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
         assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(opened.observer.metadata().unwrap_err().contains("disabled"));
+        assert_eq!(
+            opened.observer.0.lock().unwrap().metadata.title,
+            original_metadata.title
+        );
         assert_eq!(
             fs::best_effort_global().best_effort_status(),
             Some(fs::BestEffortStatus::Dropped)
@@ -7447,6 +7749,7 @@ mod tests {
                 .unwrap_err()
                 .contains("poisoned")
         );
+        assert!(opened.observer.metadata().unwrap_err().contains("poisoned"));
         assert!(opened.observer.commit_creation().is_err());
         assert!(opened.observer.prepare_creation().is_err());
         let original = fs::read(&path).unwrap();
@@ -7486,6 +7789,13 @@ mod tests {
                 opened
                     .observer
                     .set_reasoning_effort(None)
+                    .unwrap_err()
+                    .contains("awaiting publication")
+            );
+            assert!(
+                opened
+                    .observer
+                    .metadata()
                     .unwrap_err()
                     .contains("awaiting publication")
             );
