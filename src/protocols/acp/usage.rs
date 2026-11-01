@@ -165,7 +165,12 @@ impl<T> Drop for Turn<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::super::activity::ExecutionOrigin;
     use super::*;
