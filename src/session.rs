@@ -332,6 +332,207 @@ pub fn new_id() -> String {
     )
 }
 
+/// Deletes a closed session without stealing active ownership.
+pub(crate) fn delete(root: &Path, session_id: &str) -> Result<(), String> {
+    validate_id(session_id)?;
+    let directory = default_directory()?;
+    let root = resolve_delete_workspace_in(root, &directory, session_id)?;
+    delete_in(&root, &directory, session_id)
+}
+
+/// Deletes only from the known workspace of an owned session. Unlike ID-only
+/// discovery, a missing session must never redirect deletion to another root.
+pub(crate) fn delete_workspace(root: &Path, session_id: &str) -> Result<(), String> {
+    delete_in(root, &default_directory()?, session_id)
+}
+
+// ID-only protocol requests must not silently select the connection's cwd when
+// another persisted workspace owns the same ID. Legacy local discovery is
+// necessarily limited to the supplied root; scoped and bound global storage
+// carry their workspace identity in the transcript.
+fn resolve_delete_workspace_in(
+    root: &Path,
+    directory: &Path,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    validate_id(session_id)?;
+    let filesystem = fs::best_effort_global();
+    let mut roots = vec![canonical_workspace(root)];
+    let mut candidates = vec![transcript_path(directory, session_id)];
+    match filesystem.read_dir(directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if entry.file_type().map_err(|e| e.to_string())?.is_dir()
+                    && entry.file_name().to_string_lossy().starts_with("w-")
+                {
+                    candidates.push(transcript_path(&entry.path(), session_id));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not discover session workspace: {error}")),
+    }
+    for path in candidates {
+        if !filesystem.try_exists(&path).map_err(|e| e.to_string())? {
+            continue;
+        }
+        if let Some(workspace) = read_authority_candidate(filesystem, &path, session_id, false)?.0 {
+            if path != transcript_path(directory, session_id)
+                && path
+                    != transcript_path(
+                        &workspace_storage_directory(directory, &workspace),
+                        session_id,
+                    )
+            {
+                return Err(format!(
+                    "session workspace does not match storage path {}",
+                    path.display()
+                ));
+            }
+            if !roots.contains(&workspace) {
+                roots.push(workspace);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for root in roots {
+        if select_authority_with(filesystem, directory, &root, session_id, false, false)?.is_some()
+        {
+            found.push(root);
+        }
+    }
+    match found.as_slice() {
+        [root] => Ok(root.clone()),
+        [] => Err(format!("session {session_id:?} does not exist")),
+        _ => Err(format!(
+            "session {session_id:?} is ambiguous across workspaces"
+        )),
+    }
+}
+
+pub(crate) fn delete_in(root: &Path, directory: &Path, session_id: &str) -> Result<(), String> {
+    validate_id(session_id)?;
+    let root = canonical_workspace(root);
+    let scoped = transcript_path(&workspace_storage_directory(directory, &root), session_id);
+    let global = transcript_path(directory, session_id);
+    let local = legacy_transcript(&root, session_id);
+    let filesystem = fs::best_effort_global();
+
+    // Match open's scoped-first ordering. Unlike migration, also lock absent
+    // and sealed sources so none can reappear while authority is removed.
+    // ExistingOrNew accepts stale files, but never steals a live native lease.
+    let mut paths = vec![scoped, global.clone(), local];
+    let mut unique = Vec::new();
+    for path in paths.drain(..) {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+    }
+    let mut locks = Vec::new();
+    for path in &unique {
+        let parent = path.parent().ok_or("session transcript has no parent")?;
+        fs::global()
+            .create_dir_all(parent)
+            .map_err(|error| format!("could not create session lock directory: {error}"))?;
+        locks.push(SessionLock::acquire(path.with_extension("lock"), true)?);
+    }
+    finish_delete_recovery(filesystem)?;
+
+    // Removing scoped authority exposes an unbound global fallback to load.
+    // Without a tombstone, preserving it and preventing resurrection conflict.
+    // Never delete unowned global history to resolve that ambiguity.
+    if filesystem.try_exists(&global).map_err(|e| e.to_string())?
+        && read_authority_candidate(filesystem, &global, session_id, false)?
+            .0
+            .is_none()
+    {
+        return Err(format!(
+            "cannot delete session {session_id:?}: global transcript has no workspace binding"
+        ));
+    }
+    let authority = select_authority_with(filesystem, directory, &root, session_id, false, false)?
+        .ok_or_else(|| {
+            format!(
+                "session {session_id:?} does not exist in {}",
+                root.display()
+            )
+        })?;
+
+    // Validate every candidate before mutation; preserve foreign global files.
+    let mut owned = Vec::new();
+    for (path, lock) in unique.iter().zip(&locks) {
+        if !filesystem.try_exists(path).map_err(|e| e.to_string())? {
+            // Display names for legacy-only histories live in the scoped
+            // directory even before a scoped transcript has been created.
+            if path != &global {
+                owned.push((path, lock));
+            }
+            continue;
+        }
+        let (workspace, _) = read_authority_candidate(filesystem, path, session_id, false)?;
+        if workspace.as_deref().is_some_and(|stored| stored != root) {
+            continue;
+        }
+        owned.push((path, lock));
+    }
+    // Remove stale histories/redirects durably BEFORE the winning history.
+    // Failed intermediate deletion leaves the winner, not a stale fallback.
+    let winner = filesystem
+        .canonicalize(&authority.path)
+        .map_err(|e| e.to_string())?;
+    let mut ordered = Vec::new();
+    for (path, lock) in owned {
+        let is_winner = filesystem.try_exists(path).map_err(|e| e.to_string())?
+            && filesystem.canonicalize(path).map_err(|e| e.to_string())? == winner;
+        ordered.push((is_winner, path, lock));
+    }
+    ordered.sort_by_key(|(is_winner, _, _)| *is_winner);
+    for (_, path, lock) in &ordered {
+        let guarded = lock.filesystem()?;
+        let parent = path.parent().ok_or("session transcript has no parent")?;
+        for metadata in [
+            metadata_path(parent, session_id),
+            catalog_metadata_path(parent, session_id),
+            path.with_extension("workspace.metadata.json"),
+        ] {
+            match guarded.remove_file(&metadata) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("could not delete {}: {error}", metadata.display()));
+                }
+            }
+        }
+        match guarded.remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not delete session transcript {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        sync_parent_directory(&guarded, path)?;
+        // Acceptance is not durability. Retain all leases through replay and
+        // parent-directory synchronization before touching the next history.
+        finish_delete_recovery(&guarded)?;
+    }
+    Ok(())
+}
+
+fn finish_delete_recovery(filesystem: &Fs) -> Result<(), String> {
+    let report = filesystem.recover();
+    if let Some(error) = report.blocked {
+        return Err(format!("could not durably delete session: {error}"));
+    }
+    if report.remaining_operations != 0 {
+        return Err("could not durably delete session: storage recovery is pending".into());
+    }
+    Ok(())
+}
+
 /// Loads a transcript without taking mutating authority.
 ///
 /// A file that lost a tool result is repaired in memory only; writing the
@@ -3577,6 +3778,158 @@ mod tests {
 
     fn session_lock_path(root: &Path, session_id: &str) -> PathBuf {
         super::lock_path(&scoped_directory(root), session_id)
+    }
+
+    #[test]
+    fn delete_closed_session_removes_load_catalog_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project_root(temp.path())).unwrap();
+        drop(
+            open(
+                temp.path(),
+                "delete-me",
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "delete this session")],
+            )
+            .unwrap(),
+        );
+        let project = project_root(temp.path());
+        let directory = session_directory(temp.path());
+        assert!(
+            !catalog_for_workspace(&project, &directory)
+                .unwrap()
+                .is_empty()
+        );
+        let metadata = metadata_path(&scoped_directory(temp.path()), "delete-me");
+        fs::write(&metadata, b"{\"display_name\":\"old name\"}").unwrap();
+        delete_in(&project, &directory, "delete-me").unwrap();
+        assert!(load(temp.path(), "delete-me").is_err());
+        assert!(
+            catalog_for_workspace(&project, &directory)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!metadata.exists());
+        assert!(!transcript_path(temp.path(), "delete-me").exists());
+    }
+
+    #[test]
+    fn delete_rejects_active_session_without_changing_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = open(
+            temp.path(),
+            "active",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "keep")],
+        )
+        .unwrap();
+        let before = load(temp.path(), "active").unwrap();
+        let error = delete_in(
+            &project_root(temp.path()),
+            &session_directory(temp.path()),
+            "active",
+        )
+        .unwrap_err();
+        assert!(error.contains("actively locked"), "{error}");
+        assert_eq!(load(temp.path(), "active").unwrap(), before);
+        drop(active);
+        delete_in(
+            &project_root(temp.path()),
+            &session_directory(temp.path()),
+            "active",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn delete_is_workspace_isolated_and_id_routing_rejects_ambiguity() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = session_directory(temp.path());
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for root in [&first, &second] {
+            drop(
+                open_in(
+                    root,
+                    &directory,
+                    "same",
+                    false,
+                    false,
+                    vec![Item::text(ItemKind::User, "keep workspace separate")],
+                )
+                .unwrap(),
+            );
+        }
+        assert!(
+            resolve_delete_workspace_in(&first, &directory, "same")
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        delete_in(&first, &directory, "same").unwrap();
+        assert!(load_in(&first, &directory, "same").is_err());
+        assert!(load_in(&second, &directory, "same").is_ok());
+        assert_eq!(
+            resolve_delete_workspace_in(&first, &directory, "same").unwrap(),
+            canonical_workspace(&second)
+        );
+        assert!(delete_in(&first, &directory, "same").is_err());
+        assert!(load_in(&second, &directory, "same").is_ok());
+    }
+
+    #[test]
+    fn delete_removes_migrated_legacy_redirect_without_resurrection() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = project_root(temp.path());
+        let directory = session_directory(temp.path());
+        let legacy = super::transcript_path(&legacy_directory(temp.path()), "legacy");
+        write_history(
+            &legacy,
+            SCHEMA_VERSION,
+            "legacy",
+            &["old"],
+            Some(canonical_workspace(&project)),
+        );
+        drop(open(temp.path(), "legacy", true, false, Vec::new()).unwrap());
+        assert!(legacy.exists());
+        delete_in(&project, &directory, "legacy").unwrap();
+        assert!(!legacy.exists());
+        assert!(load(temp.path(), "legacy").is_err());
+        assert!(
+            catalog_for_workspace(&project, &directory)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_rejects_unbound_global_fallback_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(
+            open(
+                temp.path(),
+                "collision",
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "scoped")],
+            )
+            .unwrap(),
+        );
+        let global = super::transcript_path(&session_directory(temp.path()), "collision");
+        write_history(&global, SCHEMA_VERSION, "collision", &["unowned"], None);
+        let before = load(temp.path(), "collision").unwrap();
+        assert!(
+            delete_in(
+                &project_root(temp.path()),
+                &session_directory(temp.path()),
+                "collision"
+            )
+            .unwrap_err()
+            .contains("no workspace binding")
+        );
+        assert!(global.exists());
+        assert_eq!(load(temp.path(), "collision").unwrap(), before);
     }
 
     fn item_text(item: &Item) -> &str {
@@ -7015,7 +7368,8 @@ mod tests {
 
     struct TranscriptOpenFaults {
         deny_transcript_read: bool,
-        // 0: healthy, 1: bufferable device I/O, 2: rejection, 3: directory sync.
+        // 0: healthy, 1: bufferable device I/O, 2: rejection, 3: directory sync,
+        // 4: bufferable transcript unlink, 5: rejected transcript unlink.
         write_failure: Arc<AtomicU64>,
     }
 
@@ -7069,6 +7423,16 @@ mod tests {
             fs::DiskBackend.create_dir(path, private)
         }
         fn remove_file(&self, path: &Path) -> io::Result<()> {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                match self.write_failure.load(Ordering::SeqCst) {
+                    4 => return Err(io::ErrorKind::StorageFull.into()),
+                    5 => return Err(io::ErrorKind::PermissionDenied.into()),
+                    _ => {}
+                }
+            }
             fs::DiskBackend.remove_file(path)
         }
         fn remove_dir(&self, path: &Path) -> io::Result<()> {
@@ -7106,6 +7470,96 @@ mod tests {
         ) -> io::Result<Box<dyn fs::BackendFile>> {
             fs::DiskBackend.open_beneath(root, relative)
         }
+    }
+
+    fn delete_fault_case(mode: u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let failure = Arc::new(AtomicU64::new(0));
+        assert!(
+            fs::initialize_global(Fs::new(Arc::new(TranscriptOpenFaults {
+                deny_transcript_read: false,
+                write_failure: failure.clone(),
+            })))
+            .is_ok()
+        );
+        let project = project_root(temp.path());
+        let directory = session_directory(temp.path());
+        // All parents exist before injecting faults, so lease acquisition and
+        // bootstrap cannot accidentally satisfy the failure assertion.
+        fs::create_dir_all(legacy_directory(temp.path())).unwrap();
+        let global = super::transcript_path(&directory, "delete-fault");
+        write_history(
+            &global,
+            SCHEMA_VERSION,
+            "delete-fault",
+            &["old"],
+            Some(canonical_workspace(&project)),
+        );
+        let opened = open(temp.path(), "delete-fault", true, false, Vec::new()).unwrap();
+        write(
+            &opened.observer,
+            &Item::text(ItemKind::User, "winning tail"),
+        );
+        opened.observer.checkpoint().unwrap();
+        drop(opened);
+        let winner = transcript_path(temp.path(), "delete-fault");
+        let before = std::fs::read(&winner).unwrap();
+        let before_items = load(temp.path(), "delete-fault").unwrap();
+        assert!(global.exists());
+        failure.store(mode, Ordering::SeqCst);
+        let error = delete_in(&project, &directory, "delete-fault").unwrap_err();
+        assert!(error.contains("could not"), "{error}");
+        // A source unlink/sync failure must not progress to the winning file.
+        assert_eq!(std::fs::read(&winner).unwrap(), before);
+        if mode == 3 {
+            // The unlink reached disk, but its directory sync remains queued.
+            assert!(!global.exists());
+        } else {
+            assert!(global.exists());
+        }
+        if mode != 5 {
+            assert!(fs::best_effort_global().status().pending_operations > 0);
+            assert!(finish_delete_recovery(fs::best_effort_global()).is_err());
+            assert_eq!(std::fs::read(&winner).unwrap(), before);
+        }
+        failure.store(0, Ordering::SeqCst);
+        finish_delete_recovery(fs::best_effort_global()).unwrap();
+        assert_eq!(fs::best_effort_global().status().pending_operations, 0);
+        assert_eq!(std::fs::read(&winner).unwrap(), before);
+        assert_eq!(load(temp.path(), "delete-fault").unwrap(), before_items);
+        delete_in(&project, &directory, "delete-fault").unwrap();
+        assert!(!winner.exists());
+        assert!(!global.exists());
+        assert!(load(temp.path(), "delete-fault").is_err());
+        assert!(
+            catalog_for_workspace(&project, &directory)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_buffered_unlink_keeps_winner_until_recovery() {
+        if isolated_process("delete_buffered_unlink_keeps_winner_until_recovery") {
+            return;
+        }
+        delete_fault_case(4);
+    }
+
+    #[test]
+    fn delete_failed_directory_sync_keeps_winner_until_recovery() {
+        if isolated_process("delete_failed_directory_sync_keeps_winner_until_recovery") {
+            return;
+        }
+        delete_fault_case(3);
+    }
+
+    #[test]
+    fn delete_rejected_unlink_keeps_winner() {
+        if isolated_process("delete_rejected_unlink_keeps_winner") {
+            return;
+        }
+        delete_fault_case(5);
     }
 
     fn checkpoint_fault_case(mode: u64, recoverable: bool) {

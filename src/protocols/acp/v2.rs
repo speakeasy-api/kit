@@ -954,6 +954,10 @@ impl Server {
             .get_or_insert_with(wire::SessionCapabilities::new)
             .fork = Some(wire::SessionForkCapabilities::new());
         capabilities
+            .session
+            .get_or_insert_with(wire::SessionCapabilities::new)
+            .delete = Some(wire::SessionDeleteCapabilities::new());
+        capabilities
             .meta
             .get_or_insert_with(Map::new)
             .insert("kit/session/status".into(), serde_json::json!({}));
@@ -1564,24 +1568,73 @@ impl Server {
         &self,
         request: wire::CloseSessionRequest,
     ) -> Result<wire::CloseSessionResponse, AcpRuntimeError> {
-        let (session, close) = {
+        self.close_or_delete(request.session_id, false).await?;
+        Ok(wire::CloseSessionResponse::new())
+    }
+
+    async fn delete(
+        &self,
+        request: wire::DeleteSessionRequest,
+    ) -> Result<wire::DeleteSessionResponse, AcpRuntimeError> {
+        self.close_or_delete(request.session_id, true).await?;
+        Ok(wire::DeleteSessionResponse::new())
+    }
+
+    async fn close_or_delete(
+        &self,
+        session_id: wire::SessionId,
+        delete: bool,
+    ) -> Result<(), AcpRuntimeError> {
+        let owned = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| AcpRuntimeError::ClientClosed)?;
-            let session = sessions
-                .remove(&request.session_id)
-                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-            let close = self.registry.session_close(session.token)?;
-            (session, close)
+            // Resolve the registered close before removing local ownership so a
+            // failed lookup cannot make a live actor unreachable.
+            if let Some(session) = sessions.get(&session_id) {
+                let close = self.registry.session_close(session.token)?;
+                Some((
+                    sessions
+                        .remove(&session_id)
+                        .expect("session remains under lock"),
+                    close,
+                ))
+            } else if delete {
+                None
+            } else {
+                return Err(AcpRuntimeError::SessionNotFound(session_id.to_string()));
+            }
         };
-        // Both explicit close and reset join the registration's one operation.
+        let root = self.runtime.root().to_path_buf();
+
+        // Once local ownership is removed, request cancellation cannot abandon
+        // cleanup or durable deletion. No map guard crosses an await.
+        let workspace_pinned = owned.is_some();
         tokio::spawn(async move {
-            session.integration.close();
-            let result = close().await;
-            drop(session);
-            result?.explicit_result()?;
-            Ok(wire::CloseSessionResponse::new())
+            let root = if let Some((session, close)) = owned {
+                let root = session.cwd.clone();
+                session.integration.close();
+                let result = close().await;
+                drop(session);
+                result?.explicit_result()?;
+                root
+            } else {
+                root
+            };
+            if delete {
+                tokio::task::spawn_blocking(move || {
+                    if workspace_pinned {
+                        crate::session::delete_workspace(&root, &session_id.to_string())
+                    } else {
+                        crate::session::delete(&root, &session_id.to_string())
+                    }
+                })
+                .await
+                .map_err(|_| AcpRuntimeError::ClientClosed)?
+                .map_err(AcpRuntimeError::Loop)?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -3234,6 +3287,20 @@ pub(crate) fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: wire::DeleteSessionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder
+                            .respond_with_result(state.delete(request).await.map_err(sdk_error))
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: wire::CloseSessionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -4148,6 +4215,114 @@ mod tests {
             panic!("expected a single ACP message, got {frame:?}");
         };
         serde_json::to_value(message).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_delete_removes_active_and_closed_history_without_conflating_close() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            None,
+        )
+        .unwrap();
+        let (mut client, agent) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent).await });
+        send_wire(
+            &client,
+            "initialize",
+            1,
+            serde_json::to_value(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("delete-test", "0"),
+            ))
+            .unwrap(),
+        );
+        let initialized = receive_wire(&mut client, "initialize").await;
+        assert!(initialized["result"]["capabilities"]["session"]["delete"].is_object());
+        for closed in [false, true] {
+            send_wire(
+                &client,
+                "session/new",
+                2,
+                serde_json::to_value(wire::NewSessionRequest::new(other.path().to_path_buf()))
+                    .unwrap(),
+            );
+            let created = receive_wire(&mut client, "new").await;
+            let session: wire::NewSessionResponse =
+                serde_json::from_value(created["result"].clone()).unwrap();
+            let id = session.session_id;
+            assert_eq!(
+                receive_wire(&mut client, "commands").await["method"],
+                "session/update"
+            );
+            if closed {
+                send_wire(
+                    &client,
+                    "session/close",
+                    3,
+                    serde_json::to_value(wire::CloseSessionRequest::new(id.clone())).unwrap(),
+                );
+                assert!(
+                    receive_wire(&mut client, "close")
+                        .await
+                        .get("result")
+                        .is_some()
+                );
+                assert!(crate::session::load(other.path(), &id.to_string()).is_ok());
+            }
+            if !closed {
+                drop(
+                    crate::session::open(
+                        root.path(),
+                        &id.to_string(),
+                        false,
+                        false,
+                        vec![Item::text(ItemKind::User, "other workspace")],
+                    )
+                    .unwrap(),
+                );
+            }
+            send_wire(
+                &client,
+                "session/delete",
+                4,
+                serde_json::to_value(wire::DeleteSessionRequest::new(id.clone())).unwrap(),
+            );
+            let deleted = receive_wire(&mut client, "delete").await;
+            assert!(deleted.get("result").is_some(), "delete failed: {deleted}");
+            assert!(crate::session::load(other.path(), &id.to_string()).is_err());
+            if !closed {
+                assert!(crate::session::load(root.path(), &id.to_string()).is_ok());
+                crate::session::delete_workspace(root.path(), &id.to_string()).unwrap();
+            }
+            assert!(
+                !crate::session::catalog(other.path())
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.id == id.to_string())
+            );
+            send_wire(
+                &client,
+                "session/delete",
+                5,
+                serde_json::to_value(wire::DeleteSessionRequest::new(id)).unwrap(),
+            );
+            assert!(
+                receive_wire(&mut client, "missing delete")
+                    .await
+                    .get("error")
+                    .is_some()
+            );
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
