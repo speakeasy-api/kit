@@ -1597,7 +1597,7 @@ impl Server {
                 Some((
                     sessions
                         .remove(&session_id)
-                        .expect("session remains under lock"),
+                        .ok_or(AcpRuntimeError::ClientClosed)?,
                     close,
                 ))
             } else if delete {
@@ -7967,7 +7967,7 @@ for line in sys.stdin:
         assert_eq!(update["upsert"], true);
         assert!(update.get("replacement").is_none());
         assert!(session.inject.is_some());
-        assert!(session.delete.is_none());
+        assert!(session.delete.is_some());
         assert!(session.fork.is_some());
     }
 

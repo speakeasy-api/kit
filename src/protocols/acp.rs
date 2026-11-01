@@ -2104,7 +2104,7 @@ impl Server {
                 Some((
                     sessions
                         .remove(&session_id)
-                        .expect("session remains under lock"),
+                        .ok_or(AcpRuntimeError::ClientClosed)?,
                     close,
                 ))
             } else if delete {
