@@ -1795,7 +1795,7 @@ async fn session_actor_inner<S: ModelSession + Send + 'static>(actor: SessionAct
             }
         }; // Drop the owning futures before handlers reborrow receivers/driver.
         if let Either::Right(Either::Right(Some(task))) = &event {
-            super::plan::observe(task);
+            super::plan::observe(&tasks, Some(task)).await;
         }
         match event {
             Either::Left(command) => match command {
@@ -2052,6 +2052,7 @@ async fn session_actor_inner<S: ModelSession + Send + 'static>(actor: SessionAct
                 None => break,
             },
         }
+        super::plan::observe(&tasks, None).await;
         if let Some(hooks) = runtime.hooks() {
             hooks.drain_turn_events(&session_id.to_string()).await;
         }

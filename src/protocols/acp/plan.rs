@@ -1,7 +1,7 @@
 //! A bounded rolling view of real task-manager work, not an inferred strategy.
 //! The session actor observes events at its existing dequeue boundary: no new
 //! consumer can steal completion events or start an autonomous continuation.
-use agentkit_task_manager::{TaskEvent, TaskKind};
+use agentkit_task_manager::{TaskEvent, TaskKind, TaskManagerHandle, TaskSnapshot};
 
 // Both the actor and structured settlement run in this task. Task-local
 // ownership lets each existing dequeue boundary observe without adding an
@@ -30,11 +30,18 @@ pub(super) async fn scope<T>(
         .await
 }
 
-pub(super) fn observe(event: &TaskEvent) {
+pub(super) async fn observe(tasks: &TaskManagerHandle, event: Option<&TaskEvent>) {
+    if OBSERVER.try_with(|_| ()).is_err() {
+        return;
+    }
+    // Approval interruptions stop the task without emitting a terminal event.
+    // Consult current execution state so queued starts cannot resurrect them.
+    // The manager scans its records here; only the retained plan is bounded.
+    let running = tasks.list_running().await;
     let _ = OBSERVER.try_with(|observer| {
         let snapshot = {
             let mut plan = observer.plan.borrow_mut();
-            plan.observe(event).then(|| plan.clone())
+            plan.reconcile(&running, event).then(|| plan.clone())
         };
         // Release the reducer borrow before invoking transport code.
         if let Some(snapshot) = snapshot {
@@ -60,9 +67,27 @@ pub(super) struct TaskPlan {
 }
 
 impl TaskPlan {
+    fn reconcile(&mut self, running: &[TaskSnapshot], event: Option<&TaskEvent>) -> bool {
+        let before = self.entries.clone();
+        self.entries
+            .retain(|entry| entry.completed || running.iter().any(|task| task.id == entry.id));
+        match event {
+            Some(TaskEvent::Started(snapshot) | TaskEvent::Detached(snapshot)) => {
+                if let Some(current) = running.iter().find(|task| task.id == snapshot.id) {
+                    self.observe(&TaskEvent::Started(current.clone()));
+                }
+            }
+            Some(event) => {
+                self.observe(event);
+            }
+            None => {}
+        }
+        self.entries != before
+    }
+
     /// Failed/cancelled work is removed, never falsely marked successful. v1
     /// has no failed/cancelled status. Results remain on the existing tool cards.
-    pub(super) fn observe(&mut self, event: &TaskEvent) -> bool {
+    fn observe(&mut self, event: &TaskEvent) -> bool {
         let (snapshot, completed) = match event {
             TaskEvent::Started(snapshot) | TaskEvent::Detached(snapshot) => (snapshot, false),
             TaskEvent::Completed(snapshot, result) if !result.is_error => (snapshot, true),
@@ -169,7 +194,6 @@ impl TaskPlan {
 mod tests {
     use super::*;
     use agentkit_core::{MetadataMap, TaskId, ToolCallId, ToolResultPart, TurnId};
-    use agentkit_task_manager::TaskSnapshot;
     use serde_json::{Value, json};
 
     fn snapshot(id: &str) -> TaskSnapshot {
@@ -234,6 +258,27 @@ mod tests {
         );
         assert!(plan.observe(&TaskEvent::Completed(task, result)));
         assert_eq!(entries(&plan).0, json!([]));
+    }
+
+    #[test]
+    fn reconciliation_emits_only_the_final_change() {
+        let mut plan = TaskPlan::default();
+        let task = snapshot("a");
+        let started = TaskEvent::Started(task.clone());
+        assert!(plan.reconcile(std::slice::from_ref(&task), Some(&started)));
+        let completed = TaskEvent::Completed(
+            task.clone(),
+            ToolResultPart::success(
+                task.call_id.clone(),
+                agentkit_core::ToolOutput::Text("done".into()),
+            ),
+        );
+        // Pruning the stopped execution and applying its completion is one update.
+        assert!(plan.reconcile(&[], Some(&completed)));
+        assert_eq!(entries(&plan).0[0]["status"], "completed");
+        assert!(!plan.reconcile(&[], Some(&completed)));
+        assert!(!plan.reconcile(&[], Some(&started)));
+        assert!(!plan.reconcile(&[], None));
     }
 
     #[test]
