@@ -1749,6 +1749,23 @@ struct SessionActor<S: ModelSession> {
 }
 
 async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
+    let sink = actor.sink.clone();
+    let session_id = actor.session_id.clone();
+    super::plan::scope(
+        move |plan| {
+            if let Err(error) = sink.update(wire::UpdateSessionNotification::new(
+                session_id.clone(),
+                plan.v2(),
+            )) {
+                tracing::debug!(%error, "failed to queue ACP v2 task plan");
+            }
+        },
+        session_actor_inner(actor),
+    )
+    .await;
+}
+
+async fn session_actor_inner<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
     let SessionActor {
         subagents,
         mut voice_monitor,
@@ -1793,6 +1810,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }),
             }
         }; // Drop the owning futures before handlers reborrow receivers/driver.
+        if let Either::Right(Either::Right(Some(task))) = &event {
+            super::plan::observe(&tasks, Some(task)).await;
+        }
         match event {
             Either::Left(command) => match command {
                 Some(Command::Prompt(command)) => {
@@ -2051,6 +2071,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 None => break,
             },
         }
+        super::plan::observe(&tasks, None).await;
         if let Some(hooks) = runtime.hooks() {
             hooks.drain_turn_events(&session_id.to_string()).await;
         }

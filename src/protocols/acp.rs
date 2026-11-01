@@ -57,6 +57,7 @@ use tracing::Instrument as _;
 mod activity;
 mod compaction_projection;
 pub(crate) mod model_switch;
+mod plan;
 mod session_info;
 mod session_pagination;
 mod skill_catalog;
@@ -2264,6 +2265,22 @@ struct SessionActor<S: ModelSession> {
 }
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
+    let client = actor.client.clone();
+    let session_id = actor.session_id.clone();
+    plan::scope(
+        move |plan| {
+            if let Err(error) =
+                client.notify_session(SessionNotification::new(session_id.clone(), plan.v1()))
+            {
+                tracing::debug!(%error, "failed to queue ACP v1 task plan");
+            }
+        },
+        session_actor_inner(actor),
+    )
+    .await;
+}
+
+async fn session_actor_inner<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
         client,
         subagents,
@@ -2306,6 +2323,9 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 }),
             }
         }; // Drop the owning futures before handlers reborrow receivers/driver.
+        if let Either::Right(Either::Right(Some(task))) = &event {
+            plan::observe(&tasks, Some(task)).await;
+        }
         match event {
             Either::Left(command) => match command {
                 Some(Command::Prompt { request, reply }) => {
@@ -2548,6 +2568,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 None => break,
             },
         }
+        plan::observe(&tasks, None).await;
         if let Some(hooks) = runtime.hooks() {
             hooks.drain_turn_events(&session_id.to_string()).await;
         }
@@ -2695,6 +2716,9 @@ pub(super) async fn settle_background_jobs(
                 Either::Right((event, _pending)) => Either::Right(event),
             }
         };
+        if let Either::Right(Some(task)) = &event {
+            plan::observe(tasks, Some(task)).await;
+        }
         match event {
             Either::Left(()) => {}
             Either::Right(event) => match event {
@@ -6574,16 +6598,33 @@ pub(super) mod tests {
             .await
             .unwrap();
 
+        let (plans_tx, mut plans_rx) = mpsc::unbounded_channel();
         assert!(
             timeout(
                 Duration::from_secs(1),
-                settle_background_jobs(&tasks, &jobs)
+                plan::scope(
+                    move |plan| {
+                        let _ = plans_tx.send(plan.v1());
+                    },
+                    settle_background_jobs(&tasks, &jobs)
+                )
             )
             .await
             .expect("failed background terminal did not settle")
             .unwrap()
         );
         assert!(tasks.list_running().await.is_empty());
+        let mut plans = Vec::new();
+        while let Ok(SessionUpdate::Plan(plan)) = plans_rx.try_recv() {
+            plans.push(plan);
+        }
+        // Fast failures may finish before their queued Started event is observed.
+        assert!(plans.last().is_none_or(|plan| plan.entries.is_empty()));
+        assert!(plans.iter().all(|plan| {
+            plan.entries
+                .iter()
+                .all(|entry| entry.status != agentkit_acp::PlanEntryStatus::Completed)
+        }));
     }
 
     #[tokio::test]
@@ -6606,6 +6647,271 @@ pub(super) mod tests {
             .expect("forced cancellation did not settle")
             .unwrap()
         );
+    }
+
+    struct PlanApprovalAdapter(usize);
+    struct PlanApprovalSession(usize);
+
+    #[async_trait]
+    impl ModelAdapter for PlanApprovalAdapter {
+        type Session = PlanApprovalSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(PlanApprovalSession(self.0))
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for PlanApprovalSession {
+        type Turn = ScriptTurn;
+
+        async fn begin_turn(
+            &mut self,
+            _request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let calls: Vec<_> = (0..std::mem::take(&mut self.0))
+                .map(|index| ToolCallPart::new(format!("approval-{index}"), "approval", json!({})))
+                .collect();
+            let mut events: VecDeque<_> = calls
+                .iter()
+                .cloned()
+                .map(ModelTurnEvent::ToolCall)
+                .collect();
+            events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
+                model: None,
+                response_id: None,
+                finish_reason: if calls.is_empty() {
+                    FinishReason::Completed
+                } else {
+                    FinishReason::ToolCall
+                },
+                output_items: if calls.is_empty() {
+                    vec![Item::text(ItemKind::Assistant, "done")]
+                } else {
+                    vec![Item {
+                        id: None,
+                        kind: ItemKind::Assistant,
+                        parts: calls.into_iter().map(Part::ToolCall).collect(),
+                        metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
+                    }]
+                },
+                usage: None,
+                metadata: MetadataMap::new(),
+            }));
+            Ok(ScriptTurn { events })
+        }
+    }
+
+    // Fake only the tool boundary; scheduling, approvals and denial results use
+    // the real task manager and loop driver.
+    struct PlanApprovalExecutor(Option<Arc<Notify>>);
+
+    #[async_trait]
+    impl ToolExecutor for PlanApprovalExecutor {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: ToolName::new("approval"),
+                description: "requires approval".into(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            }]
+        }
+
+        async fn execute(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> agentkit_tools_core::ToolExecutionOutcome {
+            use agentkit_tools_core::{
+                ApprovalReason, ApprovalRequest, ToolExecutionOutcome, ToolInterruption,
+            };
+            if let Some(release) = &self.0 {
+                release.notified().await;
+            }
+            ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(ApprovalRequest {
+                task_id: None,
+                call_id: Some(request.call_id),
+                id: "plan-approval".into(),
+                request_kind: "tool.test".into(),
+                reason: ApprovalReason::SensitivePath,
+                summary: "requires approval".into(),
+                metadata: MetadataMap::new(),
+            }))
+        }
+
+        async fn execute_approved(
+            &self,
+            request: ToolRequest,
+            _approval: &agentkit_tools_core::ApprovalRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> agentkit_tools_core::ToolExecutionOutcome {
+            agentkit_tools_core::ToolExecutionOutcome::Completed(ToolResult {
+                result: ToolResultPart::success(
+                    request.call_id,
+                    ToolOutput::Text("approved".into()),
+                ),
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
+    async fn approval_task_plan_case(count: usize, approve: bool, observe_before_approval: bool) {
+        use agentkit_tools_core::ApprovalDecision;
+        let manager = AsyncTaskManager::new();
+        let tasks = manager.handle();
+        let release = observe_before_approval.then(|| Arc::new(Notify::new()));
+        let mut driver = Agent::builder()
+            .model(PlanApprovalAdapter(count))
+            .tool_executor(PlanApprovalExecutor(release.clone()))
+            .task_manager(manager)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(AgentkitSessionId::new("plan-approval")).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "run the tools")])
+            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        plan::scope(
+            move |plan| {
+                tx.send(plan.v1()).unwrap();
+            },
+            async {
+                let mut step = if let Some(release) = release {
+                    assert_eq!(count, 1);
+                    let observation = async {
+                        let started = tasks.next_event().await.unwrap();
+                        assert!(matches!(started, TaskEvent::Started(_)));
+                        plan::observe(&tasks, Some(&started)).await;
+                        release.notify_one();
+                    };
+                    let (step, ()) = tokio::join!(driver.next(), observation);
+                    step.unwrap()
+                } else {
+                    driver.next().await.unwrap()
+                };
+                let mut approvals = 0;
+                loop {
+                    match step {
+                        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                            approvals += 1;
+                            driver
+                                .resolve_approval_for(
+                                    pending.request.call_id.unwrap(),
+                                    if approve {
+                                        ApprovalDecision::Approve
+                                    } else {
+                                        ApprovalDecision::Deny { reason: None }
+                                    },
+                                )
+                                .unwrap();
+                        }
+                        LoopStep::Finished(result)
+                            if result.finish_reason != FinishReason::ToolCall =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                    step = driver.next().await.unwrap();
+                }
+                assert_eq!(approvals, count);
+                let transcript = driver.snapshot().transcript;
+                let results: Vec<_> = transcript
+                    .iter()
+                    .flat_map(|item| &item.parts)
+                    .filter_map(|part| {
+                        if let Part::ToolResult(result) = part {
+                            Some(result)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(results.len(), count);
+                assert!(results.iter().all(|result| result.is_error != approve));
+                assert!(tasks.list_running().await.is_empty());
+                // This is the post-handler reconciliation, before any queued starts.
+                plan::observe(&tasks, None).await;
+                // Real denied approvals emit only Started. Approved executions reuse
+                // the task ID and emit a second Started followed by Completed.
+                while let Some(Some(event)) = tasks.next_event().now_or_never() {
+                    plan::observe(&tasks, Some(&event)).await;
+                }
+            },
+        )
+        .await;
+        let mut plans = Vec::new();
+        while let Ok(SessionUpdate::Plan(plan)) = rx.try_recv() {
+            plans.push(plan);
+        }
+        if approve {
+            let entries = &plans.last().unwrap().entries;
+            assert_eq!(entries.len(), count);
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.status == agentkit_acp::PlanEntryStatus::Completed)
+            );
+        } else if observe_before_approval {
+            assert!(
+                plans
+                    .first()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .any(|entry| entry.status == agentkit_acp::PlanEntryStatus::InProgress)
+            );
+            assert!(plans.last().unwrap().entries.is_empty());
+            assert!(plans.iter().all(|plan| {
+                plan.entries
+                    .iter()
+                    .all(|entry| entry.status != agentkit_acp::PlanEntryStatus::Completed)
+            }));
+        } else {
+            assert!(
+                plans.is_empty(),
+                "denied tasks must not resurrect from delayed starts"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_denial_reconciles_visible_task_without_terminal_event() {
+        timeout(
+            Duration::from_secs(5),
+            approval_task_plan_case(1, false, true),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_denied_approvals_exceed_plan_capacity_without_tombstones() {
+        timeout(
+            Duration::from_secs(5),
+            approval_task_plan_case(70, false, false),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_task_retry_completes_after_delayed_starts() {
+        timeout(
+            Duration::from_secs(5),
+            approval_task_plan_case(1, true, false),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7234,9 +7540,13 @@ pub(super) mod tests {
             completed[0].kind,
             agentkit_task_manager::TaskKind::Background
         );
+        let mut task_plans = Vec::new();
         let notification = timeout(Duration::from_secs(1), async {
             loop {
                 let notification = updates_rx.recv().await.expect("update stream closed");
+                if let SessionUpdate::Plan(plan) = &notification.update {
+                    task_plans.push(plan.clone());
+                }
                 if let agentkit_acp::SessionUpdate::AgentMessageChunk(chunk) = &notification.update
                     && let agentkit_acp::ContentBlock::Text(text) = &chunk.content
                     && text.text == "autonomous background completion"
@@ -7248,6 +7558,15 @@ pub(super) mod tests {
         .await
         .expect("completion did not produce an unsolicited agent update");
         assert_eq!(notification.session_id.to_string(), "s-actor-session");
+        assert!(
+            task_plans
+                .iter()
+                .any(|plan| plan.entries.iter().any(|entry| {
+                    entry.content == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && entry.priority == agentkit_acp::PlanEntryPriority::Low
+                        && entry.status == agentkit_acp::PlanEntryStatus::Completed
+                }))
+        );
         assert!(observed_handoff.load(Ordering::SeqCst));
         let started = turn_states_rx.recv().await.expect("missing turn start");
         let ended = turn_states_rx.recv().await.expect("missing turn end");
