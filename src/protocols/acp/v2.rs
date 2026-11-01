@@ -2714,31 +2714,16 @@ fn partial_transcript_replay(
     let Some(cursor) = cursor else {
         return Ok(updates);
     };
-    // Legacy replay IDs use item offsets and are not stable under compaction.
-    // Accept only IDs carried in durable metadata (including thought sections).
-    let mut retained = std::collections::HashSet::new();
-    for item in transcript {
-        if let Some(id) = item.metadata.get(identity::KEY).and_then(Value::as_str) {
-            retained.insert(id.to_owned());
-        }
-        for part in &item.parts {
-            let metadata = match part {
-                Part::Text(text) => &text.metadata,
-                Part::Reasoning(reasoning) => &reasoning.metadata,
-                _ => continue,
-            };
-            if let Some(id) = metadata.get(identity::KEY).and_then(Value::as_str) {
-                retained.insert(id.to_owned());
-            }
-            if let Some(sections) = metadata.get(identity::SECTIONS_KEY)
-                && let Ok(sections) =
-                    serde_json::from_value::<Vec<identity::ThoughtSection>>(sections.clone())
-            {
-                retained.extend(sections.into_iter().map(|section| section.id));
-            }
-        }
-    }
-    if cursor.session_id != session_id.to_string() || !retained.contains(&cursor.message_id) {
+    // User messages are stable replay boundaries. Assistant messages/thoughts
+    // can accumulate content across each other's first-seen positions, so an
+    // assistant identity is not a safe cut through a consolidated response.
+    let retained = transcript
+        .iter()
+        .filter(|item| item.kind == ItemKind::User)
+        .filter_map(|item| item.metadata.get(identity::KEY).and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    if cursor.session_id != session_id.to_string() || !retained.contains(cursor.message_id.as_str())
+    {
         return Err(invalid_replay_cursor());
     }
     let position = updates
@@ -2746,8 +2731,6 @@ fn partial_transcript_replay(
         .position(|notification| {
             let id = match &notification.update {
                 wire::SessionUpdate::UserMessage(message) => &message.message_id,
-                wire::SessionUpdate::AgentMessage(message) => &message.message_id,
-                wire::SessionUpdate::AgentThought(message) => &message.message_id,
                 _ => return false,
             };
             id.to_string() == cursor.message_id
@@ -8102,6 +8085,51 @@ for line in sys.stdin:
             let cursor: wire::ReplayFrom = serde_json::from_value(value).unwrap();
             assert!(parse_replay_cursor(Some(&cursor), &session).is_err());
         }
+    }
+
+    #[test]
+    fn partial_replay_rejects_cuts_through_consolidated_assistant_messages() {
+        let session = wire::SessionId::new("saved");
+        let mut user = Item::text(ItemKind::User, "question");
+        let user_id = identity::stamp_user(std::slice::from_mut(&mut user));
+        let mut response = Item::text(ItemKind::Assistant, "a");
+        let mut thought = agentkit_core::ReasoningPart::summary("thought");
+        thought
+            .metadata
+            .insert(identity::KEY.into(), "thought-id".into());
+        response.parts.push(Part::Reasoning(thought));
+        response.parts.push(Part::text("b"));
+        for part in &mut response.parts {
+            if let Part::Text(text) = part {
+                text.metadata
+                    .insert(identity::KEY.into(), "agent-id".into());
+            }
+        }
+        let transcript = [user, response];
+        let replay = transcript_replay(&session, &transcript);
+        assert!(
+            matches!(&replay[1].update, wire::SessionUpdate::AgentMessage(message) if message.content.len() == 2)
+        );
+        for id in ["thought-id", "agent-id"] {
+            let cursor = ReplayCursor {
+                session_id: "saved".into(),
+                message_id: id.into(),
+                _meta: None,
+            };
+            assert!(matches!(
+                partial_transcript_replay(&session, &transcript, Some(&cursor)),
+                Err(AcpRuntimeError::Unsupported(_))
+            ));
+        }
+        let cursor = ReplayCursor {
+            session_id: "saved".into(),
+            message_id: user_id.to_string(),
+            _meta: None,
+        };
+        assert_eq!(
+            partial_transcript_replay(&session, &transcript, Some(&cursor)).unwrap(),
+            replay
+        );
     }
 
     #[test]

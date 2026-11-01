@@ -240,15 +240,15 @@ ACP clients can supply additional stdio MCP servers per session: use `mcpServers
 
 ### Replay retained ACP v2 messages
 
-To rebuild a conversation after reconnecting, send `session/resume` with `replayFrom: {"type":"start"}`. To replay only a suffix, use Kit's inclusive cursor with a message ID previously received from that session:
+To rebuild a conversation after reconnecting, send `session/resume` with `replayFrom: {"type":"start"}`. To replay only a suffix, use Kit's inclusive cursor with a durable user-message ID previously received from that session:
 
 ```json
 {"type":"_kit_message","sessionId":"SESSION_ID","messageId":"MESSAGE_ID"}
 ```
 
-Set this object as `replayFrom`; its `sessionId` must match the request's `sessionId`. Replay includes the identified complete user message, agent message, or agent thought and all later retained updates. Store the cursor with the session ID and deduplicate complete messages by message ID. The cursor is not an HTTP SSE event ID and does not resume an interrupted model request.
+Set this object as `replayFrom`; its `sessionId` must match the request's `sessionId`. Replay includes the identified complete user message and all later retained updates. Store the cursor with the session ID and deduplicate complete messages by message ID. The cursor is not an HTTP SSE event ID and does not resume an interrupted model request.
 
-Only messages with durable identities support partial replay. Legacy offset-based replay IDs, tool-call IDs, unknown IDs, and IDs removed by compaction are rejected with JSON-RPC `-32602` (Invalid params), as are malformed or session-mismatched cursors. Retry explicitly with `{"type":"start"}` to rebuild from retained history; Kit does not silently fall back to a different position.
+Only user messages with durable identities support partial replay. Agent-message and thought IDs cannot be used as boundaries because their content can accumulate across other messages in the same response; choose the preceding user message instead. Agent-message IDs, thought IDs, legacy offset-based replay IDs, tool-call IDs, unknown IDs, and IDs removed by compaction are rejected with JSON-RPC `-32602` (Invalid params), as are malformed or session-mismatched cursors. Retry explicitly with `{"type":"start"}` to rebuild from retained history; Kit does not silently fall back to a different position.
 
 ## Configure `~/.kit/config.toml`
 
