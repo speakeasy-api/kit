@@ -15,6 +15,8 @@ use std::{
 use agent_client_protocol::{ByteStreams, UntypedMessage};
 
 mod messages;
+#[cfg(test)]
+mod negotiation_tests;
 mod protocol;
 mod stream;
 pub(crate) mod transcript;
@@ -614,6 +616,11 @@ async fn next_actor_event(
     .await
 }
 
+enum Startup {
+    Session(Box<Ready>),
+    RetryV1,
+}
+
 struct Ready {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
@@ -1078,82 +1085,110 @@ impl ChildSession {
         cancellation: TurnCancellation,
     ) -> Result<(Self, ChildOutput), ChildError> {
         let context = config.harnesses.launch_context(&harness);
-        let actor_context = context.clone();
-        let (tx, mut rx) = mpsc::channel(1);
-        let (ready_tx, mut ready_rx) = oneshot::channel();
-        let (closed_tx, closed_rx) = watch::channel(false);
-        let actor_tx = tx.clone();
-        let mut task = tokio::spawn(async move {
-            let result = run(
-                RunConfig {
-                    config,
-                    harness,
-                    persisted,
-                    model,
-                    depth,
-                    context: actor_context,
-                },
-                &mut rx,
-                ready_tx,
-                closed_tx.clone(),
+        let deadline = tokio::time::Instant::now() + HANDSHAKE;
+        let mut offer = protocol::Version::V2;
+        loop {
+            let actor_context = context.clone();
+            let config = config.clone();
+            let harness = harness.clone();
+            let persisted = persisted.clone();
+            let model = model.clone();
+            let (tx, mut rx) = mpsc::channel(1);
+            let (ready_tx, mut ready_rx) = oneshot::channel();
+            let (closed_tx, closed_rx) = watch::channel(false);
+            let actor_tx = tx.clone();
+            let mut task = tokio::spawn(async move {
+                let result = run(
+                    RunConfig {
+                        config,
+                        harness,
+                        persisted,
+                        model,
+                        depth,
+                        offer,
+                        context: actor_context,
+                    },
+                    &mut rx,
+                    ready_tx,
+                    closed_tx.clone(),
+                )
+                .await;
+                let _ = closed_tx.send(true);
+                result
+            });
+            // Startup is a one-shot race, not a scheduler: either simultaneous result
+            // was valid before. Prefer readiness, then actor exit, over cancellation
+            // and timeout; abort and join the actor on cancellation/timeout as before.
+            let result = match select(
+                select(&mut ready_rx, &mut task),
+                select(
+                    std::pin::pin!(cancellation.cancelled()),
+                    std::pin::pin!(tokio::time::sleep_until(deadline)),
+                ),
             )
-            .await;
-            let _ = closed_tx.send(true);
-            result
-        });
-        // Startup is a one-shot race, not a scheduler: either simultaneous result
-        // was valid before. Prefer readiness, then actor exit, over cancellation
-        // and timeout; abort and join the actor on cancellation/timeout as before.
-        let result = match select(
-            select(&mut ready_rx, &mut task),
-            select(
-                std::pin::pin!(cancellation.cancelled()),
-                std::pin::pin!(tokio::time::sleep(HANDSHAKE)),
-            ),
-        )
-        .await
-        {
-            Either::Left((Either::Left((ready, _)), _)) => match ready {
-                Ok(Ok(ready)) => Ok(ready),
-                Ok(Err(error)) => Err(ChildError::Failed(error)),
-                Err(_) => {
-                    return Err(ChildError::Failed(match task.await {
+            .await
+            {
+                Either::Left((Either::Left((ready, _)), _)) => match ready {
+                    Ok(Ok(Startup::Session(ready))) => Ok(*ready),
+                    Ok(Ok(Startup::RetryV1)) => {
+                        // Tear down the rejected connection and its process before a
+                        // single v1 attempt. Never initialize the same peer twice.
+                        task.abort();
+                        let _ = task.await;
+                        if cancellation.is_cancelled() {
+                            return Err(ChildError::Cancelled);
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(ChildError::Failed(context.error(
+                                "handshake timeout",
+                                format!("no response within {} seconds", HANDSHAKE.as_secs()),
+                            )));
+                        }
+                        offer = protocol::Version::V1;
+                        continue;
+                    }
+                    Ok(Err(error)) => Err(ChildError::Failed(error)),
+                    Err(_) => {
+                        return Err(ChildError::Failed(match task.await {
+                            Ok(Ok(())) => "nested agent exited during startup".into(),
+                            Ok(Err(error)) => error,
+                            Err(error) => format!("nested agent startup actor failed: {error}"),
+                        }));
+                    }
+                },
+                Either::Right((Either::Left(((), _)), _)) => Err(ChildError::Cancelled),
+                Either::Right((Either::Right(((), _)), _)) => {
+                    Err(ChildError::Failed(context.error(
+                        "handshake timeout",
+                        format!("no response within {} seconds", HANDSHAKE.as_secs()),
+                    )))
+                }
+                Either::Left((Either::Right((joined, _)), _)) => {
+                    return Err(ChildError::Failed(match joined {
                         Ok(Ok(())) => "nested agent exited during startup".into(),
-                        Ok(Err(error)) => error,
-                        Err(error) => format!("nested agent startup actor failed: {error}"),
+                        Ok(Err(e)) => e,
+                        Err(e) => format!("nested agent startup actor failed: {e}"),
                     }));
                 }
-            },
-            Either::Right((Either::Left(((), _)), _)) => Err(ChildError::Cancelled),
-            Either::Right((Either::Right(((), _)), _)) => Err(ChildError::Failed(context.error(
-                "handshake timeout",
-                format!("no response within {} seconds", HANDSHAKE.as_secs()),
-            ))),
-            Either::Left((Either::Right((joined, _)), _)) => {
-                return Err(ChildError::Failed(match joined {
-                    Ok(Ok(())) => "nested agent exited during startup".into(),
-                    Ok(Err(e)) => e,
-                    Err(e) => format!("nested agent startup actor failed: {e}"),
-                }));
-            }
-        };
-        match result {
-            Ok(ready) => Ok((
-                Self {
-                    tx: actor_tx,
-                    session_id: ready.session_id,
-                    capabilities: ready.capabilities,
-                    serial: Arc::new(tokio::sync::Mutex::new(())),
-                    closed: closed_rx,
-                    descendant_parent: ready.descendant_parent,
-                },
-                ready.replay,
-            )),
-            Err(error) => {
-                task.abort();
-                let _ = task.await;
-                Err(error)
-            }
+            };
+            return match result {
+                Ok(ready) => Ok((
+                    Self {
+                        tx: actor_tx,
+                        session_id: ready.session_id,
+                        capabilities: ready.capabilities,
+                        serial: Arc::new(tokio::sync::Mutex::new(())),
+                        closed: closed_rx,
+                        descendant_parent: ready.descendant_parent,
+                    },
+                    ready.replay,
+                )),
+                Err(error) => {
+                    task.abort();
+                    let _ = task.await;
+                    Err(error)
+                }
+            };
         }
     }
 
@@ -1361,6 +1396,7 @@ struct RunConfig {
     model: Option<String>,
     depth: usize,
     context: LaunchContext,
+    offer: protocol::Version,
 }
 
 /// Keeps a nested harness's private runtime events out of the parent runtime.
@@ -1426,7 +1462,7 @@ fn child_request_error(
 async fn run(
     run_config: RunConfig,
     rx: &mut mpsc::Receiver<Request>,
-    ready: oneshot::Sender<Result<Ready, String>>,
+    ready: oneshot::Sender<Result<Startup, String>>,
     closed: watch::Sender<bool>,
 ) -> Result<(), String> {
     let RunConfig {
@@ -1436,6 +1472,7 @@ async fn run(
         model,
         depth,
         context,
+        offer,
     } = run_config;
     let permission_policy = config.harnesses.permission_policy(&harness)?;
     let mut command = config.harnesses.spawn(
@@ -1591,9 +1628,13 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = match protocol::initialize(&connection).await {
+            let initialized = match protocol::initialize(&connection, offer).await {
                 Ok(initialized) => initialized,
                 Err(error) => {
+                    if offer == protocol::Version::V2 && protocol::requires_v1(&error) {
+                        let _ = ready.send(Ok(Startup::RetryV1));
+                        return std::future::pending().await;
+                    }
                     if let Some(message) = child_auth_required(&error, &[]) {
                         // Publish a received auth response before process-exit
                         // classification can replace it with a generic failure.
@@ -1697,12 +1738,12 @@ async fn run(
                 return Err(agent_client_protocol::Error::internal_error());
             }
             ready_flag.store(true, Ordering::Release);
-            let _ = ready.send(Ok(Ready {
+            let _ = ready.send(Ok(Startup::Session(Box::new(Ready {
                 session_id: session.session_id,
                 capabilities,
                 descendant_parent,
                 replay,
-            }));
+            }))));
             let mut next_branch = 0;
             loop {
                 let request = match next_actor_event(rx, &mut fatal_rx, &mut tasks, &mut next_branch).await {

@@ -10,10 +10,14 @@ use agentkit_acp as v1;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
+#[cfg(test)]
+mod negotiation_tests;
+
 // The SDK's stock Client builder pins v1 (and rewrites initialize), while
 // Client.v2() rejects v1. These JSON-RPC roles leave protocol selection to this
-// module so one subprocess can negotiate either version without a second
-// initialization or respawn. Request payloads still use the SDK's typed schemas.
+// module without reinitializing a connection. An explicit v2 rejection may
+// cause the caller to start a fresh process with a v1 offer. Request payloads
+// still use the SDK's typed schemas.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Client;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,19 +67,25 @@ pub(super) struct PermissionRequest {
     pub options: Vec<v1::PermissionOption>,
 }
 
-fn initialize_params() -> Result<Value, Error> {
+fn initialize_params(version: Version) -> Result<Value, Error> {
     let mut params = serde_json::to_value(
-        v1::InitializeRequest::new(ProtocolVersion::V2)
-            .client_info(v1::Implementation::new("kit", env!("CARGO_PKG_VERSION")))
-            .client_capabilities(
-                v1::ClientCapabilities::new()
-                    .subagents(v1::SubagentCapabilities::default())
-                    .session(
-                        v1::ClientSessionCapabilities::new()
-                            .compaction(v1::CompactionCapabilities::default()),
-                    ),
-            ),
+        v1::InitializeRequest::new(match version {
+            Version::V1 => ProtocolVersion::V1,
+            Version::V2 => ProtocolVersion::V2,
+        })
+        .client_info(v1::Implementation::new("kit", env!("CARGO_PKG_VERSION")))
+        .client_capabilities(
+            v1::ClientCapabilities::new()
+                .subagents(v1::SubagentCapabilities::default())
+                .session(
+                    v1::ClientSessionCapabilities::new()
+                        .compaction(v1::CompactionCapabilities::default()),
+                ),
+        ),
     )?;
+    if version == Version::V1 {
+        return Ok(params);
+    }
     let v2_params = serde_json::to_value(v2::InitializeRequest::new(
         ProtocolVersion::V2,
         v2::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
@@ -88,12 +98,32 @@ fn initialize_params() -> Result<Value, Error> {
 
 pub(super) type Initialized = (Version, v1::AgentCapabilities, Vec<v1::AuthMethod>, bool);
 
-pub(super) async fn initialize(connection: &ConnectionTo<Agent>) -> Result<Initialized, Error> {
+// ACP has no structured supported-version error. Recognize the explicit SDK
+// rejection, not arbitrary invalid requests or messages containing "version".
+pub(super) fn requires_v1(error: &Error) -> bool {
+    const REJECTION: &str =
+        "unsupported ACP protocol version 2; this endpoint only supports ACP protocol version 1";
+    error.code == agent_client_protocol::ErrorCode::InvalidRequest
+        && (error.data.as_ref().and_then(Value::as_str) == Some(REJECTION)
+            || error.message == REJECTION)
+}
+
+pub(super) async fn initialize(
+    connection: &ConnectionTo<Agent>,
+    offer: Version,
+) -> Result<Initialized, Error> {
     let response = connection
-        .send_request(UntypedMessage::new("initialize", initialize_params()?)?)
+        .send_request(UntypedMessage::new(
+            "initialize",
+            initialize_params(offer)?,
+        )?)
         .block_task()
         .await?;
-    negotiated(response)
+    let initialized = negotiated(response)?;
+    if offer == Version::V1 && initialized.0 != Version::V1 {
+        return Err(Error::invalid_request());
+    }
+    Ok(initialized)
 }
 
 fn negotiated(response: Value) -> Result<Initialized, Error> {
@@ -337,7 +367,7 @@ mod tests {
 
     #[test]
     fn handshake_identifies_kit_without_advertising_services() {
-        let params = initialize_params().unwrap();
+        let params = initialize_params(Version::V2).unwrap();
         assert_eq!(params["protocolVersion"], 2);
         assert_eq!(params["clientInfo"], params["info"]);
         assert_eq!(params["info"]["name"], "kit");
