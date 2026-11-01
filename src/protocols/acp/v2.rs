@@ -4262,6 +4262,15 @@ mod tests {
                 receive_wire(&mut client, "commands").await["method"],
                 "session/update"
             );
+            // Creation now publishes metadata after available commands. Consume
+            // that notification before expecting a close/delete response.
+            let metadata = receive_wire(&mut client, "session metadata notification").await;
+            assert_eq!(metadata["method"], "session/update");
+            assert_eq!(metadata["params"]["sessionId"], id.to_string());
+            assert_eq!(
+                metadata["params"]["update"]["sessionUpdate"],
+                "session_info_update"
+            );
             if closed {
                 send_wire(
                     &client,
