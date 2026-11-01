@@ -17,14 +17,15 @@ use agentkit_acp::{
     AgentAuthCapabilities, AudioContent, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
     AuthenticateResponse, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
     BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
-    LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
-    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionForkCapabilities, SessionInfo, SessionListCapabilities,
+    ContentBlock, ContentChunk, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
+    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, ImageContent,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
+    NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities,
+    PromptRequest, PromptResponse, ResourceLink, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionDeleteCapabilities, SessionForkCapabilities, SessionInfo, SessionListCapabilities,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, TextContent, TextResourceContents, ToolCallStatus,
     ToolCallUpdateFields,
@@ -615,6 +616,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    cwd: PathBuf,
     subagents: Option<crate::tools::Subagents>,
     voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
@@ -2026,6 +2028,7 @@ impl Server {
             &mut admission,
             registered,
             SessionHandle {
+                cwd: runtime.root().to_path_buf(),
                 subagents: Some(driver.subagents),
                 voice_state,
                 token,
@@ -2129,29 +2132,73 @@ impl Server {
         &self,
         request: CloseSessionRequest,
     ) -> Result<CloseSessionResponse, AcpRuntimeError> {
-        // Closing uses the same out-of-band interrupt, then waits for the
-        // actor to reach and acknowledge the serialized close boundary.
-        let (session, close) = {
+        self.close_or_delete(request.session_id, false).await?;
+        Ok(CloseSessionResponse::new())
+    }
+
+    async fn delete(
+        &self,
+        request: DeleteSessionRequest,
+    ) -> Result<DeleteSessionResponse, AcpRuntimeError> {
+        self.close_or_delete(request.session_id, true).await?;
+        Ok(DeleteSessionResponse::new())
+    }
+
+    async fn close_or_delete(
+        &self,
+        session_id: agentkit_acp::SessionId,
+        delete: bool,
+    ) -> Result<(), AcpRuntimeError> {
+        let owned = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| AcpRuntimeError::ClientClosed)?;
-            let session = sessions
-                .remove(&request.session_id)
-                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-            // Actor removal takes the local map first, so registration remains
-            // available until we have captured its shared close operation.
-            let close = self.registry.session_close(session.token)?;
-            (session, close)
+            // Resolve the registered close before removing local ownership so a
+            // failed lookup cannot make a live actor unreachable.
+            if let Some(session) = sessions.get(&session_id) {
+                let close = self.registry.session_close(session.token)?;
+                Some((
+                    sessions
+                        .remove(&session_id)
+                        .ok_or(AcpRuntimeError::ClientClosed)?,
+                    close,
+                ))
+            } else if delete {
+                None
+            } else {
+                return Err(AcpRuntimeError::SessionNotFound(session_id.to_string()));
+            }
         };
+        let root = self.runtime.root().to_path_buf();
         let integration = Arc::clone(&self.integration);
-        // Request cancellation must not abandon cleanup after local removal.
+        // Once local ownership is removed, request cancellation cannot abandon
+        // cleanup or durable deletion. No map guard crosses an await.
+        let workspace_pinned = owned.is_some();
         tokio::spawn(async move {
-            let _ = integration.interrupt_session(&request.session_id);
-            let result = close().await;
-            drop(session); // Keep the command sender alive through close.
-            result?.explicit_result()?;
-            Ok(CloseSessionResponse::new())
+            let root = if let Some((session, close)) = owned {
+                let root = session.cwd.clone();
+                let _ = integration.interrupt_session(&session_id);
+                let result = close().await;
+                drop(session);
+                result?.explicit_result()?;
+                root
+            } else {
+                root
+            };
+            if delete {
+                tokio::task::spawn_blocking(move || {
+                    if workspace_pinned {
+                        crate::session::delete_workspace(&root, &session_id.to_string())
+                    } else {
+                        crate::session::delete(&root, &session_id.to_string())
+                    }
+                })
+                .await
+                .map_err(|_| AcpRuntimeError::ClientClosed)?
+                .map_err(AcpRuntimeError::Loop)?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -3419,6 +3466,20 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: DeleteSessionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder
+                            .respond_with_result(state.delete(request).await.map_err(sdk_error))
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: CloseSessionRequest, responder, cx| {
                     let span = crate::telemetry::incoming::span(request.meta.as_ref());
 
@@ -3473,7 +3534,8 @@ fn capabilities(logout_authentication: bool) -> agentkit_acp::AgentCapabilities 
                 .list(SessionListCapabilities::new())
                 .fork(SessionForkCapabilities::new())
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
-                .close(SessionCloseCapabilities::new()),
+                .close(SessionCloseCapabilities::new())
+                .delete(SessionDeleteCapabilities::new()),
         );
     if logout_authentication {
         capabilities.auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
@@ -4094,6 +4156,7 @@ pub(super) mod tests {
         });
         let (commands, received) = mpsc::channel(1);
         let session = SessionHandle {
+            cwd: server.runtime.root().to_path_buf(),
             subagents: None,
             voice_state: Default::default(),
             token,
@@ -5167,6 +5230,7 @@ pub(super) mod tests {
                 server.sessions.lock().unwrap().insert(
                     id.clone(),
                     SessionHandle {
+                        cwd: server.runtime.root().to_path_buf(),
                         subagents: None,
                         voice_state: Default::default(),
                         token,
@@ -6464,6 +6528,7 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                cwd: server.runtime.root().to_path_buf(),
                 subagents: None,
                 voice_state: Default::default(),
                 token: 1,
@@ -6530,6 +6595,7 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                cwd: server.runtime.root().to_path_buf(),
                 subagents: None,
                 voice_state: Default::default(),
                 token: 1,
@@ -8527,6 +8593,98 @@ pub(super) mod tests {
                     .send_request(CloseSessionRequest::new(source.session_id))
                     .block_task()
                     .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn session_delete_removes_active_and_closed_history_without_conflating_close() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        agent_client_protocol::Client
+            .builder()
+            .connect_with(client_transport, async move |connection| {
+                let initialized = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                assert!(
+                    initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .delete
+                        .is_some()
+                );
+                for closed in [false, true] {
+                    let session = connection
+                        .send_request(NewSessionRequest::new(other.path().to_path_buf()))
+                        .block_task()
+                        .await?;
+                    let id = session.session_id;
+                    if closed {
+                        connection
+                            .send_request(CloseSessionRequest::new(id.clone()))
+                            .block_task()
+                            .await?;
+                        assert!(crate::session::load(other.path(), &id.to_string()).is_ok());
+                    }
+                    if !closed {
+                        // Same ID in a different workspace must not redirect an
+                        // owned actor's deletion away from its recorded cwd.
+                        drop(
+                            crate::session::open(
+                                root.path(),
+                                &id.to_string(),
+                                false,
+                                false,
+                                vec![Item::text(ItemKind::User, "other workspace")],
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    connection
+                        .send_request(DeleteSessionRequest::new(id.clone()))
+                        .block_task()
+                        .await?;
+                    assert!(crate::session::load(other.path(), &id.to_string()).is_err());
+                    if !closed {
+                        assert!(crate::session::load(root.path(), &id.to_string()).is_ok());
+                        crate::session::delete_workspace(root.path(), &id.to_string()).unwrap();
+                    }
+                    let listed = connection
+                        .send_request(ListSessionsRequest::new().cwd(other.path().to_path_buf()))
+                        .block_task()
+                        .await?;
+                    assert!(!listed.sessions.iter().any(|entry| entry.session_id == id));
+                    connection
+                        .send_request(LoadSessionRequest::new(
+                            id.clone(),
+                            other.path().to_path_buf(),
+                        ))
+                        .block_task()
+                        .await
+                        .expect_err("deleted history must not load");
+                    connection
+                        .send_request(DeleteSessionRequest::new(id))
+                        .block_task()
+                        .await
+                        .expect_err("unknown deletion must not succeed");
+                }
                 Ok(())
             })
             .await
