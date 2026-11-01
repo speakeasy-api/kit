@@ -494,7 +494,11 @@ fn usage_update(usage: &Usage) -> Option<wire::UsageUpdate> {
     ]
     .iter()
     .find_map(|key| usage.metadata.get(*key).and_then(|value| value.as_u64()))?;
-    Some(wire::UsageUpdate::new(used, size))
+    let update = wire::UsageUpdate::new(used, size);
+    Some(match &usage.cost {
+        Some(cost) => update.cost(wire::Cost::new(cost.amount, cost.currency.clone())),
+        None => update,
+    })
 }
 
 impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
@@ -3791,6 +3795,26 @@ mod tests {
         assert_eq!(usage.size, 272_000);
         assert!(usage.cost.is_undefined());
         assert!(serde_json::to_value(usage).unwrap().get("cost").is_none());
+    }
+
+    #[test]
+    fn usage_update_preserves_reported_cost() {
+        for (amount, currency) in [(0.125, "USD"), (0.0, "EUR")] {
+            let usage = Usage::new(agentkit_core::TokenUsage::new(50, 3))
+                .with_cost(agentkit_core::CostUsage::new(amount, currency))
+                .with_metadata(MetadataMap::from([(
+                    "context_window".into(),
+                    json!(272_000),
+                )]));
+            let update = usage_update(&usage).expect("known context window");
+            let value = serde_json::to_value(update).unwrap();
+            assert_eq!(
+                value["cost"],
+                json!({"amount": amount, "currency": currency})
+            );
+            assert_eq!(value["used"], 53);
+            assert_eq!(value["size"], 272_000);
+        }
     }
 
     #[test]
