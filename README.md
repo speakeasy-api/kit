@@ -363,7 +363,7 @@ permissions = "deny"               # deny (default) | cancel — Kit never auto-
 
 [acp.codex]
 command = "npx"
-args = ["-y", "@agentclientprotocol/codex-acp@1.4.0"]
+args = ["-y", "@agentclientprotocol/codex-acp@2.5.0"]
 
 [acp.cursor]
 command = "cursor-agent"
@@ -378,6 +378,8 @@ designer = "opus"
 [subagent.harnesses."acp.kit".models]
 flash = "openrouter:openai/gpt-5.6-luna"
 ```
+
+For Codex, use the [native fork setup](docs/user/subagents-and-acp-harnesses.md#codex-native-forks) with Codex CLI 0.166.0 and `CODEX_PATH` set before starting Kit.
 
 Before the first Claude subagent, authenticate the adapter with `npx -y @agentclientprotocol/claude-agent-acp@0.69.0 --cli auth login --claudeai` for a Claude subscription, or use `--console` for Anthropic Console API billing. Kit loads `AGENTS.md` files from the working directory and its ancestors as project instructions. See [Getting started and configuration](docs/user/getting-started-and-configuration.md) for all other settings.
 
