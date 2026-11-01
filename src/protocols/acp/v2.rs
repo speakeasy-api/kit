@@ -1781,6 +1781,18 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         set_v2_config(&adapter, &catalog, request).map_err(sdk_error)
                     }
                     .await;
+                    // Notifications describe committed state, independent of
+                    // whether the original request is still awaiting a reply.
+                    if let Ok(response) = &result
+                        && let Err(error) = sink.update(wire::UpdateSessionNotification::new(
+                            session_id.clone(),
+                            wire::SessionUpdate::ConfigOptionUpdate(wire::ConfigOptionUpdate::new(
+                                response.config_options.clone(),
+                            )),
+                        ))
+                    {
+                        tracing::debug!(%error, "failed to queue ACP v2 config options update");
+                    }
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -4056,6 +4068,134 @@ mod tests {
         assert!(closed.get("result").is_some(), "close failed: {closed}");
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn committed_config_updates_match_responses_in_both_protocols() {
+        for version in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let credentials = crate::credentials::CredentialStorage::Memory;
+            crate::provider::store_openrouter_test_credentials(&credentials);
+            let runtime = Runtime::new_with_provider_credentials_and_effort(
+                root.path(),
+                "test-model",
+                crate::ProviderKind::OpenRouter,
+                credentials,
+                None,
+            )
+            .unwrap();
+            let (mut client, agent) = agent_client_protocol::Channel::duplex();
+            let server = tokio::spawn(async move {
+                if version == 1 {
+                    super::super::tests::serve_transport(runtime, agent)
+                        .await
+                        .unwrap();
+                } else {
+                    v2_router(runtime, SessionRegistry::new())
+                        .connect_to(agent)
+                        .await
+                        .unwrap();
+                }
+            });
+            let initialize = if version == 1 {
+                serde_json::to_value(agentkit_acp::InitializeRequest::new(
+                    wire::ProtocolVersion::V1,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_value(wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("config-test", "0"),
+                ))
+                .unwrap()
+            };
+            send_wire(&client, "initialize", 1, initialize);
+            assert_eq!(receive_wire(&mut client, "initialize").await["id"], 1);
+            let new_session = if version == 1 {
+                serde_json::to_value(agentkit_acp::NewSessionRequest::new(
+                    root.path().to_path_buf(),
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_value(wire::NewSessionRequest::new(root.path().to_path_buf()))
+                    .unwrap()
+            };
+            send_wire(&client, "session/new", 2, new_session);
+            let created = receive_wire(&mut client, "new session").await;
+            let session_id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+            // Exercise both selection paths and rejected values using the real
+            // session actor. No provider generation request is necessary.
+            for (offset, config, value, valid) in [
+                (0, "reasoning_effort", "high", true),
+                (1, "unknown", "high", false),
+                (2, "reasoning_effort", "invalid", false),
+                (3, "model", "openrouter:not-offered", false),
+                (4, "model", "openrouter:test-model", true),
+                (5, "reasoning_effort", "default", true),
+            ] {
+                let id = 3 + offset;
+                let request = if version == 1 {
+                    serde_json::to_value(agentkit_acp::SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        config,
+                        value,
+                    ))
+                    .unwrap()
+                } else {
+                    serde_json::to_value(wire::SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        config,
+                        value,
+                    ))
+                    .unwrap()
+                };
+                send_wire(&client, "session/set_config_option", id, request);
+                let mut response = None;
+                let mut options = None;
+                while response.is_none() || (valid && options.is_none()) {
+                    let frame = receive_wire(&mut client, "config response/update").await;
+                    if frame["id"] == id {
+                        assert_eq!(frame.get("result").is_some(), valid, "{frame}");
+                        response = Some(frame);
+                    } else if frame["params"]["update"]["sessionUpdate"] == "config_option_update" {
+                        assert!(valid, "rejected config emitted an update: {frame}");
+                        assert!(options.is_none(), "duplicate config update: {frame}");
+                        assert_eq!(frame["params"]["sessionId"], session_id);
+                        options = Some(frame["params"]["update"]["configOptions"].clone());
+                    }
+                }
+                if let Some(options) = options {
+                    assert_eq!(options, response.unwrap()["result"]["configOptions"]);
+                    let key = if version == 1 { "id" } else { "configId" };
+                    let selected = options
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|option| option[key] == config)
+                        .unwrap();
+                    assert_eq!(selected["currentValue"], value);
+                }
+            }
+            send_wire(
+                &client,
+                "session/close",
+                9,
+                serde_json::json!({"sessionId":session_id}),
+            );
+            loop {
+                let frame = receive_wire(&mut client, "close").await;
+                assert_ne!(
+                    frame["params"]["update"]["sessionUpdate"], "config_option_update",
+                    "late update: {frame}"
+                );
+                if frame["id"] == 9 {
+                    assert!(frame.get("result").is_some(), "{frame}");
+                    break;
+                }
+            }
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[test]

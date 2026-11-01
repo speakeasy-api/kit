@@ -147,7 +147,7 @@ async fn resource_subscription_wakes_idle_session_reads_and_unsubscribes() {
         .bind_session(AcpSessionBinding::new(
             session_id.clone(),
             loop_id.clone(),
-            client,
+            client.clone(),
         ))
         .unwrap();
     let drain = tokio::spawn(async move {
@@ -185,6 +185,7 @@ async fn resource_subscription_wakes_idle_session_reads_and_unsubscribes() {
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let skills = runtime.current_skills().await.unwrap();
     let actor = tokio::spawn(session_actor(SessionActor {
+        client,
         subagents: None,
         voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(&[]),
         session_id: session_id.clone(),
