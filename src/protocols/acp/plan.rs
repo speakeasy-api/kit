@@ -160,7 +160,12 @@ impl TaskPlan {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_macros)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
     use agentkit_core::{MetadataMap, TaskId, ToolCallId, ToolResultPart, TurnId};
