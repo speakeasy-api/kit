@@ -1830,7 +1830,7 @@ impl Server {
         let binding = SessionBindingGuard::new(Arc::clone(&self.integration), session_id.clone());
         let observer = ResponseInterruptionNoticeObserver::new(
             self.integration.as_ref().clone(),
-            client,
+            client.clone(),
             session_id.clone(),
             activity.clone(),
         )
@@ -1875,6 +1875,7 @@ impl Server {
         let (tx, rx) = mpsc::channel(8);
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
+            client,
             subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
@@ -2170,6 +2171,7 @@ pub(super) async fn detach_compose_call(
 }
 
 struct SessionActor<S: ModelSession> {
+    client: AcpClientHandle,
     subagents: Option<crate::tools::subagent::Subagents>,
     voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: agentkit_acp::SessionId,
@@ -2190,6 +2192,7 @@ struct SessionActor<S: ModelSession> {
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
+        client,
         subagents,
         mut voice_monitor,
         session_id,
@@ -2332,6 +2335,20 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         set_config(&adapter, &catalog, request).map_err(sdk_error)
                     }
                     .await;
+                    // Publish from the actor after commit, even if the requester
+                    // stopped waiting. A delivery failure cannot undo selection.
+                    if let Ok(response) = &result
+                        && let Err(error) = client.notify_session(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ConfigOptionUpdate(
+                                agentkit_acp::ConfigOptionUpdate::new(
+                                    response.config_options.clone(),
+                                ),
+                            ),
+                        ))
+                    {
+                        tracing::debug!(%error, "failed to queue ACP config options update");
+                    }
                     let _ = reply.send(result);
                 }
                 Some(Command::Fork {
@@ -3449,7 +3466,7 @@ pub(super) mod tests {
     use super::*;
     use agentkit_acp::StopReason;
 
-    async fn serve_transport(
+    pub(super) async fn serve_transport(
         runtime: Arc<Runtime>,
         transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
     ) -> Result<(), AcpRuntimeError> {
@@ -6806,8 +6823,12 @@ pub(super) mod tests {
         let cancellation = CancellationController::new();
         integration
             .bind_session(
-                AcpSessionBinding::new(acp_session_id.clone(), agentkit_session_id.clone(), client)
-                    .cancellation(cancellation.clone()),
+                AcpSessionBinding::new(
+                    acp_session_id.clone(),
+                    agentkit_session_id.clone(),
+                    client.clone(),
+                )
+                .cancellation(cancellation.clone()),
             )
             .unwrap();
 
@@ -6883,6 +6904,7 @@ pub(super) mod tests {
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let skills = runtime.current_skills().await.unwrap();
         let actor = tokio::spawn(session_actor(SessionActor {
+            client,
             subagents: None,
             voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(&[]),
             session_id: acp_session_id.clone(),
