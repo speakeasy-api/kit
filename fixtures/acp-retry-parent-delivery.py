@@ -19,7 +19,7 @@ KIT = sys.argv[1]
 CHILD = str(pathlib.Path(__file__).with_name("mock-acp-retry.py").resolve())
 
 
-def run(version, background):
+def run(version, background, notice_support=True):
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
         (root / ".kit").mkdir()
@@ -105,7 +105,7 @@ def run(version, background):
 
             try:
                 send(1, "initialize", {"protocolVersion": version,
-                     "clientInfo": {"name": "retry-test", "version": "1"}, "clientCapabilities": {"subagents": {}},
+                     "clientInfo": {"name": "retry-test", "version": "1"}, "clientCapabilities": {"subagents": {}, "session": {"notices": {}} if notice_support else {}},
                      "info": {"name": "retry-test", "version": "1"}, "capabilities": {}})
                 assert response(1)["protocolVersion"] == version
                 send(2, "session/new", {"cwd": directory, "mcpServers": []})
@@ -114,6 +114,8 @@ def run(version, background):
                      "prompt": [{"type": "text", "text": "Run the transport test"}]})
                 notices = []
                 child_ids = set()
+                if not notice_support:
+                    release.write_text("not negotiated")
                 parent_done = False
                 while not parent_done:
                     message = receive()
@@ -137,6 +139,10 @@ def run(version, background):
                 all_notices = [u for u in all_updates if u.get("sessionUpdate") == "notice"]
                 retries = [u["_meta"]["kit/providerRetry"] for u in all_notices
                            if "kit/providerRetry" in u.get("_meta", {})]
+                if not notice_support:
+                    assert not retries, retries
+                    assert errors.empty(), list(errors.queue)
+                    return
                 assert [n["status"] for n in retries] == ["scheduled", "succeeded"], retries
                 assert len(child_ids) == 1
                 assert any(n["title"] == "Ordinary notice" for n in all_notices)
@@ -166,3 +172,6 @@ def run(version, background):
 for protocol in (1, 2):
     for detached in (False, True):
         run(protocol, detached)
+
+for detached in (False, True):
+    run(1, detached, notice_support=False)

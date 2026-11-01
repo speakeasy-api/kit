@@ -79,7 +79,8 @@ fn initialize_params(version: Version) -> Result<Value, Error> {
                 .subagents(v1::SubagentCapabilities::default())
                 .session(
                     v1::ClientSessionCapabilities::new()
-                        .compaction(v1::CompactionCapabilities::default()),
+                        .compaction(v1::CompactionCapabilities::default())
+                        .notices(v1::NoticeCapabilities::default()),
                 ),
         ),
     )?;
@@ -375,6 +376,10 @@ mod tests {
         assert_eq!(params["capabilities"], json!({}));
         assert_eq!(
             params["clientCapabilities"]["session"]["compaction"],
+            json!({})
+        );
+        assert_eq!(
+            params["clientCapabilities"]["session"]["notices"],
             json!({})
         );
         let caps: v1::ClientCapabilities =
