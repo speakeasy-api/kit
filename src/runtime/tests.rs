@@ -262,6 +262,7 @@ mod reasoning_effort_persistence {
         let driver = runtime
             .start_acp_driver_with_mcp(
                 AcpDriverContext {
+                    activity: crate::protocols::acp::activity::SessionActivity::new(|_| Ok(())),
                     ask_user: None,
                     cwd: runtime.root().to_path_buf(),
                     additional_directories: vec![],

@@ -38,7 +38,7 @@ a2a-protocol-server = { version = "=0.14.1", default-features = false }
 a2a-protocol-types = "=0.14.1"
 agenthooksprotocol = { version = "=0.10.1", default-features = false, features = ["reqwest", "tokio-process"] }
 agent-client-protocol = { package = "agentkit-acp-sdk", version = "=3.6.0", features = ["stdio", "unstable_session_fork", "unstable_session_inject", "unstable_subagents"] }
-agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.14.0" }
+agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.14.0", features = ["unstable_end_turn_token_usage"] }
 agent-client-protocol-http = { package = "agentkit-acp-http", version = "=3.6.0", default-features = false, features = ["server", "client"] }
 agentkit-acp = { version = "=0.12.0", features = ["unstable-inject"] }
 agentkit-adapter-completions = "=0.11.0"

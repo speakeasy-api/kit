@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use agentkit_acp::AcpRuntimeError;
-use agentkit_core::FinishReason;
+use agentkit_core::{FinishReason, TokenUsage};
 use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum ExecutionOrigin {
+pub(crate) enum ExecutionOrigin {
     #[default]
     Prompt,
     Autonomous,
@@ -22,12 +22,13 @@ enum State {
 
 /// An ordered snapshot, not another reducer. Projections select only wire format.
 #[derive(Clone, Debug)]
-pub(super) struct Transition {
+pub(crate) struct Transition {
     pub id: u64,
     pub origin: ExecutionOrigin,
     pub active: bool,
     pub reason: FinishReason,
     pub error: Option<String>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Default)]
@@ -38,6 +39,8 @@ struct Activity {
     current: Option<Transition>,
     projecting: bool,
     executing: bool,
+    completed_usage: Option<TokenUsage>,
+    request_usage: Option<TokenUsage>,
 }
 
 /// Session-owned lifecycle instrument shared by the actor and its observer.
@@ -50,14 +53,14 @@ struct Activity {
 /// Abandoned executions/projections isolate this owner: external delivery cannot
 /// be rolled back or safely retried after unwind or cancellation.
 #[derive(Clone)]
-pub(super) struct SessionActivity {
+pub(crate) struct SessionActivity {
     pub(super) tool_projection: Arc<std::sync::OnceLock<super::tool_projection::Subscription>>,
     state: Arc<Mutex<Activity>>,
     project: Arc<dyn Fn(Transition) -> Result<(), AcpRuntimeError> + Send + Sync>,
 }
 
 impl SessionActivity {
-    pub(super) fn new(
+    pub(crate) fn new(
         project: impl Fn(Transition) -> Result<(), AcpRuntimeError> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -65,6 +68,56 @@ impl SessionActivity {
             state: Arc::new(Mutex::new(Activity::default())),
             project: Arc::new(project),
         }
+    }
+
+    // A dropped request remains provisional until the next request or settlement:
+    // loop-level context recovery can supersede it after dropping the model turn.
+    // These transitions do not call client code or await; poison stays isolated.
+    pub(super) fn begin_request(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state == State::Unavailable {
+            return;
+        }
+        let tokens = state.request_usage.take();
+        if let (Some(current), Some(tokens)) = (&mut state.current, tokens) {
+            super::usage::accumulate(&mut current.usage, tokens);
+        }
+    }
+
+    pub(super) fn record_usage(&self, tokens: TokenUsage) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state != State::Unavailable && state.current.is_some() {
+            state.request_usage = Some(tokens);
+        }
+    }
+
+    pub(super) fn record_compaction_usage(&self, tokens: TokenUsage) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state == State::Unavailable {
+            return;
+        }
+        if let Some(current) = &mut state.current {
+            super::usage::accumulate(&mut current.usage, tokens);
+        }
+    }
+
+    pub(super) fn completed_usage(&self) -> Result<Option<TokenUsage>, AcpRuntimeError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("session activity is poisoned".into()))?;
+        if state.state == State::Unavailable {
+            return Err(AcpRuntimeError::Loop(
+                "session activity is unavailable".into(),
+            ));
+        }
+        Ok(state.completed_usage.clone())
     }
 
     /// Called after domain cleanup and before the protocol content flush/Idle.
@@ -136,7 +189,9 @@ impl SessionActivity {
             active: true,
             reason: FinishReason::Completed,
             error: None,
+            usage: None,
         };
+        state.completed_usage = None;
         state.current = Some(transition.clone());
         state.next_id = id;
         state.state = State::Running;
@@ -175,7 +230,9 @@ impl SessionActivity {
                         active: true,
                         reason: FinishReason::Completed,
                         error: None,
+                        usage: None,
                     };
+                    state.completed_usage = None;
                     state.current = Some(transition.clone());
                     state.next_id = id;
                     state.state = State::Running;
@@ -185,6 +242,10 @@ impl SessionActivity {
                     state.state = State::Running;
                     None
                 }
+            }
+            AgentEvent::ResponseAttemptSuperseded => {
+                state.request_usage = None;
+                None
             }
             AgentEvent::TurnFinished(result) if state.state != State::Idle => {
                 state.state = State::Settling;
@@ -232,7 +293,11 @@ impl SessionActivity {
         }
         state.origin = ExecutionOrigin::Prompt;
         state.state = State::Idle;
+        let request_usage = state.request_usage.take();
         let terminal = state.current.take().map(|mut terminal| {
+            if let Some(tokens) = request_usage {
+                super::usage::accumulate(&mut terminal.usage, tokens);
+            }
             terminal.active = false;
             if let Some(reason) = reason {
                 terminal.reason = reason;
@@ -243,6 +308,9 @@ impl SessionActivity {
             terminal.error = error;
             terminal
         });
+        state.completed_usage = terminal
+            .as_ref()
+            .and_then(|terminal| terminal.usage.clone());
         state.projecting = terminal.is_some();
         drop(state);
         if let Some(terminal) = terminal {
@@ -273,6 +341,7 @@ impl SessionActivity {
             }
             if state.state == State::Idle {
                 state.origin = origin;
+                state.completed_usage = None;
             }
             state.executing = true;
         }
