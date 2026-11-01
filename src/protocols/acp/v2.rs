@@ -34,7 +34,7 @@ use tracing::Instrument as _;
 
 use crate::{
     provider::{ProviderKind, SelectableAdapter, authentication_method_id},
-    runtime::{AcpDriverContext, BackgroundJobs, Runtime},
+    runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, Runtime},
 };
 
 use super::activity::{ExecutionOrigin, SessionActivity};
@@ -643,6 +643,10 @@ struct PromptCommand {
 }
 
 enum Command {
+    Fork {
+        parent_context: Option<(String, String)>,
+        reply: oneshot::Sender<Result<AcpForkState, AcpRuntimeError>>,
+    },
     Prompt(PromptCommand),
     SetConfig {
         request: wire::SetSessionConfigOptionRequest,
@@ -671,11 +675,42 @@ struct SessionHandle {
     tasks: TaskManagerHandle,
 }
 
-struct AttachedSession {
+struct AttachedSession<C = ()> {
+    creation: C,
     session_id: wire::SessionId,
     config_options: Vec<wire::SessionConfigOption>,
     canonical_transcript: Vec<Item>,
     activation: oneshot::Sender<()>,
+}
+
+struct PreparedFork {
+    response: wire::ForkSessionResponse,
+    activation: oneshot::Sender<()>,
+    creation: crate::session::SessionObserver,
+}
+
+impl PreparedFork {
+    /// Validation and cleanup ownership precede submission. Only private,
+    /// infallible publication and actor activation may follow a success response.
+    fn submit<E>(
+        self,
+        respond: impl FnOnce(
+            Result<wire::ForkSessionResponse, agent_client_protocol::Error>,
+        ) -> Result<(), E>,
+    ) -> Result<Option<wire::SessionId>, E> {
+        let creation = match self.creation.prepare_creation() {
+            Ok(creation) => creation,
+            Err(error) => {
+                respond(Err(sdk_error(AcpRuntimeError::Loop(error))))?;
+                return Ok(None);
+            }
+        };
+        let session_id = self.response.session_id.clone();
+        respond(Ok(self.response))?;
+        creation.commit();
+        let _ = self.activation.send(());
+        Ok(Some(session_id))
+    }
 }
 
 struct BindingGuard {
@@ -831,12 +866,12 @@ impl Server {
         Ok(wire::LogoutAuthResponse::new())
     }
 
-    fn publish_session(
+    fn publish_session<C>(
         &self,
         admission: &mut super::SessionAdmission,
         publication: PendingSessionPublication,
-        commit: impl FnOnce() -> Result<(), AcpRuntimeError>,
-    ) -> Result<(), SessionPublicationError> {
+        commit: impl FnOnce() -> Result<C, AcpRuntimeError>,
+    ) -> Result<C, SessionPublicationError> {
         if !admission.active || !Arc::ptr_eq(&admission.registry, &self.registry.inner) {
             return Err(SessionPublicationError::AdmissionClosed);
         }
@@ -874,10 +909,10 @@ impl Server {
                 publication.completed.clone(),
             )
             .map_err(|()| SessionPublicationError::AdmissionClosed)?;
-        commit().map_err(SessionPublicationError::Commit)?;
+        let committed = commit().map_err(SessionPublicationError::Commit)?;
         sessions.insert(publication.session_id, publication.session);
         rollback.armed = false;
-        Ok(())
+        Ok(committed)
     }
 
     fn remove_session(&self, session_id: &wire::SessionId, token: u64) {
@@ -914,6 +949,10 @@ impl Server {
         // version even when the requested version is unsupported; the client
         // then disconnects if it cannot speak v2. It does not switch wire schemas.
         let mut capabilities = agentkit_acp::v2::agent_capabilities();
+        capabilities
+            .session
+            .get_or_insert_with(wire::SessionCapabilities::new)
+            .fork = Some(wire::SessionForkCapabilities::new());
         capabilities
             .meta
             .get_or_insert_with(Map::new)
@@ -975,6 +1014,8 @@ impl Server {
                 },
                 connection,
                 claim,
+                None,
+                crate::runtime::SessionClaim::commit,
             )
             .await?;
         let AttachedSession {
@@ -1036,6 +1077,8 @@ impl Server {
                 },
                 connection,
                 claim,
+                None,
+                crate::runtime::SessionClaim::commit,
             )
             .await?;
         let updates = if replay {
@@ -1106,12 +1149,59 @@ impl Server {
         Ok(wire::ListSessionsResponse::new(sessions).next_cursor(next))
     }
 
-    async fn attach_session(
+    async fn fork_session(
+        self: &Arc<Self>,
+        request: wire::ForkSessionRequest,
+        connection: V2ConnectionTo<Client>,
+    ) -> Result<PreparedFork, AcpRuntimeError> {
+        let parent_context = super::fork_parent_context(request.meta.as_ref());
+        let (sender, _, _) = self.prompt_route(&request.session_id)?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(Command::Fork {
+                parent_context,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        let forked = rx
+            .await
+            .map_err(|_| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))??;
+        let claim = self.runtime.claim_session_fork()?;
+        let attached = self
+            .attach_session(
+                SessionSetup {
+                    replay_history: false,
+                    cwd: request.cwd.0,
+                    additional_directories: request
+                        .additional_directories
+                        .into_iter()
+                        .map(|path| path.0)
+                        .collect(),
+                    mcp_servers: request.mcp_servers,
+                },
+                connection,
+                claim,
+                Some(forked),
+                crate::runtime::SessionClaim::defer_fork_commit,
+            )
+            .await?;
+        Ok(PreparedFork {
+            response: wire::ForkSessionResponse::new(attached.session_id)
+                .config_options(attached.config_options),
+            activation: attached.activation,
+            creation: attached.creation,
+        })
+    }
+
+    async fn attach_session<C>(
         self: &Arc<Self>,
         setup: SessionSetup,
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
-    ) -> Result<AttachedSession, AcpRuntimeError> {
+        forked: Option<AcpForkState>,
+        commit: impl FnOnce(crate::runtime::SessionClaim) -> Result<C, AcpRuntimeError> + Send,
+    ) -> Result<AttachedSession<C>, AcpRuntimeError> {
         let SessionSetup {
             cwd,
             additional_directories,
@@ -1163,7 +1253,7 @@ impl Server {
             response_attempt_replacement: true,
         };
         let driver = runtime
-            .start_acp_driver_with_mcp(context, &mut claim, None, mcp.clone())
+            .start_acp_driver_with_mcp(context, &mut claim, forked, mcp.clone())
             .await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let reasoning = driver
@@ -1298,22 +1388,26 @@ impl Server {
                     tasks,
                 },
             },
-            || claim.commit(),
+            || commit(claim),
         );
-        if let Err(error) = publication {
-            drop(activation);
-            actor_task.abort();
-            let _ = actor_task.await;
-            return Err(match error {
-                SessionPublicationError::AdmissionClosed => AcpRuntimeError::ClientClosed,
-                SessionPublicationError::Commit(error) => error,
-            });
-        }
+        let creation = match publication {
+            Ok(creation) => creation,
+            Err(error) => {
+                drop(activation);
+                actor_task.abort();
+                let _ = actor_task.await;
+                return Err(match error {
+                    SessionPublicationError::AdmissionClosed => AcpRuntimeError::ClientClosed,
+                    SessionPublicationError::Commit(error) => error,
+                });
+            }
+        };
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
             session_id: session_id.to_string(),
         });
         drop(actor_task);
         Ok(AttachedSession {
+            creation,
             session_id,
             config_options,
             canonical_transcript,
@@ -1773,6 +1867,54 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         set_v2_config(&adapter, &catalog, request).map_err(sdk_error)
                     }
                     .await;
+                    let _ = reply.send(result);
+                }
+                Some(Command::Fork {
+                    parent_context,
+                    reply,
+                }) => {
+                    let result = (|| {
+                        activity.check_prompt_admission()?;
+                        let foreground = activity.snapshot()?;
+                        let background = background_jobs.activity();
+                        let active_children = subagents
+                            .as_ref()
+                            .map(|s| s.active_count())
+                            .transpose()
+                            .map_err(|e| AcpRuntimeError::Loop(e.to_string()))?
+                            .unwrap_or(0);
+                        if background.active
+                            || background.unacknowledged_terminals
+                            || active_children != 0
+                        {
+                            return Err(AcpRuntimeError::Loop(
+                                "session must be settled before snapshot".into(),
+                            ));
+                        }
+                        let transcript = driver.snapshot().transcript;
+                        let children_after = subagents
+                            .as_ref()
+                            .map(|s| s.active_count())
+                            .transpose()
+                            .map_err(|e| AcpRuntimeError::Loop(e.to_string()))?
+                            .unwrap_or(0);
+                        if foreground != activity.snapshot()?
+                            || background != background_jobs.activity()
+                            || children_after != 0
+                        {
+                            return Err(AcpRuntimeError::Loop(
+                                "session changed during snapshot admission; retry".into(),
+                            ));
+                        }
+                        Ok(AcpForkState {
+                            transcript,
+                            selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
+                            reasoning_effort: adapter
+                                .reasoning_effort()
+                                .map_err(AcpRuntimeError::Loop)?,
+                            parent_context,
+                        })
+                    })();
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -2842,6 +2984,27 @@ pub(crate) fn component(
                                 .await
                                 .map_err(list_sessions_error),
                         )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: wire::ForkSessionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    let connection = cx.clone();
+                    cx.spawn(async move {
+                        match state.fork_session(request, connection.clone()).await {
+                            Ok(prepared) => {
+                                prepared
+                                    .submit(|response| responder.respond_with_result(response))?;
+                                Ok(())
+                            }
+                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
+                        }
                     })?;
                     Ok(())
                 }
@@ -5794,7 +5957,7 @@ mod tests {
                 pending_publication(&server, "failed-publication");
             let mut completed = publication.completed.clone();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                server.publish_session(&mut admission, publication, || {
+                server.publish_session::<()>(&mut admission, publication, || {
                     if unwind {
                         panic!("commit callback unwound");
                     }
@@ -5843,7 +6006,7 @@ mod tests {
         let mut admission = registry.begin_attachment().unwrap();
         registry.close_gate_and_snapshot(false);
         let (publication, actor, _received) = pending_publication(&server, "rejected-publication");
-        let result = server.publish_session(&mut admission, publication, || {
+        let result = server.publish_session::<()>(&mut admission, publication, || {
             panic!("rejected commit ran")
         });
         assert!(matches!(
@@ -5875,7 +6038,7 @@ mod tests {
         let (original, original_actor, _received) = pending_publication(&server, "original");
         let token = original.token;
         server
-            .publish_session(&mut original_admission, original, || Ok(()))
+            .publish_session::<()>(&mut original_admission, original, || Ok(()))
             .unwrap();
         let mut duplicate_admission = registry.begin_attachment().unwrap();
         let (mut duplicate, duplicate_actor, _duplicate_received) =
@@ -5883,7 +6046,7 @@ mod tests {
         duplicate.token = token;
         duplicate.session.token = token;
         assert!(matches!(
-            server.publish_session(&mut duplicate_admission, duplicate, || panic!(
+            server.publish_session::<()>(&mut duplicate_admission, duplicate, || panic!(
                 "duplicate commit ran"
             )),
             Err(SessionPublicationError::AdmissionClosed)
@@ -5948,7 +6111,7 @@ mod tests {
             let busy = Arc::clone(&publication.session.busy);
             let session_id = publication.session_id.clone();
             server
-                .publish_session(&mut admission, publication, || Ok(()))
+                .publish_session::<()>(&mut admission, publication, || Ok(()))
                 .unwrap();
             let (sender, _, _) = server.prompt_route(&session_id).unwrap();
             let (reply, _ack) = oneshot::channel();
@@ -6002,7 +6165,7 @@ mod tests {
         let busy = Arc::clone(&publication.session.busy);
         let session_id = publication.session_id.clone();
         server
-            .publish_session(&mut admission, publication, || Ok(()))
+            .publish_session::<()>(&mut admission, publication, || Ok(()))
             .unwrap();
         let (reply, _ack) = oneshot::channel();
         server
@@ -6275,7 +6438,7 @@ mod tests {
         let publisher_server = Arc::clone(&server);
         let published_session_id = session_id.clone();
         let publisher = tokio::task::spawn_blocking(move || {
-            publisher_server.publish_session(
+            publisher_server.publish_session::<()>(
                 &mut admission,
                 PendingSessionPublication {
                     token,
@@ -6552,6 +6715,286 @@ mod tests {
             let _ = server.await;
             result.expect("MCP rejection client timed out").unwrap();
         }
+    }
+
+    #[test]
+    fn fork_submission_keeps_cleanup_until_response_succeeds() {
+        for delivery in ["success", "failure", "unwind", "rejected"] {
+            let root = tempfile::tempdir().unwrap();
+            let id = crate::session::new_id();
+            let opened = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+            )
+            .unwrap();
+            // A creation already owned by a prepared publication is rejected by
+            // normal APIs, just as poison/write fencing is rejected in session tests.
+            let held = if delivery == "rejected" {
+                Some(opened.observer.prepare_creation().unwrap())
+            } else {
+                None
+            };
+            let (activation, mut activated) = oneshot::channel();
+            let prepared = PreparedFork {
+                response: wire::ForkSessionResponse::new(id.clone()),
+                activation,
+                creation: opened.observer.clone(),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prepared.submit(|response| {
+                    if delivery == "rejected" {
+                        assert!(response.is_err(), "invalid creation cannot report success");
+                        return Ok(());
+                    }
+                    assert!(response.is_ok());
+                    // Response callbacks cannot invalidate the prepared writer.
+                    assert!(
+                        opened
+                            .observer
+                            .replace(&[Item::text(ItemKind::User, "reentry")])
+                            .is_err()
+                    );
+                    assert!(crate::session::load(root.path(), &id).is_ok());
+                    match delivery {
+                        "failure" => Err("response closed"),
+                        "unwind" => panic!("response interrupted"),
+                        _ => Ok(()),
+                    }
+                })
+            }));
+            match delivery {
+                "success" => {
+                    assert!(result.unwrap().unwrap().is_some());
+                    assert!(activated.try_recv().is_ok());
+                }
+                "failure" => assert_eq!(result.unwrap().unwrap_err(), "response closed"),
+                "unwind" => assert!(result.is_err()),
+                "rejected" => assert!(result.unwrap().unwrap().is_none()),
+                _ => unreachable!(),
+            }
+            if delivery != "success" {
+                assert!(matches!(
+                    activated.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            }
+            drop(held);
+            drop(opened);
+            assert_eq!(
+                crate::session::load(root.path(), &id).is_ok(),
+                delivery == "success"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_fork_requires_settled_background_and_preserves_parent_context() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            &workspace,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let state = Arc::new(Server::new(runtime, SessionRegistry::new()));
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let client = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .v2()
+                .connect_to(client_transport)
+                .await
+        });
+        let agent = agent_client_protocol::Agent.v2().connect_with(
+            agent_transport,
+            async move |connection| {
+                let (response, activation) = state
+                    .new_session(wire::NewSessionRequest::new(workspace), connection.clone())
+                    .await
+                    .unwrap();
+                activation.send(()).unwrap();
+                let (commands, jobs) = {
+                    let sessions = state.sessions.lock().unwrap();
+                    let source = sessions.get(&response.session_id).unwrap();
+                    (source.commands.clone(), source.background_jobs.clone())
+                };
+                jobs.register_foreground_for_test("snapshot-background");
+                jobs.detach("snapshot-background").unwrap();
+                let parent = Some((response.session_id.to_string(), "parent".into()));
+                for stage in 0..3 {
+                    let (reply, snapshot) = oneshot::channel();
+                    commands
+                        .send(Command::Fork {
+                            parent_context: parent.clone(),
+                            reply,
+                        })
+                        .await
+                        .unwrap();
+                    let snapshot = snapshot.await.unwrap();
+                    if stage == 2 {
+                        assert_eq!(snapshot.unwrap().parent_context, parent);
+                    } else {
+                        assert!(snapshot.is_err());
+                    }
+                    if stage == 0 {
+                        jobs.finish_for_test("snapshot-background");
+                    } else if stage == 1 {
+                        jobs.acknowledge_terminal(&agentkit_core::ToolCallId::new(
+                            "snapshot-background",
+                        ));
+                    }
+                }
+                // Dropping a prepared fork must discard its provisional transcript.
+                let prepared = state
+                    .fork_session(
+                        wire::ForkSessionRequest::new(
+                            response.session_id.clone(),
+                            root.path().to_path_buf(),
+                        ),
+                        connection,
+                    )
+                    .await
+                    .unwrap();
+                let child = prepared.response.session_id.to_string();
+                drop(prepared);
+                state
+                    .close(wire::CloseSessionRequest::new(response.session_id))
+                    .await
+                    .unwrap();
+                state.registry.shutdown().await;
+                assert!(crate::session::load(root.path(), &child).is_err());
+                Ok(())
+            },
+        );
+        let result = timeout(Duration::from_secs(10), agent).await;
+        client.abort();
+        let _ = client.await;
+        result
+            .expect("snapshot client timed out")
+            .expect("snapshot client failed");
+    }
+
+    #[tokio::test]
+    async fn v2_fork_preserves_history_and_advertises_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let source = crate::session::new_id();
+        drop(
+            crate::session::open(
+                &workspace,
+                &source,
+                false,
+                false,
+                vec![
+                    Item::text(ItemKind::System, "system"),
+                    Item::text(ItemKind::User, "fork this history"),
+                ],
+            )
+            .unwrap(),
+        );
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            &workspace,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |_notification: wire::UpdateSessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |cx| {
+                let initialized = cx
+                    .send_request(wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("fork-test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                assert!(initialized.capabilities.session.unwrap().fork.is_some());
+                let missing = cx
+                    .send_request(wire::ForkSessionRequest::new("missing", workspace.clone()))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    i32::from(missing.code),
+                    i32::from(sdk_error(AcpRuntimeError::SessionNotFound("missing".into())).code)
+                );
+                cx.send_request(wire::ResumeSessionRequest::new(
+                    source.clone(),
+                    workspace.clone(),
+                ))
+                .block_task()
+                .await?;
+                // Failed child setup leaves the source attached and creates no durable child.
+                cx.send_request(wire::ForkSessionRequest::new(
+                    source.clone(),
+                    workspace.join("missing"),
+                ))
+                .block_task()
+                .await
+                .expect_err("invalid child workspace");
+                assert_eq!(crate::session::catalog(&workspace).unwrap().len(), 1);
+                let child = cx
+                    .send_request(
+                        wire::ForkSessionRequest::new(source.clone(), workspace.clone()).meta(
+                            Map::from_iter([
+                                (
+                                    super::super::FORK_PARENT_ID_META.into(),
+                                    Value::String(source.clone()),
+                                ),
+                                (
+                                    super::super::FORK_PARENT_NAME_META.into(),
+                                    Value::String("parent".into()),
+                                ),
+                            ]),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                assert_ne!(child.session_id.to_string(), source);
+                assert!(!child.config_options.is_empty());
+                for id in [
+                    wire::SessionId::new(source.clone()),
+                    child.session_id.clone(),
+                ] {
+                    cx.send_request(wire::CloseSessionRequest::new(id))
+                        .block_task()
+                        .await?;
+                }
+                let original = crate::session::load(&workspace, &source).unwrap();
+                let forked =
+                    crate::session::load(&workspace, &child.session_id.to_string()).unwrap();
+                assert!(
+                    serde_json::to_string(&forked)
+                        .unwrap()
+                        .contains("fork this history")
+                );
+                assert_eq!(
+                    serde_json::to_value(original).unwrap(),
+                    serde_json::to_value(forked).unwrap()
+                );
+                Ok(())
+            });
+        let result = timeout(Duration::from_secs(10), client).await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("fork client timed out")
+            .expect("fork client failed");
     }
 
     #[tokio::test]
@@ -7187,7 +7630,7 @@ for line in sys.stdin:
         assert!(update.get("replacement").is_none());
         assert!(session.inject.is_some());
         assert!(session.delete.is_none());
-        assert!(session.fork.is_none());
+        assert!(session.fork.is_some());
     }
 
     #[test]
