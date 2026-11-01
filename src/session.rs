@@ -419,10 +419,18 @@ pub(crate) fn delete_in(root: &Path, directory: &Path, session_id: &str) -> Resu
     let local = legacy_transcript(&root, session_id);
     let filesystem = fs::best_effort_global();
 
-    // Match open's scoped-first ordering. Unlike migration, also lock absent
-    // and sealed sources so none can reappear while authority is removed.
+    // Match open's scoped-first ordering. Lock absent and sealed sources in
+    // existing storage, but never recreate an absent legacy workspace directory.
+    // Globally stored history must remain deletable after its workspace is gone.
     // ExistingOrNew accepts stale files, but never steals a live native lease.
-    let mut paths = vec![scoped, global.clone(), local];
+    let mut paths = vec![scoped, global.clone()];
+    let local_parent = local.parent().ok_or("legacy transcript has no parent")?;
+    if filesystem
+        .try_exists(local_parent)
+        .map_err(|error| format!("could not inspect legacy session directory: {error}"))?
+    {
+        paths.push(local);
+    }
     let mut unique = Vec::new();
     for path in paths.drain(..) {
         if !unique.contains(&path) {
@@ -3812,6 +3820,27 @@ mod tests {
         );
         assert!(!metadata.exists());
         assert!(!transcript_path(temp.path(), "delete-me").exists());
+    }
+
+    #[test]
+    fn delete_does_not_recreate_removed_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project_root(temp.path())).unwrap();
+        drop(
+            open(
+                temp.path(),
+                "delete-me",
+                false,
+                false,
+                vec![Item::text(ItemKind::User, "history")],
+            )
+            .unwrap(),
+        );
+        let project = project_root(temp.path());
+        fs::remove_dir_all(&project).unwrap();
+        delete_in(&project, &session_directory(temp.path()), "delete-me").unwrap();
+        assert!(!project.exists());
+        assert!(load(temp.path(), "delete-me").is_err());
     }
 
     #[test]
