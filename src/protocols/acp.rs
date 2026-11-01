@@ -1448,6 +1448,7 @@ impl Drop for SessionPublicationRollback<'_> {
 struct Server {
     // Connection-local snapshot. Only initialize writes; a new connection starts disabled.
     subagent_updates: AtomicBool,
+    form_elicitation: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -1473,6 +1474,7 @@ impl Server {
     fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
             subagent_updates: AtomicBool::new(false),
+            form_elicitation: AtomicBool::new(false),
             runtime,
             integration: Arc::new(integration),
             registry,
@@ -1583,6 +1585,14 @@ impl Server {
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
         self.subagent_updates.store(
             request.client_capabilities.subagents.is_some(),
+            Ordering::Release,
+        );
+        self.form_elicitation.store(
+            request
+                .client_capabilities
+                .elicitation
+                .as_ref()
+                .is_some_and(|value| value.form.is_some()),
             Ordering::Release,
         );
         let logout_authentication = self.runtime.supports_logout_authentication();
@@ -1836,7 +1846,9 @@ impl Server {
         )
         .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
-            ask_user: None,
+            ask_user: self.form_elicitation.load(Ordering::Acquire).then(|| {
+                crate::tools::ask_user::AskUserTool::new_v1(connection.clone(), session_id.clone())
+            }),
             cwd,
             additional_directories,
             integration: Arc::new(observer),
@@ -3719,6 +3731,38 @@ pub(super) mod tests {
             assert_eq!(server.subagent_updates.load(Ordering::Acquire), supported);
         }
         assert!(!create_server().subagent_updates.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn v1_form_capabilities_reset_on_initialize_and_new_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let create_server = || {
+            Server::new(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                AcpIntegration::builder()
+                    .name("form-test")
+                    .approval_resolver(AutoDenyResolver)
+                    .build()
+                    .unwrap(),
+                SessionRegistry::new(),
+            )
+        };
+        let server = create_server();
+        assert!(!server.form_elicitation.load(Ordering::Acquire));
+        for (capabilities, supported) in [
+            (json!({"elicitation": {"form": {}}}), true),
+            (json!({"elicitation": {"url": {}}}), false),
+            (json!({"elicitation": {"form": {}}}), true),
+            (json!({}), false),
+        ] {
+            let request = serde_json::from_value(json!({
+                "protocolVersion":1, "clientCapabilities": capabilities,
+            }))
+            .unwrap();
+            server.initialize(request).await;
+            assert_eq!(server.form_elicitation.load(Ordering::Acquire), supported);
+        }
+        assert!(!create_server().form_elicitation.load(Ordering::Acquire));
     }
 
     #[test]

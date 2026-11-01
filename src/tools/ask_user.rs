@@ -1,7 +1,10 @@
 //! Connection-bound, foreground-only structured user questions.
 use std::{collections::BTreeSet, sync::Arc};
 
-use agent_client_protocol::{Client, V2ConnectionTo, schema::v2 as wire};
+use agent_client_protocol::{
+    Client, ConnectionTo, V2ConnectionTo,
+    schema::{v1, v2 as wire},
+};
 use agentkit_core::{ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
@@ -48,7 +51,7 @@ fn text_schema(min: usize, max: usize) -> Value {
 #[derive(Clone)]
 pub(crate) struct AskUserTool {
     spec: ToolSpec,
-    connection: V2ConnectionTo<Client>,
+    connection: QuestionConnection,
     session: wire::SessionId,
     // This lock owns no mutable data. The permit serializes dialogs and their
     // requires_action/running pair. Cancellation drops the permit; no repair or
@@ -56,8 +59,25 @@ pub(crate) struct AskUserTool {
     admission: Arc<tokio::sync::Mutex<()>>,
 }
 
+#[derive(Clone)]
+enum QuestionConnection {
+    V1(ConnectionTo<Client>),
+    V2(V2ConnectionTo<Client>),
+}
+
 impl AskUserTool {
     pub(crate) fn new(connection: V2ConnectionTo<Client>, session: wire::SessionId) -> Self {
+        Self::with_connection(QuestionConnection::V2(connection), session)
+    }
+
+    pub(crate) fn new_v1(connection: ConnectionTo<Client>, session: v1::SessionId) -> Self {
+        Self::with_connection(
+            QuestionConnection::V1(connection),
+            wire::SessionId::new(session.to_string()),
+        )
+    }
+
+    fn with_connection(connection: QuestionConnection, session: wire::SessionId) -> Self {
         let option = object([
             ("type", Value::from("object")),
             (
@@ -452,12 +472,47 @@ impl Drop for Waiting<'_> {
 }
 impl AskUserTool {
     fn state(&self, state: wire::StateUpdate) -> Result<(), ToolError> {
-        self.connection
-            .send_notification(wire::UpdateSessionNotification::new(
-                self.session.clone(),
-                wire::SessionUpdate::StateUpdate(state),
-            ))
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))
+        match &self.connection {
+            // v1 has no foreground session state update notification.
+            QuestionConnection::V1(_) => Ok(()),
+            QuestionConnection::V2(connection) => connection
+                .send_notification(wire::UpdateSessionNotification::new(
+                    self.session.clone(),
+                    wire::SessionUpdate::StateUpdate(state),
+                ))
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string())),
+        }
+    }
+
+    async fn elicit(
+        &self,
+        request: wire::CreateElicitationRequest,
+    ) -> Result<wire::CreateElicitationResponse, ToolError> {
+        match &self.connection {
+            QuestionConnection::V2(connection) => connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string())),
+            QuestionConnection::V1(connection) => {
+                // Form fields and session/tool-call scopes have the same wire shape.
+                // Keep question validation and answer handling shared across versions.
+                let request: v1::CreateElicitationRequest = serde_json::from_value(
+                    serde_json::to_value(request).map_err(|_| invalid("invalid question form"))?,
+                )
+                .map_err(|_| invalid("invalid question form"))?;
+                let response = connection
+                    .send_request(request)
+                    .block_task()
+                    .await
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                serde_json::from_value(
+                    serde_json::to_value(response)
+                        .map_err(|_| invalid("invalid question response"))?,
+                )
+                .map_err(|_| invalid("invalid question response"))
+            }
+        }
     }
 }
 
@@ -503,12 +558,7 @@ impl Tool for AskUserTool {
             let _waiting = Waiting(self);
             // Dropping block_task drops SentRequest: the SDK sends the targeted
             // $/cancel_request, never a blanket cancellation of session dialogs.
-            let response = self
-                .connection
-                .send_request(elicitation)
-                .block_task()
-                .await
-                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            let response = self.elicit(elicitation).await?;
             if cancellation
                 .as_ref()
                 .is_some_and(|cancel| cancel.is_cancelled())

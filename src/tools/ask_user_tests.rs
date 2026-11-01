@@ -586,3 +586,221 @@ fn aggregate_request_limit_counts_serialized_utf8_not_characters() {
         matches!(rejected, Err(ToolError::InvalidInput(message)) if message.contains("128 KiB") && message.contains("split"))
     );
 }
+
+fn v1_response(value: Value) -> v1::CreateElicitationResponse {
+    serde_json::from_value(value).unwrap()
+}
+
+#[tokio::test]
+async fn v1_real_acp_request_returns_answer() {
+    let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+    let client = agent_client_protocol::Client.builder().on_receive_request(
+        async move |request: v1::CreateElicitationRequest, responder, _cx| {
+            assert_eq!(request.message, "Choose the implementation.");
+            let v1::ElicitationMode::Form(form) = request.mode else {
+                panic!("expected form")
+            };
+            let v1::ElicitationScope::Session(scope) = form.scope else {
+                panic!("expected session")
+            };
+            assert_eq!(scope.session_id.to_string(), "session");
+            let reply = match scope.tool_call_id.unwrap().to_string().as_str() {
+                "call" => {
+                    json!({"action":"accept","content":{"question_0":["tui"],"question_1":"small"}})
+                }
+                "decline" => json!({"action":"decline"}),
+                "cancel" => json!({"action":"cancel"}),
+                other => panic!("unexpected request {other}"),
+            };
+            responder.respond(v1_response(reply))
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+    let (ready, initialized) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        client
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(
+                        v1::InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        )
+                        .client_capabilities(
+                            v1::ClientCapabilities::new().elicitation(
+                                v1::ElicitationCapabilities::new()
+                                    .form(v1::ElicitationFormCapabilities::new()),
+                            ),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let _ = ready.send(());
+                std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+            })
+            .await
+    });
+    agent_client_protocol::Agent
+        .builder()
+        .on_receive_request(
+            async move |_request: v1::InitializeRequest, responder, _cx| {
+                responder.respond(v1::InitializeResponse::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent_transport, async move |connection| {
+            initialized.await.unwrap();
+            let tool = AskUserTool::new_v1(connection, v1::SessionId::new("session"));
+            let cancelled_controller = CancellationController::new();
+            let cancelled_context = context(&cancelled_controller);
+            cancelled_controller.interrupt();
+            assert!(matches!(
+                tool.invoke(
+                    ToolRequest::new(
+                        "already-cancelled",
+                        "ask_user",
+                        example(),
+                        "session",
+                        "turn"
+                    ),
+                    &mut cancelled_context.borrowed(),
+                )
+                .await,
+                Err(ToolError::Cancelled)
+            ));
+            let controller = CancellationController::new();
+            let context = context(&controller);
+            let wrong_session = tool
+                .invoke(
+                    ToolRequest::new("wrong", "ask_user", example(), "another-session", "turn"),
+                    &mut context.borrowed(),
+                )
+                .await;
+            assert!(matches!(wrong_session, Err(ToolError::ExecutionFailed(_))));
+            let result = tool
+                .invoke(
+                    ToolRequest::new("call", "ask_user", example(), "session", "turn"),
+                    &mut context.borrowed(),
+                )
+                .await
+                .unwrap();
+            assert!(!result.result.is_error);
+            for action in ["decline", "cancel"] {
+                let result = tool
+                    .invoke(
+                        ToolRequest::new(action, "ask_user", example(), "session", "turn"),
+                        &mut context.borrowed(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result.result.is_error);
+                assert_eq!(
+                    result.result.output,
+                    ToolOutput::structured(json!({"action":action}))
+                );
+            }
+            Ok::<_, agent_client_protocol::Error>(())
+        })
+        .await
+        .unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn v1_turn_cancellation_cancels_individual_acp_request() {
+    let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+    let controller = CancellationController::new();
+    let interrupt = controller.clone();
+    let (cancelled, cancellation_seen) = tokio::sync::oneshot::channel();
+    let cancelled = Arc::new(tokio::sync::Mutex::new(Some(cancelled)));
+    let client = agent_client_protocol::Client.builder().on_receive_request(
+        async move |request: v1::CreateElicitationRequest, responder, cx| {
+            let v1::ElicitationMode::Form(form) = request.mode else {
+                panic!("expected form")
+            };
+            let v1::ElicitationScope::Session(scope) = form.scope else {
+                panic!("expected session")
+            };
+            if scope.tool_call_id.unwrap().to_string() == "retry" {
+                return responder.respond(v1_response(json!({"action":"decline"})));
+            }
+            let cancellation = responder.cancellation();
+            let cancelled = cancelled.clone();
+            interrupt.interrupt();
+            cx.spawn(async move {
+                cancellation.cancelled().await;
+                if let Some(sender) = cancelled.lock().await.take() {
+                    let _ = sender.send(());
+                }
+                responder.respond(v1_response(json!({"action":"cancel"})))
+            })?;
+            Ok(())
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+    let (ready, initialized) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        client
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(
+                        v1::InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        )
+                        .client_capabilities(
+                            v1::ClientCapabilities::new().elicitation(
+                                v1::ElicitationCapabilities::new()
+                                    .form(v1::ElicitationFormCapabilities::new()),
+                            ),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let _ = ready.send(());
+                std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+            })
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent_client_protocol::Agent
+            .builder()
+            .on_receive_request(
+                async move |_request: v1::InitializeRequest, responder, _cx| {
+                    responder.respond(v1::InitializeResponse::new(
+                        agent_client_protocol::schema::ProtocolVersion::V1,
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent_transport, async move |connection| {
+                initialized.await.unwrap();
+                let tool = AskUserTool::new_v1(connection, v1::SessionId::new("session"));
+                let context = context(&controller);
+                let result = tool
+                    .invoke(
+                        ToolRequest::new("call", "ask_user", example(), "session", "turn"),
+                        &mut context.borrowed(),
+                    )
+                    .await;
+                assert!(matches!(result, Err(ToolError::Cancelled)));
+                cancellation_seen.await.unwrap();
+                let next_controller = CancellationController::new();
+                let next_context = super::tests::context(&next_controller);
+                let result = tool
+                    .invoke(
+                        ToolRequest::new("retry", "ask_user", example(), "session", "turn"),
+                        &mut next_context.borrowed(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result.result.is_error);
+                Ok::<_, agent_client_protocol::Error>(())
+            }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    task.abort();
+}
