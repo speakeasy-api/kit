@@ -1819,23 +1819,6 @@ struct SessionActor<S: ModelSession> {
 }
 
 async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
-    let sink = actor.sink.clone();
-    let session_id = actor.session_id.clone();
-    super::plan::scope(
-        move |plan| {
-            if let Err(error) = sink.update(wire::UpdateSessionNotification::new(
-                session_id.clone(),
-                plan.v2(),
-            )) {
-                tracing::debug!(%error, "failed to queue ACP v2 task plan");
-            }
-        },
-        session_actor_inner(actor),
-    )
-    .await;
-}
-
-async fn session_actor_inner<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
     let SessionActor {
         subagents,
         mut voice_monitor,
@@ -1880,9 +1863,6 @@ async fn session_actor_inner<S: ModelSession + Send + 'static>(actor: SessionAct
                 }),
             }
         }; // Drop the owning futures before handlers reborrow receivers/driver.
-        if let Either::Right(Either::Right(Some(task))) = &event {
-            super::plan::observe(&tasks, Some(task)).await;
-        }
         match event {
             Either::Left(command) => match command {
                 Some(Command::Prompt(command)) => {
@@ -2141,7 +2121,6 @@ async fn session_actor_inner<S: ModelSession + Send + 'static>(actor: SessionAct
                 None => break,
             },
         }
-        super::plan::observe(&tasks, None).await;
         if let Some(hooks) = runtime.hooks() {
             hooks.drain_turn_events(&session_id.to_string()).await;
         }
@@ -5547,6 +5526,21 @@ mod tests {
         assert_running_then_idle(
             &recording.updates.lock().unwrap(),
             wire::StopReason::EndTurn,
+        );
+        let updates = recording.updates.lock().unwrap().clone();
+        assert!(
+            updates
+                .iter()
+                .all(|update| !matches!(update.update, wire::SessionUpdate::PlanUpdate(_)))
+        );
+        assert!(
+            updates.iter().any(|update| matches!(
+                &update.update,
+                wire::SessionUpdate::ToolCallUpdate(tool)
+                    if tool.tool_call_id.to_string() == "background-call"
+                        && tool.status == MaybeUndefined::Value(wire::ToolCallStatus::Completed)
+            )),
+            "background completion must update its tool card"
         );
         assert_eq!(turns.load(Ordering::SeqCst), 3);
         assert!(
