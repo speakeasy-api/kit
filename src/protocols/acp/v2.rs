@@ -3145,9 +3145,10 @@ pub(crate) fn component(
                                     let _ = activation.send(());
                                     Ok(())
                                 }
-                                Err(AcpRuntimeError::Unsupported(detail)) => responder.respond_with_error(
-                                    agent_client_protocol::Error::invalid_params().data(detail),
-                                ),
+                                Err(AcpRuntimeError::Unsupported(detail)) => responder
+                                    .respond_with_error(
+                                        agent_client_protocol::Error::invalid_params().data(detail),
+                                    ),
                                 Err(error) => responder.respond_with_error(sdk_error(error)),
                             }
                         }
