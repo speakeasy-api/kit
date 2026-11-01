@@ -1597,6 +1597,20 @@ pub fn catalog(root: &Path) -> Result<Vec<CatalogEntry>, String> {
     catalog_for_workspace(root, &default_directory()?)
 }
 
+/// Reads one session with exactly the same authority and title rules as the catalog.
+/// Unlike listing, this does not discover or scan unrelated workspace sessions.
+pub(crate) fn catalog_entry(root: &Path, id: &str) -> Result<Option<CatalogEntry>, String> {
+    validate_id(id)?;
+    Ok(catalog_for_session_with(
+        fs::best_effort_global(),
+        root,
+        &default_directory()?,
+        true,
+        Some(id),
+    )?
+    .pop())
+}
+
 /// Sets or clears a durable session's custom display name.
 ///
 /// Passing `None` clears the custom name. The transcript and its mutation lock are
@@ -1841,6 +1855,16 @@ fn catalog_for_workspace_with(
     global_directory: &Path,
     backfill: bool,
 ) -> Result<Vec<CatalogEntry>, String> {
+    catalog_for_session_with(filesystem, root, global_directory, backfill, None)
+}
+
+fn catalog_for_session_with(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+    backfill: bool,
+    session_id: Option<&str>,
+) -> Result<Vec<CatalogEntry>, String> {
     let root = filesystem.canonicalize(root).map_err(|error| {
         format!(
             "could not resolve workspace root {}: {error}",
@@ -1857,7 +1881,10 @@ fn catalog_for_workspace_with(
             root.display()
         ));
     }
-    let ids = discover_workspace_ids(filesystem, &root, global_directory, backfill)?;
+    let ids = match session_id {
+        Some(id) => vec![id.to_owned()],
+        None => discover_workspace_ids(filesystem, &root, global_directory, backfill)?,
+    };
     let mut entries = Vec::with_capacity(ids.len());
     let directory = workspace_storage_directory(global_directory, &root);
     for id in ids {
@@ -5440,6 +5467,68 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn targeted_catalog_matches_listing_without_returning_other_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let _first = open_in(
+            root.path(),
+            storage.path(),
+            "first",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "First title")],
+        )
+        .unwrap();
+        let _other = open_in(
+            root.path(),
+            storage.path(),
+            "other",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Other title")],
+        )
+        .unwrap();
+        let targeted = || {
+            catalog_for_session_with(
+                fs::best_effort_global(),
+                root.path(),
+                storage.path(),
+                true,
+                Some("first"),
+            )
+            .unwrap()
+        };
+        for title in [None, Some("Renamed"), None] {
+            set_display_name_in(root.path(), storage.path(), "first", title).unwrap();
+            let entries = targeted();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, "first");
+            assert_eq!(
+                entries[0].title.as_deref(),
+                Some(title.unwrap_or("First title"))
+            );
+            let listed = catalog_for_workspace(root.path(), storage.path()).unwrap();
+            assert_eq!(
+                Some(&entries[0]),
+                listed.iter().find(|entry| entry.id == "first")
+            );
+            assert_eq!(targeted(), entries);
+        }
+        assert!(
+            catalog_for_session_with(
+                fs::best_effort_global(),
+                root.path(),
+                storage.path(),
+                true,
+                Some("missing"),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(catalog_entry(root.path(), "../invalid").is_err());
     }
 
     #[test]

@@ -56,6 +56,7 @@ use tracing::Instrument as _;
 
 mod activity;
 pub(crate) mod model_switch;
+mod session_info;
 mod session_pagination;
 mod skill_catalog;
 mod subagents;
@@ -1923,12 +1924,22 @@ impl Server {
                         Ok(())
                     },
                 ));
+                let info = std::pin::pin!(session_info::poll(
+                    runtime.root().to_path_buf(),
+                    session_id.to_string(),
+                    |metadata| {
+                        connection.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            metadata.v1(),
+                        ))
+                    },
+                ));
                 let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
                     let _ = connection
                         .send_notification(available_commands_update(session_id.clone(), commands));
                 }));
                 // Dropping the losing future stops polling with its session.
-                let _ = select(actor, polling).await;
+                let _ = select(actor, select(polling, info)).await;
             }
         });
         let registered = RegisteredSession {
@@ -7165,12 +7176,26 @@ pub(super) mod tests {
                     updates_rx.try_recv(),
                     Ok(SessionUpdate::AgentMessageChunk(_))
                 ));
-                assert!(matches!(
-                    timeout(Duration::from_secs(1), updates_rx.recv())
+                let mut commands_seen = false;
+                let mut metadata_seen = false;
+                for _ in 0..2 {
+                    match timeout(Duration::from_secs(10), updates_rx.recv())
                         .await
-                        .expect("available commands update timed out"),
-                    Some(SessionUpdate::AvailableCommandsUpdate(_))
-                ));
+                        .expect("initial updates timed out")
+                        .unwrap()
+                    {
+                        SessionUpdate::AvailableCommandsUpdate(_) => commands_seen = true,
+                        SessionUpdate::SessionInfoUpdate(info) => {
+                            let value = serde_json::to_value(info).unwrap();
+                            let entry = crate::session::catalog(&workspace).unwrap().pop().unwrap();
+                            assert_eq!(value["title"], "remember me");
+                            assert_eq!(value["updatedAt"], entry.updated_at_rfc3339());
+                            metadata_seen = true;
+                        }
+                        other => panic!("unexpected initial update: {other:?}"),
+                    }
+                }
+                assert!(commands_seen && metadata_seen);
 
                 connection
                     .send_request(CloseSessionRequest::new(session_id.clone()))
@@ -7193,12 +7218,26 @@ pub(super) mod tests {
                     updates_rx.try_recv(),
                     Ok(SessionUpdate::AgentMessageChunk(_))
                 ));
-                assert!(matches!(
-                    timeout(Duration::from_secs(1), updates_rx.recv())
+                let mut commands_seen = false;
+                let mut metadata_seen = false;
+                for _ in 0..2 {
+                    match timeout(Duration::from_secs(10), updates_rx.recv())
                         .await
-                        .expect("available commands update timed out"),
-                    Some(SessionUpdate::AvailableCommandsUpdate(_))
-                ));
+                        .expect("initial updates timed out")
+                        .unwrap()
+                    {
+                        SessionUpdate::AvailableCommandsUpdate(_) => commands_seen = true,
+                        SessionUpdate::SessionInfoUpdate(info) => {
+                            let value = serde_json::to_value(info).unwrap();
+                            let entry = crate::session::catalog(&workspace).unwrap().pop().unwrap();
+                            assert_eq!(value["title"], "remember me");
+                            assert_eq!(value["updatedAt"], entry.updated_at_rfc3339());
+                            metadata_seen = true;
+                        }
+                        other => panic!("unexpected initial update: {other:?}"),
+                    }
+                }
+                assert!(commands_seen && metadata_seen);
                 connection
                     .send_request(CloseSessionRequest::new(session_id.clone()))
                     .block_task()
