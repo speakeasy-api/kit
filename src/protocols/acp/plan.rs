@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(entries(&plan).0[0]["priority"], "low");
         let result = ToolResultPart::success(
             task.call_id.clone(),
-            agentkit_core::ToolOutput::Json(json!({"private": "not projected"})),
+            agentkit_core::ToolOutput::structured(json!({"private": "not projected"})),
         );
         assert!(plan.observe(&TaskEvent::Completed(task, result)));
         let (v1, v2) = entries(&plan);
