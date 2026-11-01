@@ -297,6 +297,20 @@ Kit reads fork capability from the child's ACP `initialize` response at runtime.
 
 Do not infer support from the agent name or an old compatibility table; ACP capabilities can change between agent releases.
 
+### Codex native forks
+
+`@agentclientprotocol/codex-acp@2.5.0` advertises and implements native `session/fork`. Use it with an authenticated Codex CLI 0.166.0 installation. Set `CODEX_PATH` to that executable in the environment before starting Kit; the adapter otherwise selects its bundled Codex CLI. The verified combination is adapter 2.5.0 with Codex CLI 0.166.0, not the bundled 0.165.0.
+
+```sh
+export CODEX_PATH="/absolute/path/to/codex"
+"$CODEX_PATH" --version  # Expect codex-cli 0.166.0
+kit
+```
+
+Configure `[acp.codex]` with `command = "npx"` and `args = ["-y", "@agentclientprotocol/codex-acp@2.5.0"]`. Authenticate Codex before launching Kit; Kit does not perform the adapter login flow. Do not put the environment assignment in the profile command: Kit launches the executable directly and inherits its environment.
+
+A native fork creates a distinct session that inherits the source conversation. Subsequent child turns do not become part of the source conversation. Kit still checks the advertised capability at runtime; older adapters without `session/fork` cannot use the Kit-only transcript fallback.
+
 ## Headless permission policy
 
 Nested agents run unattended and cannot ask the user interactively. Kit selects `allow_always` when offered, otherwise `allow_once`. If the child offers no allow option, Kit cancels the request; it never selects a rejection option.
