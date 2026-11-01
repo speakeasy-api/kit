@@ -65,8 +65,8 @@ description = "Rust tests without the tui feature; arguments pass through like t
 run = "scripts/isolated-home.sh cargo test --locked --no-default-features"
 
 [tasks."test:scripts"]
-description = "Shell tests for the release scripts"
-run = ["scripts/tests/test_next_release_version.sh", "scripts/tests/test_linux_audio_linkage.sh", "scripts/tests/test_install.sh"]
+description = "Tests for the release scripts"
+run = ["scripts/tests/test_next_release_version.sh", "scripts/tests/test_linux_audio_linkage.sh", "scripts/tests/test_install.sh", "python3 -m unittest scripts/tests/test_generate_agent_manifest.py"]
 
 [tasks.check]
 description = "Everything CI runs on Linux"

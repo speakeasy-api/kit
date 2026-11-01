@@ -511,15 +511,21 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum kit-*.tar.gz Kit-*.zip > SHA256SUMS
           prerelease=${{ needs.verify.outputs.prerelease }}
+          assets=(kit-*.tar.gz Kit-*.zip)
+          if [[ $prerelease == false ]]; then
+            python3 ../scripts/generate-agent-manifest.py "$RELEASE_VERSION" .
+            assets+=(agent.json)
+          fi
+          sha256sum "${assets[@]}" > SHA256SUMS
+          assets+=(SHA256SUMS)
           title="Kit $RELEASE_VERSION"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" kit-*.tar.gz Kit-*.zip SHA256SUMS \
+            gh release upload "$RELEASE_TAG" "${assets[@]}" \
               --clobber --repo "$GITHUB_REPOSITORY"
           else
             create_args=(
-              "$RELEASE_TAG" kit-*.tar.gz Kit-*.zip SHA256SUMS
+              "$RELEASE_TAG" "${assets[@]}"
               --repo "$GITHUB_REPOSITORY"
               --verify-tag
               --title "$title"
