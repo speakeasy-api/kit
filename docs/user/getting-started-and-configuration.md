@@ -233,6 +233,8 @@ kit acp --root /path/to/project --protocol-version 1
 kit acp --root /path/to/project --protocol-version 2
 ```
 
+Stable [GitHub releases](https://github.com/speakeasy-api/kit/releases) include an `agent.json` manifest for ACP registry integrations. It pins the macOS Apple Silicon and Linux x86-64 CLI archives and their SHA-256 checksums, and launches `./kit acp` after extraction. Prereleases do not include this stable-channel manifest. Publishing the manifest does not automatically add Kit to an editor's agent catalog; catalog inclusion requires a separate [ACP registry submission](https://github.com/agentclientprotocol/registry/blob/main/CONTRIBUTING.md).
+
 ACP clients can supply additional stdio MCP servers per session: use `mcpServers` on v1 `session/new`, `session/load`, or `session/fork`, or on v2 `session/new` or `session/resume`. V2 stdio entries require `type: "stdio"`. These servers are attachment-scoped, preserve configured servers, and must be supplied again when reattaching; Kit does not persist their launch configuration.
 
 ## Configure `~/.kit/config.toml`
