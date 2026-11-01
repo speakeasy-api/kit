@@ -8108,7 +8108,7 @@ for line in sys.stdin:
         let transcript = [user, response];
         let replay = transcript_replay(&session, &transcript);
         assert!(
-            matches!(&replay[1].update, wire::SessionUpdate::AgentMessage(message) if message.content.len() == 2)
+            matches!(&replay[1].update, wire::SessionUpdate::AgentMessage(message) if message.content.value().is_some_and(|content| content.len() == 2))
         );
         for id in ["thought-id", "agent-id"] {
             let cursor = ReplayCursor {
