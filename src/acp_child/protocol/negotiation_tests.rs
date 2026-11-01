@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+
 use super::{Client, Version, initialize, request};
 use agent_client_protocol::{
     Builder, Channel,

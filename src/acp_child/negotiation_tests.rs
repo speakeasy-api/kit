@@ -1,4 +1,5 @@
 //! Subprocess-boundary coverage: each peer records its actual PID and wire requests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 use super::*;
 use serde_json::json;
 
