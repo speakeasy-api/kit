@@ -65,6 +65,11 @@ pub(super) async fn poll<E>(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use agentkit_core::{Item, ItemKind, Timestamp};
