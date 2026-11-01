@@ -272,7 +272,7 @@ kit config set ask_user false
 
 This writes `ask_user = false` in `~/.kit/config.toml`. Restart the running Kit
 process to apply the setting; configuration is read at startup. The default is
-`true`, but the tool still requires an ACP v2 client that supports form elicitation.
+`true`, but the tool still requires an ACP client that supports form elicitation.
 This setting does not disable generic form display or change the TUI's advertised
 form capability.
 
