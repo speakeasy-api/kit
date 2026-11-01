@@ -55,7 +55,7 @@ use tokio::{
 };
 use tracing::Instrument as _;
 
-mod activity;
+pub(crate) mod activity;
 mod compaction_projection;
 pub(crate) mod model_switch;
 mod plan;
@@ -64,6 +64,7 @@ mod session_pagination;
 mod skill_catalog;
 mod subagents;
 pub(crate) mod tool_projection;
+pub(crate) mod usage;
 pub mod v2;
 
 use crate::{
@@ -1906,6 +1907,7 @@ impl Server {
         .with_compaction(self.compaction_updates.load(Ordering::Acquire))
         .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
+            activity: activity.clone(),
             ask_user: self.form_elicitation.load(Ordering::Acquire).then(|| {
                 crate::tools::ask_user::AskUserTool::new_v1(connection.clone(), session_id.clone())
             }),
@@ -2401,7 +2403,10 @@ async fn session_actor_inner<S: ModelSession>(actor: SessionActor<S>) {
                         .instrument(span)
                         .await;
                     let response = result.and_then(|reason| {
-                        agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
+                        let usage = activity.completed_usage()?;
+                        agentkit_acp::finish_reason_to_stop_reason(&reason).map(|reason| {
+                            PromptResponse::new(reason).usage(usage.as_ref().map(usage::v1))
+                        })
                     });
                     let _ = reply.send(response);
                 }

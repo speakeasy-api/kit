@@ -543,6 +543,7 @@ pub(crate) struct AcpForkState {
 }
 
 pub(crate) struct AcpDriverContext<I = AcpIntegration> {
+    pub activity: crate::protocols::acp::activity::SessionActivity,
     pub ask_user: Option<crate::tools::ask_user::AskUserTool>,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -689,8 +690,11 @@ impl Drop for SessionClaim {
 
 pub(crate) struct AcpDriver {
     pub subagents: Subagents,
-    pub driver:
-        LoopDriver<crate::protocols::acp::v2::identity::Session<HookedSession<SelectableSession>>>,
+    pub driver: LoopDriver<
+        crate::protocols::acp::usage::Session<
+            crate::protocols::acp::v2::identity::Session<HookedSession<SelectableSession>>,
+        >,
+    >,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
@@ -2354,10 +2358,13 @@ impl Runtime {
                     crate::request_budget::RequestBudget::current().seconds(),
                 ),
             })
-            .model(crate::protocols::acp::v2::identity::Adapter {
-                enabled: context.response_attempt_replacement,
-                inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
-                    .with_child(hook_child),
+            .model(crate::protocols::acp::usage::Adapter {
+                activity: context.activity,
+                inner: crate::protocols::acp::v2::identity::Adapter {
+                    enabled: context.response_attempt_replacement,
+                    inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
+                        .with_child(hook_child),
+                },
             })
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs_and_mcp(
@@ -3713,6 +3720,7 @@ mod additional_directory_tests {
             let driver = runtime
                 .start_acp_driver_with_mcp(
                     AcpDriverContext {
+                        activity: crate::protocols::acp::activity::SessionActivity::new(|_| Ok(())),
                         ask_user: None,
                         cwd: root.path().to_path_buf(),
                         additional_directories: vec![],

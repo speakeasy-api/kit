@@ -441,7 +441,8 @@ fn native_activity<S: AcpSessionUpdateSink + 'static>(
         } else {
             wire::StateUpdate::Idle(
                 wire::IdleStateUpdate::new()
-                    .stop_reason(finish_reason_to_stop_reason(&transition.reason)),
+                    .stop_reason(finish_reason_to_stop_reason(&transition.reason))
+                    .usage(transition.usage.as_ref().map(super::usage::v2)),
             )
         };
         send_state(&sink, &session_id, state)
@@ -1261,6 +1262,7 @@ impl Server {
         )
         .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
+            activity: activity.clone(),
             ask_user,
             cwd,
             additional_directories,
@@ -3594,6 +3596,39 @@ mod tests {
                 _ => unreachable!("only terminal methods are advertised"),
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn end_turn_usage_is_projected_only_on_idle() {
+        let sink = RecordingSink::default();
+        let activity = native_activity(wire::SessionId::new("usage-idle"), sink.clone());
+        activity.observe(&AgentEvent::TurnStarted {
+            session_id: SessionId::new("usage-idle"),
+            turn_id: agentkit_core::TurnId::new("usage-turn"),
+        });
+        activity.begin_request();
+        activity.record_usage(
+            agentkit_core::TokenUsage::new(12, 8)
+                .with_reasoning_tokens(3)
+                .with_cached_input_tokens(5)
+                .with_cache_write_input_tokens(2),
+        );
+        activity
+            .settle(Some(FinishReason::Cancelled), None)
+            .unwrap();
+        let updates = sink.updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        let wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle)) = &updates[1].update
+        else {
+            panic!("expected terminal idle");
+        };
+        let usage = idle.usage.as_ref().unwrap();
+        assert_eq!(usage.total_tokens, 20);
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.thought_tokens, Some(3));
+        assert_eq!(usage.cached_read_tokens, Some(5));
+        assert_eq!(usage.cached_write_tokens, Some(2));
     }
 
     #[derive(Clone, Default)]
