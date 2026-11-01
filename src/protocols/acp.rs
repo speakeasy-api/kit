@@ -188,11 +188,14 @@ fn available_commands_update(
             commands
                 .into_iter()
                 .map(|(name, description)| {
-                    let input = (name != "compact").then(|| {
-                        agentkit_acp::AvailableCommandInput::Unstructured(
-                            agentkit_acp::UnstructuredCommandInput::new("Optional arguments"),
-                        )
-                    });
+                    let hint = if name == "compact" {
+                        "Optional next message after compaction"
+                    } else {
+                        "Optional arguments"
+                    };
+                    let input = Some(agentkit_acp::AvailableCommandInput::Unstructured(
+                        agentkit_acp::UnstructuredCommandInput::new(hint),
+                    ));
                     AvailableCommand::new(name, description).input(input)
                 })
                 .collect(),
@@ -5406,7 +5409,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn available_commands_advertises_skills_with_optional_arguments() {
+    fn available_commands_advertises_compact_and_skill_optional_arguments() {
         let notification = available_commands_update(
             agentkit_acp::SessionId::new("session"),
             vec![
@@ -5425,7 +5428,17 @@ pub(super) mod tests {
                 .collect::<Vec<_>>(),
             ["compact", "review"]
         );
-        assert!(update.available_commands[0].input.is_none());
+        let Some(agentkit_acp::AvailableCommandInput::Unstructured(input)) =
+            &update.available_commands[0].input
+        else {
+            panic!("expected compact next-message hint");
+        };
+        assert_eq!(input.hint, "Optional next message after compaction");
+        let encoded = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            encoded["availableCommands"][0]["input"]["hint"],
+            "Optional next message after compaction"
+        );
         assert_eq!(update.available_commands[1].description, "Review changes");
         let Some(agentkit_acp::AvailableCommandInput::Unstructured(input)) =
             &update.available_commands[1].input
