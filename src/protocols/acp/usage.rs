@@ -56,6 +56,78 @@ pub(super) fn v2(tokens: &TokenUsage) -> agent_client_protocol_schema::v2::Usage
     .cached_write_tokens(tokens.cache_write_input_tokens)
 }
 
+// Unknown is distinct from invalid: omission preserves a client's previous value,
+// whereas incompatible currencies (or non-finite amounts) must clear it.
+#[derive(Clone, Debug, Default)]
+pub(super) enum SessionCost {
+    #[default]
+    Unknown,
+    Cleared,
+    Known(agentkit_core::CostUsage),
+    Invalid,
+}
+
+impl SessionCost {
+    pub(super) fn add(&mut self, next: Option<agentkit_core::CostUsage>) {
+        let Some(next) = next else { return };
+        if !next.amount.is_finite() {
+            *self = Self::Invalid;
+            return;
+        }
+        match self {
+            Self::Unknown | Self::Cleared => *self = Self::Known(next),
+            Self::Known(total) if total.currency == next.currency => {
+                let amount = total.amount + next.amount;
+                if amount.is_finite() {
+                    total.amount = amount;
+                } else {
+                    *self = Self::Invalid;
+                }
+            }
+            _ => *self = Self::Invalid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct SessionUsage {
+    pub context: Option<(u64, u64)>,
+    pub cost: SessionCost,
+}
+
+impl SessionUsage {
+    pub(super) fn update_context(&mut self, usage: &agentkit_core::Usage) {
+        let Some(tokens) = &usage.tokens else { return };
+        let Some(used) = tokens.input_tokens.checked_add(tokens.output_tokens) else {
+            return;
+        };
+        let size = [
+            "context_window",
+            "context_window_tokens",
+            "model.context_window",
+            "model.context_length",
+            "openrouter.context_length",
+        ]
+        .iter()
+        .find_map(|key| usage.metadata.get(*key).and_then(|value| value.as_u64()))
+        .or(self.context.map(|(_, size)| size));
+        if let Some(size) = size {
+            self.context = Some((used, size));
+        }
+    }
+
+    pub(super) fn v2(&self) -> Option<agent_client_protocol_schema::v2::UsageUpdate> {
+        use agent_client_protocol_schema::v2::{Cost, UsageUpdate};
+        let (used, size) = self.context?;
+        let update = UsageUpdate::new(used, size);
+        Some(match &self.cost {
+            SessionCost::Unknown => update,
+            SessionCost::Known(cost) => update.cost(Cost::new(cost.amount, cost.currency.clone())),
+            SessionCost::Invalid | SessionCost::Cleared => update.cost(None),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Accounting {
     Main(SessionActivity),
@@ -79,6 +151,7 @@ pub(crate) struct Turn<T> {
     inner: T,
     accounting: Accounting,
     tokens: Option<TokenUsage>,
+    cost: Option<agentkit_core::CostUsage>,
 }
 
 #[async_trait]
@@ -117,6 +190,7 @@ impl<S: ModelSession> ModelSession for Session<S> {
             inner: self.inner.begin_turn(request, cancellation).await?,
             accounting: self.accounting.clone(),
             tokens: None,
+            cost: None,
         })
     }
 
@@ -140,6 +214,19 @@ impl<T: ModelTurn> ModelTurn for Turn<T> {
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         let event = self.inner.next_event(cancellation).await?;
+        let usage = match &event {
+            Some(ModelTurnEvent::Usage(usage)) => Some(usage),
+            Some(ModelTurnEvent::Finished(result)) => result.usage.as_ref(),
+            _ => None,
+        };
+        if let Some(usage) = usage {
+            if let Some(cost) = &usage.cost {
+                self.cost = Some(cost.clone());
+            }
+            if let Accounting::Main(activity) = &self.accounting {
+                activity.record_cost(usage);
+            }
+        }
         match &event {
             Some(ModelTurnEvent::Usage(usage)) => {
                 // Snapshots replace, rather than add to, the current request.
@@ -157,7 +244,10 @@ impl<T: ModelTurn> ModelTurn for Turn<T> {
                     self.tokens = Some(tokens.clone());
                 }
             }
-            Some(ModelTurnEvent::ResponseAttemptSuperseded) => self.tokens = None,
+            Some(ModelTurnEvent::ResponseAttemptSuperseded) => {
+                self.tokens = None;
+                self.cost = None;
+            }
             _ => {}
         }
         Ok(event)
@@ -169,6 +259,9 @@ impl<T> Drop for Turn<T> {
         // The loop drops the request before foreground settlement, including
         // cancellation and errors. Preserve real partial usage in those cases.
         // This concrete owner method invokes no client code, awaits or callbacks.
+        if let Accounting::Compaction(activity) = &self.accounting {
+            activity.record_compaction_cost(self.cost.take());
+        }
         if let Some(tokens) = self.tokens.take() {
             match &self.accounting {
                 Accounting::Main(activity) => activity.record_usage(tokens),
@@ -305,11 +398,202 @@ mod tests {
             inner: ProviderTurn(events.into()),
             accounting: Accounting::Main(activity.clone()),
             tokens: None,
+            cost: None,
         };
         while let Ok(Some(event)) = turn.next_event(None).await {
             if matches!(event, ModelTurnEvent::Finished(_)) {
                 break;
             }
+        }
+    }
+
+    fn monetary(amount: f64, currency: &str) -> Usage {
+        Usage::new(TokenUsage::new(10, 2))
+            .with_cost(agentkit_core::CostUsage::new(amount, currency))
+            .with_metadata(MetadataMap::from([("context_window".into(), 1000.into())]))
+    }
+
+    fn cost_json(activity: &SessionActivity) -> serde_json::Value {
+        serde_json::to_value(activity.session_usage().unwrap().v2().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_cost_replaces_snapshots_and_survives_foreground_intervals() {
+        let activity = SessionActivity::new(|_| Ok(()));
+        for expected in [3.0, 6.0] {
+            activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    async {
+                        start(&activity);
+                        let mut final_event = finished(None);
+                        if let ModelTurnEvent::Finished(result) = &mut final_event {
+                            result.usage = Some(monetary(2.0, "USD"));
+                        }
+                        request(
+                            &activity,
+                            vec![
+                                Ok(ModelTurnEvent::Usage(monetary(0.5, "USD"))),
+                                Ok(ModelTurnEvent::Usage(monetary(1.0, "USD"))),
+                                Ok(ModelTurnEvent::Usage(Usage::new(TokenUsage::new(11, 2)))),
+                                Ok(final_event),
+                            ],
+                        )
+                        .await;
+                        request(
+                            &activity,
+                            vec![Ok(ModelTurnEvent::Usage(monetary(1.0, "USD")))],
+                        )
+                        .await;
+                        assert_eq!(cost_json(&activity)["cost"]["amount"], expected);
+                        Ok(())
+                    },
+                    |_| None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cost_json(&activity)["cost"]["amount"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_cost_omits_missing_preserves_zero_and_clears_mixed_currencies() {
+        let activity = SessionActivity::new(|_| Ok(()));
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    start(&activity);
+                    let mut unknown = monetary(0.0, "USD");
+                    unknown.cost = None;
+                    request(&activity, vec![Ok(ModelTurnEvent::Usage(unknown))]).await;
+                    assert!(cost_json(&activity).get("cost").is_none());
+                    request(
+                        &activity,
+                        vec![Ok(ModelTurnEvent::Usage(monetary(0.0, "USD")))],
+                    )
+                    .await;
+                    assert_eq!(cost_json(&activity)["cost"]["amount"], 0.0);
+                    request(
+                        &activity,
+                        vec![Ok(ModelTurnEvent::Usage(monetary(1.0, "EUR")))],
+                    )
+                    .await;
+                    assert_eq!(cost_json(&activity)["cost"], serde_json::Value::Null);
+                    request(
+                        &activity,
+                        vec![Ok(ModelTurnEvent::Usage(monetary(1.0, "USD")))],
+                    )
+                    .await;
+                    assert_eq!(cost_json(&activity)["cost"], serde_json::Value::Null);
+                    Ok(())
+                },
+                |_| None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cost_json(&activity)["cost"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn session_cost_supersession_clears_provisional_but_keeps_compaction() {
+        let activity = SessionActivity::new(|_| Ok(()));
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    start(&activity);
+                    request(
+                        &activity,
+                        vec![Ok(ModelTurnEvent::Usage(monetary(7.0, "USD")))],
+                    )
+                    .await;
+                    assert_eq!(cost_json(&activity)["cost"]["amount"], 7.0);
+                    activity.observe(&AgentEvent::ResponseAttemptSuperseded);
+                    assert_eq!(
+                        cost_json(&activity).get("cost"),
+                        Some(&serde_json::Value::Null)
+                    );
+                    request(
+                        &activity,
+                        vec![Ok(ModelTurnEvent::Usage(monetary(4.0, "USD")))],
+                    )
+                    .await;
+                    let mut compaction = Turn {
+                        inner: ProviderTurn(
+                            vec![Ok(ModelTurnEvent::Usage(monetary(2.0, "USD")))].into(),
+                        ),
+                        accounting: Accounting::Compaction(activity.clone()),
+                        tokens: None,
+                        cost: None,
+                    };
+                    compaction.next_event(None).await.unwrap();
+                    drop(compaction);
+                    activity.observe(&AgentEvent::ResponseAttemptSuperseded);
+                    assert_eq!(cost_json(&activity)["cost"]["amount"], 2.0);
+                    request(
+                        &activity,
+                        vec![Ok(ModelTurnEvent::Usage(monetary(1.0, "USD")))],
+                    )
+                    .await;
+                    Ok(())
+                },
+                |_| None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cost_json(&activity)["cost"]["amount"], 3.0);
+    }
+
+    #[tokio::test]
+    async fn session_cost_ignores_background_compaction_and_preserves_partial_failure() {
+        let activity = SessionActivity::new(|_| Ok(()));
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    start(&activity);
+                    request(
+                        &activity,
+                        vec![
+                            Ok(ModelTurnEvent::Usage(monetary(2.0, "USD"))),
+                            Err(LoopError::Provider("failed".into())),
+                        ],
+                    )
+                    .await;
+                    let mut background = Turn {
+                        inner: ProviderTurn(
+                            vec![Ok(ModelTurnEvent::Usage(monetary(8.0, "EUR")))].into(),
+                        ),
+                        accounting: Accounting::Disabled,
+                        tokens: None,
+                        cost: None,
+                    };
+                    background.next_event(None).await.unwrap();
+                    drop(background);
+                    Ok(())
+                },
+                |_| None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cost_json(&activity)["cost"]["amount"], 2.0);
+    }
+
+    #[test]
+    fn session_cost_rejects_nonfinite_amounts_and_overflow() {
+        for amounts in [[f64::NAN, 0.0], [f64::INFINITY, 0.0], [f64::MAX, f64::MAX]] {
+            let mut usage = SessionUsage {
+                context: Some((1, 100)),
+                ..Default::default()
+            };
+            for amount in amounts {
+                usage
+                    .cost
+                    .add(Some(agentkit_core::CostUsage::new(amount, "USD")));
+            }
+            let value = serde_json::to_value(usage.v2().unwrap()).unwrap();
+            assert_eq!(value.get("cost"), Some(&serde_json::Value::Null));
         }
     }
 
@@ -508,6 +792,7 @@ mod tests {
             ),
             accounting: Accounting::Main(activity.clone()),
             tokens: None,
+            cost: None,
         };
         turn.next_event(None).await.unwrap();
         drop(turn);
