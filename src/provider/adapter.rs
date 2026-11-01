@@ -284,6 +284,10 @@ impl SelectableAdapter {
         Ok(self)
     }
 
+    pub(crate) fn session_observer(&self) -> Option<crate::session::SessionObserver> {
+        self.session_observer.clone()
+    }
+
     /// Strict close barrier; adapters without durable sessions have nothing to flush.
     pub(crate) fn checkpoint_transcript(&self) -> Result<(), String> {
         self.session_observer

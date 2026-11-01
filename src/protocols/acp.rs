@@ -1875,6 +1875,7 @@ impl Server {
             .map_err(|error| record_acp_runtime_failure(&session_id, "skill_catalog", error))?;
         let (tx, rx) = mpsc::channel(8);
         let voice_state = crate::runtime::voice_state::VoiceState::default();
+        let metadata_observer = driver.adapter.session_observer();
         let actor = SessionActor {
             subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
@@ -1924,16 +1925,12 @@ impl Server {
                         Ok(())
                     },
                 ));
-                let info = std::pin::pin!(session_info::poll(
-                    runtime.root().to_path_buf(),
-                    session_id.to_string(),
-                    |metadata| {
-                        connection.send_notification(SessionNotification::new(
-                            session_id.clone(),
-                            metadata.v1(),
-                        ))
-                    },
-                ));
+                let info = std::pin::pin!(session_info::poll(metadata_observer, |metadata| {
+                    connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        metadata.v1(),
+                    ))
+                },));
                 let polling = std::pin::pin!(skill_catalog::poll_commands(runtime, |commands| {
                     let _ = connection
                         .send_notification(available_commands_update(session_id.clone(), commands));
