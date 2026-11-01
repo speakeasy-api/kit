@@ -2256,6 +2256,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         match event {
             Either::Left(command) => match command {
                 Some(Command::Prompt { request, reply }) => {
+                    let span = crate::telemetry::incoming::operation(request.meta.as_ref());
                     let result = activity
                         .execute(
                             activity::ExecutionOrigin::Prompt,
@@ -2274,7 +2275,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             ),
                             |reason| Some(reason.clone()),
                         )
-                        .instrument(crate::telemetry::error_spans::operation("acp"))
+                        .instrument(span)
                         .await;
                     let response = result.and_then(|reason| {
                         agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
@@ -2289,6 +2290,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     reply,
                     cancellation_generation,
                 }) => {
+                    let span = crate::telemetry::incoming::operation(request.meta.as_ref());
                     let result = async {
                         let cancellation = integration
                             .cancellation_handle(&session_id)
@@ -2354,6 +2356,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         }
                         set_config(&adapter, &catalog, request).map_err(sdk_error)
                     }
+                    .instrument(span)
                     .await;
                     // Publish from the actor after commit, even if the requester
                     // stopped waiting. A delivery failure cannot undo selection.
@@ -3060,7 +3063,10 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: InitializeRequest, responder, _cx| {
-                    responder.respond(state.initialize(request).await)
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+                    async { responder.respond(state.initialize(request).await) }
+                        .instrument(span)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -3069,7 +3075,10 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: AuthenticateRequest, responder, _cx| {
-                    responder.respond_with_result(state.authenticate(request))
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+                    async { responder.respond_with_result(state.authenticate(request)) }
+                        .instrument(span)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -3078,10 +3087,15 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |_request: LogoutRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(_request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(state.logout().await.map_err(sdk_error))
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder.respond_with_result(state.logout().await.map_err(sdk_error))
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3091,18 +3105,23 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: NewSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
-                        match state.new_session(request, connection.clone()).await {
-                            Ok((response, activation)) => {
-                                responder.respond(response)?;
-                                let _ = activation.send(());
-                                Ok(())
+                    cx.spawn(
+                        async move {
+                            match state.new_session(request, connection.clone()).await {
+                                Ok((response, activation)) => {
+                                    responder.respond(response)?;
+                                    let _ = activation.send(());
+                                    Ok(())
+                                }
+                                Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                             }
-                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
-                    })?;
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3112,23 +3131,28 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: LoadSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
-                        match state.load_session(request, connection.clone()).await {
-                            Ok(prepared) => {
-                                for notification in prepared.replay {
-                                    connection.send_notification(notification)?;
+                    cx.spawn(
+                        async move {
+                            match state.load_session(request, connection.clone()).await {
+                                Ok(prepared) => {
+                                    for notification in prepared.replay {
+                                        connection.send_notification(notification)?;
+                                    }
+                                    responder.respond(prepared.response)?;
+                                    // Once success is reported, retain and activate the session even
+                                    // if the optional post-response command update cannot be sent.
+                                    let _ = prepared.activation.send(());
+                                    Ok(())
                                 }
-                                responder.respond(prepared.response)?;
-                                // Once success is reported, retain and activate the session even
-                                // if the optional post-response command update cannot be sent.
-                                let _ = prepared.activation.send(());
-                                Ok(())
+                                Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                             }
-                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
-                    })?;
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3138,18 +3162,24 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: ForkSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
-                        match state.fork_session(request, connection.clone()).await {
-                            Ok(prepared) => {
-                                prepared
-                                    .submit(|response| responder.respond_with_result(response))?;
-                                Ok(())
+                    cx.spawn(
+                        async move {
+                            match state.fork_session(request, connection.clone()).await {
+                                Ok(prepared) => {
+                                    prepared.submit(|response| {
+                                        responder.respond_with_result(response)
+                                    })?;
+                                    Ok(())
+                                }
+                                Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                             }
-                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
-                    })?;
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3159,15 +3189,20 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: ListSessionsRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(
-                            state
-                                .list_sessions(request)
-                                .await
-                                .map_err(list_sessions_error),
-                        )
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder.respond_with_result(
+                                state
+                                    .list_sessions(request)
+                                    .await
+                                    .map_err(list_sessions_error),
+                            )
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3177,11 +3212,16 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: PromptRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder
-                            .respond_with_result(state.prompt(request).await.map_err(sdk_error))
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder
+                                .respond_with_result(state.prompt(request).await.map_err(sdk_error))
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -3191,10 +3231,15 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: SetSessionConfigOptionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(state.set_config(request).await)
-                    })?;
+                    cx.spawn(
+                            async move {
+                                responder.respond_with_result(state.set_config(request).await)
+                            }
+                            .instrument(span),
+                        )?;
                     Ok(())
                 }
             },
@@ -3286,10 +3331,16 @@ fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: CloseSessionRequest, responder, cx| {
+                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
+
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
-                        responder.respond_with_result(state.close(request).await.map_err(sdk_error))
-                    })?;
+                    cx.spawn(
+                        async move {
+                            responder
+                                .respond_with_result(state.close(request).await.map_err(sdk_error))
+                        }
+                        .instrument(span),
+                    )?;
                     Ok(())
                 }
             },
@@ -8078,6 +8129,66 @@ pub(super) mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn trace_context_reaches_v1_and_v2_ingress_spans() {
+        use futures_util::StreamExt as _;
+        for version in [1, 2] {
+            let (dispatch, spans, _provider) = crate::telemetry::incoming::tests::capture();
+            tracing::dispatcher::with_default(&dispatch, || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let root = tempfile::tempdir().unwrap();
+                    let runtime = Runtime::new_with_provider_and_credentials(
+                        root.path(), "gpt-5.4", crate::ProviderKind::OpenAiSubscription,
+                        crate::credentials::CredentialStorage::Memory,
+                    ).unwrap();
+                    let registry = SessionRegistry::new();
+                    let router = agent_client_protocol::Agent.protocol_router()
+                        .with_v1(component(runtime.clone(), registry.clone()).unwrap())
+                        .with_v2(v2::component(runtime, registry));
+                    let (mut client, agent) = agent_client_protocol::Channel::duplex();
+                    let server = tokio::spawn(async move { router.connect_to(agent).await });
+                    let mut params = serde_json::json!({
+                        "protocolVersion": version,
+                        "clientInfo": {"name": "trace-test", "version": "0"},
+                        "clientCapabilities": {},
+                        "_meta": {
+                            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                            "tracestate": "vendor=ok",
+                            "baggage": "secret=private",
+                            "authorization": "private"
+                        }
+                    });
+                    if version == 2 {
+                        let info = params.as_object_mut().unwrap().remove("clientInfo").unwrap();
+                        params["info"] = info;
+                        params.as_object_mut().unwrap().remove("clientCapabilities");
+                    }
+                    client.tx.unbounded_send(agent_client_protocol::TransportFrame::Single(
+                        agent_client_protocol::RawJsonRpcMessage::request("initialize".into(), params, 1.into()).unwrap(),
+                    )).unwrap();
+                    let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.rx.next()).await.unwrap().unwrap();
+                    let agent_client_protocol::TransportFrame::Single(response) = response else { panic!("expected single response") };
+                    let response = serde_json::to_value(response).unwrap();
+                    assert!(response.get("result").is_some(), "{response}");
+                    drop(client);
+                    tokio::time::timeout(std::time::Duration::from_secs(10), server).await.unwrap().unwrap().unwrap();
+                });
+            });
+            let requests = spans
+                .try_iter()
+                .filter(|span| span.name == "acp.request")
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 1, "v{version}");
+            let span = &requests[0];
+            assert_eq!(
+                span.span_context.trace_id().to_string(),
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            );
+            assert_eq!(span.parent_span_id.to_string(), "00f067aa0ba902b7");
+            assert!(!format!("{:?}", span.attributes).contains("private"));
+        }
     }
 }
 
