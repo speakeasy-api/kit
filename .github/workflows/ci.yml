@@ -127,7 +127,6 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
 
-  # Preserve the existing required check while lint and tests run concurrently.
   test:
     if: always()
     needs: [lint, test-rust]
