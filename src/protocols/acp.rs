@@ -3034,7 +3034,12 @@ impl ConnectTo<Client> for HttpConnection {
     }
 }
 
-pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
+pub(crate) fn http_router(
+    runtime: Arc<Runtime>,
+    registry: SessionRegistry,
+    cors: agent_client_protocol_http::CorsOptions,
+    health_endpoint: bool,
+) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
         HttpConnection(component(Arc::clone(&runtime), registry.clone()).map(|v1| {
             agent_client_protocol::Agent
@@ -3043,7 +3048,11 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
                 .with_v2(v2::component(Arc::clone(&runtime), registry.clone()))
         }))
     })
-    .with_options(agent_client_protocol_http::ServerOptions::default().with_health_endpoint(false))
+    .with_options(
+        agent_client_protocol_http::ServerOptions::default()
+            .with_cors(cors)
+            .with_health_endpoint(health_endpoint),
+    )
     .into_router()
 }
 

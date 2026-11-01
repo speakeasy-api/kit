@@ -19,7 +19,7 @@ Kit has no general permissions or interactive approval framework for its own too
 
 `kit serve` starts an HTTP listener and serves ACP on stdio by default. A2A is enabled by default; `--remote-acp` adds ACP at `/acp`, and `--no-a2a --remote-acp` exposes only remote ACP. `--no-stdio` requires `--remote-acp` and makes the foreground server independent of stdin for daemon or service-manager use. When no address is configured, Kit binds an available loopback address (`127.0.0.1:0`). Use `kit acp` when no HTTP listener is wanted.
 
-Without `--server-credential-file`, the HTTP listener performs no authentication or authorization, and the A2A Agent Card advertises no security requirements. Every client that can reach the listener can submit work to a Kit agent with the configured root and tools. When a credential file is configured, it must contain one non-empty bearer token, optionally followed by one newline; Kit requires that token on every A2A and remote ACP request and advertises Bearer security in the Agent Card. Consequently:
+Without `--server-credential-file`, the HTTP listener performs no authentication or authorization, and the A2A Agent Card advertises no security requirements. Every client that can reach the listener can submit work to a Kit agent with the configured root and tools. When a credential file is configured, it must contain one non-empty bearer token, optionally followed by one newline; Kit requires that token on every A2A and remote ACP application request (browser CORS preflight is unauthenticated) and advertises Bearer security in the Agent Card. Consequently:
 
 - Keep the default loopback binding unless remote access is deliberately required.
 - Binding `0.0.0.0`, a LAN address, or another non-loopback interface exposes a coding agent, not just a read-only status endpoint. Do not run a remotely reachable daemon without `--server-credential-file`; also put appropriate external authentication and network controls in front of it.
@@ -40,6 +40,22 @@ kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 \
 Stop the server with SIGINT or, on Unix, SIGTERM. Kit stops accepting HTTP connections and interrupts active sessions, allowing roughly five seconds for cleanup before forcing unfinished sessions to stop. Inspect interrupted work for partial side effects. Signal-triggered shutdown exits successfully; an unexpected listener failure remains an error.
 
 Confirm current options with `kit serve --help`.
+
+### Configure remote ACP health checks and browser access
+
+Health checks and cross-origin browser access are disabled by default. Enable `/health` with `--http-health`, and allow only the browser origins you trust with repeatable `--http-allowed-origin` options. Both flags require `--remote-acp`:
+
+```sh
+kit serve --remote-acp --no-a2a --no-stdio --http 127.0.0.1:8081 \
+  --server-credential-file /private/token --http-health \
+  --http-allowed-origin https://client.example.com
+```
+
+`GET /health` returns `200` when the listener is serving; it does not check model-provider availability. If a server credential is configured, health requests require the same bearer token as ACP requests. Origins must be exact HTTP or HTTPS origins without paths, credentials, trailing slashes, or wildcards. The allowlist applies to both `/acp` and `/acp/v2`, including WebSocket origin checks; it does not grant browser access to A2A routes.
+
+CORS preflight requests do not require a bearer token, but actual ACP requests still do. Browser clients can send an `Authorization: Bearer …` header; cookie-based credentialed CORS is not enabled. CORS is not authentication: non-browser clients can omit `Origin`, so keep bearer authentication and network controls in place.
+
+HTTP SSE event resumption through `Last-Event-ID` is not supported. Kit rejects that header on ACP endpoints with HTTP `400` rather than silently starting a stream that could omit updates. Reconnect and use ACP v2 `session/resume` to replay retained conversation history; this is not exactly-once transport delivery or continuation of an interrupted prompt.
 
 ## Permission requests and their limitations
 
