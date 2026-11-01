@@ -2750,3 +2750,107 @@ async fn status_matches_external_reconnect_capacity_and_preserves_retired_work()
     wait_for_available_permits(&manager, MAX_LIVE_SUBAGENTS).await;
     assert_eq!(manager.active_count().unwrap(), 0);
 }
+
+/// Real ACP subprocess transport. The synthetic notices deliberately do not
+/// stand in for tests of provider retries or their accounting.
+#[tokio::test]
+async fn retry_notices_arrive_live_from_v1_and_v2_children_without_extra_outcomes() {
+    use std::time::Duration;
+    for version in [1, 2] {
+        for terminal in ["succeeded", "stopped"] {
+            let root = tempfile::tempdir().unwrap();
+            let release = root.path().join("release");
+            let mut config = manager_with_generic_harness(root.path(), Vec::new()).child_config();
+            config.harnesses =
+                crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+                    "generic".into(),
+                    crate::acp_child::AcpHarnessProfile {
+                        command: "python3".into(),
+                        args: vec![
+                            format!("{}/fixtures/mock-acp-retry.py", env!("CARGO_MANIFEST_DIR")),
+                            version.to_string(),
+                            release.display().to_string(),
+                            terminal.into(),
+                        ],
+                        permissions: Default::default(),
+                    },
+                )]))
+                .unwrap();
+            let (manager, events) = observe_events(Subagents::new(config));
+            let mut updates = manager.subscribe_updates("parent".into(), false);
+            let create = manager.create(
+                "retry transport".into(),
+                CreateOptions::default(),
+                0,
+                TurnCancellation::default(),
+                None,
+            );
+            tokio::pin!(create);
+            let mut notices = Vec::new();
+            // Releasing only after the stream receives progress proves that
+            // delivery does not wait for the child's terminal response.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut create => panic!("child settled before release: {result:?}"),
+                        value = updates.recv() => {
+                            let (_, value) = value.unwrap();
+                            if value["sessionUpdate"] == "notice" {
+                                let scheduled = value["_meta"]["kit/providerRetry"]["status"] == "scheduled";
+                                notices.push(value);
+                                if scheduled { break; }
+                            }
+                        }
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(notices.len(), 2);
+            std::fs::write(&release, b"go").unwrap();
+            let handle = tokio::time::timeout(Duration::from_secs(10), &mut create)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(handle.output, Value::String("CHILD_DONE".into()));
+            while let Ok((_, value)) = updates.try_recv() {
+                if value["sessionUpdate"] == "notice" {
+                    notices.push(value);
+                }
+            }
+            assert_eq!(notices.len(), 3);
+            assert_eq!(notices[0]["title"], "Ordinary notice");
+            assert_eq!(notices[2]["_meta"]["kit/providerRetry"]["status"], terminal);
+            // Child activity uses the process runtime-event transport, not the
+            // manager's lifecycle sink. Assert the live ACP payload here;
+            // acp_child's focused parsing test covers its activity projection.
+            let scheduled = &notices[1]["_meta"]["kit/providerRetry"];
+            assert_eq!(scheduled["status"], "scheduled");
+            assert_eq!(scheduled["attempts"], 2);
+            assert_eq!(scheduled["next_delay_ms"], 25);
+            let cleared = &notices[2]["_meta"]["kit/providerRetry"];
+            assert_eq!(cleared["attempts"], 2);
+            assert_eq!(cleared["next_delay_ms"], 0);
+            assert_eq!(cleared["completed_backoff_ms"], 25);
+            let settled = emitted(&events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(event,
+                        events::RuntimeEvent::SubagentStateChanged {
+                            id, status: SubagentStatus::Idle, outcome: Some(_), ..
+                        } if id == &handle.id
+                    )
+                })
+                .count();
+            assert_eq!(
+                settled, 1,
+                "retry clearing is not a second generation outcome"
+            );
+            let state = manager.lookup(&handle).unwrap();
+            let state = state.lock().await;
+            assert_eq!(state.generation, 1);
+            assert_eq!(state.status, SubagentStatus::Idle);
+            assert_eq!(state.outcome, Some(GenerationOutcome::Success));
+            drop(state);
+            manager.shutdown().await.unwrap();
+        }
+    }
+}

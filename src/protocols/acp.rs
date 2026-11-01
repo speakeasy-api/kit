@@ -59,6 +59,7 @@ pub(crate) mod activity;
 mod compaction_projection;
 pub(crate) mod model_switch;
 mod plan;
+pub(crate) mod retry_projection;
 mod session_info;
 mod session_pagination;
 mod skill_catalog;
@@ -1324,6 +1325,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
+    retry: retry_projection::Projection,
     compaction: Option<compaction_projection::Projection>,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
@@ -1340,6 +1342,7 @@ impl ResponseInterruptionNoticeObserver {
         activity: activity::SessionActivity,
     ) -> Self {
         Self {
+            retry: retry_projection::Projection::default(),
             compaction: None,
             hook_messages: None,
             activity,
@@ -1377,6 +1380,13 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
+        if let Some(update) = self.retry.observe(&event.event)
+            && let Err(error) = self
+                .client
+                .notify_session(SessionNotification::new(self.session_id.clone(), update))
+        {
+            tracing::debug!(%error, "failed to queue provider retry update");
+        }
         if let Some(compaction) = &self.compaction {
             for update in compaction.observe(&event.event) {
                 if let Err(error) = self
@@ -5976,6 +5986,97 @@ pub(super) mod tests {
             }),
             "the finalization flush must include the terminal inner-tool card"
         );
+    }
+
+    #[test]
+    fn retry_notices_reach_v1_client_without_model_results() {
+        use agentkit_loop::{
+            ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRetryEvent,
+            ProviderRoute, RetryAccounting, RetryProgress,
+        };
+        use std::time::Duration;
+
+        for succeeded in [true, false] {
+            let integration = AcpIntegration::builder()
+                .name("retry-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap();
+            let session_id = agentkit_acp::SessionId::new("retry-test");
+            let loop_id = AgentkitSessionId::new("retry-test-loop");
+            let (client, mut messages) = AcpClientHandle::channel();
+            let observer = ResponseInterruptionNoticeObserver::new(
+                integration,
+                client,
+                session_id.clone(),
+                legacy_activity(session_id.clone(), |_| Ok(())),
+            );
+            let scheduled =
+                AgentEvent::ProviderRetry(ProviderRetryEvent::Scheduled(RetryProgress {
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    reason: ProviderFailureReason::Transport,
+                    upstream: ProviderClassification::default(),
+                    accounting: RetryAccounting {
+                        attempts: 2,
+                        completed_backoff: Duration::from_millis(125),
+                        elapsed: Duration::from_millis(300),
+                    },
+                    next_delay: Duration::from_millis(250),
+                }));
+            let terminal_accounting = RetryAccounting {
+                attempts: 3,
+                completed_backoff: Duration::from_millis(375),
+                elapsed: Duration::from_millis(800),
+            };
+            let terminal = AgentEvent::ProviderRetry(if succeeded {
+                ProviderRetryEvent::Succeeded {
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    accounting: terminal_accounting,
+                }
+            } else {
+                ProviderRetryEvent::Stopped(ProviderFailure {
+                    last_attempt_reason: None,
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    reason: ProviderFailureReason::RetryExhausted,
+                    upstream: ProviderClassification::default(),
+                    accounting: terminal_accounting,
+                })
+            });
+            // A repeated terminal observation must not add a second outcome.
+            for event in [scheduled, terminal.clone(), terminal] {
+                observer.handle_event(ObservedEvent {
+                    session_id: Arc::new(loop_id.clone()),
+                    event,
+                });
+            }
+            let mut updates = Vec::new();
+            while let Ok(message) = messages.try_recv() {
+                let AcpClientMessage::SessionNotification(notification) = message else {
+                    panic!("retry activity must only emit session notifications");
+                };
+                assert_eq!(notification.session_id, session_id);
+                updates.push(notification.update);
+            }
+            // Retry accounting is activity only: no model, usage, or idle result.
+            assert_eq!(updates.len(), 2);
+            for (update, expected) in updates.iter().zip([
+                json!({
+                    "status": "scheduled", "route": "open_ai_chat_gpt_responses",
+                    "attempts": 2, "category": "transport", "next_delay_ms": 250,
+                    "completed_backoff_ms": 125
+                }),
+                json!({
+                    "status": if succeeded { "succeeded" } else { "stopped" },
+                    "route": "open_ai_chat_gpt_responses", "attempts": 3,
+                    "category": if succeeded { Value::Null } else { json!("retry_exhausted") },
+                    "next_delay_ms": 0, "completed_backoff_ms": 375
+                }),
+            ]) {
+                assert!(matches!(update, SessionUpdate::Notice(_)));
+                let value = serde_json::to_value(update).unwrap();
+                assert_eq!(value["_meta"]["kit/providerRetry"], expected);
+            }
+        }
     }
 
     #[test]

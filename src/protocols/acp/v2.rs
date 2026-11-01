@@ -482,6 +482,7 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
 
 #[derive(Clone)]
 struct ResponseReplacementObserver<S> {
+    retry: super::retry_projection::Projection,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
@@ -498,6 +499,7 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
         activity: SessionActivity,
     ) -> Self {
         Self {
+            retry: super::retry_projection::Projection::default(),
             compaction: super::compaction_projection::Projection::default(),
             hook_messages: None,
             inner,
@@ -552,6 +554,17 @@ where
     S: AcpSessionUpdateSink + Clone,
 {
     fn handle_event(&self, event: ObservedEvent) {
+        if let Some(update) = self.retry.observe(&event.event) {
+            // Notices have the same wire shape in ACP v1 and v2.
+            if let Ok(update) = serde_json::to_value(update).and_then(serde_json::from_value)
+                && let Err(error) = self.sink.inner.update(wire::UpdateSessionNotification::new(
+                    self.session_id.clone(),
+                    update,
+                ))
+            {
+                tracing::debug!(%error, "failed to queue provider retry update");
+            }
+        }
         for update in self.compaction.observe(&event.event) {
             // Compaction's wire contract is identical in v1 and v2.
             let update = serde_json::to_value(update).and_then(serde_json::from_value);
@@ -3628,6 +3641,100 @@ mod tests {
         assert_eq!(usage.thought_tokens, Some(3));
         assert_eq!(usage.cached_read_tokens, Some(5));
         assert_eq!(usage.cached_write_tokens, Some(2));
+    }
+
+    #[test]
+    fn retry_notices_reach_v2_sink_without_results_or_replacements() {
+        use agentkit_loop::{
+            ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRetryEvent,
+            ProviderRoute, RetryAccounting, RetryProgress,
+        };
+        use std::time::Duration;
+
+        for succeeded in [true, false] {
+            let integration = AcpIntegration::default();
+            let recording = RecordingSink::default();
+            let sink = ResponseReplacementSink::new(recording.clone());
+            let session_id = wire::SessionId::new("retry-test");
+            let loop_id = SessionId::new("retry-test-loop");
+            let observer = ResponseReplacementObserver::new(
+                integration,
+                sink.clone(),
+                session_id.clone(),
+                native_activity(session_id.clone(), sink),
+            );
+            let scheduled =
+                AgentEvent::ProviderRetry(ProviderRetryEvent::Scheduled(RetryProgress {
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    reason: ProviderFailureReason::Transport,
+                    upstream: ProviderClassification::default(),
+                    accounting: RetryAccounting {
+                        attempts: 2,
+                        completed_backoff: Duration::from_millis(125),
+                        elapsed: Duration::from_millis(300),
+                    },
+                    next_delay: Duration::from_millis(250),
+                }));
+            let terminal_accounting = RetryAccounting {
+                attempts: 3,
+                completed_backoff: Duration::from_millis(375),
+                elapsed: Duration::from_millis(800),
+            };
+            let terminal = AgentEvent::ProviderRetry(if succeeded {
+                ProviderRetryEvent::Succeeded {
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    accounting: terminal_accounting,
+                }
+            } else {
+                ProviderRetryEvent::Stopped(ProviderFailure {
+                    last_attempt_reason: None,
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    reason: ProviderFailureReason::RetryExhausted,
+                    upstream: ProviderClassification::default(),
+                    accounting: terminal_accounting,
+                })
+            });
+            // A repeated terminal observation must not add a second outcome.
+            for event in [scheduled, terminal.clone(), terminal] {
+                observer.handle_event(ObservedEvent {
+                    session_id: Arc::new(loop_id.clone()),
+                    event,
+                });
+            }
+            // Retry notices must not become tracked response content that a
+            // supersession clears or replaces with an empty model message.
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_id.clone()),
+                event: AgentEvent::ResponseAttemptSuperseded,
+            });
+            let notifications = recording.updates.lock().unwrap();
+            let updates: Vec<_> = notifications
+                .iter()
+                .map(|notification| {
+                    assert_eq!(notification.session_id, session_id);
+                    notification.update.clone()
+                })
+                .collect();
+            // Retry accounting is activity only: no model, usage, or idle result.
+            assert_eq!(updates.len(), 2);
+            for (update, expected) in updates.iter().zip([
+                json!({
+                    "status": "scheduled", "route": "open_ai_chat_gpt_responses",
+                    "attempts": 2, "category": "transport", "next_delay_ms": 250,
+                    "completed_backoff_ms": 125
+                }),
+                json!({
+                    "status": if succeeded { "succeeded" } else { "stopped" },
+                    "route": "open_ai_chat_gpt_responses", "attempts": 3,
+                    "category": if succeeded { Value::Null } else { json!("retry_exhausted") },
+                    "next_delay_ms": 0, "completed_backoff_ms": 375
+                }),
+            ]) {
+                assert!(matches!(update, wire::SessionUpdate::Notice(_)));
+                let value = serde_json::to_value(update).unwrap();
+                assert_eq!(value["_meta"]["kit/providerRetry"], expected);
+            }
+        }
     }
 
     #[derive(Clone, Default)]
