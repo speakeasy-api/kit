@@ -237,6 +237,19 @@ Stable [GitHub releases](https://github.com/speakeasy-api/kit/releases) include 
 
 ACP clients can supply additional stdio MCP servers per session: use `mcpServers` on v1 `session/new`, `session/load`, or `session/fork`, or on v2 `session/new` or `session/resume`. V2 stdio entries require `type: "stdio"`. These servers are attachment-scoped, preserve configured servers, and must be supplied again when reattaching; Kit does not persist their launch configuration.
 
+
+### Replay retained ACP v2 messages
+
+To rebuild a conversation after reconnecting, send `session/resume` with `replayFrom: {"type":"start"}`. To replay only a suffix, use Kit's inclusive cursor with a message ID previously received from that session:
+
+```json
+{"type":"_kit_message","sessionId":"SESSION_ID","messageId":"MESSAGE_ID"}
+```
+
+Set this object as `replayFrom`; its `sessionId` must match the request's `sessionId`. Replay includes the identified complete user message, agent message, or agent thought and all later retained updates. Store the cursor with the session ID and deduplicate complete messages by message ID. The cursor is not an HTTP SSE event ID and does not resume an interrupted model request.
+
+Only messages with durable identities support partial replay. Legacy offset-based replay IDs, tool-call IDs, unknown IDs, and IDs removed by compaction are rejected with JSON-RPC `-32602` (Invalid params), as are malformed or session-mismatched cursors. Retry explicitly with `{"type":"start"}` to rebuild from retained history; Kit does not silently fall back to a different position.
+
 ## Configure `~/.kit/config.toml`
 
 At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown top-level keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.

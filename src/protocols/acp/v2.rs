@@ -679,7 +679,7 @@ struct AttachedSession<C = ()> {
     creation: C,
     session_id: wire::SessionId,
     config_options: Vec<wire::SessionConfigOption>,
-    canonical_transcript: Vec<Item>,
+    replay_updates: Vec<wire::UpdateSessionNotification>,
     activation: oneshot::Sender<()>,
 }
 
@@ -787,6 +787,7 @@ struct SessionSetup {
     additional_directories: Vec<PathBuf>,
     mcp_servers: Vec<wire::McpServer>,
     replay_history: bool,
+    replay_cursor: Option<ReplayCursor>,
 }
 
 struct Server {
@@ -1011,6 +1012,7 @@ impl Server {
                         .collect(),
                     mcp_servers: request.mcp_servers,
                     replay_history: false,
+                    replay_cursor: None,
                 },
                 connection,
                 claim,
@@ -1042,15 +1044,8 @@ impl Server {
         ),
         AcpRuntimeError,
     > {
-        let replay = match request.replay_from {
-            None => false,
-            Some(wire::ReplayFrom::Start(_)) => true,
-            Some(_) => {
-                return Err(AcpRuntimeError::Unsupported(
-                    "unsupported ACP v2 replay cursor".into(),
-                ));
-            }
-        };
+        let replay = request.replay_from.is_some();
+        let replay_cursor = parse_replay_cursor(request.replay_from.as_ref(), &request.session_id)?;
         let root = Runtime::workspace_root(&request.cwd.0)?;
         let claim = self
             .runtime
@@ -1074,6 +1069,7 @@ impl Server {
                         .collect(),
                     mcp_servers: request.mcp_servers,
                     replay_history: replay,
+                    replay_cursor,
                 },
                 connection,
                 claim,
@@ -1081,14 +1077,9 @@ impl Server {
                 crate::runtime::SessionClaim::commit,
             )
             .await?;
-        let updates = if replay {
-            transcript_replay(&attached.session_id, &attached.canonical_transcript)
-        } else {
-            Vec::new()
-        };
         Ok((
             wire::ResumeSessionResponse::new().config_options(attached.config_options),
-            updates,
+            attached.replay_updates,
             attached.activation,
         ))
     }
@@ -1172,6 +1163,7 @@ impl Server {
             .attach_session(
                 SessionSetup {
                     replay_history: false,
+                    replay_cursor: None,
                     cwd: request.cwd.0,
                     additional_directories: request
                         .additional_directories
@@ -1207,6 +1199,7 @@ impl Server {
             additional_directories,
             mcp_servers,
             replay_history,
+            replay_cursor,
         } = setup;
         let runtime = self.runtime.for_workspace(&cwd).await?;
         let cwd = runtime.root().to_path_buf();
@@ -1263,6 +1256,13 @@ impl Server {
         let catalog = driver.adapter.model_catalog(&current).await;
         let config_options = v2_config_options(&current, reasoning, &catalog);
         let canonical_transcript = driver.canonical_transcript;
+        // Validate before spawning or publishing the attachment. BindingGuard and
+        // the uncommitted claim release ownership on rejection.
+        let replay_updates = if replay_history {
+            partial_transcript_replay(&session_id, &canonical_transcript, replay_cursor.as_ref())?
+        } else {
+            Vec::new()
+        };
         let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
             .map_err(|error| AcpRuntimeError::Loop(format!("skill catalog error: {error}")))?;
         let background_jobs = driver.background_jobs.clone();
@@ -1418,7 +1418,7 @@ impl Server {
             creation,
             session_id,
             config_options,
-            canonical_transcript,
+            replay_updates,
             activation,
         })
     }
@@ -2670,6 +2670,92 @@ fn catalog_session_info(entry: &crate::session::CatalogEntry, cwd: &Path) -> wir
     info
 }
 
+/// Kit cursors name retained, persisted message identities, never array offsets.
+/// The cursor is inclusive, as required by ACP. Compacted/unknown identities
+/// are rejected; callers can explicitly retry with `start`.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReplayCursor {
+    session_id: String,
+    message_id: String,
+    #[serde(rename = "_meta")]
+    _meta: Option<Value>,
+}
+
+fn parse_replay_cursor(
+    replay: Option<&wire::ReplayFrom>,
+    session_id: &wire::SessionId,
+) -> Result<Option<ReplayCursor>, AcpRuntimeError> {
+    match replay {
+        None | Some(wire::ReplayFrom::Start(_)) => Ok(None),
+        Some(wire::ReplayFrom::Other(other)) if other.type_ == "_kit_message" => {
+            let cursor: ReplayCursor =
+                serde_json::from_value(Value::Object(other.fields.clone().into_iter().collect()))
+                    .map_err(|_| invalid_replay_cursor())?;
+            if cursor.session_id != session_id.to_string() || cursor.message_id.is_empty() {
+                return Err(invalid_replay_cursor());
+            }
+            Ok(Some(cursor))
+        }
+        Some(_) => Err(invalid_replay_cursor()),
+    }
+}
+
+fn invalid_replay_cursor() -> AcpRuntimeError {
+    AcpRuntimeError::Unsupported("invalid or no longer retained ACP replay cursor".into())
+}
+
+fn partial_transcript_replay(
+    session_id: &wire::SessionId,
+    transcript: &[Item],
+    cursor: Option<&ReplayCursor>,
+) -> Result<Vec<wire::UpdateSessionNotification>, AcpRuntimeError> {
+    let mut updates = transcript_replay(session_id, transcript);
+    let Some(cursor) = cursor else {
+        return Ok(updates);
+    };
+    // Legacy replay IDs use item offsets and are not stable under compaction.
+    // Accept only IDs carried in durable metadata (including thought sections).
+    let mut retained = std::collections::HashSet::new();
+    for item in transcript {
+        if let Some(id) = item.metadata.get(identity::KEY).and_then(Value::as_str) {
+            retained.insert(id.to_owned());
+        }
+        for part in &item.parts {
+            let metadata = match part {
+                Part::Text(text) => &text.metadata,
+                Part::Reasoning(reasoning) => &reasoning.metadata,
+                _ => continue,
+            };
+            if let Some(id) = metadata.get(identity::KEY).and_then(Value::as_str) {
+                retained.insert(id.to_owned());
+            }
+            if let Some(sections) = metadata.get(identity::SECTIONS_KEY)
+                && let Ok(sections) =
+                    serde_json::from_value::<Vec<identity::ThoughtSection>>(sections.clone())
+            {
+                retained.extend(sections.into_iter().map(|section| section.id));
+            }
+        }
+    }
+    if cursor.session_id != session_id.to_string() || !retained.contains(&cursor.message_id) {
+        return Err(invalid_replay_cursor());
+    }
+    let position = updates
+        .iter()
+        .position(|notification| {
+            let id = match &notification.update {
+                wire::SessionUpdate::UserMessage(message) => &message.message_id,
+                wire::SessionUpdate::AgentMessage(message) => &message.message_id,
+                wire::SessionUpdate::AgentThought(message) => &message.message_id,
+                _ => return false,
+            };
+            id.to_string() == cursor.message_id
+        })
+        .ok_or_else(invalid_replay_cursor)?;
+    Ok(updates.split_off(position))
+}
+
 fn transcript_replay(
     session_id: &wire::SessionId,
     transcript: &[Item],
@@ -3076,6 +3162,9 @@ pub(crate) fn component(
                                     let _ = activation.send(());
                                     Ok(())
                                 }
+                                Err(AcpRuntimeError::Unsupported(detail)) => responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params().data(detail),
+                                ),
                                 Err(error) => responder.respond_with_error(sdk_error(error)),
                             }
                         }
@@ -7860,6 +7949,179 @@ for line in sys.stdin:
         assert!(session.inject.is_some());
         assert!(session.delete.is_none());
         assert!(session.fork.is_some());
+    }
+
+    #[tokio::test]
+    async fn v2_unknown_replay_cursor_rolls_back_and_retries_partial_cold_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let session_id = crate::session::new_id();
+        let mut transcript = vec![
+            Item::text(ItemKind::User, "earlier question"),
+            Item::text(ItemKind::User, "retained question"),
+            Item::text(ItemKind::Assistant, "retained answer"),
+        ];
+        identity::stamp_user(&mut transcript[..1]);
+        let cursor_id = identity::stamp_user(&mut transcript[1..2]);
+        let Part::Text(answer) = &mut transcript[2].parts[0] else {
+            unreachable!("assistant fixture is text");
+        };
+        answer
+            .metadata
+            .insert(identity::KEY.into(), json!("stable-answer"));
+        // Persist and close before creating the runtime: replay must use disk identities.
+        drop(
+            crate::session::open(&workspace, &session_id, false, false, transcript.clone())
+                .unwrap(),
+        );
+        let saved =
+            serde_json::to_value(crate::session::load(&workspace, &session_id).unwrap()).unwrap();
+        let expected =
+            transcript_replay(&wire::SessionId::new(session_id.clone()), &transcript)[1..].to_vec();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            &workspace,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime.clone(), SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |notification: wire::UpdateSessionNotification, _cx| {
+                    updates.send(notification).unwrap();
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(terminal_auth_initialize_request())
+                    .block_task()
+                    .await?;
+                let cursor = |message_id: &str| {
+                    serde_json::from_value::<wire::ReplayFrom>(json!({
+                        "type": "_kit_message",
+                        "sessionId": session_id,
+                        "messageId": message_id,
+                    }))
+                    .unwrap()
+                };
+                let error = connection
+                    .send_request(
+                        wire::ResumeSessionRequest::new(session_id.clone(), workspace.clone())
+                            .replay_from(cursor("unknown-durable-message")),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("unknown cursor must reject attachment");
+                assert_eq!(
+                    i32::from(error.code),
+                    i32::from(wire::Error::invalid_params().code)
+                );
+                assert!(
+                    received.try_recv().is_err(),
+                    "rejected replay must emit no updates"
+                );
+                assert_eq!(
+                    serde_json::to_value(crate::session::load(&workspace, &session_id).unwrap())
+                        .unwrap(),
+                    saved
+                );
+                // Claim acquisition proves the failed resume released its reservation.
+                drop(runtime.claim_session_load(&session_id).unwrap());
+                connection
+                    .send_request(
+                        wire::ResumeSessionRequest::new(session_id.clone(), workspace.clone())
+                            .replay_from(cursor(&cursor_id.to_string())),
+                    )
+                    .block_task()
+                    .await?;
+                for expected in expected {
+                    assert_eq!(received.recv().await.unwrap(), expected);
+                }
+                connection
+                    .send_request(wire::CloseSessionRequest::new(session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            });
+        let result = timeout(Duration::from_secs(30), client).await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("partial cold replay client timed out")
+            .expect("partial cold replay client failed");
+    }
+
+    #[test]
+    fn partial_replay_cursor_is_inclusive_durable_and_session_scoped() {
+        let session = wire::SessionId::new("saved");
+        let mut transcript = vec![
+            Item::text(ItemKind::User, "first"),
+            Item::text(ItemKind::User, "second"),
+            Item::text(ItemKind::Assistant, "answer"),
+        ];
+        let id = identity::stamp_user(&mut transcript[1..2]);
+        let Part::Text(answer) = &mut transcript[2].parts[0] else {
+            unreachable!("assistant fixture is text");
+        };
+        answer
+            .metadata
+            .insert(identity::KEY.into(), json!("stable-answer"));
+        let value = serde_json::json!({"type":"_kit_message", "sessionId":"saved", "messageId":id});
+        let wire_cursor: wire::ReplayFrom = serde_json::from_value(value.clone()).unwrap();
+        let cursor = parse_replay_cursor(Some(&wire_cursor), &session)
+            .unwrap()
+            .unwrap();
+        let updates = partial_transcript_replay(&session, &transcript, Some(&cursor)).unwrap();
+        assert_eq!(updates.len(), 2);
+        assert!(
+            matches!(&updates[0].update, wire::SessionUpdate::UserMessage(message) if message.message_id == id)
+        );
+        // Removing earlier history must not move this cursor to another message.
+        transcript.remove(0);
+        assert_eq!(
+            updates,
+            partial_transcript_replay(&session, &transcript, Some(&cursor)).unwrap()
+        );
+        assert!(parse_replay_cursor(Some(&wire_cursor), &wire::SessionId::new("other")).is_err());
+        transcript.remove(0);
+        assert!(partial_transcript_replay(&session, &transcript, Some(&cursor)).is_err());
+        for value in [
+            serde_json::json!({"type":"future"}),
+            serde_json::json!({"type":"_kit_message", "sessionId":"saved"}),
+            serde_json::json!({"type":"_kit_message", "sessionId":"saved", "messageId":""}),
+        ] {
+            let cursor: wire::ReplayFrom = serde_json::from_value(value).unwrap();
+            assert!(parse_replay_cursor(Some(&cursor), &session).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_replay_rejects_legacy_offset_ids_and_unknown_ids() {
+        let session = wire::SessionId::new("saved");
+        let transcript = [Item::text(ItemKind::User, "legacy")];
+        for id in ["saved-replay-0-user", "missing"] {
+            let cursor = ReplayCursor {
+                session_id: "saved".into(),
+                message_id: id.into(),
+                _meta: None,
+            };
+            assert!(partial_transcript_replay(&session, &transcript, Some(&cursor)).is_err());
+        }
+        assert_eq!(
+            partial_transcript_replay(&session, &transcript, None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
