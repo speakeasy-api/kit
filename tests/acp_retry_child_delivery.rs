@@ -1,6 +1,10 @@
 //! Local-only ACP parent/child transport coverage. Synthetic child notices do
 //! not establish provider retry accounting; provider fixtures cover that layer.
-#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 
 #[test]
 fn acp_v1_v2_forward_foreground_and_background_child_retry_notices() {
