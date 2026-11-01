@@ -112,11 +112,14 @@ fn available_commands_update(
             commands
                 .into_iter()
                 .map(|(name, description)| {
-                    let input = (name != "compact").then(|| {
-                        wire::AvailableCommandInput::Text(wire::TextCommandInput::new(
-                            "Optional arguments",
-                        ))
-                    });
+                    let hint = if name == "compact" {
+                        "Optional next message after compaction"
+                    } else {
+                        "Optional arguments"
+                    };
+                    let input = Some(wire::AvailableCommandInput::Text(
+                        wire::TextCommandInput::new(hint),
+                    ));
                     wire::AvailableCommand::Command(
                         wire::Command::new(name, description).input(input),
                     )
@@ -5894,7 +5897,7 @@ mod tests {
     }
 
     #[test]
-    fn available_commands_advertises_skills_with_optional_arguments() {
+    fn available_commands_advertises_compact_and_skill_optional_arguments() {
         let notification = available_commands_update(
             wire::SessionId::new("session"),
             vec![
@@ -5919,7 +5922,10 @@ mod tests {
         let wire::AvailableCommand::Command(review) = &update.available_commands[1] else {
             panic!("expected native review slash command");
         };
-        assert!(compact.input.is_none());
+        let Some(wire::AvailableCommandInput::Text(input)) = &compact.input else {
+            panic!("expected compact next-message hint");
+        };
+        assert_eq!(input.hint, "Optional next message after compaction");
         assert_eq!(review.description, "Review changes");
         let Some(wire::AvailableCommandInput::Text(input)) = &review.input else {
             panic!("expected text argument hint");
@@ -5928,7 +5934,11 @@ mod tests {
         let encoded = serde_json::to_value(&update).unwrap();
         assert_eq!(encoded["availableCommands"][0]["type"], "command");
         assert_eq!(encoded["availableCommands"][0]["name"], "compact");
-        assert!(encoded["availableCommands"][0].get("input").is_none());
+        assert_eq!(encoded["availableCommands"][0]["input"]["type"], "text");
+        assert_eq!(
+            encoded["availableCommands"][0]["input"]["hint"],
+            "Optional next message after compaction"
+        );
         assert_eq!(encoded["availableCommands"][1]["type"], "command");
         assert_eq!(encoded["availableCommands"][1]["input"]["type"], "text");
     }
