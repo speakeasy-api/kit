@@ -25,39 +25,87 @@ jobs:
       - run: mise run test:scripts
       - run: mise run lint
 
-  test-rust:
+  test-build:
+    name: Build tests (${{ matrix.flavor }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: full
+            flags: ''
+            cache: linux-test
+          - flavor: headless
+            flags: --no-default-features
+            cache: linux-headless
     steps:
       - uses: useblacksmith/checkout@v1
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: linux-test
-      - run: mise run setup:linux
-      - run: mise run test
-      - run: mise run build
-      - run: mise run test:linux-no-audio -- target/debug/kit
-
-  # The container images build without the tui feature.
-  test-headless:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: useblacksmith/checkout@v1
-      - uses: jdx/mise-action@v4
-      - uses: Swatinem/rust-cache@v2
+          shared-key: ${{ matrix.cache }}
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
         with:
-          shared-key: linux-headless
+          tool: cargo-nextest@0.9.150
       - run: mise run setup:linux
-      - run: mise run test:headless
-      - run: mise run build:headless
-      - name: Check the headless binary
+      - name: Compile and archive tests
+        env:
+          FLAGS: ${{ matrix.flags }}
+        run: mise run test:archive -- $FLAGS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.flavor }}
+          path: target/nextest.tar.zst
+          compression-level: 0
+          retention-days: 1
+      - name: Run doctests
+        env:
+          FLAGS: ${{ matrix.flags }}
+        run: mise run test:doc -- $FLAGS
+      - if: matrix.flavor == 'full'
         run: |
+          mise run build
+          mise run test:linux-no-audio -- target/debug/kit
+      - if: matrix.flavor == 'headless'
+        run: |
+          mise run build:headless
           mise run check:linux-audio-linkage -- target/debug/kit
           target/debug/kit --version
           if target/debug/kit --help | grep -qw tui; then
             echo "headless build must not expose the tui command" >&2
             exit 1
           fi
+
+  test-shards:
+    name: Tests (${{ matrix.flavor }}, ${{ matrix.partition }})
+    needs: test-build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [full, headless]
+        # The unpartitioned control separates nextest gains from sharding gains.
+        partition: ['hash:1/2', 'hash:2/2', 'hash:1/1']
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: jdx/mise-action@v4
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        with:
+          tool: cargo-nextest@0.9.150
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-${{ matrix.flavor }}
+          path: ${{ runner.temp }}/tests
+      - name: Run archived tests
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          mise run test:archive-run -- \
+            --archive-file "$RUNNER_TEMP/tests/nextest.tar.zst" \
+            --extract-to "$GITHUB_WORKSPACE" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --partition "$PARTITION" \
+            --status-level fail --final-status-level fail
 
   macos-rust:
     runs-on: blacksmith-6vcpu-macos-15
@@ -131,11 +179,12 @@ jobs:
   # Preserve the existing required check while lint and tests run concurrently.
   test:
     if: always()
-    needs: [lint, test-rust]
+    needs: [lint, test-build, test-shards]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Require lint and Rust tests
         env:
           LINT_RESULT: ${{ needs.lint.result }}
-          TEST_RESULT: ${{ needs.test-rust.result }}
-        run: test "$LINT_RESULT" = success && test "$TEST_RESULT" = success
+          BUILD_RESULT: ${{ needs.test-build.result }}
+          TEST_RESULT: ${{ needs.test-shards.result }}
+        run: test "$LINT_RESULT" = success && test "$BUILD_RESULT" = success && test "$TEST_RESULT" = success

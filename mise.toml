@@ -117,3 +117,15 @@ run = "scripts/docker-build.sh"
 [tasks."docker:tag"]
 description = "Tag pushed image digests with the release tags for a flavor: mise run docker:tag -- FLAVOR IMAGE@sha256:... [...]"
 run = "scripts/docker-tag.sh"
+
+[tasks."test:archive"]
+description = "Build a nextest archive for the CI sharding experiment"
+run = "cargo nextest archive --locked --archive-file target/nextest.tar.zst"
+
+[tasks."test:archive-run"]
+description = "Run archived tests with an isolated home"
+run = "scripts/isolated-home.sh cargo nextest run"
+
+[tasks."test:doc"]
+description = "Keep doctest coverage outside nextest"
+run = "scripts/isolated-home.sh cargo test --locked --doc"
