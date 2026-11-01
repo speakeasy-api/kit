@@ -237,6 +237,8 @@ Stable [GitHub releases](https://github.com/speakeasy-api/kit/releases) include 
 
 ACP clients can supply additional stdio MCP servers per session: use `mcpServers` on v1 `session/new`, `session/load`, or `session/fork`, or on v2 `session/new` or `session/resume`. V2 stdio entries require `type: "stdio"`. These servers are attachment-scoped, preserve configured servers, and must be supplied again when reattaching; Kit does not persist their launch configuration.
 
+For ACP client replay cursors and recovery behavior, see the [native Kit replay protocol reference](../reference/gateway-protocol.md#replay-retained-messages-from-native-kit).
+
 ## Configure `~/.kit/config.toml`
 
 At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown top-level keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.

@@ -152,3 +152,17 @@ For native stdio and Streamable HTTP entries, additive update semantics, and the
 - These bounds exclude allocator overhead, transient JSON conversion, arbitrary application state, and HTTP/TLS/socket buffers. They are not a hard process-memory ceiling or a denial-of-service-hardening claim. The bounded transport supports HTTP/SSE, not WebSocket upgrades. SSE has no replay cursor: reopening a stream alone cannot recover lost events. Recovery uses fresh initialization and session-level resume, not SSE event IDs. There is no idle connection expiration or body-read deadline: disconnected peers that do not DELETE or otherwise terminate their transport can retain connection slots. Slot exhaustion may require restarting the gateway; do not expose it to untrusted clients.
 
 HTTP POST bodies are limited to 1 MiB, including streamed bodies. Supervisor queues and pending child requests are bounded. Child stdout frames are limited to 8 MiB before JSON parsing; oversized or malformed frames stop that child. There is no fixed resident-session count ceiling; provision host resources independently of transport limits.
+
+## Replay retained messages from native Kit
+
+This extension applies to direct native Kit ACP v2 connections (`kit acp --protocol-version 2` or `kit serve --remote-acp`), not the gateway. Gateway `session/resume` accepts replay from `start` only.
+
+To rebuild a conversation after reconnecting, send `session/resume` with `replayFrom: {"type":"start"}`. To replay only a suffix, use Kit's inclusive cursor with a durable user-message ID previously received from that session:
+
+```json
+{"type":"_kit_message","sessionId":"SESSION_ID","messageId":"MESSAGE_ID"}
+```
+
+Set this object as `replayFrom`; its `sessionId` must match the request's `sessionId`. Replay includes the identified complete user message and all later retained updates. Store the cursor with the session ID and deduplicate complete messages by message ID. The cursor is not an HTTP SSE event ID and does not resume an interrupted model request.
+
+Only user messages with durable identities support partial replay. Agent-message and thought IDs cannot be used as boundaries because their content can accumulate across other messages in the same response; choose the preceding user message instead. Agent-message IDs, thought IDs, legacy offset-based replay IDs, tool-call IDs, unknown IDs, and IDs removed by compaction are rejected with JSON-RPC `-32602` (Invalid params), as are malformed or session-mismatched cursors. Retry explicitly with `{"type":"start"}` to rebuild from retained history; Kit does not silently fall back to a different position.
