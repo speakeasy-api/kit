@@ -56,19 +56,28 @@ pub(super) fn v2(tokens: &TokenUsage) -> agent_client_protocol_schema::v2::Usage
     .cached_write_tokens(tokens.cache_write_input_tokens)
 }
 
+#[derive(Clone)]
+pub(crate) enum Accounting {
+    Main(SessionActivity),
+    // Compaction is independent foreground work, not a replaceable main response.
+    Compaction(SessionActivity),
+    Disabled,
+}
+
+#[derive(Clone)]
 pub(crate) struct Adapter<A> {
     pub(crate) inner: A,
-    pub(crate) activity: SessionActivity,
+    pub(crate) accounting: Accounting,
 }
 
 pub(crate) struct Session<S> {
     inner: S,
-    activity: SessionActivity,
+    accounting: Accounting,
 }
 
 pub(crate) struct Turn<T> {
     inner: T,
-    activity: SessionActivity,
+    accounting: Accounting,
     tokens: Option<TokenUsage>,
 }
 
@@ -79,7 +88,7 @@ impl<A: ModelAdapter> ModelAdapter for Adapter<A> {
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
         Ok(Session {
             inner: self.inner.start_session(config).await?,
-            activity: self.activity.clone(),
+            accounting: self.accounting.clone(),
         })
     }
 
@@ -101,10 +110,12 @@ impl<S: ModelSession> ModelSession for Session<S> {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        self.activity.begin_request();
+        if let Accounting::Main(activity) = &self.accounting {
+            activity.begin_request();
+        }
         Ok(Turn {
             inner: self.inner.begin_turn(request, cancellation).await?,
-            activity: self.activity.clone(),
+            accounting: self.accounting.clone(),
             tokens: None,
         })
     }
@@ -159,7 +170,11 @@ impl<T> Drop for Turn<T> {
         // cancellation and errors. Preserve real partial usage in those cases.
         // This concrete owner method invokes no client code, awaits or callbacks.
         if let Some(tokens) = self.tokens.take() {
-            self.activity.record_usage(tokens);
+            match &self.accounting {
+                Accounting::Main(activity) => activity.record_usage(tokens),
+                Accounting::Compaction(activity) => activity.record_compaction_usage(tokens),
+                Accounting::Disabled => {}
+            }
         }
     }
 }
@@ -190,6 +205,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct Provider;
     #[async_trait]
     impl ModelAdapter for Provider {
@@ -229,7 +245,7 @@ mod tests {
         let mut driver = agentkit_loop::Agent::builder()
             .model(Adapter {
                 inner: Provider,
-                activity: activity.clone(),
+                accounting: Accounting::Main(activity.clone()),
             })
             .observer(activity.clone())
             .build()
@@ -287,7 +303,7 @@ mod tests {
         activity.begin_request();
         let mut turn = Turn {
             inner: ProviderTurn(events.into()),
-            activity: activity.clone(),
+            accounting: Accounting::Main(activity.clone()),
             tokens: None,
         };
         while let Ok(Some(event)) = turn.next_event(None).await {
@@ -417,6 +433,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_turn_usage_includes_real_compaction_without_committing_superseded_main() {
+        use agentkit_compaction::{CompactionReason, Compactor};
+        use agentkit_core::{Item, ItemKind};
+        for superseded in [false, true] {
+            let activity = SessionActivity::new(|_| Ok(()));
+            start(&activity);
+            request(&activity, vec![Ok(finished(Some(TokenUsage::new(100, 2))))]).await;
+            let compactor = crate::compaction::strategy(
+                Adapter {
+                    inner: Provider,
+                    accounting: Accounting::Compaction(activity.clone()),
+                },
+                agentkit_loop::TelemetryConfig::default(),
+                "summary",
+                "usage",
+                None,
+                crate::compaction::policy::CompactionConfig::default(),
+            );
+            let history = vec![
+                Item::text(ItemKind::User, "old question ".repeat(10_000)),
+                Item::text(ItemKind::Assistant, "old answer ".repeat(10_000)),
+                Item::text(ItemKind::User, "current request"),
+            ];
+            compactor
+                .compact(&history, CompactionReason::Manual, None)
+                .await
+                .unwrap();
+            if superseded {
+                activity.observe(&AgentEvent::ResponseAttemptSuperseded);
+            }
+            request(&activity, vec![Ok(finished(Some(TokenUsage::new(20, 3))))]).await;
+            activity.settle(None, None).unwrap();
+            let expected = if superseded {
+                TokenUsage::new(30, 8)
+            } else {
+                TokenUsage::new(130, 10)
+            };
+            assert_eq!(activity.completed_usage().unwrap(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
     async fn end_turn_usage_loop_recovery_supersedes_only_last_request() {
         let activity = SessionActivity::new(|_| Ok(()));
         start(&activity);
@@ -448,7 +506,7 @@ mod tests {
             inner: ProviderTurn(
                 vec![Ok(ModelTurnEvent::Usage(Usage::new(TokenUsage::new(7, 1))))].into(),
             ),
-            activity: activity.clone(),
+            accounting: Accounting::Main(activity.clone()),
             tokens: None,
         };
         turn.next_event(None).await.unwrap();

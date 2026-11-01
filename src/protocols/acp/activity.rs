@@ -95,6 +95,18 @@ impl SessionActivity {
         }
     }
 
+    pub(super) fn record_compaction_usage(&self, tokens: TokenUsage) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state == State::Unavailable {
+            return;
+        }
+        if let Some(current) = &mut state.current {
+            super::usage::accumulate(&mut current.usage, tokens);
+        }
+    }
+
     pub(super) fn completed_usage(&self) -> Result<Option<TokenUsage>, AcpRuntimeError> {
         let state = self
             .state

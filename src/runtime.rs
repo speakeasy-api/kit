@@ -1024,6 +1024,7 @@ impl Runtime {
         adapter: SelectableAdapter,
         persistence: Option<crate::session::SessionObserver>,
         owner_session: String,
+        activity: Option<crate::protocols::acp::activity::SessionActivity>,
     ) -> Result<crate::compaction::AutomaticCompactor, String> {
         let hooks_compaction = match &self.hooks {
             Some(hooks) => hooks.intercepts_compaction().await?,
@@ -1036,7 +1037,12 @@ impl Runtime {
             format!("compaction-{owner_session}")
         };
         let compactor = crate::compaction::automatic_with_policy(
-            adapter.clone(),
+            crate::protocols::acp::usage::Adapter {
+                inner: adapter.clone(),
+                accounting: activity
+                    .map(crate::protocols::acp::usage::Accounting::Compaction)
+                    .unwrap_or(crate::protocols::acp::usage::Accounting::Disabled),
+            },
             self.agentkit_telemetry(),
             persistence,
             compactor_session,
@@ -1899,6 +1905,7 @@ impl Runtime {
                     adapter.clone(),
                     Some(opened.observer.clone()),
                     session_id.clone(),
+                    None,
                 )
                 .await
                 .map_err(|error| {
@@ -2100,7 +2107,7 @@ impl Runtime {
         let skills = self.fresh_skills();
         let recorded = crate::session::TransientTranscript::new(transcript.clone());
         let compactor = self
-            .compactor(self.adapter.clone(), None, session.clone())
+            .compactor(self.adapter.clone(), None, session.clone(), None)
             .await
             .map_err(LoopError::InvalidState)?
             .mirroring(recorded.clone());
@@ -2325,6 +2332,7 @@ impl Runtime {
                 adapter.clone(),
                 Some(opened.observer.clone()),
                 session_id.clone(),
+                Some(context.activity.clone()),
             )
             .await
             .map_err(AcpRuntimeError::Loop)?;
@@ -2359,7 +2367,7 @@ impl Runtime {
                 ),
             })
             .model(crate::protocols::acp::usage::Adapter {
-                activity: context.activity,
+                accounting: crate::protocols::acp::usage::Accounting::Main(context.activity),
                 inner: crate::protocols::acp::v2::identity::Adapter {
                     enabled: context.response_attempt_replacement,
                     inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
