@@ -331,6 +331,23 @@ pub(crate) fn record_runtime_error(
     )
 }
 
+// Exact local messages only: never retain arbitrary provider text or image data.
+fn local_image_error_message(message: &str) -> Option<&'static str> {
+    use crate::provider::chatgpt::{
+        IMAGE_DECODE_ERROR, IMAGE_DIMENSIONS_ERROR, IMAGE_SOURCE_BYTES_ERROR,
+    };
+    match message {
+        "Responses image dimensions are too large" | IMAGE_DIMENSIONS_ERROR => {
+            Some(IMAGE_DIMENSIONS_ERROR)
+        }
+        "Responses image exceeds the 10 MiB source limit" | IMAGE_SOURCE_BYTES_ERROR => {
+            Some(IMAGE_SOURCE_BYTES_ERROR)
+        }
+        "Responses image could not be decoded" | IMAGE_DECODE_ERROR => Some(IMAGE_DECODE_ERROR),
+        _ => None,
+    }
+}
+
 fn classify(
     error: &LoopError,
 ) -> Option<(
@@ -368,6 +385,8 @@ fn classify(
                     provider_message(code, message),
                     diagnostics,
                 ))
+            } else if let Some(message) = local_image_error_message(message) {
+                Some(("provider", "provider_error", message.into(), None))
             } else {
                 // Legacy string errors have no stable classification; do not parse their display.
                 Some((
@@ -1059,6 +1078,29 @@ mod tests {
             );
             assert!(!message.contains("secret"));
             assert!(!message.contains("example.invalid"));
+        }
+    }
+
+    #[test]
+    fn local_image_diagnostics_are_actionable_and_exactly_allowlisted() {
+        for source in [
+            crate::provider::chatgpt::IMAGE_DIMENSIONS_ERROR,
+            crate::provider::chatgpt::IMAGE_SOURCE_BYTES_ERROR,
+            crate::provider::chatgpt::IMAGE_DECODE_ERROR,
+            "Responses image dimensions are too large",
+            "Responses image exceeds the 10 MiB source limit",
+            "Responses image could not be decoded",
+        ] {
+            let (_, code, message, diagnostics) =
+                classify(&LoopError::Provider(source.into())).unwrap();
+            assert_eq!(code, "provider_error");
+            assert_eq!(message, super::local_image_error_message(source).unwrap());
+            assert!(diagnostics.is_none());
+            let (_, _, message, _) = classify(&LoopError::Provider(format!(
+                "{source}: secret-image-data https://secret.invalid"
+            )))
+            .unwrap();
+            assert_eq!(message, "provider request failed");
         }
     }
 

@@ -49,6 +49,9 @@ const MAX_DECODED_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 // Match managed-file import limits; retain the independent decoded-byte bound.
 const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 8_192;
+pub(crate) const IMAGE_DIMENSIONS_ERROR: &str = "Responses image exceeds the safe decode budget (16,777,216 pixels or 64 MiB decoded); start a new conversation with a resized image.";
+pub(crate) const IMAGE_SOURCE_BYTES_ERROR: &str = "Responses image exceeds the 10 MiB source limit; start a new conversation with a smaller image.";
+pub(crate) const IMAGE_DECODE_ERROR: &str = "Responses image could not be decoded within the safety limits; start a new conversation with a smaller valid PNG or JPEG image.";
 const MAX_TOOL_RESULT_DEPTH: usize = 8;
 const JPEG_DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
 const MAX_NORMALIZED_IMAGE_BYTES: usize = ((MAX_FIELD_BYTES - JPEG_DATA_URL_PREFIX.len()) / 4) * 3;
@@ -479,12 +482,16 @@ fn normalize_openai_parts(
         check_image_cancellation(cancellation)?;
         match part {
             Part::Media(media) if media.modality == Modality::Image => {
-                if serialized_image_bytes(&media.data, &media.mime_type)
-                    .is_some_and(|bytes| bytes > MAX_FIELD_BYTES)
+                let exceeds_wire_budget = serialized_image_bytes(&media.data, &media.mime_type)
+                    .is_some_and(|bytes| bytes > MAX_FIELD_BYTES);
+                if let Some(source) = inline_image_bytes(&media.data, &media.mime_type)?
+                    && let Some(normalized) = normalize_image_bytes(
+                        source,
+                        &media.mime_type,
+                        exceeds_wire_budget,
+                        cancellation,
+                    )?
                 {
-                    let source = inline_image_bytes(&media.data, &media.mime_type)?
-                        .ok_or_else(|| protocol("Responses oversized image is not inline data"))?;
-                    let normalized = normalize_image_bytes(source, &media.mime_type, cancellation)?;
                     media.mime_type = "image/jpeg".into();
                     media.data = DataRef::InlineBytes(normalized);
                 }
@@ -541,31 +548,61 @@ fn inline_image_bytes(data: &DataRef, mime_type: &str) -> Result<Option<Vec<u8>>
         DataRef::Uri(_) | DataRef::Handle(_) => return Ok(None),
         DataRef::InlineBytes(bytes) => {
             if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
-                return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+                return Err(protocol(IMAGE_SOURCE_BYTES_ERROR));
             }
             return Ok(Some(bytes.clone()));
         }
     };
     let max_base64_bytes = MAX_SOURCE_IMAGE_BYTES.div_ceil(3) * 4;
     if text.len() > max_base64_bytes {
-        return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+        return Err(protocol(IMAGE_SOURCE_BYTES_ERROR));
     }
     let bytes = BASE64
         .decode(text)
         .map_err(|_| protocol("Responses image is not valid base64"))?;
     if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
-        return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+        return Err(protocol(IMAGE_SOURCE_BYTES_ERROR));
     }
     Ok(Some(bytes))
+}
+
+// The WebP codec allocates EXIF from declared chunk ranges. Check those ranges
+// against the bounded source before orientation can read top-level or frame metadata.
+fn validate_webp_ranges(bytes: &[u8]) -> Result<(), LoopError> {
+    fn chunks(mut bytes: &[u8], frames: bool) -> Option<()> {
+        while !bytes.is_empty() {
+            let header = bytes.get(..8)?;
+            let size = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+            let end = 8usize.checked_add(size)?;
+            let payload = bytes.get(8..end)?;
+            if frames && &header[..4] == b"ANMF" {
+                chunks(payload.get(16..)?, false)?;
+            }
+            bytes = bytes.get(end.checked_add(size % 2)?..)?;
+        }
+        Some(())
+    }
+    let valid = (|| {
+        if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
+            return None;
+        }
+        let size = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+        if size.checked_add(8)? != bytes.len() {
+            return None;
+        }
+        chunks(bytes.get(12..)?, true)
+    })();
+    valid.ok_or_else(|| protocol(IMAGE_DECODE_ERROR))
 }
 
 fn normalize_image_bytes(
     bytes: Vec<u8>,
     mime_type: &str,
+    exceeds_wire_budget: bool,
     cancellation: Option<&agentkit_core::TurnCancellation>,
-) -> Result<Vec<u8>, LoopError> {
+) -> Result<Option<Vec<u8>>, LoopError> {
     check_image_cancellation(cancellation)?;
-    let mut reader = ImageReader::new(Cursor::new(bytes));
+    let mut reader = ImageReader::new(Cursor::new(bytes.as_slice()));
     if let Some(format) = ImageFormat::from_mime_type(mime_type) {
         reader.set_format(format);
     } else {
@@ -573,28 +610,36 @@ fn normalize_image_bytes(
             .with_guessed_format()
             .map_err(|_| protocol("Responses image format could not be detected"))?;
     }
+    if reader.format() == Some(ImageFormat::WebP) {
+        validate_webp_ranges(&bytes)?;
+    }
     let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    // Source axes are bounded by the pixel budget, not the output-axis limit.
+    // This admits long screenshots without increasing decoded pixels or bytes.
+    limits.max_image_width = Some(MAX_IMAGE_PIXELS as u32);
+    limits.max_image_height = Some(MAX_IMAGE_PIXELS as u32);
     limits.max_alloc = Some(MAX_DECODED_IMAGE_BYTES);
     reader.limits(limits);
 
     let mut decoder = reader
         .into_decoder()
-        .map_err(|_| protocol("Responses image could not be decoded"))?;
+        .map_err(|_| protocol(IMAGE_DECODE_ERROR))?;
     let (width, height) = decoder.dimensions();
-    if width > MAX_IMAGE_DIMENSION
-        || height > MAX_IMAGE_DIMENSION
+    if width == 0
+        || height == 0
         || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
         || decoder.total_bytes() > MAX_DECODED_IMAGE_BYTES
     {
-        return Err(protocol("Responses image dimensions are too large"));
+        return Err(protocol(IMAGE_DIMENSIONS_ERROR));
+    }
+    if !exceeds_wire_budget && width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION {
+        return Ok(None);
     }
     let orientation = decoder
         .orientation()
         .map_err(|_| protocol("Responses image orientation could not be read"))?;
-    let mut image = DynamicImage::from_decoder(decoder)
-        .map_err(|_| protocol("Responses image could not be decoded"))?;
+    let mut image =
+        DynamicImage::from_decoder(decoder).map_err(|_| protocol(IMAGE_DECODE_ERROR))?;
     image.apply_orientation(orientation);
     check_image_cancellation(cancellation)?;
     let rgba = image.into_rgba8();
@@ -605,7 +650,7 @@ fn normalize_image_bytes(
             |channel: u8| ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
         Rgb([flatten(pixel[0]), flatten(pixel[1]), flatten(pixel[2])])
     });
-    encode_image_to_budget(DynamicImage::ImageRgb8(rgb), cancellation)
+    encode_image_to_budget(DynamicImage::ImageRgb8(rgb), cancellation).map(Some)
 }
 
 fn encode_image_to_budget(
@@ -613,6 +658,12 @@ fn encode_image_to_budget(
     cancellation: Option<&agentkit_core::TurnCancellation>,
 ) -> Result<Vec<u8>, LoopError> {
     const QUALITIES: [u8; 5] = [85, 75, 65, 55, 45];
+    if image.width() > MAX_IMAGE_DIMENSION || image.height() > MAX_IMAGE_DIMENSION {
+        check_image_cancellation(cancellation)?;
+        // Thumbnail avoids a full-source-width floating-point resize intermediate
+        // for very wide, thin images. Preserve aspect ratio and a nonzero thin axis.
+        image = image.thumbnail(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION);
+    }
     loop {
         let mut smallest = Vec::new();
         for quality in QUALITIES {
@@ -1264,7 +1315,16 @@ mod tests {
 
     #[test]
     fn unlisted_subscription_model_projects_images_on_each_request_only() {
-        let request = image_tool_request();
+        let mut request = image_tool_request();
+        let png = noisy_png(10, 10);
+        let expected_url = format!("data:image/png;base64,{}", BASE64.encode(&png));
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![
+            Part::text("Selected screenshot"),
+            Part::media(Modality::Image, "image/png", DataRef::InlineBytes(png)),
+        ]);
         let original = serde_json::to_value(&request.transcript).unwrap();
         let config = OpenAIResponsesConfig::chatgpt_private(
             "gpt-6-astra",
@@ -1286,7 +1346,7 @@ mod tests {
             assert_eq!(wire["input"][0]["call_id"], "image-call");
             let output = wire["input"][0]["output"].to_string();
             assert!(output.contains("Selected screenshot"));
-            assert!(!output.contains("AQID"));
+            assert!(!output.contains(&expected_url));
             assert_eq!(wire["input"][1]["role"], "user");
             let images: Vec<_> = wire["input"][1]["content"]
                 .as_array()
@@ -1295,7 +1355,7 @@ mod tests {
                 .filter(|part| part["type"] == "input_image")
                 .collect();
             assert_eq!(images.len(), 1);
-            assert_eq!(images[0]["image_url"], "data:image/png;base64,AQID");
+            assert_eq!(images[0]["image_url"], expected_url);
             if let Some(previous) = previous_wire {
                 assert_eq!(wire, previous);
             }
@@ -1317,6 +1377,176 @@ mod tests {
 
         assert!(serialized_image_bytes(&at_limit, "image/jpeg").unwrap() <= MAX_FIELD_BYTES);
         assert!(serialized_image_bytes(&over_limit, "image/jpeg").unwrap() > MAX_FIELD_BYTES);
+    }
+
+    #[test]
+    fn tall_acp_images_normalize_on_initial_and_retained_text_turns() {
+        use agentkit_core::Item;
+        for noisy in [true, false] {
+            let png = if noisy {
+                noisy_png(100, MAX_IMAGE_DIMENSION + 1)
+            } else {
+                let mut bytes = Cursor::new(Vec::new());
+                DynamicImage::new_rgb8(100, MAX_IMAGE_DIMENSION + 1)
+                    .write_to(&mut bytes, ImageFormat::Png)
+                    .unwrap();
+                bytes.into_inner()
+            };
+            let url = format!("data:image/png;base64,{}", BASE64.encode(&png));
+            assert_eq!(url.len() > MAX_FIELD_BYTES, noisy);
+            let mut request = image_tool_request();
+            request.transcript = vec![Item::new(
+                ItemKind::User,
+                vec![Part::media(Modality::Image, "image/png", DataRef::Uri(url))],
+            )];
+            let original = serde_json::to_value(&request.transcript).unwrap();
+            for retained in [false, true] {
+                if retained {
+                    request
+                        .transcript
+                        .push(Item::new(ItemKind::User, vec![Part::text("Continue")]));
+                }
+                let normalized = normalize_openai_images(request.clone(), None).unwrap();
+                let config = OpenAIResponsesConfig::chatgpt_private(
+                    "gpt-5.4",
+                    Authentication::bearer("test-key"),
+                )
+                .with_limits(OpenAIResponsesLimits {
+                    max_request_bytes: MAX_REQUEST_BYTES,
+                    max_attempt_bytes: MAX_ATTEMPT_BYTES,
+                    max_wire_bytes: MAX_WIRE_BYTES,
+                    max_items: MAX_ITEMS,
+                    max_text_bytes: MAX_FIELD_BYTES,
+                });
+                let wire = config.encode_request(&normalized).unwrap();
+                let url = wire["input"][0]["content"][0]["image_url"]
+                    .as_str()
+                    .unwrap();
+                assert!(url.len() <= MAX_FIELD_BYTES);
+                let bytes = BASE64
+                    .decode(url.strip_prefix(JPEG_DATA_URL_PREFIX).unwrap())
+                    .unwrap();
+                let image = image::load_from_memory(&bytes).unwrap();
+                assert!(image.width() <= MAX_IMAGE_DIMENSION);
+                assert!(image.height() <= MAX_IMAGE_DIMENSION);
+                assert_eq!(
+                    serde_json::to_value(&request.transcript[0]).unwrap(),
+                    original[0]
+                );
+                if retained {
+                    assert!(wire.to_string().contains("Continue"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn webp_metadata_ranges_are_bounded_before_decoder_construction() {
+        let mut valid = Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(10, 10)
+            .write_to(&mut valid, ImageFormat::WebP)
+            .unwrap();
+        validate_webp_ranges(valid.get_ref()).unwrap();
+        for nested in [false, true] {
+            let mut chunks = Vec::new();
+            if nested {
+                chunks.extend_from_slice(b"ANMF");
+                chunks.extend_from_slice(&24u32.to_le_bytes());
+                chunks.extend_from_slice(&[0; 16]);
+            }
+            chunks.extend_from_slice(b"EXIF");
+            chunks.extend_from_slice(&u32::MAX.to_le_bytes());
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&(4 + chunks.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(b"WEBP");
+            bytes.extend(chunks);
+            assert!(validate_webp_ranges(&bytes).is_err());
+            let mut request = image_tool_request();
+            request.transcript = vec![agentkit_core::Item::new(
+                ItemKind::User,
+                vec![Part::media(
+                    Modality::Image,
+                    "image/webp",
+                    DataRef::InlineBytes(bytes),
+                )],
+            )];
+            assert!(
+                matches!(normalize_openai_images(request, None), Err(LoopError::Provider(message))
+                if message == IMAGE_DECODE_ERROR)
+            );
+        }
+    }
+
+    #[test]
+    fn webp_range_validation_checks_padding_container_and_frame_boundaries() {
+        fn riff(chunks: &[u8]) -> Vec<u8> {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&(4 + chunks.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(b"WEBP");
+            bytes.extend_from_slice(chunks);
+            bytes
+        }
+        let mut chunks = b"EXIF".to_vec();
+        chunks.extend_from_slice(&1u32.to_le_bytes());
+        chunks.push(0);
+        assert!(validate_webp_ranges(&riff(&chunks)).is_err());
+        chunks.push(0);
+        let mut valid = riff(&chunks);
+        validate_webp_ranges(&valid).unwrap();
+        valid.push(0);
+        assert!(validate_webp_ranges(&valid).is_err());
+
+        let mut frame = b"ANMF".to_vec();
+        frame.extend_from_slice(&24u32.to_le_bytes());
+        frame.extend_from_slice(&[0; 16]);
+        frame.extend_from_slice(b"EXIF");
+        frame.extend_from_slice(&8u32.to_le_bytes());
+        // Child payload would fit the file but crosses its parent frame boundary.
+        frame.extend_from_slice(b"JUNK");
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        assert!(validate_webp_ranges(&riff(&frame)).is_err());
+    }
+
+    #[test]
+    fn compressed_images_still_obey_source_pixel_budget() {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(4097, 4097)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        assert!(bytes.get_ref().len() < MAX_NORMALIZED_IMAGE_BYTES);
+        let mut request = image_tool_request();
+        request.transcript = vec![agentkit_core::Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(bytes.into_inner()),
+            )],
+        )];
+        assert!(
+            matches!(normalize_openai_images(request, None), Err(LoopError::Provider(message))
+            if message == IMAGE_DIMENSIONS_ERROR)
+        );
+    }
+
+    #[test]
+    fn fitting_inline_images_keep_original_encoding_and_metadata() {
+        let png = noisy_png(10, 10);
+        let mut request = image_tool_request();
+        request.transcript = vec![agentkit_core::Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(png),
+            )],
+        )];
+        let original = serde_json::to_value(&request.transcript).unwrap();
+        let normalized = normalize_openai_images(request, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&normalized.transcript).unwrap(),
+            original
+        );
     }
 
     #[test]
