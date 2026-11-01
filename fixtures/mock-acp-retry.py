@@ -36,6 +36,8 @@ for line in sys.stdin:
     method = request["method"]
     result = {}
     if method == "initialize":
+        notices_enabled = (version == 2 or isinstance(
+            request["params"].get("clientCapabilities", {}).get("session", {}).get("notices"), dict))
         result = ({"protocolVersion": 1, "agentCapabilities": {}}
                   if version == 1 else
                   {"protocolVersion": 2, "info": {"name": "retry-fixture", "version": "1"},
@@ -46,7 +48,8 @@ for line in sys.stdin:
         if version == 2:
             send({"jsonrpc": "2.0", "id": request["id"], "result": {"messageId": "accepted"}})
             update({"sessionUpdate": "state_update", "state": "running"})
-        update({"sessionUpdate": "notice", "severity": "info", "title": "Ordinary notice"})
+        if notices_enabled:
+            update({"sessionUpdate": "notice", "severity": "info", "title": "Ordinary notice"})
         notice("scheduled")
         deadline = time.monotonic() + 20
         while not release.exists():

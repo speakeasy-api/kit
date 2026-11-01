@@ -140,7 +140,7 @@ def run(version, background, notice_support=True):
                 retries = [u["_meta"]["kit/providerRetry"] for u in all_notices
                            if "kit/providerRetry" in u.get("_meta", {})]
                 if not notice_support:
-                    assert not retries, retries
+                    assert not all_notices, all_notices
                     assert errors.empty(), list(errors.queue)
                     return
                 assert [n["status"] for n in retries] == ["scheduled", "succeeded"], retries

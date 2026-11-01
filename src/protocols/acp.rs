@@ -1510,7 +1510,7 @@ impl Drop for SessionPublicationRollback<'_> {
 struct Server {
     // Connection-local snapshot. Only initialize writes; a new connection starts disabled.
     subagent_updates: AtomicBool,
-    retry_notices: AtomicBool,
+    notices_supported: AtomicBool,
     form_elicitation: AtomicBool,
     compaction_updates: AtomicBool,
     runtime: Arc<Runtime>,
@@ -1538,7 +1538,7 @@ impl Server {
     fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
             subagent_updates: AtomicBool::new(false),
-            retry_notices: AtomicBool::new(false),
+            notices_supported: AtomicBool::new(false),
             form_elicitation: AtomicBool::new(false),
             compaction_updates: AtomicBool::new(false),
             runtime,
@@ -1649,7 +1649,7 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
-        self.retry_notices.store(
+        self.notices_supported.store(
             request
                 .client_capabilities
                 .session
@@ -1930,7 +1930,7 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
-        .with_retry_notices(self.retry_notices.load(Ordering::Acquire))
+        .with_retry_notices(self.notices_supported.load(Ordering::Acquire))
         .with_compaction(self.compaction_updates.load(Ordering::Acquire))
         .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
@@ -2009,7 +2009,7 @@ impl Server {
                 .subagents
                 .subscribe_updates(session_id.to_string(), replay_history)
         });
-        let retry_notices = self.retry_notices.load(Ordering::Acquire);
+        let notices_supported = self.notices_supported.load(Ordering::Acquire);
         let actor_task = tokio::spawn(async move {
             let _shutdown_bridge = shutdown_bridge;
             let _guard = guard;
@@ -2020,11 +2020,9 @@ impl Server {
                     session_actor(actor),
                     subagent_updates,
                     |session_id, update| {
-                        // A child can negotiate notices independently of this parent.
-                        // Only this typed retry stream is governed here; other notice
-                        // producers retain their existing presentation policy.
-                        if !retry_notices && update["_meta"][retry_projection::META_KEY].is_object()
-                        {
+                        // A child negotiates notice support independently. Do not
+                        // forward that update type to a v1 parent without support.
+                        if !notices_supported && update["sessionUpdate"] == "notice" {
                             return Ok(());
                         }
                         if let Some(update) = subagents::v1_update(update) {
@@ -4015,7 +4013,7 @@ pub(super) mod tests {
             )
         };
         let server = create_server();
-        assert!(!server.retry_notices.load(Ordering::Acquire));
+        assert!(!server.notices_supported.load(Ordering::Acquire));
         for (capabilities, supported) in [
             (json!({"session":{"notices":{}}}), true),
             (json!({"session":{"notices":null}}), false),
@@ -4032,9 +4030,9 @@ pub(super) mod tests {
                     .unwrap(),
                 )
                 .await;
-            assert_eq!(server.retry_notices.load(Ordering::Acquire), supported);
+            assert_eq!(server.notices_supported.load(Ordering::Acquire), supported);
         }
-        assert!(!create_server().retry_notices.load(Ordering::Acquire));
+        assert!(!create_server().notices_supported.load(Ordering::Acquire));
     }
 
     #[tokio::test]
