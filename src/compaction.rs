@@ -1021,6 +1021,56 @@ impl LoopMutator for AutomaticCompactor {
     }
 }
 
+/// A recovery boundary can drop a pending mutation before polling its result.
+/// Every started foreground compaction must still receive one terminal event.
+struct CompactionLifecycle<'a, 'ctx> {
+    ctx: &'a LoopCtx<'ctx>,
+    finished: bool,
+}
+
+impl CompactionLifecycle<'_, '_> {
+    fn finish(&mut self, dirty: bool, metadata: MetadataMap) {
+        // Commit before calling observers, including when an observer unwinds.
+        self.finished = true;
+        self.ctx.emitter.emit(AgentEvent::MutationFinished {
+            session_id: self.ctx.session_id.clone(),
+            turn_id: self.ctx.turn_id.cloned(),
+            mutator: "automatic-compaction".into(),
+            dirty,
+            metadata,
+        });
+    }
+}
+
+impl Drop for CompactionLifecycle<'_, '_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let cancelled = self
+            .ctx
+            .cancellation
+            .as_ref()
+            .is_some_and(|c| c.is_cancelled());
+        let deadline = self.ctx.recovery.is_some_and(|recovery| {
+            tokio::time::Instant::now() >= tokio::time::Instant::from_std(recovery.deadline)
+        });
+        let mut metadata = MetadataMap::new();
+        metadata.insert("cancelled".into(), (cancelled || !deadline).into());
+        metadata.insert(
+            "error".into(),
+            if cancelled || !deadline {
+                "compaction cancelled".into()
+            } else {
+                LoopError::ContextRecoveryDeadlineExceeded
+                    .to_string()
+                    .into()
+            },
+        );
+        self.finish(false, metadata);
+    }
+}
+
 impl AutomaticCompactor {
     async fn mutate_inner(
         &self,
@@ -1053,6 +1103,10 @@ impl AutomaticCompactor {
             mutator: "automatic-compaction".into(),
             point: ctx.point,
         });
+        let mut lifecycle = CompactionLifecycle {
+            ctx: &ctx,
+            finished: false,
+        };
         let reason_label = format!("{reason:?}");
         let started = Instant::now();
         let report_runtime = self.persistence.is_some();
@@ -1129,30 +1183,20 @@ impl AutomaticCompactor {
         match result {
             Ok(compacted) => {
                 if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    metadata.insert("cancelled".into(), true.into());
+                    lifecycle.finish(false, metadata);
                     finish(false, false);
                     return Err(LoopError::Cancelled);
                 }
                 if compacted == **cursor {
-                    ctx.emitter.emit(AgentEvent::MutationFinished {
-                        session_id: ctx.session_id.clone(),
-                        turn_id: ctx.turn_id.cloned(),
-                        mutator: "automatic-compaction".into(),
-                        dirty: false,
-                        metadata,
-                    });
+                    lifecycle.finish(false, metadata);
                     finish(true, false);
                     return Ok(());
                 }
                 if compacted.is_empty() {
                     let error = "cannot persist an empty transcript replacement".to_string();
                     metadata.insert("error".into(), error.clone().into());
-                    ctx.emitter.emit(AgentEvent::MutationFinished {
-                        session_id: ctx.session_id.clone(),
-                        turn_id: ctx.turn_id.cloned(),
-                        mutator: "automatic-compaction".into(),
-                        dirty: false,
-                        metadata,
-                    });
+                    lifecycle.finish(false, metadata);
                     finish(false, false);
                     return Err(LoopError::Mutator(error));
                 }
@@ -1173,26 +1217,30 @@ impl AutomaticCompactor {
                     "replaced_items".into(),
                     (before.saturating_sub(compacted.len()) as u64).into(),
                 );
+                if let Some(summary) = compacted.iter().find(|item| is_compaction_summary(item)) {
+                    let text = summary
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            Part::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    metadata.insert("summary".into(), text.into());
+                }
                 **cursor = compacted;
-                ctx.emitter.emit(AgentEvent::MutationFinished {
-                    session_id: ctx.session_id.clone(),
-                    turn_id: ctx.turn_id.cloned(),
-                    mutator: "automatic-compaction".into(),
-                    dirty: true,
-                    metadata,
-                });
+                lifecycle.finish(true, metadata);
                 finish(true, true);
                 Ok(())
             }
             Err(error) => {
+                metadata.insert(
+                    "cancelled".into(),
+                    matches!(error, CompactionError::Cancelled).into(),
+                );
                 metadata.insert("error".into(), error.to_string().into());
-                ctx.emitter.emit(AgentEvent::MutationFinished {
-                    session_id: ctx.session_id.clone(),
-                    turn_id: ctx.turn_id.cloned(),
-                    mutator: "automatic-compaction".into(),
-                    dirty: false,
-                    metadata,
-                });
+                lifecycle.finish(false, metadata);
                 finish(false, false);
                 match error {
                     CompactionError::Cancelled => Err(LoopError::Cancelled),
@@ -1573,6 +1621,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn outer_recovery_deadline_wins_over_summary_retry_budget() {
+        let (send, receive) = std::sync::mpsc::channel();
         let (summary_backend, summary_requests) = stalled_backend(None);
         let compactor = AutomaticCompactor {
             inner: StrategyCompactor::new(
@@ -1597,6 +1646,7 @@ mod tests {
                 budget: outer_budget,
             })
             .mutator(compactor)
+            .observer(CapturedEvents(send))
             .build()
             .unwrap()
             .start(SessionConfig::new("outer-summary-deadline"))
@@ -1620,6 +1670,83 @@ mod tests {
         assert_eq!(&snapshot[..history.len()], &history);
         assert_eq!(item_text(snapshot.last().unwrap()), Some("current request"));
         assert!(!snapshot.iter().any(is_compaction_summary));
+        let terminal = receive
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::MutationFinished { metadata, .. } => Some(metadata),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].contains_key("error"));
+        assert_eq!(
+            terminal[0]
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(!terminal[0].contains_key("summary"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outer_recovery_cancellation_finishes_compaction() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let controller = Arc::new(agentkit_core::CancellationController::new());
+        let (summary_backend, summary_requests) = stalled_backend(Some(controller.clone()));
+        let compactor = AutomaticCompactor {
+            inner: StrategyCompactor::new(
+                |_: &[Item], _| None,
+                CompactionPipeline::new().with_strategy(test_strategy()),
+            )
+            .with_backend(summary_backend),
+            persistence: None,
+            mirror: None,
+            policy: CompactionConfig::default(),
+            preparation: None,
+        };
+        let history = recovery_summary_request().items;
+        let (main_backend, _main_requests) = rejecting_backend(true, 0);
+        let outer_budget = std::time::Duration::from_millis(100);
+        let mut driver = Agent::builder()
+            .model(main_backend.adapter)
+            .cancellation(controller.handle())
+            .transcript(history.clone())
+            .input(vec![Item::text(ItemKind::User, "current request")])
+            .context_recovery(agentkit_loop::ContextRecoveryPolicy {
+                max_attempts: 3,
+                budget: outer_budget,
+            })
+            .mutator(compactor)
+            .observer(CapturedEvents(send))
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("outer-summary-deadline"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(driver.next().await.unwrap(), LoopStep::Finished(result) if result.finish_reason == FinishReason::Cancelled)
+        );
+        assert_eq!(summary_requests.try_iter().count(), 1);
+        let snapshot = driver.snapshot().transcript;
+        assert_eq!(&snapshot[..history.len()], &history);
+        assert_eq!(item_text(&snapshot[history.len()]), Some("current request"));
+        assert!(!snapshot.iter().any(is_compaction_summary));
+        let terminal = receive
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::MutationFinished { metadata, .. } => Some(metadata),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].contains_key("error"));
+        assert_eq!(
+            terminal[0]
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(!terminal[0].contains_key("summary"));
     }
 
     #[tokio::test]
@@ -1846,6 +1973,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_compaction_continues_after_persistence_loses_ownership() {
+        let (send, receive) = std::sync::mpsc::channel();
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("sessions");
         let initial = vec![
@@ -1891,6 +2019,7 @@ mod tests {
             .transcript(transcript)
             .input(vec![marker])
             .mutator(compactor)
+            .observer(CapturedEvents(send))
             .build()
             .unwrap();
         let mut driver = agent.start(SessionConfig::new("abc")).await.unwrap();
@@ -1905,6 +2034,24 @@ mod tests {
         assert_eq!(
             crate::session::load_in(root.path(), &directory, "abc").unwrap(),
             before
+        );
+        let summary = compacted
+            .iter()
+            .find(|item| is_compaction_summary(item))
+            .unwrap();
+        let terminal = receive
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::MutationFinished { metadata, .. } => Some(metadata),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0]
+                .get("summary")
+                .and_then(serde_json::Value::as_str),
+            item_text(summary)
         );
         drop(replacement);
     }
