@@ -823,6 +823,13 @@ impl Command {
                     .action(clap::ArgAction::SetTrue)
                     .help("Expose ACP over HTTP/SSE and WebSocket at `/acp`"),
             );
+            let command = command
+                .arg(clap::Arg::new("http_health").long("http-health")
+                    .action(clap::ArgAction::SetTrue).requires("remote_acp")
+                    .help("Expose authenticated GET /health for remote ACP"))
+                .arg(clap::Arg::new("http_allowed_origin").long("http-allowed-origin")
+                    .value_name("ORIGIN").action(clap::ArgAction::Append).requires("remote_acp")
+                    .help("Allow this exact browser origin for remote ACP (repeatable; no wildcard)"));
             let command = command.arg(
                 clap::Arg::new("no_a2a")
                     .long("no-a2a")
@@ -1175,6 +1182,11 @@ impl Command {
                 reasoning_effort: optional_arg(matches, "reasoning_effort")?,
                 a2a: optional_arg(matches, "a2a")?,
                 remote_acp: required_arg(matches, "remote_acp")?,
+                http_health: required_arg(matches, "http_health")?,
+                http_allowed_origins: matches
+                    .get_many::<String>("http_allowed_origin")
+                    .map(|values| values.cloned().collect())
+                    .unwrap_or_default(),
                 no_a2a: required_arg(matches, "no_a2a")?,
                 no_stdio: required_arg(matches, "no_stdio")?,
                 stdio_protocol_version: required_arg(matches, "stdio_protocol_version")?,
@@ -1722,6 +1734,8 @@ enum Command {
         a2a: Option<String>,
         /// Expose ACP over HTTP/SSE and WebSocket at `/acp`.
         remote_acp: bool,
+        http_health: bool,
+        http_allowed_origins: Vec<String>,
         /// Do not expose A2A on the HTTP listener.
         no_a2a: bool,
         /// Do not serve ACP on stdio. Requires remote ACP over HTTP.
@@ -2270,6 +2284,8 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             a2a,
             remote_acp,
+            http_health,
+            http_allowed_origins,
             no_a2a,
             no_stdio,
             stdio_protocol_version,
@@ -2356,13 +2372,17 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
             let serve_a2a = !no_a2a;
             let sessions = kit::protocols::acp::SessionRegistry::new();
-            let http = kit::protocols::http::start_with_registry(
+            let http = kit::protocols::http::start_with_options(
                 runtime.clone(),
                 address,
                 serve_a2a,
                 remote_acp,
                 server_credential_file.as_deref(),
                 sessions.clone(),
+                kit::protocols::http::HttpOptions {
+                    health_endpoint: http_health,
+                    allowed_origins: http_allowed_origins,
+                },
             )
             .await?;
             let bound = http.address();
@@ -4543,6 +4563,30 @@ future_option = true
 
     #[test]
     fn serve_selects_remote_protocols_without_changing_stdio_acp() {
+        assert!(Cli::try_parse_from(["kit", "serve", "--http-health"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "serve",
+                "--http-allowed-origin",
+                "https://example.com"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "kit",
+            "serve",
+            "--remote-acp",
+            "--http-health",
+            "--http-allowed-origin",
+            "https://one.example",
+            "--http-allowed-origin",
+            "https://two.example",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Serve { http_health: true, http_allowed_origins, .. } if http_allowed_origins == ["https://one.example", "https://two.example"])
+        );
         assert!(
             Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "openrouter",]).is_ok()
         );

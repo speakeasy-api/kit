@@ -2749,12 +2749,17 @@ pub async fn serve_with_registry(
     super::connect_stdio(v2_router(runtime, registry)).await
 }
 
-pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
+pub(crate) fn http_router(
+    runtime: Arc<Runtime>,
+    registry: SessionRegistry,
+    cors: agent_client_protocol_http::CorsOptions,
+) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
         v2_router(Arc::clone(&runtime), registry.clone())
     })
     .with_options(
         agent_client_protocol_http::ServerOptions::default()
+            .with_cors(cors)
             .with_path("/acp/v2")
             .with_health_endpoint(false),
     )

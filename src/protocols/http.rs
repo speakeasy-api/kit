@@ -107,6 +107,61 @@ impl Drop for HttpServer {
     }
 }
 
+/// Opt-in remote ACP HTTP features. Defaults preserve same-origin access only.
+#[derive(Clone, Debug, Default)]
+pub struct HttpOptions {
+    pub health_endpoint: bool,
+    pub allowed_origins: Vec<String>,
+}
+
+impl HttpOptions {
+    fn cors(&self) -> io::Result<agent_client_protocol_http::CorsOptions> {
+        for origin in &self.allowed_origins {
+            let valid = url::Url::parse(origin).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.origin().ascii_serialization() == *origin
+            });
+            if !valid {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ACP CORS origins must be exact http(s) origins without paths, credentials, or wildcards",
+                ));
+            }
+        }
+        if self.allowed_origins.is_empty() {
+            Ok(agent_client_protocol_http::CorsOptions::disabled())
+        } else {
+            agent_client_protocol_http::CorsOptions::allow_origins(&self.allowed_origins)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AcpRouter {
+    router: Router,
+    cors: agent_client_protocol_http::CorsOptions,
+}
+
+impl AcpRouter {
+    fn apply_error_cors<B>(&self, request: &Request<B>, response: &mut Response<Body>) {
+        if !matches!(request.uri().path(), "/acp" | "/acp/v2") {
+            return;
+        }
+        if let agent_client_protocol_http::CorsOptions::AllowOrigins(origins) = &self.cors
+            && let Some(origin) = request.headers().get(header::ORIGIN)
+            && origins.contains(origin)
+        {
+            response
+                .headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+            response
+                .headers_mut()
+                .append(header::VARY, HeaderValue::from_static("Origin"));
+        }
+    }
+}
+
 pub async fn start(
     runtime: Arc<Runtime>,
     address: String,
@@ -133,6 +188,35 @@ pub async fn start_with_registry(
     credential_file: Option<&Path>,
     sessions: crate::protocols::acp::SessionRegistry,
 ) -> Result<HttpServer, Box<dyn std::error::Error>> {
+    start_with_options(
+        runtime,
+        address,
+        serve_a2a,
+        serve_remote_acp,
+        credential_file,
+        sessions,
+        HttpOptions::default(),
+    )
+    .await
+}
+
+pub async fn start_with_options(
+    runtime: Arc<Runtime>,
+    address: String,
+    serve_a2a: bool,
+    serve_remote_acp: bool,
+    credential_file: Option<&Path>,
+    sessions: crate::protocols::acp::SessionRegistry,
+    options: HttpOptions,
+) -> Result<HttpServer, Box<dyn std::error::Error>> {
+    let cors = options.cors()?;
+    if !serve_remote_acp && (options.health_endpoint || !options.allowed_origins.is_empty()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ACP HTTP options require remote ACP",
+        )
+        .into());
+    }
     if !serve_a2a && !serve_remote_acp {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -155,9 +239,19 @@ pub async fn start_with_registry(
         .then(|| crate::protocols::a2a::dispatcher(runtime.clone(), bound, credential.is_some()))
         .transpose()?
         .map(Arc::new);
-    let acp = serve_remote_acp.then(|| {
-        crate::protocols::acp::http_router(runtime.clone(), sessions.clone())
-            .merge(crate::protocols::acp::v2::http_router(runtime, sessions))
+    let acp = serve_remote_acp.then(|| AcpRouter {
+        router: crate::protocols::acp::http_router(
+            runtime.clone(),
+            sessions.clone(),
+            cors.clone(),
+            options.health_endpoint,
+        )
+        .merge(crate::protocols::acp::v2::http_router(
+            runtime,
+            sessions,
+            cors.clone(),
+        )),
+        cors,
     });
     let stop_accepting = crate::resilient_fs::shutdown_token().child_token();
     let accepts_stopped = CancellationToken::new();
@@ -183,7 +277,7 @@ pub async fn start_with_registry(
 async fn serve_bound(
     listener: tokio::net::TcpListener,
     a2a: Option<Arc<a2a_protocol_server::JsonRpcDispatcher>>,
-    acp: Option<Router>,
+    acp: Option<AcpRouter>,
     credential: Option<BearerToken>,
     stop_accepting: CancellationToken,
     accepts_stopped: CancellationToken,
@@ -317,9 +411,35 @@ fn report_connection(result: Result<(), tokio::task::JoinError>) {
 async fn dispatch(
     request: Request<hyper::body::Incoming>,
     a2a: Option<Arc<a2a_protocol_server::JsonRpcDispatcher>>,
-    acp: Option<Router>,
+    acp: Option<AcpRouter>,
     credential: Option<BearerToken>,
 ) -> Result<Response<Body>, Infallible> {
+    // Browser preflight carries no bearer token and cannot invoke an ACP method.
+    // Delegate origin/method policy to the SDK, adding the host's auth header.
+    if request.method() == axum::http::Method::OPTIONS
+        && matches!(request.uri().path(), "/acp" | "/acp/v2")
+        && request.headers().contains_key(header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+        && let Some(router) = acp.clone()
+    {
+        let mut response = router.router.oneshot(request.map(Body::new)).await?;
+        if let Some(headers) = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .cloned()
+        {
+            let mut value = headers.as_bytes().to_vec();
+            value.extend_from_slice(b",authorization,last-event-id");
+            if let Ok(value) = HeaderValue::from_bytes(&value) {
+                response
+                    .headers_mut()
+                    .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
+            }
+        }
+        return Ok(response);
+    }
     if credential
         .as_ref()
         .is_some_and(|credential| !credential.authorizes(request.headers()))
@@ -329,13 +449,31 @@ async fn dispatch(
         response
             .headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        if let Some(router) = &acp {
+            router.apply_error_cors(&request, &mut response);
+        }
         return Ok(response);
     }
 
+    // The SDK does not retain transport event IDs. Never silently accept an
+    // event cursor and give clients a fresh stream that can omit updates.
     if matches!(request.uri().path(), "/acp" | "/acp/v2")
+        && request.headers().contains_key("last-event-id")
+    {
+        let mut response = Response::new(Body::from(
+            "Last-Event-ID resumption is unsupported; use ACP session/resume",
+        ));
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        if let Some(router) = &acp {
+            router.apply_error_cors(&request, &mut response);
+        }
+        return Ok(response);
+    }
+
+    if matches!(request.uri().path(), "/acp" | "/acp/v2" | "/health")
         && let Some(router) = acp
     {
-        let response = router.oneshot(request.map(Body::new)).await?;
+        let response = router.router.oneshot(request.map(Body::new)).await?;
         return Ok(response);
     }
 
@@ -362,6 +500,183 @@ mod tests {
 
     use super::{BearerToken, start};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn http_origins_require_an_explicit_http_origin() {
+        for origin in [
+            "*",
+            "null",
+            "https://example.com/path",
+            "https://user@example.com",
+            "https://example.com/",
+            "file:///tmp",
+        ] {
+            assert!(
+                super::HttpOptions {
+                    allowed_origins: vec![origin.into()],
+                    ..Default::default()
+                }
+                .cors()
+                .is_err()
+            );
+        }
+        assert_eq!(
+            super::HttpOptions::default().cors().unwrap(),
+            agent_client_protocol_http::CorsOptions::Disabled
+        );
+        assert!(
+            super::HttpOptions {
+                allowed_origins: vec!["https://example.com".into()],
+                ..Default::default()
+            }
+            .cors()
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_health_and_cors_are_opt_in_and_preserve_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let credential = directory.path().join("token");
+        std::fs::write(&credential, "secret-token").unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let client = reqwest::Client::new();
+        for enabled in [false, true] {
+            let mut server = super::start_with_options(
+                runtime.clone(),
+                "127.0.0.1:0".into(),
+                false,
+                true,
+                Some(&credential),
+                crate::protocols::acp::SessionRegistry::new(),
+                super::HttpOptions {
+                    health_endpoint: enabled,
+                    allowed_origins: if enabled {
+                        vec!["https://example.com".into()]
+                    } else {
+                        vec![]
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let base = format!("http://{}", server.address());
+            assert_eq!(
+                client
+                    .get(format!("{base}/health"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+            let health = client
+                .get(format!("{base}/health"))
+                .bearer_auth("secret-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                health.status(),
+                if enabled {
+                    reqwest::StatusCode::OK
+                } else {
+                    reqwest::StatusCode::NOT_FOUND
+                }
+            );
+            for path in ["/acp", "/acp/v2"] {
+                for origin in ["https://example.com", "https://denied.example"] {
+                    let response = client
+                        .request(reqwest::Method::OPTIONS, format!("{base}{path}"))
+                        .header("origin", origin)
+                        .header("access-control-request-method", "POST")
+                        .header(
+                            "access-control-request-headers",
+                            "authorization,content-type,last-event-id",
+                        )
+                        .send()
+                        .await
+                        .unwrap();
+                    let allowed = response.headers().get("access-control-allow-origin");
+                    if enabled && origin == "https://example.com" {
+                        assert_eq!(allowed.unwrap(), origin);
+                        assert!(
+                            response.headers()["access-control-allow-headers"]
+                                .to_str()
+                                .unwrap()
+                                .contains("authorization")
+                        );
+                        assert!(
+                            response.headers()["access-control-allow-headers"]
+                                .to_str()
+                                .unwrap()
+                                .contains("last-event-id")
+                        );
+                    } else {
+                        assert!(allowed.is_none());
+                    }
+                }
+                // Preflight never authorizes work; browser clients can read errors.
+                for origin in [
+                    None,
+                    Some("https://example.com"),
+                    Some("https://denied.example"),
+                ] {
+                    for authenticated in [false, true] {
+                        let mut request = client
+                            .get(format!("{base}{path}"))
+                            .header("last-event-id", "unsupported-event");
+                        if let Some(origin) = origin {
+                            request = request.header("origin", origin);
+                        }
+                        if authenticated {
+                            request = request.bearer_auth("secret-token");
+                        }
+                        let response = request.send().await.unwrap();
+                        assert_eq!(
+                            response.status(),
+                            if authenticated {
+                                reqwest::StatusCode::BAD_REQUEST
+                            } else {
+                                reqwest::StatusCode::UNAUTHORIZED
+                            }
+                        );
+                        if enabled && origin == Some("https://example.com") {
+                            assert_eq!(
+                                response.headers()["access-control-allow-origin"],
+                                "https://example.com"
+                            );
+                            assert_eq!(response.headers()["vary"], "Origin");
+                        } else {
+                            assert!(
+                                response
+                                    .headers()
+                                    .get("access-control-allow-origin")
+                                    .is_none()
+                            );
+                            assert!(response.headers().get("vary").is_none());
+                        }
+                    }
+                }
+            }
+            let response = client
+                .get(format!("{base}/.well-known/agent-card.json"))
+                .header("origin", "https://example.com")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+            assert!(
+                response
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .is_none()
+            );
+
+            server.shutdown();
+            server.join().await.unwrap();
+        }
+    }
 
     #[test]
     fn credential_file_accepts_one_token_and_one_trailing_newline() {
