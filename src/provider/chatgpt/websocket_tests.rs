@@ -481,25 +481,110 @@ fn http(listener: &TcpListener, status: &str, body: &str) -> (String, Value) {
 }
 
 #[tokio::test]
-async fn subscription_retries_reach_the_session_retry_observer() {
-    let (endpoint, peer) = server(|listener| {
-        let mut lost = tungstenite::accept(accept(&listener)).unwrap();
-        receive(&mut lost, false);
-        drop(lost);
-        let mut fresh = tungstenite::accept(accept(&listener)).unwrap();
-        receive(&mut fresh, false);
-        success(&mut fresh, "retried", "first answer");
-    });
-    let mut session = session_with_retries(&endpoint, 1).await;
-    let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observed = Arc::clone(&retries);
-    session.set_retry_observer(Some(Arc::new(move |_| {
-        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    })));
-    let mut turn = begin(&mut session, false).await;
-    finished(&mut turn, "retried", "first answer").await;
-    peer.join().unwrap();
-    assert!(retries.load(std::sync::atomic::Ordering::SeqCst) > 0);
+async fn subscription_retries_project_real_success_and_exhaustion_without_payloads() {
+    use crate::protocols::acp::retry_projection::{META_KEY, Projection};
+    use agentkit_loop::{AgentEvent, ProviderRetryEvent};
+    for succeeds in [true, false] {
+        let (endpoint, peer) = server(move |listener| {
+            for attempt in 1..=4 {
+                let mut socket = tungstenite::accept(accept(&listener)).unwrap();
+                receive(&mut socket, false);
+                if succeeds && attempt == 4 {
+                    success(&mut socket, "retried", "first answer");
+                } else {
+                    socket
+                        .send(Message::Text(
+                            response("customer-secret-id", "")[0].to_string().into(),
+                        ))
+                        .unwrap();
+                    socket.send(Message::Text(json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": "customer-secret-id",
+                            "error": {"type": "server_error", "code": "server_error", "status": 503,
+                                "message": "secret-provider-body customer-secret-id bearer-secret first question"}
+                        }
+                    }).to_string().into())).unwrap();
+                }
+            }
+        });
+        let mut session = session_with_retries(&endpoint, 3).await;
+        let projection = Projection::default();
+        let (send, receive) = std::sync::mpsc::channel();
+        session.set_retry_observer(Some(Arc::new(move |event| {
+            let update = projection.observe(&AgentEvent::ProviderRetry(event));
+            send.send((event, update)).unwrap();
+        })));
+        let mut turn = begin(&mut session, false).await;
+        if succeeds {
+            finished(&mut turn, "retried", "first answer").await;
+        } else {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    match turn.next_event(None).await {
+                        Err(_) => break,
+                        Ok(Some(ModelTurnEvent::Finished(_))) => panic!("exhaustion succeeded"),
+                        Ok(Some(_)) => {}
+                        Ok(None) => panic!("exhaustion did not return its failure"),
+                    }
+                }
+            })
+            .await
+            .expect("exhaustion hung");
+        }
+        peer.join().unwrap();
+        let observed: Vec<_> = receive.try_iter().collect();
+        let scheduled: Vec<_> = observed
+            .iter()
+            .filter_map(|(event, _)| match event {
+                ProviderRetryEvent::Scheduled(progress) => Some(progress.accounting.attempts),
+                _ => None,
+            })
+            .collect();
+        // The provider itself coalesces rapid schedules. Do not infer sends
+        // from notice count: terminal accounting must retain all four sends.
+        assert_eq!(scheduled.first(), Some(&1));
+        assert!(scheduled.iter().all(|attempt| (1..=3).contains(attempt)));
+        assert!(scheduled.windows(2).all(|pair| pair[0] < pair[1]));
+        let terminals: Vec<_> = observed
+            .iter()
+            .filter(|(event, _)| !matches!(event, ProviderRetryEvent::Scheduled(_)))
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        let accounting = match terminals[0].0 {
+            ProviderRetryEvent::Succeeded { accounting, .. } if succeeds => accounting,
+            ProviderRetryEvent::Stopped(failure) if !succeeds => failure.accounting,
+            _ => panic!("wrong retry terminal observation"),
+        };
+        assert_eq!(accounting.attempts, 4);
+        assert_eq!(accounting.completed_backoff, Duration::ZERO);
+        let updates: Vec<_> = observed
+            .into_iter()
+            .filter_map(|(_, update)| update)
+            .collect();
+        assert!((2..=4).contains(&updates.len()));
+        let values: Vec<_> = updates
+            .into_iter()
+            .map(|update| serde_json::to_value(update).unwrap())
+            .collect();
+        assert_eq!(values[0]["_meta"][META_KEY]["attempts"], 1);
+        assert_eq!(values.last().unwrap()["_meta"][META_KEY]["attempts"], 4);
+        assert_eq!(
+            values.last().unwrap()["_meta"][META_KEY]["status"],
+            if succeeds { "succeeded" } else { "stopped" }
+        );
+        let encoded = serde_json::to_string(&values).unwrap();
+        for secret in [
+            "secret-provider-body",
+            "customer-secret-id",
+            "bearer-secret",
+            "first question",
+            "loopback-only",
+            &endpoint,
+        ] {
+            assert!(!encoded.contains(secret), "retry notice leaked {secret}");
+        }
+    }
 }
 
 #[tokio::test]

@@ -809,6 +809,7 @@ impl AgentActivity {
                     tool.2 = running;
                 }
             }
+            SubagentActivity::Retry { .. } => {}
             SubagentActivity::Plan { entry } => self.plan = entry,
             SubagentActivity::Title { title } => self.title = title,
         }

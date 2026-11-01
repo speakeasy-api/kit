@@ -509,6 +509,15 @@ fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActi
     use agentkit_acp::{PlanEntryStatus, ToolCallStatus};
     let running = |status| matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
     match update {
+        SessionUpdate::Notice(notice) => {
+            let progress = notice
+                .meta
+                .as_ref()?
+                .get(crate::protocols::acp::retry_projection::META_KEY)?;
+            serde_json::from_value(progress.clone())
+                .ok()
+                .map(|progress| SubagentActivity::Retry { progress })
+        }
         SessionUpdate::ToolCall(call) => Some(SubagentActivity::Tool {
             id: call.tool_call_id.to_string(),
             title: Some(call.title.clone()),
@@ -2362,6 +2371,46 @@ mod tests {
 
     fn update(value: Value) -> SessionUpdate {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn retry_notice_activity_is_typed_and_does_not_reclassify_ordinary_notices() {
+        use crate::events::{RetryStatus, SubagentActivity};
+        let mut notice = json!({"sessionUpdate":"notice", "severity":"info",
+        "title":"arbitrary upstream title", "description":"SECRET payload",
+        "_meta":{"kit/providerRetry":{
+            "status":"scheduled", "route":"open_ai_responses", "attempts":2,
+            "category":"transport", "next_delay_ms":25, "completed_backoff_ms":10,
+            "upstream_body":"SECRET payload"
+        }}});
+        for (status, expected) in [
+            ("scheduled", RetryStatus::Scheduled),
+            ("succeeded", RetryStatus::Succeeded),
+            ("stopped", RetryStatus::Stopped),
+        ] {
+            notice["_meta"]["kit/providerRetry"]["status"] = json!(status);
+            let activity = roster_activity(&update(notice.clone())).unwrap();
+            let SubagentActivity::Retry { progress } = &activity else {
+                panic!("retry notice must produce retry activity");
+            };
+            assert_eq!(progress.status, expected);
+            assert_eq!(progress.attempts, 2);
+            assert_eq!(progress.next_delay_ms, 25);
+            assert_eq!(progress.completed_backoff_ms, 10);
+            let encoded = serde_json::to_string(&activity).unwrap();
+            assert!(!encoded.contains("SECRET"));
+            assert!(!encoded.contains("arbitrary upstream"));
+        }
+        notice["_meta"]["kit/providerRetry"]["attempts"] = json!("SECRET");
+        assert!(roster_activity(&update(notice.clone())).is_none());
+        notice.as_object_mut().unwrap().remove("_meta");
+        let ordinary = update(notice);
+        assert!(roster_activity(&ordinary).is_none());
+        let mut output = ChildOutput::default();
+        output.record(ordinary);
+        assert_eq!(output.updates.len(), 1);
+        assert_eq!(output.updates[0]["description"], "SECRET payload");
+        assert!(output.text.is_empty());
     }
 
     #[test]

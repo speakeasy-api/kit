@@ -83,6 +83,9 @@ pub enum RuntimeEvent {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentActivity {
+    Retry {
+        progress: ProviderRetryProgress,
+    },
     Tool {
         id: String,
         title: Option<String>,
@@ -94,6 +97,27 @@ pub enum SubagentActivity {
     Title {
         title: Option<String>,
     },
+}
+
+/// Sanitized observational accounting, not a second model/tool result.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRetryProgress {
+    pub status: RetryStatus,
+    pub route: agentkit_loop::ProviderRoute,
+    /// Actual sends already started, not the planned next retry attempt.
+    pub attempts: u64,
+    pub category: Option<agentkit_loop::ProviderFailureReason>,
+    pub next_delay_ms: u64,
+    /// Requested durations of fully completed waits; interrupted waits add zero.
+    pub completed_backoff_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStatus {
+    Scheduled,
+    Succeeded,
+    Stopped,
 }
 
 /// The product behind an ACP harness, inferred from its launch command.

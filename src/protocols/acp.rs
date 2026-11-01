@@ -59,6 +59,7 @@ pub(crate) mod activity;
 mod compaction_projection;
 pub(crate) mod model_switch;
 mod plan;
+pub(crate) mod retry_projection;
 mod session_info;
 mod session_pagination;
 mod skill_catalog;
@@ -1324,6 +1325,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
+    retry: Option<retry_projection::Projection>,
     compaction: Option<compaction_projection::Projection>,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
@@ -1340,6 +1342,7 @@ impl ResponseInterruptionNoticeObserver {
         activity: activity::SessionActivity,
     ) -> Self {
         Self {
+            retry: None,
             compaction: None,
             hook_messages: None,
             activity,
@@ -1347,6 +1350,11 @@ impl ResponseInterruptionNoticeObserver {
             client,
             session_id,
         }
+    }
+
+    fn with_retry_notices(mut self, enabled: bool) -> Self {
+        self.retry = enabled.then(retry_projection::Projection::default);
+        self
     }
 
     fn with_compaction(mut self, enabled: bool) -> Self {
@@ -1377,6 +1385,14 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
+        if let Some(retry) = &self.retry
+            && let Some(update) = retry.observe(&event.event)
+            && let Err(error) = self
+                .client
+                .notify_session(SessionNotification::new(self.session_id.clone(), update))
+        {
+            tracing::debug!(%error, "failed to queue provider retry update");
+        }
         if let Some(compaction) = &self.compaction {
             for update in compaction.observe(&event.event) {
                 if let Err(error) = self
@@ -1494,6 +1510,7 @@ impl Drop for SessionPublicationRollback<'_> {
 struct Server {
     // Connection-local snapshot. Only initialize writes; a new connection starts disabled.
     subagent_updates: AtomicBool,
+    notices_supported: AtomicBool,
     form_elicitation: AtomicBool,
     compaction_updates: AtomicBool,
     runtime: Arc<Runtime>,
@@ -1521,6 +1538,7 @@ impl Server {
     fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
             subagent_updates: AtomicBool::new(false),
+            notices_supported: AtomicBool::new(false),
             form_elicitation: AtomicBool::new(false),
             compaction_updates: AtomicBool::new(false),
             runtime,
@@ -1631,6 +1649,14 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+        self.notices_supported.store(
+            request
+                .client_capabilities
+                .session
+                .as_ref()
+                .is_some_and(|session| session.notices.is_some()),
+            Ordering::Release,
+        );
         self.compaction_updates.store(
             request
                 .client_capabilities
@@ -1904,6 +1930,7 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
+        .with_retry_notices(self.notices_supported.load(Ordering::Acquire))
         .with_compaction(self.compaction_updates.load(Ordering::Acquire))
         .with_hook_messages(runtime.hooks());
         let context = AcpDriverContext {
@@ -1982,6 +2009,7 @@ impl Server {
                 .subagents
                 .subscribe_updates(session_id.to_string(), replay_history)
         });
+        let notices_supported = self.notices_supported.load(Ordering::Acquire);
         let actor_task = tokio::spawn(async move {
             let _shutdown_bridge = shutdown_bridge;
             let _guard = guard;
@@ -1992,6 +2020,11 @@ impl Server {
                     session_actor(actor),
                     subagent_updates,
                     |session_id, update| {
+                        // A child negotiates notice support independently. Do not
+                        // forward that update type to a v1 parent without support.
+                        if !notices_supported && update["sessionUpdate"] == "notice" {
+                            return Ok(());
+                        }
                         if let Some(update) = subagents::v1_update(update) {
                             connection
                                 .send_notification(SessionNotification::new(session_id, update))?;
@@ -3963,6 +3996,43 @@ pub(super) mod tests {
             assert_eq!(server.subagent_updates.load(Ordering::Acquire), supported);
         }
         assert!(!create_server().subagent_updates.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn v1_retry_notice_capabilities_reset_on_initialize_and_new_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let create_server = || {
+            Server::new(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                AcpIntegration::builder()
+                    .name("retry-capability-test")
+                    .approval_resolver(AutoDenyResolver)
+                    .build()
+                    .unwrap(),
+                SessionRegistry::new(),
+            )
+        };
+        let server = create_server();
+        assert!(!server.notices_supported.load(Ordering::Acquire));
+        for (capabilities, supported) in [
+            (json!({"session":{"notices":{}}}), true),
+            (json!({"session":{"notices":null}}), false),
+            (json!({"session":{"notices":{}}}), true),
+            (json!({"session":{}}), false),
+            (json!({"session":{"notices":{}}}), true),
+            (json!({}), false),
+        ] {
+            server
+                .initialize(
+                    serde_json::from_value(
+                        json!({"protocolVersion":1,"clientCapabilities":capabilities}),
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(server.notices_supported.load(Ordering::Acquire), supported);
+        }
+        assert!(!create_server().notices_supported.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -5976,6 +6046,102 @@ pub(super) mod tests {
             }),
             "the finalization flush must include the terminal inner-tool card"
         );
+    }
+
+    #[test]
+    fn retry_notices_reach_v1_client_without_model_results() {
+        use agentkit_loop::{
+            ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRetryEvent,
+            ProviderRoute, RetryAccounting, RetryProgress,
+        };
+        use std::time::Duration;
+
+        for (succeeded, supported) in [(true, true), (false, true), (true, false), (false, false)] {
+            let integration = AcpIntegration::builder()
+                .name("retry-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap();
+            let session_id = agentkit_acp::SessionId::new("retry-test");
+            let loop_id = AgentkitSessionId::new("retry-test-loop");
+            let (client, mut messages) = AcpClientHandle::channel();
+            let observer = ResponseInterruptionNoticeObserver::new(
+                integration,
+                client,
+                session_id.clone(),
+                legacy_activity(session_id.clone(), |_| Ok(())),
+            )
+            .with_retry_notices(supported);
+            let scheduled =
+                AgentEvent::ProviderRetry(ProviderRetryEvent::Scheduled(RetryProgress {
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    reason: ProviderFailureReason::Transport,
+                    upstream: ProviderClassification::default(),
+                    accounting: RetryAccounting {
+                        attempts: 2,
+                        completed_backoff: Duration::from_millis(125),
+                        elapsed: Duration::from_millis(300),
+                    },
+                    next_delay: Duration::from_millis(250),
+                }));
+            let terminal_accounting = RetryAccounting {
+                attempts: 3,
+                completed_backoff: Duration::from_millis(375),
+                elapsed: Duration::from_millis(800),
+            };
+            let terminal = AgentEvent::ProviderRetry(if succeeded {
+                ProviderRetryEvent::Succeeded {
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    accounting: terminal_accounting,
+                }
+            } else {
+                ProviderRetryEvent::Stopped(ProviderFailure {
+                    last_attempt_reason: None,
+                    route: ProviderRoute::OpenAiChatGptResponses,
+                    reason: ProviderFailureReason::RetryExhausted,
+                    upstream: ProviderClassification::default(),
+                    accounting: terminal_accounting,
+                })
+            });
+            // A repeated terminal observation must not add a second outcome.
+            for event in [scheduled, terminal.clone(), terminal] {
+                observer.handle_event(ObservedEvent {
+                    session_id: Arc::new(loop_id.clone()),
+                    event,
+                });
+            }
+            let mut updates = Vec::new();
+            while let Ok(message) = messages.try_recv() {
+                let AcpClientMessage::SessionNotification(notification) = message else {
+                    panic!("retry activity must only emit session notifications");
+                };
+                assert_eq!(notification.session_id, session_id);
+                updates.push(notification.update);
+            }
+            if !supported {
+                assert!(updates.is_empty());
+                continue;
+            }
+            // Retry accounting is activity only: no model, usage, or idle result.
+            assert_eq!(updates.len(), 2);
+            for (update, expected) in updates.iter().zip([
+                json!({
+                    "status": "scheduled", "route": "open_ai_chat_gpt_responses",
+                    "attempts": 2, "category": "transport", "next_delay_ms": 250,
+                    "completed_backoff_ms": 125
+                }),
+                json!({
+                    "status": if succeeded { "succeeded" } else { "stopped" },
+                    "route": "open_ai_chat_gpt_responses", "attempts": 3,
+                    "category": if succeeded { Value::Null } else { json!("retry_exhausted") },
+                    "next_delay_ms": 0, "completed_backoff_ms": 375
+                }),
+            ]) {
+                assert!(matches!(update, SessionUpdate::Notice(_)));
+                let value = serde_json::to_value(update).unwrap();
+                assert_eq!(value["_meta"]["kit/providerRetry"], expected);
+            }
+        }
     }
 
     #[test]
