@@ -33,6 +33,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-verify
       - name: Prepare release candidate
         id: release
         shell: bash
@@ -183,6 +186,9 @@ jobs:
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
       - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-x64
       - run: mise run setup:linux
       - name: Build and package
         shell: bash
@@ -226,6 +232,9 @@ jobs:
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
       - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-arm64
       - name: Check optional signing credentials
         id: signing
         shell: bash
@@ -402,7 +411,7 @@ jobs:
           if-no-files-found: error
 
   release-notes:
-    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, container-build]
+    needs: [verify, linux-x64]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -449,7 +458,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, release-notes]
+    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, container-build, release-notes]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write

@@ -7,15 +7,32 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
+  lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
       - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-lint
       - run: mise run setup:linux
       - run: mise run test:scripts
       - run: mise run lint
+
+  test-rust:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-test
+      - run: mise run setup:linux
       - run: mise run test
       - run: mise run build
       - run: mise run test:linux-no-audio -- target/debug/kit
@@ -26,6 +43,9 @@ jobs:
     steps:
       - uses: useblacksmith/checkout@v1
       - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-headless
       - run: mise run setup:linux
       - run: mise run test:headless
       - run: mise run build:headless
@@ -54,6 +74,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-kit-helper
+          compression-level: 0
           path: ${{ runner.temp }}/kit.tar.gz
           if-no-files-found: error
           retention-days: 1
@@ -89,7 +110,7 @@ jobs:
           printf stale > "$stale"
           chmod +x "$stale"
           # The helper was downloaded above; skip the debug cargo build the task normally depends on.
-          mise run --no-deps macos:test
+          mise run --skip-deps macos:test
           cmp target/aarch64-apple-darwin/release/kit "$stale"
       - name: Validate Release archive and bundled helper
         shell: bash
@@ -105,3 +126,14 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.speakeasy.kit.desktop
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+
+  test:
+    if: always()
+    needs: [lint, test-rust]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Require lint and Rust tests
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test-rust.result }}
+        run: test "$LINT_RESULT" = success && test "$TEST_RESULT" = success
