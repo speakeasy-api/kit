@@ -604,9 +604,10 @@ fn resolve_blocking(
 ) -> Result<BlockingResolution, String> {
     let mut resolved = ResolvedPlugins::default();
     let mut verified_git_revisions = BTreeMap::new();
-    let mut manifest_names = BTreeSet::new();
     let mut loaded_generations = Vec::new();
     let mut skipped = BTreeSet::new();
+    let required = |alias: &str| source_plan.is_none_or(|plan| plan.required.contains(alias));
+    let mut candidates = Vec::new();
     for (alias, config) in configs {
         if source_plan.is_some_and(|plan| plan.skipped.contains(alias)) {
             continue;
@@ -647,12 +648,6 @@ fn resolve_blocking(
                     root.display()
                 )
             })?;
-            if manifest_names.contains(&plugin.manifest().name) {
-                return Err(format!(
-                    "plugin {alias:?} duplicates manifest name {:?}",
-                    plugin.manifest().name
-                ));
-            }
             let mut mcp = None;
             if !plugin.mcp_servers().is_empty() {
                 let data_dir = data_root.join(&plugin.manifest().name);
@@ -682,19 +677,37 @@ fn resolve_blocking(
             }
             Ok((plugin, verified_revision, mcp))
         })();
-        let (plugin, verified_revision, mcp) = match loaded {
-            Ok(loaded) => loaded,
+        match loaded {
+            Ok(loaded) => candidates.push((alias, loaded)),
             Err(error) => {
-                skip_failed_plugin(
-                    alias,
-                    error,
-                    source_plan.is_none_or(|plan| plan.required.contains(alias)),
-                )?;
+                skip_failed_plugin(alias, error, required(alias))?;
                 skipped.insert(alias.clone());
+            }
+        }
+    }
+    let mut owners = BTreeMap::new();
+    for prefer_required in [true, false] {
+        for (alias, (plugin, _, _)) in &candidates {
+            if required(alias) != prefer_required {
                 continue;
             }
-        };
-        manifest_names.insert(plugin.manifest().name.clone());
+            let name = &plugin.manifest().name;
+            if owners.contains_key(name) {
+                skip_failed_plugin(
+                    alias,
+                    format!("plugin {alias:?} duplicates manifest name {name:?}"),
+                    prefer_required,
+                )?;
+                skipped.insert((*alias).clone());
+            } else {
+                owners.insert(name.clone(), *alias);
+            }
+        }
+    }
+    for (alias, (plugin, verified_revision, mcp)) in candidates {
+        if owners.get(&plugin.manifest().name) != Some(&alias) {
+            continue;
+        }
         if let Some(revision) = verified_revision {
             verified_git_revisions.insert(alias.clone(), revision);
         }
@@ -4337,6 +4350,53 @@ mod tests {
 
         fs::write(broken.join("plugin.json"), "{").unwrap();
         assert!(runtime.stage_for_poll().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn published_plugin_keeps_manifest_name_over_new_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let write_plugin = |root: &Path| {
+            let skill = root.join("skills/shared");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                root.join("plugin.json"),
+                MANIFEST.replace("test-plugin", "shared"),
+            )
+            .unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: shared\ndescription: Skill.\n---\nbody\n",
+            )
+            .unwrap();
+        };
+        let existing = directory.path().join("existing");
+        let added = directory.path().join("added");
+        write_plugin(&existing);
+        fs::write(
+            &config,
+            format!(
+                "[plugins.a-new]\nsource = 'path'\npath = '{}'\n\
+                 [plugins.z-existing]\nsource = 'path'\npath = '{}'\n",
+                added.display(),
+                existing.display()
+            ),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let published = runtime.snapshot().package_roots.clone();
+        assert_eq!(published.len(), 1);
+
+        write_plugin(&added);
+        let staged = runtime.stage_for_poll().await.unwrap();
+        assert_eq!(staged.resolved.package_roots, published);
     }
 
     #[tokio::test]
