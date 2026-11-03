@@ -137,6 +137,8 @@ struct SourceFingerprint {
     candidate: blake3::Hash,
     resolved: blake3::Hash,
     remote_revisions: BTreeMap<(String, Option<String>), PlannedGitRevision>,
+    loaded: BTreeSet<String>,
+    complete: bool,
 }
 
 #[derive(Clone)]
@@ -151,6 +153,8 @@ struct SourcePlan {
     candidate_fingerprint: blake3::Hash,
     path_sources: BTreeMap<String, PlannedPathSource>,
     git_revisions: BTreeMap<String, PlannedGitRevision>,
+    skipped: BTreeSet<String>,
+    required: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +172,7 @@ struct ResolvedGitSource {
 struct BlockingResolution {
     resolved: ResolvedPlugins,
     git_revisions: BTreeMap<String, ResolvedGitRevision>,
+    skipped: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -183,8 +188,10 @@ impl SourcePlan {
         runtime_root: &Path,
     ) -> Result<(), String> {
         let configured_paths = configs
-            .values()
-            .filter(|config| matches!(config, PluginConfig::Path { .. }))
+            .iter()
+            .filter(|(alias, config)| {
+                matches!(config, PluginConfig::Path { .. }) && !self.skipped.contains(*alias)
+            })
             .count();
         if configured_paths != self.path_sources.len() {
             return Err("not all staged plugin paths have fingerprints".into());
@@ -193,6 +200,9 @@ impl SourcePlan {
             let PluginConfig::Path { path } = config else {
                 continue;
             };
+            if self.skipped.contains(alias) {
+                continue;
+            }
             let expected = self
                 .path_sources
                 .get(alias)
@@ -210,15 +220,21 @@ impl SourcePlan {
 
     fn verified_fingerprint(
         &self,
+        configs: &BTreeMap<String, PluginConfig>,
         resolved: &BTreeMap<String, ResolvedGitRevision>,
+        complete: bool,
     ) -> Result<SourceFingerprint, String> {
-        if resolved.len() != self.git_revisions.len() {
+        let staged = self
+            .git_revisions
+            .iter()
+            .filter(|(alias, _)| !self.skipped.contains(*alias));
+        if resolved.len() != staged.clone().count() {
             return Err("not all staged Git revisions were verified".into());
         }
         let mut fingerprint = blake3::Hasher::new();
         fingerprint.update(b"kit-plugin-resolved-sources-v1");
         fingerprint.update(self.candidate_fingerprint.as_bytes());
-        for (alias, planned) in &self.git_revisions {
+        for (alias, planned) in staged {
             let verified = resolved
                 .get(alias)
                 .ok_or_else(|| format!("Git revision for plugin {alias:?} was not verified"))?;
@@ -235,6 +251,12 @@ impl SourcePlan {
             candidate: self.candidate_fingerprint,
             resolved: fingerprint.finalize(),
             remote_revisions: self.remote_revisions.clone(),
+            loaded: configs
+                .keys()
+                .filter(|alias| !self.skipped.contains(*alias))
+                .cloned()
+                .collect(),
+            complete,
         })
     }
 }
@@ -378,17 +400,9 @@ impl PluginRuntime {
                 fingerprint.remote_revisions.clear();
             }
         }
-        stage_with_skill_cache(
-            &configs,
-            &self.inner.runtime_root,
-            &self.inner.cache_root,
-            &self.inner.skill_cache_root,
-            &self.inner.data_root,
-            published,
-            runner,
-        )
-        .await
-        .map_err(bounded_diagnostic)
+        stage_with_skill_cache(&self.inner, &configs, published, runner)
+            .await
+            .map_err(bounded_diagnostic)
     }
 
     pub(crate) async fn generation_lease(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
@@ -495,34 +509,35 @@ enum BlockingStage {
 }
 
 async fn stage_with_skill_cache(
+    inner: &PluginRuntimeInner,
     configs: &BTreeMap<String, PluginConfig>,
-    runtime_root: &Path,
-    cache_root: &Path,
-    skill_cache_root: &Path,
-    data_root: &Path,
     published: PublishedPlugins,
     runner: Arc<dyn GitRunner + Send>,
 ) -> Result<StagedPlugins, String> {
     let configs = configs.clone();
-    let runtime_root = runtime_root.to_path_buf();
-    let cache_root = cache_root.to_path_buf();
-    let skill_cache_root = skill_cache_root.to_path_buf();
-    let data_root = data_root.to_path_buf();
+    let runtime_root = inner.runtime_root.clone();
+    let cache_root = inner.cache_root.clone();
+    let skill_cache_root = inner.skill_cache_root.clone();
+    let data_root = inner.data_root.clone();
     let staged = tokio::task::spawn_blocking(move || -> Result<BlockingStage, String> {
         // Polls still inspect every local source and config entry, but reuse
         // verified remote revisions. Invocation always probes mutable refs.
+        // Plugins outside the published generation are skipped on failure;
+        // published plugins keep their last verified generation instead.
         let cached = published.source_fingerprint.as_ref();
-        let source_plan = source_plan_with_cached_revisions(
+        let mut source_plan = source_plan_with_cached_revisions(
             &configs,
             &runtime_root,
             &cache_root,
             runner.as_ref(),
             cached.map(|fingerprint| &fingerprint.remote_revisions),
+            cached
+                .map(|fingerprint| fingerprint.loaded.clone())
+                .unwrap_or_default(),
         )?;
-        if let Some(mut source_fingerprint) = published
-            .source_fingerprint
-            .filter(|fingerprint| fingerprint.candidate == source_plan.candidate_fingerprint)
-        {
+        if let Some(mut source_fingerprint) = published.source_fingerprint.filter(|fingerprint| {
+            fingerprint.complete && fingerprint.candidate == source_plan.candidate_fingerprint
+        }) {
             source_fingerprint.remote_revisions = source_plan.remote_revisions;
             return Ok(BlockingStage::Reused {
                 resolved: published.resolved,
@@ -538,8 +553,14 @@ async fn stage_with_skill_cache(
             Some(&source_plan),
             runner.as_ref(),
         )?;
+        let complete = resolution.skipped.is_empty();
+        for alias in resolution.skipped {
+            source_plan.path_sources.remove(&alias);
+            source_plan.skipped.insert(alias);
+        }
         source_plan.verify_path_fingerprints(&configs, &runtime_root)?;
-        let source_fingerprint = source_plan.verified_fingerprint(&resolution.git_revisions)?;
+        let source_fingerprint =
+            source_plan.verified_fingerprint(&configs, &resolution.git_revisions, complete)?;
         Ok(BlockingStage::Fresh {
             resolved: resolution.resolved,
             source_fingerprint,
@@ -583,69 +604,115 @@ fn resolve_blocking(
 ) -> Result<BlockingResolution, String> {
     let mut resolved = ResolvedPlugins::default();
     let mut verified_git_revisions = BTreeMap::new();
-    let mut manifest_names = BTreeSet::new();
     let mut loaded_generations = Vec::new();
+    let mut skipped = BTreeSet::new();
+    let required = |alias: &str| source_plan.is_none_or(|plan| plan.required.contains(alias));
+    let mut candidates = Vec::new();
     for (alias, config) in configs {
-        validate_alias(alias)?;
-        let root = match config {
-            PluginConfig::Path { path } => resolve_path(path, runtime_root)?,
-            PluginConfig::Archive {
-                url,
-                sha256,
-                subdir,
-            } => resolve_archive(url, sha256, subdir.as_deref(), cache_root)?,
-            PluginConfig::Git { url, rev, subdir } => match source_plan {
-                Some(source_plan) => {
-                    let planned = source_plan.git_revisions.get(alias).ok_or_else(|| {
-                        format!("missing staged Git revision for plugin {alias:?}")
-                    })?;
-                    let verified =
-                        resolve_git_planned(url, subdir.as_deref(), cache_root, planned, runner)?;
-                    verified_git_revisions.insert(alias.clone(), verified.revision);
-                    verified.root
-                }
-                None => resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root, runner)?,
-            },
-        };
-        let plugin = load_plugin(&root).map_err(|error| {
-            format!(
-                "could not load plugin {alias:?} from {}: {error}",
-                root.display()
-            )
-        })?;
-        if !manifest_names.insert(plugin.manifest().name.clone()) {
-            return Err(format!(
-                "plugin {alias:?} duplicates manifest name {:?}",
-                plugin.manifest().name
-            ));
+        if source_plan.is_some_and(|plan| plan.skipped.contains(alias)) {
+            continue;
         }
-        log_plugin_diagnostics(alias, &plugin);
-        if !plugin.mcp_servers().is_empty() {
-            let data_dir = data_root.join(&plugin.manifest().name);
-            fs::create_dir_all(&data_dir).map_err(|error| {
+        let loaded = (|| -> Result<_, String> {
+            validate_alias(alias)?;
+            let mut verified_revision = None;
+            let root = match config {
+                PluginConfig::Path { path } => resolve_path(path, runtime_root)?,
+                PluginConfig::Archive {
+                    url,
+                    sha256,
+                    subdir,
+                } => resolve_archive(url, sha256, subdir.as_deref(), cache_root)?,
+                PluginConfig::Git { url, rev, subdir } => match source_plan {
+                    Some(source_plan) => {
+                        let planned = source_plan.git_revisions.get(alias).ok_or_else(|| {
+                            format!("missing staged Git revision for plugin {alias:?}")
+                        })?;
+                        let verified = resolve_git_planned(
+                            url,
+                            subdir.as_deref(),
+                            cache_root,
+                            planned,
+                            runner,
+                        )?;
+                        verified_revision = Some(verified.revision);
+                        verified.root
+                    }
+                    None => {
+                        resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root, runner)?
+                    }
+                },
+            };
+            let plugin = load_plugin(&root).map_err(|error| {
                 format!(
-                    "could not create data directory for plugin {alias:?} at {}: {error}",
-                    data_dir.display()
+                    "could not load plugin {alias:?} from {}: {error}",
+                    root.display()
                 )
             })?;
-            let data_dir = fs::canonicalize(&data_dir).map_err(|error| {
-                format!("could not resolve data directory for plugin {alias:?}: {error}")
-            })?;
-            if !fs::metadata(&data_dir).is_ok_and(|metadata| metadata.is_dir()) {
-                return Err(format!(
-                    "plugin data path is not a directory: {}",
-                    data_dir.display()
-                ));
+            let mut mcp = None;
+            if !plugin.mcp_servers().is_empty() {
+                let data_dir = data_root.join(&plugin.manifest().name);
+                fs::create_dir_all(&data_dir).map_err(|error| {
+                    format!(
+                        "could not create data directory for plugin {alias:?} at {}: {error}",
+                        data_dir.display()
+                    )
+                })?;
+                let data_dir = fs::canonicalize(&data_dir).map_err(|error| {
+                    format!("could not resolve data directory for plugin {alias:?}: {error}")
+                })?;
+                if !fs::metadata(&data_dir).is_ok_and(|metadata| metadata.is_dir()) {
+                    return Err(format!(
+                        "plugin data path is not a directory: {}",
+                        data_dir.display()
+                    ));
+                }
+                require_plugin_disk(&data_dir)?;
+                mcp = Some(ResolvedPluginMcp {
+                    alias: alias.clone(),
+                    manifest_name: plugin.manifest().name.clone(),
+                    root: plugin.root().to_path_buf(),
+                    data_dir,
+                    servers: plugin.mcp_servers().to_vec(),
+                });
             }
-            require_plugin_disk(&data_dir)?;
-            resolved.mcp_plugins.push(ResolvedPluginMcp {
-                alias: alias.clone(),
-                manifest_name: plugin.manifest().name.clone(),
-                root: plugin.root().to_path_buf(),
-                data_dir,
-                servers: plugin.mcp_servers().to_vec(),
-            });
+            Ok((plugin, verified_revision, mcp))
+        })();
+        match loaded {
+            Ok(loaded) => candidates.push((alias, loaded)),
+            Err(error) => {
+                skip_failed_plugin(alias, error, required(alias))?;
+                skipped.insert(alias.clone());
+            }
         }
+    }
+    let mut owners = BTreeMap::new();
+    for prefer_required in [true, false] {
+        for (alias, (plugin, _, _)) in &candidates {
+            if required(alias) != prefer_required {
+                continue;
+            }
+            let name = &plugin.manifest().name;
+            if owners.contains_key(name) {
+                skip_failed_plugin(
+                    alias,
+                    format!("plugin {alias:?} duplicates manifest name {name:?}"),
+                    prefer_required,
+                )?;
+                skipped.insert((*alias).clone());
+            } else {
+                owners.insert(name.clone(), *alias);
+            }
+        }
+    }
+    for (alias, (plugin, verified_revision, mcp)) in candidates {
+        if owners.get(&plugin.manifest().name) != Some(&alias) {
+            continue;
+        }
+        if let Some(revision) = verified_revision {
+            verified_git_revisions.insert(alias.clone(), revision);
+        }
+        log_plugin_diagnostics(alias, &plugin);
+        resolved.mcp_plugins.extend(mcp);
         resolved.package_roots.push(plugin.root().to_path_buf());
         resolved
             .skill_directories
@@ -679,6 +746,7 @@ fn resolve_blocking(
     Ok(BlockingResolution {
         resolved,
         git_revisions: verified_git_revisions,
+        skipped,
     })
 }
 
@@ -1503,7 +1571,14 @@ fn source_plan(
     cache_root: &Path,
     runner: &dyn GitRunner,
 ) -> Result<SourcePlan, String> {
-    source_plan_with_cached_revisions(configs, runtime_root, cache_root, runner, None)
+    source_plan_with_cached_revisions(
+        configs,
+        runtime_root,
+        cache_root,
+        runner,
+        None,
+        BTreeSet::new(),
+    )
 }
 
 fn source_plan_with_cached_revisions(
@@ -1512,88 +1587,106 @@ fn source_plan_with_cached_revisions(
     cache_root: &Path,
     runner: &dyn GitRunner,
     cached: Option<&BTreeMap<(String, Option<String>), PlannedGitRevision>>,
+    required: BTreeSet<String>,
 ) -> Result<SourcePlan, String> {
     let mut remote_revisions = BTreeMap::new();
     let mut fingerprint = blake3::Hasher::new();
     let mut path_sources = BTreeMap::new();
     let mut git_revisions = BTreeMap::new();
+    let mut skipped = BTreeSet::new();
     fingerprint.update(b"kit-plugin-sources-v2");
     for (alias, config) in configs {
-        validate_alias(alias)?;
         hash_fingerprint_field(&mut fingerprint, alias.as_bytes());
-        match config {
-            PluginConfig::Path { path } => {
-                fingerprint.update(&[0]);
-                let root = resolve_path(path, runtime_root)?;
-                hash_fingerprint_field(&mut fingerprint, root.as_os_str().as_encoded_bytes());
-                let tree_fingerprint = local_plugin_tree_fingerprint(&root)?;
-                hash_fingerprint_field(&mut fingerprint, tree_fingerprint.as_bytes());
-                path_sources.insert(
-                    alias.clone(),
-                    PlannedPathSource {
-                        canonical_root: root,
-                        tree_fingerprint,
-                    },
-                );
-            }
-            PluginConfig::Archive {
-                url,
-                sha256,
-                subdir,
-            } => {
-                fingerprint.update(&[1]);
-                let url = Url::parse(url)
-                    .map_err(|error| format!("invalid plugin archive URL: {error}"))?;
-                validate_download_url(&url)?;
-                let digest = parse_sha256(sha256)?;
-                let subdir = subdir.as_deref().map(validate_relative_path).transpose()?;
-                hash_fingerprint_field(&mut fingerprint, url.as_str().as_bytes());
-                hash_fingerprint_field(&mut fingerprint, &digest);
-                if let Some(subdir) = subdir {
-                    hash_fingerprint_field(&mut fingerprint, subdir.as_os_str().as_encoded_bytes());
-                } else {
-                    hash_fingerprint_field(&mut fingerprint, &[]);
-                }
-            }
-            PluginConfig::Git { url, rev, subdir } => {
-                fingerprint.update(&[2]);
-                let url = validate_git_url(url)?;
-                let revision = rev
-                    .as_deref()
-                    .map(validate_git_revision)
-                    .transpose()?
-                    .unwrap_or(GitRevision::DefaultBranch);
-                let subdir = subdir.as_deref().map(validate_git_subdir).transpose()?;
-                hash_fingerprint_field(&mut fingerprint, url.as_str().as_bytes());
-                if let Some(subdir) = subdir {
-                    hash_fingerprint_field(&mut fingerprint, subdir.as_os_str().as_encoded_bytes());
-                } else {
-                    hash_fingerprint_field(&mut fingerprint, &[]);
-                }
-                let key = (url.as_str().to_owned(), rev.clone());
-                let planned = if let Some(planned) = cached.and_then(|cached| cached.get(&key)) {
-                    planned.clone()
-                } else {
-                    match &revision {
-                        GitRevision::Commit(oid) => PlannedGitRevision {
-                            fetch_revision: revision.clone(),
-                            raw_oid: oid.clone(),
-                            commit_oid: oid.clone(),
+        let mut entry = blake3::Hasher::new();
+        let planned = (|| -> Result<(), String> {
+            validate_alias(alias)?;
+            match config {
+                PluginConfig::Path { path } => {
+                    entry.update(&[0]);
+                    let root = resolve_path(path, runtime_root)?;
+                    hash_fingerprint_field(&mut entry, root.as_os_str().as_encoded_bytes());
+                    let tree_fingerprint = local_plugin_tree_fingerprint(&root)?;
+                    hash_fingerprint_field(&mut entry, tree_fingerprint.as_bytes());
+                    path_sources.insert(
+                        alias.clone(),
+                        PlannedPathSource {
+                            canonical_root: root,
+                            tree_fingerprint,
                         },
-                        GitRevision::Ref(_) | GitRevision::DefaultBranch => probe_git_revision(
-                            OsStr::new(url.as_str()),
-                            &sha256_text(url.as_str()),
-                            &revision,
-                            cache_root,
-                            runner,
-                        )?,
+                    );
+                }
+                PluginConfig::Archive {
+                    url,
+                    sha256,
+                    subdir,
+                } => {
+                    entry.update(&[1]);
+                    let url = Url::parse(url)
+                        .map_err(|error| format!("invalid plugin archive URL: {error}"))?;
+                    validate_download_url(&url)?;
+                    let digest = parse_sha256(sha256)?;
+                    let subdir = subdir.as_deref().map(validate_relative_path).transpose()?;
+                    hash_fingerprint_field(&mut entry, url.as_str().as_bytes());
+                    hash_fingerprint_field(&mut entry, &digest);
+                    if let Some(subdir) = subdir {
+                        hash_fingerprint_field(&mut entry, subdir.as_os_str().as_encoded_bytes());
+                    } else {
+                        hash_fingerprint_field(&mut entry, &[]);
                     }
-                };
-                remote_revisions.insert(key, planned.clone());
+                }
+                PluginConfig::Git { url, rev, subdir } => {
+                    entry.update(&[2]);
+                    let url = validate_git_url(url)?;
+                    let revision = rev
+                        .as_deref()
+                        .map(validate_git_revision)
+                        .transpose()?
+                        .unwrap_or(GitRevision::DefaultBranch);
+                    let subdir = subdir.as_deref().map(validate_git_subdir).transpose()?;
+                    hash_fingerprint_field(&mut entry, url.as_str().as_bytes());
+                    if let Some(subdir) = subdir {
+                        hash_fingerprint_field(&mut entry, subdir.as_os_str().as_encoded_bytes());
+                    } else {
+                        hash_fingerprint_field(&mut entry, &[]);
+                    }
+                    let key = (url.as_str().to_owned(), rev.clone());
+                    let planned = if let Some(planned) = cached.and_then(|cached| cached.get(&key))
+                    {
+                        planned.clone()
+                    } else {
+                        match &revision {
+                            GitRevision::Commit(oid) => PlannedGitRevision {
+                                fetch_revision: revision.clone(),
+                                raw_oid: oid.clone(),
+                                commit_oid: oid.clone(),
+                            },
+                            GitRevision::Ref(_) | GitRevision::DefaultBranch => probe_git_revision(
+                                OsStr::new(url.as_str()),
+                                &sha256_text(url.as_str()),
+                                &revision,
+                                cache_root,
+                                runner,
+                            )?,
+                        }
+                    };
+                    remote_revisions.insert(key, planned.clone());
+                    entry.update(&[1]);
+                    hash_fingerprint_field(&mut entry, planned.raw_oid.as_bytes());
+                    hash_fingerprint_field(&mut entry, planned.commit_oid.as_bytes());
+                    git_revisions.insert(alias.clone(), planned);
+                }
+            }
+            Ok(())
+        })();
+        match planned {
+            Ok(()) => {
+                fingerprint.update(&[0]);
+                fingerprint.update(entry.finalize().as_bytes());
+            }
+            Err(error) => {
+                skip_failed_plugin(alias, error, required.contains(alias))?;
                 fingerprint.update(&[1]);
-                hash_fingerprint_field(&mut fingerprint, planned.raw_oid.as_bytes());
-                hash_fingerprint_field(&mut fingerprint, planned.commit_oid.as_bytes());
-                git_revisions.insert(alias.clone(), planned);
+                skipped.insert(alias.clone());
             }
         }
     }
@@ -1602,7 +1695,17 @@ fn source_plan_with_cached_revisions(
         candidate_fingerprint: fingerprint.finalize(),
         path_sources,
         git_revisions,
+        skipped,
+        required,
     })
+}
+
+fn skip_failed_plugin(alias: &str, error: String, required: bool) -> Result<(), String> {
+    if required {
+        return Err(error);
+    }
+    tracing::warn!(plugin = alias, "skipping plugin: {error}");
+    Ok(())
 }
 
 fn local_plugin_tree_fingerprint(root: &Path) -> Result<blake3::Hash, String> {
@@ -4188,6 +4291,156 @@ mod tests {
         assert_eq!(rebuilt.resolved.skills[0].body, "body");
         assert!(!rebuilt.resolved.skills[0].body.contains("poisoned"));
         assert!(runtime.snapshot().skill_directories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_load_skips_unavailable_plugins() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let write_plugin = |root: &Path, name: &str| {
+            let skill = root.join("skills").join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                root.join("plugin.json"),
+                MANIFEST.replace("test-plugin", name),
+            )
+            .unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Skill.\n---\nbody\n"),
+            )
+            .unwrap();
+        };
+        let live = directory.path().join("live");
+        let missing = directory.path().join("missing");
+        let broken = directory.path().join("broken");
+        write_plugin(&live, "live");
+        write_plugin(&broken, "broken");
+        fs::write(broken.join("plugin.json"), "{").unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[plugins.broken]\nsource = 'path'\npath = '{}'\n\
+                 [plugins.live]\nsource = 'path'\npath = '{}'\n\
+                 [plugins.missing]\nsource = 'path'\npath = '{}'\n",
+                broken.display(),
+                live.display(),
+                missing.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.snapshot().package_roots.len(), 1);
+        let refreshed = runtime.stage().await.unwrap();
+        assert_eq!(refreshed.resolved.package_roots.len(), 1);
+
+        write_plugin(&missing, "missing");
+        write_plugin(&broken, "broken");
+        let staged = runtime.stage_for_poll().await.unwrap();
+        assert_eq!(staged.resolved.package_roots.len(), 3);
+        runtime.publish(staged);
+
+        fs::write(broken.join("plugin.json"), "{").unwrap();
+        assert!(runtime.stage_for_poll().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn published_plugin_keeps_manifest_name_over_new_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let write_plugin = |root: &Path| {
+            let skill = root.join("skills/shared");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                root.join("plugin.json"),
+                MANIFEST.replace("test-plugin", "shared"),
+            )
+            .unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: shared\ndescription: Skill.\n---\nbody\n",
+            )
+            .unwrap();
+        };
+        let existing = directory.path().join("existing");
+        let added = directory.path().join("added");
+        write_plugin(&existing);
+        fs::write(
+            &config,
+            format!(
+                "[plugins.a-new]\nsource = 'path'\npath = '{}'\n\
+                 [plugins.z-existing]\nsource = 'path'\npath = '{}'\n",
+                added.display(),
+                existing.display()
+            ),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let published = runtime.snapshot().package_roots.clone();
+        assert_eq!(published.len(), 1);
+
+        write_plugin(&added);
+        let staged = runtime.stage_for_poll().await.unwrap();
+        assert_eq!(staged.resolved.package_roots, published);
+    }
+
+    #[tokio::test]
+    async fn resolve_time_skip_is_retried_without_source_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        let skill = package.join("skills/served");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            package.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"live":{"type":"streamable-http","url":"https://example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: served\ndescription: Skill.\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[plugins.served]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        let data = directory.path().join("data");
+        fs::write(&data, "blocks the plugin data directory").unwrap();
+
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            data.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.snapshot().mcp_plugins.is_empty());
+
+        fs::remove_file(&data).unwrap();
+        let staged = runtime.stage_for_poll().await.unwrap();
+        assert_eq!(staged.resolved.mcp_plugins.len(), 1);
     }
 
     #[tokio::test]
