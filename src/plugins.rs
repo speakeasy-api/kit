@@ -137,6 +137,8 @@ struct SourceFingerprint {
     candidate: blake3::Hash,
     resolved: blake3::Hash,
     remote_revisions: BTreeMap<(String, Option<String>), PlannedGitRevision>,
+    loaded: BTreeSet<String>,
+    complete: bool,
 }
 
 #[derive(Clone)]
@@ -152,13 +154,7 @@ struct SourcePlan {
     path_sources: BTreeMap<String, PlannedPathSource>,
     git_revisions: BTreeMap<String, PlannedGitRevision>,
     skipped: BTreeSet<String>,
-    failures: PluginFailures,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PluginFailures {
-    Abort,
-    Skip,
+    required: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,7 +220,9 @@ impl SourcePlan {
 
     fn verified_fingerprint(
         &self,
+        configs: &BTreeMap<String, PluginConfig>,
         resolved: &BTreeMap<String, ResolvedGitRevision>,
+        complete: bool,
     ) -> Result<SourceFingerprint, String> {
         let staged = self
             .git_revisions
@@ -253,6 +251,12 @@ impl SourcePlan {
             candidate: self.candidate_fingerprint,
             resolved: fingerprint.finalize(),
             remote_revisions: self.remote_revisions.clone(),
+            loaded: configs
+                .keys()
+                .filter(|alias| !self.skipped.contains(*alias))
+                .cloned()
+                .collect(),
+            complete,
         })
     }
 }
@@ -283,13 +287,7 @@ impl PluginRuntime {
             data_root,
             ResolvedPlugins::default(),
         );
-        let staged = runtime
-            .stage_with_policy(
-                Arc::new(SystemGitRunner::default()),
-                true,
-                PluginFailures::Skip,
-            )
-            .await?;
+        let staged = runtime.stage().await?;
         runtime.publish(staged);
         Ok(runtime)
     }
@@ -356,27 +354,21 @@ impl PluginRuntime {
     }
 
     pub(crate) async fn stage_for_poll(&self) -> Result<StagedPlugins, String> {
-        self.stage_with_policy(
-            Arc::new(SystemGitRunner::default()),
-            false,
-            PluginFailures::Abort,
-        )
-        .await
+        self.stage_with_policy(Arc::new(SystemGitRunner::default()), false)
+            .await
     }
 
     async fn stage_with_git_runner(
         &self,
         runner: Arc<dyn GitRunner + Send>,
     ) -> Result<StagedPlugins, String> {
-        self.stage_with_policy(runner, true, PluginFailures::Abort)
-            .await
+        self.stage_with_policy(runner, true).await
     }
 
     async fn stage_with_policy(
         &self,
         runner: Arc<dyn GitRunner + Send>,
         refresh_remote: bool,
-        failures: PluginFailures,
     ) -> Result<StagedPlugins, String> {
         let contents = match crate::config_files::read_to_string(&self.inner.config_path) {
             Ok(contents) => contents,
@@ -408,7 +400,7 @@ impl PluginRuntime {
                 fingerprint.remote_revisions.clear();
             }
         }
-        stage_with_skill_cache(&self.inner, &configs, published, runner, failures)
+        stage_with_skill_cache(&self.inner, &configs, published, runner)
             .await
             .map_err(bounded_diagnostic)
     }
@@ -521,7 +513,6 @@ async fn stage_with_skill_cache(
     configs: &BTreeMap<String, PluginConfig>,
     published: PublishedPlugins,
     runner: Arc<dyn GitRunner + Send>,
-    failures: PluginFailures,
 ) -> Result<StagedPlugins, String> {
     let configs = configs.clone();
     let runtime_root = inner.runtime_root.clone();
@@ -531,6 +522,8 @@ async fn stage_with_skill_cache(
     let staged = tokio::task::spawn_blocking(move || -> Result<BlockingStage, String> {
         // Polls still inspect every local source and config entry, but reuse
         // verified remote revisions. Invocation always probes mutable refs.
+        // Plugins outside the published generation are skipped on failure;
+        // published plugins keep their last verified generation instead.
         let cached = published.source_fingerprint.as_ref();
         let mut source_plan = source_plan_with_cached_revisions(
             &configs,
@@ -538,12 +531,13 @@ async fn stage_with_skill_cache(
             &cache_root,
             runner.as_ref(),
             cached.map(|fingerprint| &fingerprint.remote_revisions),
-            failures,
+            cached
+                .map(|fingerprint| fingerprint.loaded.clone())
+                .unwrap_or_default(),
         )?;
-        if let Some(mut source_fingerprint) = published
-            .source_fingerprint
-            .filter(|fingerprint| fingerprint.candidate == source_plan.candidate_fingerprint)
-        {
+        if let Some(mut source_fingerprint) = published.source_fingerprint.filter(|fingerprint| {
+            fingerprint.complete && fingerprint.candidate == source_plan.candidate_fingerprint
+        }) {
             source_fingerprint.remote_revisions = source_plan.remote_revisions;
             return Ok(BlockingStage::Reused {
                 resolved: published.resolved,
@@ -559,12 +553,14 @@ async fn stage_with_skill_cache(
             Some(&source_plan),
             runner.as_ref(),
         )?;
+        let complete = resolution.skipped.is_empty();
         for alias in resolution.skipped {
             source_plan.path_sources.remove(&alias);
             source_plan.skipped.insert(alias);
         }
         source_plan.verify_path_fingerprints(&configs, &runtime_root)?;
-        let source_fingerprint = source_plan.verified_fingerprint(&resolution.git_revisions)?;
+        let source_fingerprint =
+            source_plan.verified_fingerprint(&configs, &resolution.git_revisions, complete)?;
         Ok(BlockingStage::Fresh {
             resolved: resolution.resolved,
             source_fingerprint,
@@ -606,7 +602,6 @@ fn resolve_blocking(
     source_plan: Option<&SourcePlan>,
     runner: &dyn GitRunner,
 ) -> Result<BlockingResolution, String> {
-    let failures = source_plan.map_or(PluginFailures::Abort, |plan| plan.failures);
     let mut resolved = ResolvedPlugins::default();
     let mut verified_git_revisions = BTreeMap::new();
     let mut manifest_names = BTreeSet::new();
@@ -690,7 +685,11 @@ fn resolve_blocking(
         let (plugin, verified_revision, mcp) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
-                skip_failed_plugin(alias, error, failures)?;
+                skip_failed_plugin(
+                    alias,
+                    error,
+                    source_plan.is_none_or(|plan| plan.required.contains(alias)),
+                )?;
                 skipped.insert(alias.clone());
                 continue;
             }
@@ -1565,7 +1564,7 @@ fn source_plan(
         cache_root,
         runner,
         None,
-        PluginFailures::Abort,
+        BTreeSet::new(),
     )
 }
 
@@ -1575,7 +1574,7 @@ fn source_plan_with_cached_revisions(
     cache_root: &Path,
     runner: &dyn GitRunner,
     cached: Option<&BTreeMap<(String, Option<String>), PlannedGitRevision>>,
-    failures: PluginFailures,
+    required: BTreeSet<String>,
 ) -> Result<SourcePlan, String> {
     let mut remote_revisions = BTreeMap::new();
     let mut fingerprint = blake3::Hasher::new();
@@ -1672,7 +1671,7 @@ fn source_plan_with_cached_revisions(
                 fingerprint.update(entry.finalize().as_bytes());
             }
             Err(error) => {
-                skip_failed_plugin(alias, error, failures)?;
+                skip_failed_plugin(alias, error, required.contains(alias))?;
                 fingerprint.update(&[1]);
                 skipped.insert(alias.clone());
             }
@@ -1684,18 +1683,16 @@ fn source_plan_with_cached_revisions(
         path_sources,
         git_revisions,
         skipped,
-        failures,
+        required,
     })
 }
 
-fn skip_failed_plugin(alias: &str, error: String, failures: PluginFailures) -> Result<(), String> {
-    match failures {
-        PluginFailures::Abort => Err(error),
-        PluginFailures::Skip => {
-            tracing::warn!(plugin = alias, "skipping plugin: {error}");
-            Ok(())
-        }
+fn skip_failed_plugin(alias: &str, error: String, required: bool) -> Result<(), String> {
+    if required {
+        return Err(error);
     }
+    tracing::warn!(plugin = alias, "skipping plugin: {error}");
+    Ok(())
 }
 
 fn local_plugin_tree_fingerprint(root: &Path) -> Result<blake3::Hash, String> {
@@ -4329,11 +4326,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime.snapshot().package_roots.len(), 1);
+        let refreshed = runtime.stage().await.unwrap();
+        assert_eq!(refreshed.resolved.package_roots.len(), 1);
 
         write_plugin(&missing, "missing");
         write_plugin(&broken, "broken");
         let staged = runtime.stage_for_poll().await.unwrap();
         assert_eq!(staged.resolved.package_roots.len(), 3);
+        runtime.publish(staged);
+
+        fs::write(broken.join("plugin.json"), "{").unwrap();
+        assert!(runtime.stage_for_poll().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_time_skip_is_retried_without_source_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        let skill = package.join("skills/served");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            package.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"live":{"type":"streamable-http","url":"https://example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: served\ndescription: Skill.\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[plugins.served]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        let data = directory.path().join("data");
+        fs::write(&data, "blocks the plugin data directory").unwrap();
+
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            data.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.snapshot().mcp_plugins.is_empty());
+
+        fs::remove_file(&data).unwrap();
+        let staged = runtime.stage_for_poll().await.unwrap();
+        assert_eq!(staged.resolved.mcp_plugins.len(), 1);
     }
 
     #[tokio::test]
@@ -4726,7 +4773,7 @@ mod tests {
         // An idle poll works even with an unavailable Git backend. It must
         // retain the last verified revision instead of probing the moved ref.
         let polled = runtime
-            .stage_with_policy(Arc::new(TimeoutRunner), false, PluginFailures::Abort)
+            .stage_with_policy(Arc::new(TimeoutRunner), false)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&published, &polled.resolved));
@@ -4755,7 +4802,7 @@ mod tests {
         )
         .unwrap();
         let added = runtime
-            .stage_with_policy(runner.clone(), false, PluginFailures::Abort)
+            .stage_with_policy(runner.clone(), false)
             .await
             .unwrap();
         assert!(
@@ -4775,7 +4822,7 @@ mod tests {
         runtime.publish(added);
         fs::write(&config, &original_config).unwrap();
         let removed = runtime
-            .stage_with_policy(runner.clone(), false, PluginFailures::Abort)
+            .stage_with_policy(runner.clone(), false)
             .await
             .unwrap();
         assert_eq!(removed.resolved.skills.len(), 1);
