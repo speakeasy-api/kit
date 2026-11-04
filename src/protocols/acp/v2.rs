@@ -2016,6 +2016,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             ));
                         }
                         Ok(AcpForkState {
+                            source_session_id: session_id.to_string(),
                             transcript,
                             selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
                             reasoning_effort: adapter

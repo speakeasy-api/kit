@@ -24,7 +24,7 @@ use agenthooksprotocol::{
     Attachment, CanonicalMessageRole, ContextCompactAfterInputRemovedItem,
     ContextCompactBeforeInputTrigger, EventType, ExecutionEventExecution,
     ExecutionEventExecutionExecuted, Harness, Registration, Session, SessionEndInputOutcome,
-    SessionStartInputTrigger, TextBodyPart, TextPart, TextParts,
+    SessionStartInputResumedFrom, SessionStartInputTrigger, TextBodyPart, TextPart, TextParts,
 };
 use agentkit_core::{FinishReason, Item, ItemKind, Part, ToolOutput, TurnCancellation};
 use agentkit_loop::LoopError;
@@ -129,6 +129,7 @@ impl Hooks {
         trigger: SessionStartInputTrigger,
         model: Option<&str>,
         child: bool,
+        resumed_from: Option<&str>,
     ) -> Result<injection::SessionLease, String> {
         let lease = self.injections.open(session, child)?;
         let producer = self.injections.producer(session);
@@ -141,13 +142,14 @@ impl Hooks {
         if let Some(model) = model {
             input.session.model = Presence::Present(model.to_owned());
         }
-        let outcome = self
-            .settle(
-                EventType::SessionStart,
-                dispatch(self.sdk.session_start(input), None).await,
-                session,
-            )
-            .ok_or_else(|| "session.start hook dispatch failed".to_owned())?;
+        if let Some(source) = resumed_from {
+            input.resumed_from = Some(SessionStartInputResumedFrom::new(source));
+        }
+        let outcome = dispatch(self.sdk.session_start(input), None)
+            .await
+            .map_err(|error| format!("session.start hook dispatch failed: {error}"))?;
+        report(EventType::SessionStart, &outcome.diagnostics);
+        self.deliver_messages(session, &outcome.outcome.messages);
         enqueue_injections(producer.as_ref(), &outcome.outcome)?;
         Ok(lease)
     }

@@ -72,6 +72,7 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
             SessionStartInputTrigger::Startup,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -699,7 +700,13 @@ async fn session_and_tool_context_wait_for_the_next_request() {
     );
     backend.respond("tool.after", json!([context_injection("tool context")]));
     let _lease = hooks
-        .session_start("session", SessionStartInputTrigger::Startup, None, false)
+        .session_start(
+            "session",
+            SessionStartInputTrigger::Startup,
+            None,
+            false,
+            None,
+        )
         .await
         .unwrap();
     call(&hooks, &Echo::new(), json!({"text":"result"})).await;
@@ -726,7 +733,13 @@ async fn session_and_tool_context_wait_for_the_next_request() {
 async fn failed_tools_can_inject_recovery_context_without_becoming_successful() {
     let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
     let _lease = hooks
-        .session_start("session", SessionStartInputTrigger::Startup, None, false)
+        .session_start(
+            "session",
+            SessionStartInputTrigger::Startup,
+            None,
+            false,
+            None,
+        )
         .await
         .unwrap();
     backend.respond("tool.after", json!([context_injection("recovery context")]));
@@ -2149,4 +2162,49 @@ async fn discovered_response_interceptor_with_upload_config_withholds_previews_a
     assert!(finished);
     hooks.sdk.shutdown().await.unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn fork_session_start_reports_source_session() {
+    let (hooks, backend) = hooks(vec![observe(&["session.start"])]);
+    let adapter = HookedAdapter::new(
+        Model::default(),
+        Some(hooks.clone()),
+        SessionStartInputTrigger::Fork,
+    )
+    .with_resumed_from(Some("source-session".into()));
+    let _session = adapter
+        .start_session(SessionConfig::new("fork-session"))
+        .await
+        .unwrap();
+    hooks.sdk.shutdown().await.unwrap();
+    let started = backend.events("session.start");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["trigger"], "fork");
+    assert_eq!(started[0]["session"]["id"], "fork-session");
+    assert_eq!(started[0]["resumedFrom"]["id"], "source-session");
+}
+
+#[tokio::test]
+async fn invalid_fork_session_start_preserves_dispatch_cause() {
+    let (hooks, _) = hooks(vec![observe(&["session.start"])]);
+    let error = hooks
+        .session_start(
+            "fork-session",
+            SessionStartInputTrigger::Fork,
+            None,
+            false,
+            None,
+        )
+        .await
+        .err()
+        .expect("fork without lineage must fail validation");
+    assert!(
+        error.starts_with("session.start hook dispatch failed: "),
+        "{error}"
+    );
+    assert!(
+        error.contains("invalid canonical intercept-request"),
+        "{error}"
+    );
 }
