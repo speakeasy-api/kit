@@ -1259,6 +1259,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         Vec::new(),
         String::new(),
     );
+    let mut user_rules = Vec::new();
     let mut visible_images: Vec<(usize, usize, Option<String>, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
         visible.push(row.0.clone());
@@ -1294,6 +1295,11 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                         break;
                     }
                     materialize(row);
+                    if matches!(app.blocks[block_index], Block::User(_))
+                        && row_index + 1 == block.rows.len()
+                    {
+                        user_rules.push(absolute - offset);
+                    }
                 }
                 for placement in &block.images {
                     let image_start = content_start + placement.row;
@@ -1328,6 +1334,17 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     }
     let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
     frame.render_widget(Paragraph::new(visible), inner);
+    for row in user_rules {
+        frame.render_widget(
+            Paragraph::new(
+                ratatui::symbols::border::ROUNDED
+                    .horizontal_bottom
+                    .repeat(inner.width as usize),
+            )
+            .style(theme::accent()),
+            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+        );
+    }
     draw_selection(frame, app, inner, offset, &row_widths);
     for (block_index, source_index, destination, y) in visible_images {
         if let Some(destination) = destination {
@@ -1681,6 +1698,16 @@ fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptR
             width,
         ));
     }
+    // Reserve a visual-only rule row. Join its empty source to the preceding
+    // logical line so copying across blocks adds neither glyphs nor line breaks.
+    // draw_transcript paints the rule over this row.
+    let source_line = rows.last().and_then(|row| row.1.2);
+    rows.push((
+        Line::default(),
+        (None, None, source_line),
+        Vec::new(),
+        String::new(),
+    ));
     rows
 }
 
@@ -2049,7 +2076,7 @@ fn user_line(text: &str, first: bool) -> LinkedLine {
     let mut spans = vec![LinkedSpan {
         span: Span::styled(
             if first { "› " } else { "  " },
-            theme::bold(theme::user_color()),
+            theme::bold(theme::accent_color()),
         ),
         url: None,
         image_end: false,
@@ -6879,6 +6906,96 @@ mod tests {
     }
 
     #[test]
+    fn user_messages_have_bold_text_and_an_accent_rule_without_selection_fill() {
+        use crate::tui::{app::Selection, theme};
+        use ratatui::style::{Color, Modifier};
+
+        for width in [16, 48, 84] {
+            let mut app = App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.blocks.push(Block::User(UserMessage {
+                text: "A longer prompt with 界\n\n[link](https://example.com)".into(),
+                images: Vec::new(),
+            }));
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rule_y = (app.transcript_top as u16..24)
+                .find(|&y| {
+                    buffer[(1, y)].symbol() == ratatui::symbols::border::ROUNDED.horizontal_bottom
+                })
+                .unwrap();
+            for x in 1..1 + app.transcript_width as u16 {
+                let cell = &buffer[(x, rule_y)];
+                assert_eq!(
+                    cell.symbol(),
+                    ratatui::symbols::border::ROUNDED.horizontal_bottom
+                );
+                assert_eq!(cell.fg, theme::accent_color());
+                assert_eq!(cell.bg, Color::Reset);
+            }
+            let caret = &buffer[(1, app.transcript_top as u16)];
+            assert_eq!(caret.symbol(), "›");
+            assert_eq!(caret.fg, theme::accent_color());
+            assert!(caret.modifier.contains(Modifier::BOLD));
+            let prompt = &buffer[(3, app.transcript_top as u16)];
+            assert!(prompt.modifier.contains(Modifier::BOLD));
+            assert_eq!(prompt.bg, Color::Reset);
+            assert!(
+                app.row_links
+                    .iter()
+                    .flatten()
+                    .any(|hit| hit.url == "https://example.com")
+            );
+            app.selection = Some(Selection {
+                anchor: (0, 0),
+                head: (app.total_lines - 1, app.transcript_width - 1),
+            });
+            let copied = app.selection_text().unwrap();
+            assert!(copied.contains("link"));
+            assert!(!copied.contains('─'));
+        }
+    }
+
+    #[test]
+    fn user_rule_does_not_add_a_line_break_when_copying_across_messages() {
+        use crate::tui::app::Selection;
+
+        for width in [4, 40] {
+            for (text, expected) in [("hi", "› hi\n\nok"), ("hi\n", "› hi\n\n\nok")] {
+                let mut app = App::new(
+                    PathBuf::from("/tmp"),
+                    "provider".into(),
+                    "model".into(),
+                    "a2a".into(),
+                );
+                app.blocks.push(Block::User(UserMessage {
+                    text: text.into(),
+                    images: Vec::new(),
+                }));
+                app.blocks.push(Block::Agent("ok".into()));
+                let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+                refresh_transcript_cache_with_images(&mut app, &mut images, width);
+                app.selection = Some(Selection {
+                    anchor: (0, 0),
+                    head: (
+                        app.transcript_prefixes.last().copied().unwrap() - 1,
+                        width - 1,
+                    ),
+                });
+                assert_eq!(app.selection_text().as_deref(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn user_attachment_links_remain_clickable() {
         let lines = [user_line(
             "inspect [Image #1](file:///tmp/image_(1).png)",
@@ -6910,7 +7027,7 @@ mod tests {
 
         assert_eq!(
             rows.iter().map(|row| line_text(&row.0)).collect::<Vec<_>>(),
-            ["› before", "  Image #1", "  ", "  after", "  "]
+            ["› before", "  Image #1", "  ", "  after", "  ", ""]
         );
         assert_eq!(rows[1].2.len(), 1);
         assert_eq!(rows[1].2[0].url, "file:///tmp/image.png");
@@ -7011,11 +7128,11 @@ mod tests {
             refresh_transcript_cache_with_images(&mut app, &mut images, width);
             let cached = app.transcript_cache[0].as_ref().unwrap();
             assert!(cached.images.is_empty());
-            assert_eq!(cached.rows.len(), 1);
+            assert_eq!(cached.rows.len(), 2);
             assert_eq!(line_text(&cached.rows[0].0), "› Image #1");
             assert_eq!(cached.rows[0].2.len(), 1);
             assert_eq!(cached.rows[0].2[0].url, "file:///tmp/image.png");
-            assert_eq!(app.transcript_prefixes.last().copied(), Some(1));
+            assert_eq!(app.transcript_prefixes.last().copied(), Some(2));
         }
 
         let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
@@ -7092,8 +7209,8 @@ mod tests {
                     refresh_transcript_cache_with_images(&mut app, &mut images, width);
                     let cached = app.transcript_cache[0].as_ref().unwrap();
                     assert!(cached.images.is_empty());
-                    assert_eq!(cached.rows.len(), 3);
-                    assert_eq!(app.transcript_prefixes.last().copied(), Some(3));
+                    assert_eq!(cached.rows.len(), 4);
+                    assert_eq!(app.transcript_prefixes.last().copied(), Some(4));
                 }
                 let cached = app.transcript_cache[0].as_ref().unwrap();
                 let links = &cached.rows[1].2;
