@@ -1259,6 +1259,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         Vec::new(),
         String::new(),
     );
+    let mut user_rules = Vec::new();
     let mut visible_images: Vec<(usize, usize, Option<String>, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
         visible.push(row.0.clone());
@@ -1294,6 +1295,11 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                         break;
                     }
                     materialize(row);
+                    if matches!(app.blocks[block_index], Block::User(_))
+                        && row_index + 1 == block.rows.len()
+                    {
+                        user_rules.push(absolute - offset);
+                    }
                 }
                 for placement in &block.images {
                     let image_start = content_start + placement.row;
@@ -1327,7 +1333,14 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         }
     }
     let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
-    draw_transcript_rows(frame, visible, inner);
+    frame.render_widget(Paragraph::new(visible), inner);
+    for row in user_rules {
+        frame.render_widget(
+            Paragraph::new("━".repeat(inner.width as usize))
+                .style(theme::bold(theme::user_color())),
+            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+        );
+    }
     draw_selection(frame, app, inner, offset, &row_widths);
     for (block_index, source_index, destination, y) in visible_images {
         if let Some(destination) = destination {
@@ -1651,18 +1664,6 @@ fn incremental_agent_rows(
     cached
 }
 
-/// Paint each row's style across the viewport, including its trailing cells.
-/// Keep visual fill out of the source spans used for selection and copying.
-fn draw_transcript_rows(frame: &mut Frame<'_>, lines: Vec<Line<'static>>, area: Rect) {
-    for (line, y) in lines.into_iter().zip(area.y..area.bottom()) {
-        let style = line.style;
-        frame.render_widget(
-            Paragraph::new(line).style(style),
-            Rect::new(area.x, y, area.width, 1),
-        );
-    }
-}
-
 fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptRow> {
     let mut rows = Vec::new();
     let mut line_start = 0;
@@ -1693,17 +1694,14 @@ fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptR
             width,
         ));
     }
-    // Apply after wrapping so continuations and explicit blank lines get the
-    // same full-width band, without adding padding to selectable/copyable text.
-    let style = theme::user_message();
-    for (line, _, _, _) in &mut rows {
-        line.style = style;
-        for span in &mut line.spans {
-            // Inline Markdown and links may specify their own foreground. Keep
-            // their modifiers, but use the band's contrasting text colour.
-            span.style = span.style.patch(style);
-        }
-    }
+    // Reserve a visual-only rule row. Its empty source keeps decoration out of
+    // selection/copy text; draw_transcript paints the rule over this row.
+    rows.push((
+        Line::default(),
+        (None, None, None),
+        Vec::new(),
+        String::new(),
+    ));
     rows
 }
 
@@ -6902,51 +6900,52 @@ mod tests {
     }
 
     #[test]
-    fn user_message_highlight_covers_wrapped_blank_and_trailing_cells() {
-        use ratatui::{style::Modifier, text::Line};
+    fn user_messages_have_bold_text_and_a_blue_rule_without_selection_fill() {
+        use crate::tui::{app::Selection, theme};
+        use ratatui::style::{Color, Modifier};
 
-        for width in [1, 2, 12, 48] {
-            let message = UserMessage {
-                text: "A longer prompt with **emphasis** and 界\n\n[link](https://example.com)"
-                    .into(),
+        for width in [16, 48, 84] {
+            let mut app = App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.blocks.push(Block::User(UserMessage {
+                text: "A longer prompt with 界\n\n[link](https://example.com)".into(),
                 images: Vec::new(),
-            };
-            let rows = user_block_rows(&message, width);
-            let height = rows.len() as u16;
-            let mut lines = rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>();
-            lines.push(Line::raw("reply"));
-            let mut terminal = Terminal::new(TestBackend::new(width as u16, height + 1)).unwrap();
+            }));
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut images = ImageRuntime::with_picker(Picker::halfblocks());
             terminal
-                .draw(|frame| super::draw_transcript_rows(frame, lines, frame.area()))
+                .draw(|frame| draw(frame, &mut app, &mut images))
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            let style = crate::tui::theme::user_message();
-            for y in 0..height {
-                for x in 0..width as u16 {
-                    // Ratatui resets the hidden cell occupied by a wide glyph.
-                    if x > 0 && buffer[(x - 1, y)].symbol().width() > 1 {
-                        continue;
-                    }
-                    let cell = &buffer[(x, y)];
-                    assert_eq!(
-                        Some(cell.bg),
-                        style.bg,
-                        "background at {x},{y}, width {width}"
-                    );
-                    assert_eq!(
-                        Some(cell.fg),
-                        style.fg,
-                        "foreground at {x},{y}, width {width}"
-                    );
-                    assert!(cell.modifier.contains(Modifier::BOLD));
-                }
+            let rule_y = (app.transcript_top as u16..24)
+                .find(|&y| buffer[(1, y)].symbol() == "━")
+                .unwrap();
+            for x in 1..1 + app.transcript_width as u16 {
+                let cell = &buffer[(x, rule_y)];
+                assert_eq!(cell.symbol(), "━");
+                assert_eq!(cell.fg, theme::user_color());
+                assert_eq!(cell.bg, Color::Reset);
             }
-            assert_ne!(Some(buffer[(0, height)].bg), style.bg);
+            let prompt = &buffer[(3, app.transcript_top as u16)];
+            assert!(prompt.modifier.contains(Modifier::BOLD));
+            assert_eq!(prompt.bg, Color::Reset);
             assert!(
-                rows.iter()
-                    .flat_map(|row| &row.2)
+                app.row_links
+                    .iter()
+                    .flatten()
                     .any(|hit| hit.url == "https://example.com")
             );
+            app.selection = Some(Selection {
+                anchor: (0, 0),
+                head: (app.total_lines - 1, app.transcript_width - 1),
+            });
+            let copied = app.selection_text().unwrap();
+            assert!(copied.contains("link"));
+            assert!(!copied.contains('━'));
         }
     }
 
@@ -6982,7 +6981,7 @@ mod tests {
 
         assert_eq!(
             rows.iter().map(|row| line_text(&row.0)).collect::<Vec<_>>(),
-            ["› before", "  Image #1", "  ", "  after", "  "]
+            ["› before", "  Image #1", "  ", "  after", "  ", ""]
         );
         assert_eq!(rows[1].2.len(), 1);
         assert_eq!(rows[1].2[0].url, "file:///tmp/image.png");
@@ -7083,11 +7082,11 @@ mod tests {
             refresh_transcript_cache_with_images(&mut app, &mut images, width);
             let cached = app.transcript_cache[0].as_ref().unwrap();
             assert!(cached.images.is_empty());
-            assert_eq!(cached.rows.len(), 1);
+            assert_eq!(cached.rows.len(), 2);
             assert_eq!(line_text(&cached.rows[0].0), "› Image #1");
             assert_eq!(cached.rows[0].2.len(), 1);
             assert_eq!(cached.rows[0].2[0].url, "file:///tmp/image.png");
-            assert_eq!(app.transcript_prefixes.last().copied(), Some(1));
+            assert_eq!(app.transcript_prefixes.last().copied(), Some(2));
         }
 
         let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
@@ -7164,8 +7163,8 @@ mod tests {
                     refresh_transcript_cache_with_images(&mut app, &mut images, width);
                     let cached = app.transcript_cache[0].as_ref().unwrap();
                     assert!(cached.images.is_empty());
-                    assert_eq!(cached.rows.len(), 3);
-                    assert_eq!(app.transcript_prefixes.last().copied(), Some(3));
+                    assert_eq!(cached.rows.len(), 4);
+                    assert_eq!(app.transcript_prefixes.last().copied(), Some(4));
                 }
                 let cached = app.transcript_cache[0].as_ref().unwrap();
                 let links = &cached.rows[1].2;
