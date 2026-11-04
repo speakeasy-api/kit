@@ -1698,11 +1698,13 @@ fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptR
             width,
         ));
     }
-    // Reserve a visual-only rule row. Its empty source keeps decoration out of
-    // selection/copy text; draw_transcript paints the rule over this row.
+    // Reserve a visual-only rule row. Join its empty source to the preceding
+    // logical line so copying across blocks adds neither glyphs nor line breaks.
+    // draw_transcript paints the rule over this row.
+    let source_line = rows.last().and_then(|row| row.1.2);
     rows.push((
         Line::default(),
-        (None, None, None),
+        (None, None, source_line),
         Vec::new(),
         String::new(),
     ));
@@ -6959,6 +6961,37 @@ mod tests {
             let copied = app.selection_text().unwrap();
             assert!(copied.contains("link"));
             assert!(!copied.contains('─'));
+        }
+    }
+
+    #[test]
+    fn user_rule_does_not_add_a_line_break_when_copying_across_messages() {
+        use crate::tui::app::Selection;
+
+        for width in [4, 40] {
+            for (text, expected) in [("hi", "› hi\n\nok"), ("hi\n", "› hi\n\n\nok")] {
+                let mut app = App::new(
+                    PathBuf::from("/tmp"),
+                    "provider".into(),
+                    "model".into(),
+                    "a2a".into(),
+                );
+                app.blocks.push(Block::User(UserMessage {
+                    text: text.into(),
+                    images: Vec::new(),
+                }));
+                app.blocks.push(Block::Agent("ok".into()));
+                let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+                refresh_transcript_cache_with_images(&mut app, &mut images, width);
+                app.selection = Some(Selection {
+                    anchor: (0, 0),
+                    head: (
+                        app.transcript_prefixes.last().copied().unwrap() - 1,
+                        width - 1,
+                    ),
+                });
+                assert_eq!(app.selection_text().as_deref(), Some(expected));
+            }
         }
     }
 
