@@ -2074,7 +2074,7 @@ fn user_line(text: &str, first: bool) -> LinkedLine {
     let mut spans = vec![LinkedSpan {
         span: Span::styled(
             if first { "› " } else { "  " },
-            theme::bold(theme::user_color()),
+            theme::bold(theme::accent_color()),
         ),
         url: None,
         image_end: false,
@@ -6939,6 +6939,10 @@ mod tests {
                 assert_eq!(cell.fg, theme::accent_color());
                 assert_eq!(cell.bg, Color::Reset);
             }
+            let caret = &buffer[(1, app.transcript_top as u16)];
+            assert_eq!(caret.symbol(), "›");
+            assert_eq!(caret.fg, theme::accent_color());
+            assert!(caret.modifier.contains(Modifier::BOLD));
             let prompt = &buffer[(3, app.transcript_top as u16)];
             assert!(prompt.modifier.contains(Modifier::BOLD));
             assert_eq!(prompt.bg, Color::Reset);
