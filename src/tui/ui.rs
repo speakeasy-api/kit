@@ -1336,8 +1336,12 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     frame.render_widget(Paragraph::new(visible), inner);
     for row in user_rules {
         frame.render_widget(
-            Paragraph::new("━".repeat(inner.width as usize))
-                .style(theme::bold(theme::user_color())),
+            Paragraph::new(
+                ratatui::symbols::border::ROUNDED
+                    .horizontal_bottom
+                    .repeat(inner.width as usize),
+            )
+            .style(theme::accent()),
             Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
         );
     }
@@ -6900,7 +6904,7 @@ mod tests {
     }
 
     #[test]
-    fn user_messages_have_bold_text_and_a_blue_rule_without_selection_fill() {
+    fn user_messages_have_bold_text_and_an_accent_rule_without_selection_fill() {
         use crate::tui::{app::Selection, theme};
         use ratatui::style::{Color, Modifier};
 
@@ -6922,12 +6926,17 @@ mod tests {
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let rule_y = (app.transcript_top as u16..24)
-                .find(|&y| buffer[(1, y)].symbol() == "━")
+                .find(|&y| {
+                    buffer[(1, y)].symbol() == ratatui::symbols::border::ROUNDED.horizontal_bottom
+                })
                 .unwrap();
             for x in 1..1 + app.transcript_width as u16 {
                 let cell = &buffer[(x, rule_y)];
-                assert_eq!(cell.symbol(), "━");
-                assert_eq!(cell.fg, theme::user_color());
+                assert_eq!(
+                    cell.symbol(),
+                    ratatui::symbols::border::ROUNDED.horizontal_bottom
+                );
+                assert_eq!(cell.fg, theme::accent_color());
                 assert_eq!(cell.bg, Color::Reset);
             }
             let prompt = &buffer[(3, app.transcript_top as u16)];
@@ -6945,7 +6954,7 @@ mod tests {
             });
             let copied = app.selection_text().unwrap();
             assert!(copied.contains("link"));
-            assert!(!copied.contains('━'));
+            assert!(!copied.contains('─'));
         }
     }
 
