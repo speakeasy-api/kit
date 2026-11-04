@@ -1327,7 +1327,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         }
     }
     let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    draw_transcript_rows(frame, visible, inner);
     draw_selection(frame, app, inner, offset, &row_widths);
     for (block_index, source_index, destination, y) in visible_images {
         if let Some(destination) = destination {
@@ -1651,6 +1651,18 @@ fn incremental_agent_rows(
     cached
 }
 
+/// Paint each row's style across the viewport, including its trailing cells.
+/// Keep visual fill out of the source spans used for selection and copying.
+fn draw_transcript_rows(frame: &mut Frame<'_>, lines: Vec<Line<'static>>, area: Rect) {
+    for (line, y) in lines.into_iter().zip(area.y..area.bottom()) {
+        let style = line.style;
+        frame.render_widget(
+            Paragraph::new(line).style(style),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+}
+
 fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptRow> {
     let mut rows = Vec::new();
     let mut line_start = 0;
@@ -1680,6 +1692,17 @@ fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptR
             &[(line, (None, None, Some(line_index)))],
             width,
         ));
+    }
+    // Apply after wrapping so continuations and explicit blank lines get the
+    // same full-width band, without adding padding to selectable/copyable text.
+    let style = theme::user_message();
+    for (line, _, _, _) in &mut rows {
+        line.style = style;
+        for span in &mut line.spans {
+            // Inline Markdown and links may specify their own foreground. Keep
+            // their modifiers, but use the band's contrasting text colour.
+            span.style = span.style.patch(style);
+        }
     }
     rows
 }
@@ -6876,6 +6899,55 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("history 99"), "{text}");
         assert!(text.contains("changed"), "{text}");
+    }
+
+    #[test]
+    fn user_message_highlight_covers_wrapped_blank_and_trailing_cells() {
+        use ratatui::{style::Modifier, text::Line};
+
+        for width in [1, 2, 12, 48] {
+            let message = UserMessage {
+                text: "A longer prompt with **emphasis** and 界\n\n[link](https://example.com)"
+                    .into(),
+                images: Vec::new(),
+            };
+            let rows = user_block_rows(&message, width);
+            let height = rows.len() as u16;
+            let mut lines = rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>();
+            lines.push(Line::raw("reply"));
+            let mut terminal = Terminal::new(TestBackend::new(width as u16, height + 1)).unwrap();
+            terminal
+                .draw(|frame| super::draw_transcript_rows(frame, lines, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let style = crate::tui::theme::user_message();
+            for y in 0..height {
+                for x in 0..width as u16 {
+                    // Ratatui resets the hidden cell occupied by a wide glyph.
+                    if x > 0 && buffer[(x - 1, y)].symbol().width() > 1 {
+                        continue;
+                    }
+                    let cell = &buffer[(x, y)];
+                    assert_eq!(
+                        Some(cell.bg),
+                        style.bg,
+                        "background at {x},{y}, width {width}"
+                    );
+                    assert_eq!(
+                        Some(cell.fg),
+                        style.fg,
+                        "foreground at {x},{y}, width {width}"
+                    );
+                    assert!(cell.modifier.contains(Modifier::BOLD));
+                }
+            }
+            assert_ne!(Some(buffer[(0, height)].bg), style.bg);
+            assert!(
+                rows.iter()
+                    .flat_map(|row| &row.2)
+                    .any(|hit| hit.url == "https://example.com")
+            );
+        }
     }
 
     #[test]

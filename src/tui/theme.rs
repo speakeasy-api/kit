@@ -91,6 +91,14 @@ pub const fn user_color() -> Color {
     Color::Blue
 }
 
+/// Submitted prompts stand apart from assistant prose using ANSI palette colours.
+pub fn user_message() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .bg(user_color())
+        .add_modifier(Modifier::BOLD)
+}
+
 pub const fn running_color() -> Color {
     Color::Cyan
 }
