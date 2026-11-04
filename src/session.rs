@@ -715,9 +715,9 @@ pub(crate) fn remove_stale_lock_in(
 
 /// Opens a new or resumed transcript and takes its mutation lock.
 ///
-/// `resume` requires the transcript to exist. `force` fences an abandoned lock;
-/// an older process checks the ownership lease before every append and can no longer
-/// write after it has been replaced.
+/// `resume` requires the transcript to exist and automatically reclaims abandoned
+/// locks. `force` also allows reclaiming an abandoned lock when creating a session.
+/// Neither option can take the mutation lock from a live owner.
 pub fn open(
     root: &Path,
     session_id: &str,
@@ -796,7 +796,7 @@ fn open_with_initial_timestamps_in(
         .create_dir_all(&scoped_directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
     let path = transcript_path(&scoped_directory, session_id);
-    let lock = SessionLock::acquire(lock_path(&scoped_directory, session_id), force)?;
+    let lock = SessionLock::acquire(lock_path(&scoped_directory, session_id), resume || force)?;
     let filesystem = lock.filesystem()?;
     if matches!(
         fs::best_effort_global().best_effort_status(),
@@ -4856,7 +4856,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_requires_explicit_override_and_only_reclaims_stale_locks() {
+    fn resume_and_force_reject_live_session_owners() {
         let root = tempfile::tempdir().unwrap();
         let first = open(
             root.path(),
@@ -4891,6 +4891,8 @@ mod tests {
             .is_err(),
             "force must not steal authority from a live owner"
         );
+        write(&first.observer, &Item::text(ItemKind::User, "still owned"));
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
         drop(first);
         fs::write(session_lock_path(root.path(), "abc"), "abandoned").unwrap();
         remove_stale_lock(root.path(), "abc").unwrap();
@@ -4905,6 +4907,90 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn resume_reclaims_abandoned_lock_without_force() {
+        let root = tempfile::tempdir().unwrap();
+        let first = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "original")],
+        )
+        .unwrap();
+        let original = first.transcript.clone();
+        drop(first);
+        let lock_path = session_lock_path(root.path(), "abc");
+        fs::write(&lock_path, "abandoned").unwrap();
+
+        // New sessions must not reuse an existing lock, even without a live owner.
+        assert!(
+            open(
+                root.path(),
+                "abc",
+                false,
+                false,
+                vec![Item::text(ItemKind::System, "replacement")],
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "abandoned");
+        let resumed = open(root.path(), "abc", true, false, vec![]).unwrap();
+        assert_eq!(resumed.transcript, original);
+        write(&resumed.observer, &Item::text(ItemKind::User, "resumed"));
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
+        drop(resumed);
+        assert!(!lock_path.exists());
+        assert_eq!(
+            open(root.path(), "abc", true, false, vec![])
+                .unwrap()
+                .transcript
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_resumes_of_abandoned_lock_have_one_owner() {
+        let root = tempfile::tempdir().unwrap();
+        drop(
+            open(
+                root.path(),
+                "abc",
+                false,
+                false,
+                vec![Item::text(ItemKind::System, "original")],
+            )
+            .unwrap(),
+        );
+        fs::write(session_lock_path(root.path(), "abc"), "abandoned").unwrap();
+        let start = std::sync::Barrier::new(3);
+        let results = std::thread::scope(|scope| {
+            let contenders: Vec<_> = (0..2)
+                .map(|_| {
+                    let root = root.path();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        open(root, "abc", true, false, vec![])
+                    })
+                })
+                .collect();
+            start.wait();
+            // Keep every successful open alive until both attempts finish.
+            contenders
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let owner = results.into_iter().find_map(Result::ok).unwrap();
+        write(&owner.observer, &Item::text(ItemKind::User, "winner"));
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
+        drop(owner);
+        assert!(open(root.path(), "abc", true, false, vec![]).is_ok());
     }
 
     #[test]

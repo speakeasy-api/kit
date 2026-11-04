@@ -257,14 +257,20 @@ fn renamed_session_is_persisted_then_selected_through_real_lock_error() {
     let metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(path.with_extension("metadata.json")).unwrap()).unwrap();
     assert_eq!(metadata["display_name"], "PersistedName");
-    // A real stale lock exercises resume validation without an authenticated agent.
-    fs::write(path.with_extension("lock"), "abandoned").unwrap();
+    // A live native owner exercises resume rejection without an authenticated agent.
+    let active = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path.with_extension("lock"))
+        .unwrap();
+    active.lock().unwrap();
     picker.keys(b"\r");
     assert!(!picker.finish().success(), "{}", picker.output);
     assert!(
         picker
             .output
-            .contains("session is locked by another Kit instance"),
+            .contains("session is actively locked by another Kit instance"),
         "{}",
         picker.output
     );
@@ -273,6 +279,7 @@ fn renamed_session_is_persisted_then_selected_through_real_lock_error() {
         "{}",
         picker.output
     );
+    active.unlock().unwrap();
 }
 #[test]
 fn newest_workspace_session_is_selected_and_revalidated() {
@@ -350,7 +357,12 @@ fn force_cannot_override_active_selected_lock_or_touch_unrelated_stale_lock() {
 }
 
 #[test]
-fn force_overrides_only_selected_stale_lock_then_reaches_auth_validation() {
+fn resume_reclaims_only_selected_stale_lock_then_reaches_auth_validation() {
+    assert_stale_lock_recovery(&[]);
+    assert_stale_lock_recovery(&["--force"]);
+}
+
+fn assert_stale_lock_recovery(extra_args: &[&str]) {
     let home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let path = session(home.path(), root.path(), "s-stale", "StaleSession");
@@ -359,17 +371,9 @@ fn force_overrides_only_selected_stale_lock_then_reaches_auth_validation() {
     fs::write(&unrelated, "unrelated stale lock").unwrap();
     // Memory credential storage and an explicit provider make authentication
     // fail locally, before any request, independently of developer credentials.
-    let mut picker = Picker::with_args(
-        home.path(),
-        root.path(),
-        &[
-            "--force",
-            "--provider",
-            "openai-subscription",
-            "--model",
-            "gpt-5",
-        ],
-    );
+    let mut args = vec!["--provider", "openai-subscription", "--model", "gpt-5"];
+    args.extend_from_slice(extra_args);
+    let mut picker = Picker::with_args(home.path(), root.path(), &args);
     picker.keys(b"\r");
     assert!(!picker.finish().success(), "{}", picker.output);
     assert!(
