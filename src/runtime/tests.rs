@@ -359,13 +359,18 @@ mod reasoning_effort_persistence {
     #[tokio::test]
     async fn fork_effort_is_persisted_and_reset_is_session_local() {
         let root = tempfile::tempdir().unwrap();
-        let original = runtime(root.path(), Some(ReasoningEffort::Low));
+        let mut original = runtime(root.path(), Some(ReasoningEffort::Low));
+        let (hooks, backend) = crate::ahp::test_support::hooks(vec![
+            crate::ahp::test_support::intercept(&["session.start"]),
+        ]);
+        Arc::get_mut(&mut original).unwrap().hooks = Some(hooks);
         let (parent_id, parent) = start(&original, original.claim_session().unwrap(), None).await;
         parent
             .adapter
             .select_reasoning_effort(Some(ReasoningEffort::High))
             .unwrap();
         let forked = AcpForkState {
+            source_session_id: parent_id.to_string(),
             transcript: parent.canonical_transcript.clone(),
             selection: parent.adapter.selection().unwrap(),
             reasoning_effort: parent.adapter.reasoning_effort().unwrap(),
@@ -381,6 +386,13 @@ mod reasoning_effort_persistence {
             fork.adapter.reasoning_effort().unwrap(),
             Some(ReasoningEffort::High)
         );
+        let starts = backend.events("session.start");
+        let fork_start = starts
+            .iter()
+            .find(|event| event["trigger"] == "fork")
+            .unwrap();
+        assert_eq!(fork_start["session"]["id"], fork_id);
+        assert_eq!(fork_start["resumedFrom"]["id"], parent_id);
         let (sibling_id, sibling) = start(&original, original.claim_session().unwrap(), None).await;
         assert_eq!(
             sibling.adapter.reasoning_effort().unwrap(),

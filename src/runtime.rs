@@ -559,6 +559,7 @@ impl SessionSelection {
 }
 
 pub(crate) struct AcpForkState {
+    pub source_session_id: String,
     pub transcript: Vec<Item>,
     pub selection: ModelSelection,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -2275,6 +2276,7 @@ impl Runtime {
             self.additional_directories(&context.additional_directories)?;
         let request = claim.request.clone();
         let session_id = request.id.clone();
+        let fork_source = forked.as_ref().map(|state| state.source_session_id.clone());
         let (forked_transcript, selected, parent_context) = match forked {
             Some(forked) => (
                 Some(forked.transcript),
@@ -2398,7 +2400,8 @@ impl Runtime {
                 inner: crate::protocols::acp::v2::identity::Adapter {
                     enabled: context.response_attempt_replacement,
                     inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
-                        .with_child(hook_child),
+                        .with_child(hook_child)
+                        .with_resumed_from(fork_source),
                 },
             })
             .telemetry(self.agentkit_telemetry())

@@ -28,6 +28,7 @@ pub(crate) struct HookedAdapter<A> {
     hooks: Option<Arc<Hooks>>,
     trigger: SessionStartInputTrigger,
     child: bool,
+    resumed_from: Option<String>,
 }
 
 impl<A> HookedAdapter<A> {
@@ -41,7 +42,13 @@ impl<A> HookedAdapter<A> {
             hooks,
             trigger,
             child: false,
+            resumed_from: None,
         }
+    }
+
+    pub(crate) fn with_resumed_from(mut self, source: Option<String>) -> Self {
+        self.resumed_from = source;
+        self
     }
 
     /// Classify this session, never the shared hook backend or process.
@@ -66,6 +73,7 @@ impl<A: ModelAdapter> ModelAdapter for HookedAdapter<A> {
                         self.trigger.clone(),
                         inner.model_name(),
                         self.child,
+                        self.resumed_from.as_deref(),
                     )
                     .await
                     .map_err(LoopError::InvalidState)?,
