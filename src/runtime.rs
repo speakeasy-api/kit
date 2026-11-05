@@ -1088,7 +1088,7 @@ impl Runtime {
             opened.observer.set_model(&selection.id())?;
         }
         let recorded_window_applies = match recorded {
-            Some(recorded) => recorded == selection.id(),
+            Some(recorded) => recorded == selection.id() && opened.usage_matches_model,
             None => !self.model_override,
         };
         Ok(RestoredModel {
@@ -2402,7 +2402,8 @@ impl Runtime {
         // cannot redirect another session served by the same runtime.
         let (selection, reasoning_effort, model_fallback, recorded_window_applies) = match selected
         {
-            Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, true),
+            // The parent may have switched since its latest usage.
+            Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, false),
             None => {
                 let restored = self
                     .restored_model(&opened, request.resume)

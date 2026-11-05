@@ -298,7 +298,6 @@ mod model_persistence {
         let driver = load(&restarted, &id).await;
         assert_eq!(model(&driver), "first/model");
         assert_eq!(driver.model_fallback, None);
-        assert!(driver.recorded_window_applies);
         driver
             .adapter
             .select(crate::provider::ModelSelection::new(
@@ -330,7 +329,9 @@ mod model_persistence {
         drop(explicit);
 
         let restarted = runtime(root.path(), "changed/default", false);
-        assert_eq!(model(&load(&restarted, &id).await), "explicit/model");
+        let driver = load(&restarted, &id).await;
+        assert_eq!(model(&driver), "explicit/model");
+        assert!(!driver.recorded_window_applies);
     }
 
     #[tokio::test]
