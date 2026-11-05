@@ -1297,7 +1297,7 @@ impl Server {
             &driver.canonical_transcript,
             &catalog,
             &current,
-            driver.recorded_window_applies,
+            driver.unattributed_usage_applies,
         );
         let canonical_transcript = driver.canonical_transcript;
         // Validate before spawning or publishing the attachment. BindingGuard and

@@ -324,14 +324,14 @@ mod model_persistence {
         let driver = load(&explicit, &id).await;
         assert_eq!(model(&driver), "explicit/model");
         assert_eq!(driver.model_fallback, None);
-        assert!(!driver.recorded_window_applies);
+        assert!(!driver.unattributed_usage_applies);
         drop(driver);
         drop(explicit);
 
         let restarted = runtime(root.path(), "changed/default", false);
         let driver = load(&restarted, &id).await;
         assert_eq!(model(&driver), "explicit/model");
-        assert!(!driver.recorded_window_applies);
+        assert!(!driver.unattributed_usage_applies);
     }
 
     #[tokio::test]
@@ -393,10 +393,10 @@ mod model_persistence {
         let driver = load(&runtime(root.path(), "the/default", false), &id).await;
         assert_eq!(model(&driver), "the/default");
         assert_eq!(driver.model_fallback, None);
-        assert!(driver.recorded_window_applies);
+        assert!(driver.unattributed_usage_applies);
         drop(driver);
         let overridden = load(&runtime(root.path(), "explicit/model", true), &id).await;
-        assert!(!overridden.recorded_window_applies);
+        assert!(!overridden.unattributed_usage_applies);
     }
 
     #[tokio::test]
@@ -422,7 +422,7 @@ mod model_persistence {
             assert_eq!(model(&driver), "the/default");
             let notice = driver.model_fallback.clone().unwrap();
             assert!(notice.contains(recorded), "{notice}");
-            assert!(!driver.recorded_window_applies);
+            assert!(!driver.unattributed_usage_applies);
             drop(driver);
 
             let reopened = crate::session::open(root.path(), &id, true, false, vec![]).unwrap();

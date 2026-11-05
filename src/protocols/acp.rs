@@ -1972,7 +1972,7 @@ impl Server {
             &driver.canonical_transcript,
             &catalog,
             &current,
-            driver.recorded_window_applies,
+            driver.unattributed_usage_applies,
         );
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();

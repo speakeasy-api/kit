@@ -731,14 +731,15 @@ pub(crate) struct AcpDriver {
     pub canonical_transcript: Vec<Item>,
     /// Set when a resumed session's recorded model could not be restored.
     pub model_fallback: Option<String>,
-    /// Whether the window recorded with the latest usage describes the selected model.
-    pub recorded_window_applies: bool,
+    /// Usage without a producing model predates model records, so it can only be
+    /// attributed to the default when the session has no record or override.
+    pub unattributed_usage_applies: bool,
 }
 
 struct RestoredModel {
     selection: ModelSelection,
     fallback: Option<String>,
-    recorded_window_applies: bool,
+    unattributed_usage_applies: bool,
 }
 
 struct McpInstallSources {
@@ -1087,14 +1088,10 @@ impl Runtime {
         if resume && self.model_override {
             opened.observer.set_model(&selection.id())?;
         }
-        let recorded_window_applies = match recorded {
-            Some(recorded) => recorded == selection.id() && opened.usage_matches_model,
-            None => !self.model_override,
-        };
         Ok(RestoredModel {
             selection,
             fallback,
-            recorded_window_applies,
+            unattributed_usage_applies: recorded.is_none() && !self.model_override,
         })
     }
 
@@ -2400,23 +2397,22 @@ impl Runtime {
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
-        let (selection, reasoning_effort, model_fallback, recorded_window_applies) = match selected
-        {
-            // The parent may have switched since its latest usage.
-            Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, false),
-            None => {
-                let restored = self
-                    .restored_model(&opened, request.resume)
-                    .await
-                    .map_err(AcpRuntimeError::Loop)?;
-                (
-                    restored.selection,
-                    opened.reasoning_effort.unwrap_or(self.reasoning_effort),
-                    restored.fallback,
-                    restored.recorded_window_applies,
-                )
-            }
-        };
+        let (selection, reasoning_effort, model_fallback, unattributed_usage_applies) =
+            match selected {
+                Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, false),
+                None => {
+                    let restored = self
+                        .restored_model(&opened, request.resume)
+                        .await
+                        .map_err(AcpRuntimeError::Loop)?;
+                    (
+                        restored.selection,
+                        opened.reasoning_effort.unwrap_or(self.reasoning_effort),
+                        restored.fallback,
+                        restored.unattributed_usage_applies,
+                    )
+                }
+            };
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             selection.provider,
             selection.model,
@@ -2522,7 +2518,7 @@ impl Runtime {
             adapter,
             canonical_transcript,
             model_fallback,
-            recorded_window_applies,
+            unattributed_usage_applies,
         };
         Ok(driver)
     }

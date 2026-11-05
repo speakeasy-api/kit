@@ -129,12 +129,12 @@ impl SessionUsage {
 }
 
 /// Context occupancy for a session whose window is known without a new response.
-/// `recorded_window` is only meaningful while the transcript's model is selected.
+/// A recorded window describes only the model that produced the latest usage.
 pub(super) fn restored_context(
     transcript: &[agentkit_core::Item],
     catalog: &[crate::provider::ModelGroup],
     selection: &crate::provider::ModelSelection,
-    recorded_window: bool,
+    unattributed_usage_applies: bool,
 ) -> Option<(u64, u64)> {
     let used = crate::compaction::latest_context_tokens(transcript)?;
     let advertised = catalog
@@ -143,12 +143,22 @@ pub(super) fn restored_context(
         .and_then(|group| group.context_windows.get(&selection.model))
         .copied()
         .filter(|window| *window > 0);
-    let size = advertised.or_else(|| {
-        recorded_window
+    let recorded = || {
+        let producer = transcript
+            .iter()
+            .rev()
+            .find_map(|item| item.usage.as_ref())?
+            .metadata
+            .get(crate::provider::USAGE_MODEL_METADATA_KEY);
+        let applies = match producer {
+            Some(producer) => producer.as_str() == Some(selection.id().as_str()),
+            None => unattributed_usage_applies,
+        };
+        applies
             .then(|| crate::compaction::context_window(transcript))
             .flatten()
-    })?;
-    Some((used, size))
+    };
+    Some((used, advertised.or_else(recorded)?))
 }
 
 #[derive(Clone)]
@@ -439,6 +449,38 @@ mod tests {
         );
         assert_eq!(
             restored_context(&transcript, &catalog(vec![]), &selection, false),
+            None
+        );
+        let stamped = |producer: &str| {
+            let mut usage = Usage::new(agentkit_core::TokenUsage::new(90, 10));
+            usage.metadata = MetadataMap::from([
+                ("context_window".into(), 1000.into()),
+                (
+                    crate::provider::USAGE_MODEL_METADATA_KEY.into(),
+                    producer.into(),
+                ),
+            ]);
+            vec![
+                agentkit_core::Item::text(agentkit_core::ItemKind::Assistant, "done")
+                    .with_usage(usage),
+            ]
+        };
+        assert_eq!(
+            restored_context(
+                &stamped(&selection.id()),
+                &catalog(vec![]),
+                &selection,
+                false
+            ),
+            Some((100, 1000))
+        );
+        assert_eq!(
+            restored_context(
+                &stamped("openrouter:other/model"),
+                &catalog(vec![]),
+                &selection,
+                true
+            ),
             None
         );
         assert_eq!(

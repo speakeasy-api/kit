@@ -163,8 +163,6 @@ pub struct OpenSession {
     pub(crate) children: Vec<DurableChild>,
     pub(crate) reasoning_effort: Option<Option<crate::ReasoningEffort>>,
     pub(crate) model: Option<String>,
-    /// False when the recorded model changed after the latest recorded usage.
-    pub(crate) usage_matches_model: bool,
 }
 
 /// Read-only metadata for one durable session in a workspace.
@@ -254,7 +252,6 @@ struct Writer {
     publication: Option<Arc<AtomicBool>>,
     reasoning_effort: Option<Option<crate::ReasoningEffort>>,
     model: Option<String>,
-    usage_matches_model: bool,
 }
 
 struct SessionLock {
@@ -841,7 +838,6 @@ fn open_with_initial_timestamps_in(
             .unwrap_or_default();
         let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
         let model = authority.as_ref().and_then(|a| a.model.clone());
-        let usage_matches_model = authority.as_ref().is_none_or(|a| a.usage_matches_model);
         let children = authority
             .as_ref()
             .map(|a| a.children.clone())
@@ -872,7 +868,6 @@ fn open_with_initial_timestamps_in(
             publication: None,
             reasoning_effort,
             model,
-            usage_matches_model,
         };
         return finish_open(
             writer,
@@ -919,7 +914,6 @@ fn open_with_initial_timestamps_in(
         .unwrap_or_default();
     let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
     let model = authority.as_ref().and_then(|a| a.model.clone());
-    let usage_matches_model = authority.as_ref().is_none_or(|a| a.usage_matches_model);
     let children = authority
         .as_ref()
         .map(|a| a.children.clone())
@@ -1025,7 +1019,6 @@ fn open_with_initial_timestamps_in(
         publication: None,
         reasoning_effort,
         model,
-        usage_matches_model,
     };
     finish_open(
         writer,
@@ -1077,7 +1070,6 @@ fn finish_open(
     Ok(OpenSession {
         reasoning_effort: writer.reasoning_effort,
         model: writer.model.clone(),
-        usage_matches_model: writer.usage_matches_model,
         children,
         transcript,
         observer: SessionObserver(Arc::new(Mutex::new(writer))),
@@ -1693,7 +1685,6 @@ type HistorySelection = (Option<Option<crate::ReasoningEffort>>, Option<String>)
 struct TranscriptHistory {
     reasoning_effort: Option<Option<crate::ReasoningEffort>>,
     model: Option<String>,
-    usage_matches_model: bool,
     children: Vec<DurableChild>,
     ancestry: Vec<(HistoryEntry, HistorySelection)>,
     items: Vec<Item>,
@@ -1771,7 +1762,6 @@ fn read_record_lines(
     let mut ancestry = Vec::new();
     let mut reasoning_effort = None;
     let mut model = None;
-    let mut usage_matches_model = true;
     let mut expected = 1_u64;
     let mut states = Vec::new();
     let mut redirect = None;
@@ -1838,7 +1828,6 @@ fn read_record_lines(
                 reasoning_effort = selection;
             }
             if selected_model.is_some() {
-                usage_matches_model &= selected_model == model;
                 model = selected_model;
             }
         } else if matches!(
@@ -1856,7 +1845,6 @@ fn read_record_lines(
             record.snapshot,
         ) {
             (Some(item), None, None, None, None) if record.schema_version <= SCHEMA_VERSION => {
-                usage_matches_model |= item.usage.is_some();
                 items.push(item.clone());
                 ancestry.push((HistoryEntry::Item(item), current_selection()));
             }
@@ -1938,7 +1926,6 @@ fn read_record_lines(
     Ok(StoredTranscript::History(TranscriptHistory {
         reasoning_effort,
         model,
-        usage_matches_model,
         children: children.into_values().collect(),
         ancestry,
         items,
@@ -2723,7 +2710,6 @@ fn list_ids_in_with(filesystem: &Fs, directory: &Path) -> Result<Vec<String>, St
 struct Authority {
     reasoning_effort: Option<Option<crate::ReasoningEffort>>,
     model: Option<String>,
-    usage_matches_model: bool,
     children: Vec<DurableChild>,
     items: Vec<Item>,
     historical_items: Vec<Vec<Item>>,
@@ -2983,7 +2969,6 @@ fn select_authority_with(
     Ok(authority.map(|candidate| Authority {
         reasoning_effort: candidate.history.reasoning_effort,
         model: candidate.history.model,
-        usage_matches_model: candidate.history.usage_matches_model,
         children: candidate.history.children,
         items: candidate.history.items,
         historical_items: candidate.history.states,
@@ -3801,48 +3786,6 @@ mod tests {
         clone_completed(root.path(), "selected", "fork").unwrap();
         let fork = open(root.path(), "fork", true, false, vec![]).unwrap();
         assert_eq!(fork.model.as_deref(), Some("anthropic:second"));
-    }
-
-    #[test]
-    fn usage_stops_matching_the_model_until_the_next_response_after_a_change() {
-        let record = |generation: u64, body: serde_json::Value| {
-            let mut record = json!({"session_id": "abc", "generation": generation});
-            record
-                .as_object_mut()
-                .unwrap()
-                .extend(body.as_object().unwrap().clone());
-            record.to_string()
-        };
-        let model = |generation, name: &str| {
-            record(
-                generation,
-                json!({"schema_version": MODEL_SCHEMA_VERSION,
-                "workspace_root": "/workspace", "model": name}),
-            )
-        };
-        let usage = |generation| {
-            let item = Item::text(ItemKind::Assistant, "done").with_usage(
-                agentkit_core::Usage::new(agentkit_core::TokenUsage::new(1, 1)),
-            );
-            record(
-                generation,
-                json!({"schema_version": SCHEMA_VERSION, "item": item}),
-            )
-        };
-        let parsed = |lines: &[String]| {
-            let bytes = lines.join("\n") + "\n";
-            let Ok(StoredTranscript::History(history)) =
-                read_records_bytes(Path::new("abc.jsonl"), "abc", bytes.as_bytes())
-            else {
-                panic!("transcript should parse");
-            };
-            history.usage_matches_model
-        };
-        assert!(parsed(&[usage(1)]));
-        assert!(parsed(&[usage(1), usage(2), model(3, "a"), usage(4)]));
-        assert!(!parsed(&[usage(1), model(2, "a")]));
-        assert!(!parsed(&[usage(1), model(2, "a"), model(3, "b")]));
-        assert!(parsed(&[usage(1), model(2, "a"), model(3, "b"), usage(4)]));
     }
 
     #[test]
