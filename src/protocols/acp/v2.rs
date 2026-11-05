@@ -1297,7 +1297,7 @@ impl Server {
             &driver.canonical_transcript,
             &catalog,
             &current,
-            model_fallback.is_none(),
+            driver.recorded_window_applies,
         );
         let canonical_transcript = driver.canonical_transcript;
         // Validate before spawning or publishing the attachment. BindingGuard and

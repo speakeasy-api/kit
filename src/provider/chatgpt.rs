@@ -116,6 +116,7 @@ impl SubscriptionModelCatalogCache {
 pub(crate) struct SubscriptionModelCatalog {
     context_windows: HashMap<String, u64>,
     visible_models: Vec<String>,
+    known_models: HashSet<String>,
 }
 
 impl SubscriptionModelCatalog {
@@ -125,6 +126,10 @@ impl SubscriptionModelCatalog {
 
     pub(crate) fn visible_models(&self) -> &[String] {
         &self.visible_models
+    }
+
+    pub(crate) fn known_models(&self) -> &HashSet<String> {
+        &self.known_models
     }
 }
 
@@ -1141,6 +1146,7 @@ fn parse_model_catalog(value: &Value) -> Result<SubscriptionModelCatalog, LoopEr
         .ok_or_else(|| protocol("model catalog omitted a bounded models list"))?;
     let mut context_windows = HashMap::new();
     let mut visible_models = Vec::new();
+    let mut known_models = HashSet::new();
     for model in models {
         let Some(slug) = model
             .get("slug")
@@ -1149,6 +1155,7 @@ fn parse_model_catalog(value: &Value) -> Result<SubscriptionModelCatalog, LoopEr
         else {
             continue;
         };
+        known_models.insert(slug.to_owned());
         if let Some(window) = model
             .get("context_window")
             .and_then(Value::as_u64)
@@ -1174,6 +1181,7 @@ fn parse_model_catalog(value: &Value) -> Result<SubscriptionModelCatalog, LoopEr
     Ok(SubscriptionModelCatalog {
         context_windows,
         visible_models,
+        known_models,
     })
 }
 
@@ -2088,6 +2096,9 @@ mod tests {
         assert_eq!(catalog.context_windows.get("hidden"), Some(&300000));
         assert_eq!(catalog.context_windows.get("later"), Some(&200000));
         assert_eq!(catalog.context_windows.len(), 2);
+        assert!(catalog.known_models.contains("hidden"));
+        assert!(catalog.known_models.contains("same-priority"));
+        assert!(!catalog.known_models.contains("bad slug"));
     }
 }
 

@@ -359,6 +359,7 @@ impl SelectableAdapter {
             .map(|catalog| DiscoveredModels {
                 models: catalog.visible_models().to_vec(),
                 context_windows: catalog.context_windows().clone(),
+                hidden_models: catalog.known_models().clone(),
             })
             .unwrap_or_default()
     }
@@ -437,7 +438,21 @@ impl SelectableAdapter {
                 .map_or(true, |models| listed(&models, &selection.model)),
             ProviderKind::Anthropic => {
                 let models = discover_anthropic(&self.credential_storage).await;
-                models.is_empty() || models.iter().any(|model| model.id == selection.model)
+                if models.is_empty() || models.iter().any(|model| model.id == selection.model) {
+                    return true;
+                }
+                // Listings carry canonical ids, but aliases are callable too.
+                let Ok(Some(credentials)) =
+                    super::anthropic_auth::credentials(&self.credential_storage)
+                else {
+                    return true;
+                };
+                !super::anthropic_catalog::confirmed_missing(
+                    super::anthropic_catalog::MODELS_URL,
+                    credentials.api_key(),
+                    &selection.model,
+                )
+                .await
             }
         }
     }
@@ -1978,13 +1993,13 @@ fn openrouter_fallback() -> Vec<String> {
 struct DiscoveredModels {
     models: Vec<String>,
     context_windows: std::collections::HashMap<String, u64>,
+    hidden_models: std::collections::HashSet<String>,
 }
 
-// Window entries also cover callable models hidden from the visible list.
 fn listed(discovered: &DiscoveredModels, model: &str) -> bool {
     discovered.models.is_empty()
         || discovered.models.iter().any(|listed| listed == model)
-        || discovered.context_windows.contains_key(model)
+        || discovered.hidden_models.contains(model)
 }
 
 fn fallback_catalog() -> DiscoveredModels {
@@ -2053,6 +2068,7 @@ fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
     Ok(DiscoveredModels {
         models,
         context_windows,
+        ..Default::default()
     })
 }
 
@@ -2320,7 +2336,8 @@ mod tests {
         assert!(listed(&DiscoveredModels::default(), "any"));
         let discovered = DiscoveredModels {
             models: vec!["visible".into()],
-            context_windows: [("hidden".to_string(), 1)].into_iter().collect(),
+            hidden_models: ["hidden".to_string()].into_iter().collect(),
+            ..Default::default()
         };
         assert!(listed(&discovered, "visible"));
         assert!(listed(&discovered, "hidden"));

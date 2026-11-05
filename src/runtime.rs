@@ -731,6 +731,14 @@ pub(crate) struct AcpDriver {
     pub canonical_transcript: Vec<Item>,
     /// Set when a resumed session's recorded model could not be restored.
     pub model_fallback: Option<String>,
+    /// Whether the window recorded with the latest usage describes the selected model.
+    pub recorded_window_applies: bool,
+}
+
+struct RestoredModel {
+    selection: ModelSelection,
+    fallback: Option<String>,
+    recorded_window_applies: bool,
 }
 
 struct McpInstallSources {
@@ -1051,25 +1059,43 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    async fn restored_selection(&self, recorded: Option<&str>) -> (ModelSelection, Option<String>) {
+    async fn restored_model(
+        &self,
+        opened: &crate::session::OpenSession,
+        resume: bool,
+    ) -> Result<RestoredModel, String> {
         let configured = ModelSelection::new(self.provider, self.model.clone());
-        let Some(recorded) = recorded else {
-            return (configured, None);
-        };
-        if self.model_override || recorded == configured.id() {
-            return (configured, None);
-        }
-        match ModelSelection::from_id(recorded) {
-            Ok(selection) if self.adapter.can_restore(&selection).await => (selection, None),
-            _ => {
-                let notice = format!(
-                    "session model {recorded} is unavailable; using {}",
-                    configured.id()
-                );
-                tracing::warn!("{notice}");
-                (configured, Some(notice))
+        let recorded = opened.model.as_deref();
+        let (selection, fallback) = match recorded {
+            Some(recorded) if !self.model_override && recorded != configured.id() => {
+                match ModelSelection::from_id(recorded) {
+                    Ok(selection) if self.adapter.can_restore(&selection).await => {
+                        (selection, None)
+                    }
+                    _ => {
+                        let notice = format!(
+                            "session model {recorded} is unavailable; using {}",
+                            configured.id()
+                        );
+                        tracing::warn!("{notice}");
+                        (configured, Some(notice))
+                    }
+                }
             }
+            _ => (configured, None),
+        };
+        if resume && self.model_override {
+            opened.observer.set_model(&selection.id())?;
         }
+        let recorded_window_applies = match recorded {
+            Some(recorded) => recorded == selection.id(),
+            None => !self.model_override,
+        };
+        Ok(RestoredModel {
+            selection,
+            fallback,
+            recorded_window_applies,
+        })
     }
 
     pub fn with_compaction(
@@ -1951,7 +1977,10 @@ impl Runtime {
                     error,
                 )
             })?;
-            let selection = self.adapter.selection()?;
+            let selection = self
+                .restored_model(&opened, request.resume)
+                .await?
+                .selection;
             let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
                 selection.provider,
                 selection.model,
@@ -2371,23 +2400,22 @@ impl Runtime {
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
-        let (selection, reasoning_effort, model_fallback) = match selected {
-            Some((selection, reasoning_effort)) => (selection, reasoning_effort, None),
+        let (selection, reasoning_effort, model_fallback, recorded_window_applies) = match selected
+        {
+            Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, true),
             None => {
-                let (selection, fallback) = self.restored_selection(opened.model.as_deref()).await;
+                let restored = self
+                    .restored_model(&opened, request.resume)
+                    .await
+                    .map_err(AcpRuntimeError::Loop)?;
                 (
-                    selection,
+                    restored.selection,
                     opened.reasoning_effort.unwrap_or(self.reasoning_effort),
-                    fallback,
+                    restored.fallback,
+                    restored.recorded_window_applies,
                 )
             }
         };
-        if request.resume && self.model_override {
-            opened
-                .observer
-                .set_model(&selection.id())
-                .map_err(AcpRuntimeError::Loop)?;
-        }
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             selection.provider,
             selection.model,
@@ -2493,6 +2521,7 @@ impl Runtime {
             adapter,
             canonical_transcript,
             model_fallback,
+            recorded_window_applies,
         };
         Ok(driver)
     }

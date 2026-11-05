@@ -11,7 +11,8 @@ use serde_json::{Map, Value};
 use crate::provider::{ModelGroup, ModelSelection};
 
 pub(crate) const META: &str = "kit.model_switch";
-const CONFIRMATION_REQUIRED_CODE: i32 = -32050;
+// JSON-RPC and ACP reserve -32768..=-32000 and -32899..=-32800.
+const CONFIRMATION_REQUIRED_CODE: i32 = -31050;
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

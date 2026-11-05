@@ -298,6 +298,7 @@ mod model_persistence {
         let driver = load(&restarted, &id).await;
         assert_eq!(model(&driver), "first/model");
         assert_eq!(driver.model_fallback, None);
+        assert!(driver.recorded_window_applies);
         driver
             .adapter
             .select(crate::provider::ModelSelection::new(
@@ -324,11 +325,51 @@ mod model_persistence {
         let driver = load(&explicit, &id).await;
         assert_eq!(model(&driver), "explicit/model");
         assert_eq!(driver.model_fallback, None);
+        assert!(!driver.recorded_window_applies);
         drop(driver);
         drop(explicit);
 
         let restarted = runtime(root.path(), "changed/default", false);
         assert_eq!(model(&load(&restarted, &id).await), "explicit/model");
+    }
+
+    #[tokio::test]
+    async fn prompt_resume_with_an_explicit_model_replaces_the_recorded_model() {
+        let root = tempfile::tempdir().unwrap();
+        let id = crate::session::new_id();
+        let opened = crate::session::open(
+            root.path(),
+            &id,
+            false,
+            false,
+            vec![agentkit_core::Item::text(
+                agentkit_core::ItemKind::System,
+                "system",
+            )],
+        )
+        .unwrap();
+        opened.observer.set_model("openrouter:first/model").unwrap();
+        drop(opened);
+        let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "explicit/model",
+            crate::ProviderKind::OpenRouter,
+            SessionRequest {
+                id: id.clone(),
+                resume: true,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("")),
+        )
+        .unwrap();
+        let runtime = Runtime::with_model_override(runtime, true).unwrap();
+        // The empty key stops the run after session setup, before any model request.
+        assert!(runtime.run_persistent("hello".into()).await.is_err());
+        drop(runtime);
+        let reopened = crate::session::open(root.path(), &id, true, true, vec![]).unwrap();
+        assert_eq!(reopened.model.as_deref(), Some("openrouter:explicit/model"));
     }
 
     #[tokio::test]
@@ -351,6 +392,10 @@ mod model_persistence {
         let driver = load(&runtime(root.path(), "the/default", false), &id).await;
         assert_eq!(model(&driver), "the/default");
         assert_eq!(driver.model_fallback, None);
+        assert!(driver.recorded_window_applies);
+        drop(driver);
+        let overridden = load(&runtime(root.path(), "explicit/model", true), &id).await;
+        assert!(!overridden.recorded_window_applies);
     }
 
     #[tokio::test]
@@ -376,6 +421,7 @@ mod model_persistence {
             assert_eq!(model(&driver), "the/default");
             let notice = driver.model_fallback.clone().unwrap();
             assert!(notice.contains(recorded), "{notice}");
+            assert!(!driver.recorded_window_applies);
             drop(driver);
 
             let reopened = crate::session::open(root.path(), &id, true, false, vec![]).unwrap();
