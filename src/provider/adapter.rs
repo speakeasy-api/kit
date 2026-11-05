@@ -279,6 +279,7 @@ impl SelectableAdapter {
     ) -> Result<Self, String> {
         if persist_initial {
             observer.set_reasoning_effort(self.reasoning_effort()?)?;
+            observer.set_model(&self.selection()?.id())?;
         }
         self.session_observer = Some(observer);
         Ok(self)
@@ -406,6 +407,41 @@ impl SelectableAdapter {
         providers
     }
 
+    /// False only on evidence: no credentials, or a successful listing that omits
+    /// the model. A failed lookup proves nothing, so the selection is kept.
+    pub(crate) async fn can_restore(&self, selection: &ModelSelection) -> bool {
+        if self.inference.get(selection.provider).is_some() {
+            return true;
+        }
+        if !self.catalog_providers().contains(&selection.provider) {
+            return false;
+        }
+        match selection.provider {
+            ProviderKind::OpenAiSubscription => {
+                listed(&self.discovered_openai_models().await, &selection.model)
+            }
+            ProviderKind::OpenRouter => {
+                let url = match std::env::var_os("OPENROUTER_BASE_URL") {
+                    None => catalog_models_url(None),
+                    Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
+                };
+                match url {
+                    Some(url) => fetch_model_ids(&url)
+                        .await
+                        .map_or(true, |models| listed(&models, &selection.model)),
+                    None => true,
+                }
+            }
+            ProviderKind::Speakeasy => fetch_model_ids(OPENROUTER_MODELS_URL)
+                .await
+                .map_or(true, |models| listed(&models, &selection.model)),
+            ProviderKind::Anthropic => {
+                let models = discover_anthropic(&self.credential_storage).await;
+                models.is_empty() || models.iter().any(|model| model.id == selection.model)
+            }
+        }
+    }
+
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
@@ -424,6 +460,10 @@ impl SelectableAdapter {
             .selection
             .lock()
             .map_err(|_| "session selection lock is poisoned")?;
+        // Same lock order and failure semantics as `select_reasoning_effort`.
+        if let Some(observer) = &self.session_observer {
+            observer.set_model(&selection.id())?;
+        }
         current.model = selection;
         current.revision = current.revision.wrapping_add(1);
         Ok(())
@@ -1940,6 +1980,13 @@ struct DiscoveredModels {
     context_windows: std::collections::HashMap<String, u64>,
 }
 
+// Window entries also cover callable models hidden from the visible list.
+fn listed(discovered: &DiscoveredModels, model: &str) -> bool {
+    discovered.models.is_empty()
+        || discovered.models.iter().any(|listed| listed == model)
+        || discovered.context_windows.contains_key(model)
+}
+
 fn fallback_catalog() -> DiscoveredModels {
     DiscoveredModels {
         models: openrouter_fallback(),
@@ -2265,6 +2312,19 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.contains("cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn only_a_successful_listing_can_prove_a_model_unavailable() {
+        use super::{DiscoveredModels, listed};
+        assert!(listed(&DiscoveredModels::default(), "any"));
+        let discovered = DiscoveredModels {
+            models: vec!["visible".into()],
+            context_windows: [("hidden".to_string(), 1)].into_iter().collect(),
+        };
+        assert!(listed(&discovered, "visible"));
+        assert!(listed(&discovered, "hidden"));
+        assert!(!listed(&discovered, "retired"));
     }
 
     #[test]

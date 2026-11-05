@@ -849,6 +849,13 @@ impl Command {
                     .requires("remote_acp"),
             );
             let command = command.arg(
+                clap::Arg::new("prefer_session_model")
+                    .long("prefer-session-model")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Treat --model and --provider as defaults for resumed sessions")
+                    .hide(true),
+            );
+            let command = command.arg(
                 clap::Arg::new("stdio_protocol_version")
                     .long("stdio-protocol-version")
                     .value_name("STDIO_PROTOCOL_VERSION")
@@ -1190,6 +1197,7 @@ impl Command {
                 no_a2a: required_arg(matches, "no_a2a")?,
                 no_stdio: required_arg(matches, "no_stdio")?,
                 stdio_protocol_version: required_arg(matches, "stdio_protocol_version")?,
+                prefer_session_model: required_arg(matches, "prefer_session_model")?,
                 server_credential_file: optional_arg(matches, "server_credential_file")?,
                 mcp: McpArgs::from_matches(matches)?,
                 terminal_auth_login: optional_arg(matches, "terminal_auth_login")?,
@@ -1770,6 +1778,8 @@ enum Command {
         no_stdio: bool,
         /// ACP wire version for stdio (defaults to v1 for compatibility).
         stdio_protocol_version: AcpProtocolVersion,
+        /// Internal: `--model` and `--provider` are only defaults for resumed sessions.
+        prefer_session_model: bool,
         /// Require this file's bearer token on every HTTP request.
         server_credential_file: Option<PathBuf>,
 
@@ -2317,6 +2327,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_a2a,
             no_stdio,
             stdio_protocol_version,
+            prefer_session_model,
             server_credential_file,
             mcp,
             terminal_auth_login: _,
@@ -2333,6 +2344,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let root = config.root(root);
+            let model_override = (model.is_some() || provider.is_some()) && !prefer_session_model;
             let model = config.model(model);
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
@@ -2365,6 +2377,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 runtime,
                 config.inference_providers.clone(),
             )?;
+            let runtime = kit::Runtime::with_model_override(runtime, model_override)?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_skill_poll_interval(
                 runtime,
@@ -2447,6 +2460,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let root = config.root(root);
+            let model_override = model.is_some() || provider.is_some();
             let model = config.model(model);
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
@@ -2478,6 +2492,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 runtime,
                 config.inference_providers.clone(),
             )?;
+            let runtime = kit::Runtime::with_model_override(runtime, model_override)?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_skill_poll_interval(
                 runtime,
@@ -2537,6 +2552,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             let root = config.root(root);
+            let model_override = model.is_some() || provider.is_some();
             let model = config.model(model);
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
@@ -2562,6 +2578,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 runtime,
                 config.inference_providers.clone(),
             )?;
+            let runtime = kit::Runtime::with_model_override(runtime, model_override)?;
             let runtime = kit::Runtime::with_compaction(runtime, config.compaction)?;
             let runtime = kit::Runtime::with_skill_poll_interval(
                 runtime,
@@ -2658,6 +2675,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(Some(id)) => Some(id),
                 None => None,
             };
+            let model_override = model.is_some() || provider.is_some();
             let model = config.model(model);
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
@@ -2696,6 +2714,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 resume.as_deref(),
                 force,
                 voice_enabled,
+                model_override,
                 &mut stop,
             )
             .await?
@@ -3324,6 +3343,7 @@ mod tests {
         let Command::Serve {
             a2a,
             stdio_protocol_version,
+            prefer_session_model,
             remote_acp,
             no_a2a,
             no_stdio,
@@ -3341,6 +3361,7 @@ mod tests {
             super::AcpProtocolVersion::V1
         ));
         assert!(!remote_acp && !no_a2a && !no_stdio && !resume && !force);
+        assert!(!prefer_session_model);
         assert!(!mcp.no_configured_mcp_config && !mcp.legacy_mcp_config);
         assert!(mcp.credentials.credential_store.is_none());
         let cli = Cli::try_parse_from(["kit", "acp"]).unwrap();

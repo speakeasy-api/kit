@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use crate::provider::{ModelGroup, ModelSelection};
 
 pub(crate) const META: &str = "kit.model_switch";
+const CONFIRMATION_REQUIRED_CODE: i32 = -32050;
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -100,7 +101,11 @@ impl Guard {
         let Some((tokens, window)) = guarded_tokens(&transcript).zip(window) else {
             return Ok(Decision::Continue);
         };
-        if current == &target || tokens * 100 < u128::from(window) * 80 {
+        // A target at least as large as the window that produced the latest usage
+        // cannot leave the session worse off, even when the prior model is unknown.
+        let fits_recorded_window = crate::compaction::context_window(&transcript)
+            .is_some_and(|recorded| window >= recorded);
+        if current == &target || fits_recorded_window || tokens * 100 < u128::from(window) * 80 {
             return Ok(Decision::Continue);
         }
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
@@ -124,8 +129,11 @@ impl Guard {
                 ("target_window".into(), Value::from(warning.target_window)),
             ])),
         )]));
-        Err(error("target model context is at least 80% occupied after a 20% tokenizer margin; continue explicitly, compact with the current model, or cancel")
-            .data(data))
+        Err(Error::new(
+            CONFIRMATION_REQUIRED_CODE,
+            "target model context is at least 80% occupied after a 20% tokenizer margin; continue explicitly, compact with the current model, or cancel",
+        )
+        .data(data))
     }
 }
 
@@ -216,6 +224,30 @@ mod tests {
         assert!(check(&mut guard, vec![measured(100)], Some(151), None).is_ok());
         assert!(check(&mut guard, vec![measured(101)], Some(151), None).is_err());
         assert!(check(&mut guard, vec![measured(u64::MAX)], Some(u64::MAX), None).is_err());
+    }
+
+    #[test]
+    fn model_switch_to_a_window_at_least_as_large_as_recorded_needs_no_confirmation() {
+        let recorded = |window: u64| {
+            let mut usage = Usage::new(TokenUsage::new(100, 0));
+            usage.metadata = MetadataMap::from_iter([("context_window".into(), json!(window))]);
+            vec![Item::text(ItemKind::Assistant, "response").with_usage(usage)]
+        };
+        for window in [150, 149] {
+            assert_eq!(
+                check(&mut Guard::default(), recorded(window), Some(150), None).unwrap(),
+                Decision::Continue
+            );
+        }
+        assert!(check(&mut Guard::default(), recorded(151), Some(150), None).is_err());
+    }
+
+    #[test]
+    fn model_switch_warning_explains_itself_with_a_distinct_code() {
+        let error = check(&mut Guard::default(), vec![measured(100)], Some(150), None).unwrap_err();
+        assert_eq!(i32::from(error.code), CONFIRMATION_REQUIRED_CODE);
+        assert!(error.message.contains("at least 80% occupied"));
+        assert!(error.data.unwrap().get(META).is_some());
     }
 
     #[test]

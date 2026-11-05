@@ -228,6 +228,162 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
     );
 }
 
+mod model_persistence {
+    use super::*;
+    use crate::runtime::{AcpDriver, AcpDriverContext, SessionClaim};
+
+    #[derive(Clone)]
+    struct Observer;
+
+    impl agentkit_loop::LoopObserver for Observer {
+        fn handle_event(&self, _event: agentkit_loop::ObservedEvent) {}
+    }
+
+    fn runtime(root: &std::path::Path, model: &str, model_override: bool) -> Arc<Runtime> {
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_credentials_and_effort(
+            root,
+            model,
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            None,
+        )
+        .unwrap();
+        Runtime::with_model_override(runtime, model_override).unwrap()
+    }
+
+    async fn start(runtime: &Arc<Runtime>, mut claim: SessionClaim) -> (String, AcpDriver) {
+        let id = claim.request.id.clone();
+        let driver = runtime
+            .start_acp_driver_with_mcp(
+                AcpDriverContext {
+                    activity: crate::protocols::acp::activity::SessionActivity::new(|_| Ok(())),
+                    ask_user: None,
+                    cwd: runtime.root().to_path_buf(),
+                    additional_directories: vec![],
+                    integration: Arc::new(Observer),
+                    cancellation: CancellationController::new().handle(),
+                    response_attempt_replacement: false,
+                },
+                &mut claim,
+                None,
+                runtime.mcp.clone(),
+            )
+            .await
+            .unwrap();
+        claim.commit().unwrap();
+        (id, driver)
+    }
+
+    async fn load(runtime: &Arc<Runtime>, id: &str) -> AcpDriver {
+        start(runtime, runtime.claim_session_load(id).unwrap())
+            .await
+            .1
+    }
+
+    fn model(driver: &AcpDriver) -> String {
+        driver.adapter.selection().unwrap().model
+    }
+
+    #[tokio::test]
+    async fn selected_model_survives_a_changed_default() {
+        let root = tempfile::tempdir().unwrap();
+        let original = runtime(root.path(), "first/model", false);
+        let (id, driver) = start(&original, original.claim_session().unwrap()).await;
+        drop(driver);
+        drop(original);
+
+        let restarted = runtime(root.path(), "changed/default", false);
+        let driver = load(&restarted, &id).await;
+        assert_eq!(model(&driver), "first/model");
+        assert_eq!(driver.model_fallback, None);
+        driver
+            .adapter
+            .select(crate::provider::ModelSelection::new(
+                crate::ProviderKind::OpenRouter,
+                "second/model",
+            ))
+            .unwrap();
+        drop(driver);
+        drop(restarted);
+
+        let restarted = runtime(root.path(), "changed/default", false);
+        assert_eq!(model(&load(&restarted, &id).await), "second/model");
+    }
+
+    #[tokio::test]
+    async fn explicit_model_overrides_and_replaces_the_recorded_model() {
+        let root = tempfile::tempdir().unwrap();
+        let original = runtime(root.path(), "first/model", false);
+        let (id, driver) = start(&original, original.claim_session().unwrap()).await;
+        drop(driver);
+        drop(original);
+
+        let explicit = runtime(root.path(), "explicit/model", true);
+        let driver = load(&explicit, &id).await;
+        assert_eq!(model(&driver), "explicit/model");
+        assert_eq!(driver.model_fallback, None);
+        drop(driver);
+        drop(explicit);
+
+        let restarted = runtime(root.path(), "changed/default", false);
+        assert_eq!(model(&load(&restarted, &id).await), "explicit/model");
+    }
+
+    #[tokio::test]
+    async fn transcript_without_a_model_record_uses_the_default_without_a_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let id = crate::session::new_id();
+        drop(
+            crate::session::open(
+                root.path(),
+                &id,
+                false,
+                false,
+                vec![agentkit_core::Item::text(
+                    agentkit_core::ItemKind::System,
+                    "system",
+                )],
+            )
+            .unwrap(),
+        );
+        let driver = load(&runtime(root.path(), "the/default", false), &id).await;
+        assert_eq!(model(&driver), "the/default");
+        assert_eq!(driver.model_fallback, None);
+    }
+
+    #[tokio::test]
+    async fn unusable_recorded_model_falls_back_with_a_notice_and_stays_recorded() {
+        for recorded in ["anthropic:no-credentials", "retired-provider:model"] {
+            let root = tempfile::tempdir().unwrap();
+            let id = crate::session::new_id();
+            let opened = crate::session::open(
+                root.path(),
+                &id,
+                false,
+                false,
+                vec![agentkit_core::Item::text(
+                    agentkit_core::ItemKind::System,
+                    "system",
+                )],
+            )
+            .unwrap();
+            opened.observer.set_model(recorded).unwrap();
+            drop(opened);
+
+            let driver = load(&runtime(root.path(), "the/default", false), &id).await;
+            assert_eq!(model(&driver), "the/default");
+            let notice = driver.model_fallback.clone().unwrap();
+            assert!(notice.contains(recorded), "{notice}");
+            drop(driver);
+
+            let reopened = crate::session::open(root.path(), &id, true, false, vec![]).unwrap();
+            assert_eq!(reopened.model.as_deref(), Some(recorded));
+        }
+    }
+}
+
 mod reasoning_effort_persistence {
     use super::*;
     use crate::ReasoningEffort;

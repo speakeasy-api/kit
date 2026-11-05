@@ -30,6 +30,7 @@ pub(crate) use children::{ChildLifecycle, DurableChild};
 const CHILD_SCHEMA_VERSION: u32 = 5;
 // Older readers must reject selection records rather than silently lose settings.
 const REASONING_SCHEMA_VERSION: u32 = 6;
+const MODEL_SCHEMA_VERSION: u32 = 7;
 pub const SCHEMA_VERSION: u32 = 3;
 const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
@@ -59,6 +60,8 @@ struct Record {
     snapshot: Option<ChildSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -159,6 +162,7 @@ pub struct OpenSession {
     pub observer: SessionObserver,
     pub(crate) children: Vec<DurableChild>,
     pub(crate) reasoning_effort: Option<Option<crate::ReasoningEffort>>,
+    pub(crate) model: Option<String>,
 }
 
 /// Read-only metadata for one durable session in a workspace.
@@ -247,6 +251,7 @@ struct Writer {
     // that owner publishes success, or forever if submission is abandoned.
     publication: Option<Arc<AtomicBool>>,
     reasoning_effort: Option<Option<crate::ReasoningEffort>>,
+    model: Option<String>,
 }
 
 struct SessionLock {
@@ -581,6 +586,7 @@ pub(crate) fn clone_completed_in(
     let authority = select_authority(directory, &canonical_workspace(root), source)?
         .ok_or_else(|| format!("session {source:?} does not exist"))?;
     let reasoning_effort = authority.reasoning_effort;
+    let model = authority.model;
     let mut transcript = authority.items;
     crate::transcript::repair_unanswered_tool_calls(&mut transcript);
     crate::transcript::rebind_forked_transcript(&mut transcript, destination);
@@ -598,6 +604,9 @@ pub(crate) fn clone_completed_in(
     )?;
     if let Some(effort) = reasoning_effort {
         opened.observer.set_reasoning_effort(effort)?;
+    }
+    if let Some(model) = model {
+        opened.observer.set_model(&model)?;
     }
     opened.observer.commit_creation()?;
     drop(opened);
@@ -828,6 +837,7 @@ fn open_with_initial_timestamps_in(
             .map(|a| LiveSessionInfo::from_items(&a.historical_items, &a.items))
             .unwrap_or_default();
         let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
+        let model = authority.as_ref().and_then(|a| a.model.clone());
         let children = authority
             .as_ref()
             .map(|a| a.children.clone())
@@ -857,6 +867,7 @@ fn open_with_initial_timestamps_in(
             created: (!resume).then(|| CreatedTranscript::new(None, filesystem, None)),
             publication: None,
             reasoning_effort,
+            model,
         };
         return finish_open(
             writer,
@@ -902,6 +913,7 @@ fn open_with_initial_timestamps_in(
         .map(|a| LiveSessionInfo::from_items(&a.historical_items, &a.items))
         .unwrap_or_default();
     let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
+    let model = authority.as_ref().and_then(|a| a.model.clone());
     let children = authority
         .as_ref()
         .map(|a| a.children.clone())
@@ -920,7 +932,7 @@ fn open_with_initial_timestamps_in(
             &workspace_root,
             &authority.items,
             &authority.children,
-            (title_seed.as_deref(), reasoning_effort),
+            (title_seed.as_deref(), reasoning_effort, model.as_deref()),
         )?;
         for legacy in authority.legacy_histories {
             let source_fs = migration_filesystem(&legacy, &lock, &migration_locks)?;
@@ -1006,6 +1018,7 @@ fn open_with_initial_timestamps_in(
         created,
         publication: None,
         reasoning_effort,
+        model,
     };
     finish_open(
         writer,
@@ -1056,6 +1069,7 @@ fn finish_open(
     }
     Ok(OpenSession {
         reasoning_effort: writer.reasoning_effort,
+        model: writer.model.clone(),
         children,
         transcript,
         observer: SessionObserver(Arc::new(Mutex::new(writer))),
@@ -1152,6 +1166,15 @@ impl SessionObserver {
             .lock()
             .map_err(|_| "session transcript writer poisoned".to_string())?
             .set_reasoning_effort(effort)
+    }
+
+    /// Records the session's model id without changing transcript items.
+    /// Follows the same best-effort persistence semantics as reasoning effort.
+    pub(crate) fn set_model(&self, model: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?
+            .set_model(model)
     }
 
     /// Appends parent-owned child state under the transcript lease and generation lock.
@@ -1293,9 +1316,37 @@ impl Writer {
                     .map_or("default", crate::ReasoningEffort::as_str)
                     .into(),
             ),
+            model: None,
         };
         self.write_record(record, generation)?;
         self.reasoning_effort = Some(effort);
+        Ok(())
+    }
+
+    fn set_model(&mut self, model: &str) -> Result<(), String> {
+        if self.model.as_deref() == Some(model) {
+            return Ok(());
+        }
+        self.ensure_lock()?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?;
+        let record = Record {
+            schema_version: MODEL_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            generation,
+            workspace_root: Some(self.workspace_root.clone()),
+            item: None,
+            replacement: None,
+            redirect: None,
+            child: None,
+            snapshot: None,
+            reasoning_effort: None,
+            model: Some(model.into()),
+        };
+        self.write_record(record, generation)?;
+        self.model = Some(model.into());
         Ok(())
     }
 
@@ -1319,6 +1370,7 @@ impl Writer {
             redirect: None,
             child: Some(child.clone()),
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         self.write_record(record, generation)?;
@@ -1371,6 +1423,7 @@ impl Writer {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         self.write_record(record, generation)
@@ -1392,6 +1445,7 @@ impl Writer {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         self.write_record(record, generation)
@@ -1626,10 +1680,13 @@ enum HistoryEntry {
     Settings,
 }
 
+type HistorySelection = (Option<Option<crate::ReasoningEffort>>, Option<String>);
+
 struct TranscriptHistory {
     reasoning_effort: Option<Option<crate::ReasoningEffort>>,
+    model: Option<String>,
     children: Vec<DurableChild>,
-    ancestry: Vec<(HistoryEntry, Option<Option<crate::ReasoningEffort>>)>,
+    ancestry: Vec<(HistoryEntry, HistorySelection)>,
     items: Vec<Item>,
     generation: u64,
     states: Vec<Vec<Item>>,
@@ -1704,6 +1761,7 @@ fn read_record_lines(
     let mut children = BTreeMap::new();
     let mut ancestry = Vec::new();
     let mut reasoning_effort = None;
+    let mut model = None;
     let mut expected = 1_u64;
     let mut states = Vec::new();
     let mut redirect = None;
@@ -1719,12 +1777,13 @@ fn read_record_lines(
                 | REDIRECT_SCHEMA_VERSION
                 | CHILD_SCHEMA_VERSION
                 | REASONING_SCHEMA_VERSION
+                | MODEL_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "unsupported session schema version {} on line {} (Kit supports {})",
                 record.schema_version,
                 index + 1,
-                REASONING_SCHEMA_VERSION
+                MODEL_SCHEMA_VERSION
             ));
         }
         if record.session_id != session_id || record.generation != expected {
@@ -1744,19 +1803,40 @@ fn read_record_lines(
             .as_deref()
             .map(crate::ReasoningEffort::from_id)
             .transpose()?;
-        if selection.is_some() {
-            if record.schema_version != REASONING_SCHEMA_VERSION
+        let selected_model = record.model;
+        if selected_model.as_deref().is_some_and(str::is_empty) {
+            return Err("invalid session model record".into());
+        }
+        let selects = selection.is_some() || selected_model.is_some();
+        if selects {
+            let version_allowed = match selected_model {
+                Some(_) => record.schema_version == MODEL_SCHEMA_VERSION,
+                None => matches!(
+                    record.schema_version,
+                    REASONING_SCHEMA_VERSION | MODEL_SCHEMA_VERSION
+                ),
+            };
+            if !version_allowed
                 || record.workspace_root.is_none()
                 || record.item.is_some()
                 || record.child.is_some()
                 || record.redirect.is_some()
             {
-                return Err("invalid reasoning effort record".into());
+                return Err("invalid session selection record".into());
             }
-            reasoning_effort = selection;
-        } else if record.schema_version == REASONING_SCHEMA_VERSION {
-            return Err("reasoning effort record missing selection".into());
+            if selection.is_some() {
+                reasoning_effort = selection;
+            }
+            if selected_model.is_some() {
+                model = selected_model;
+            }
+        } else if matches!(
+            record.schema_version,
+            REASONING_SCHEMA_VERSION | MODEL_SCHEMA_VERSION
+        ) {
+            return Err("session selection record missing selection".into());
         }
+        let current_selection = || (reasoning_effort, model.clone());
         match (
             record.item,
             record.replacement,
@@ -1766,19 +1846,22 @@ fn read_record_lines(
         ) {
             (Some(item), None, None, None, None) if record.schema_version <= SCHEMA_VERSION => {
                 items.push(item.clone());
-                ancestry.push((HistoryEntry::Item(item), reasoning_effort));
+                ancestry.push((HistoryEntry::Item(item), current_selection()));
             }
             (None, Some(replacement), None, None, None)
                 if matches!(
                     record.schema_version,
-                    PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION | REASONING_SCHEMA_VERSION
+                    PREVIOUS_SCHEMA_VERSION
+                        | SCHEMA_VERSION
+                        | REASONING_SCHEMA_VERSION
+                        | MODEL_SCHEMA_VERSION
                 ) && !replacement.is_empty() =>
             {
                 if !items.is_empty() {
                     states.push(items.clone());
                 }
                 items = replacement.clone();
-                ancestry.push((HistoryEntry::Replacement(replacement), reasoning_effort));
+                ancestry.push((HistoryEntry::Replacement(replacement), current_selection()));
             }
             (None, None, Some(target), None, None)
                 if record.schema_version == REDIRECT_SCHEMA_VERSION
@@ -1792,12 +1875,12 @@ fn read_record_lines(
             {
                 child.validate()?;
                 children.insert(child.id.clone(), child.clone());
-                ancestry.push((HistoryEntry::Child(Box::new(child)), reasoning_effort));
+                ancestry.push((HistoryEntry::Child(Box::new(child)), current_selection()));
             }
             (None, None, None, None, Some(snapshot))
                 if matches!(
                     record.schema_version,
-                    CHILD_SCHEMA_VERSION | REASONING_SCHEMA_VERSION
+                    CHILD_SCHEMA_VERSION | REASONING_SCHEMA_VERSION | MODEL_SCHEMA_VERSION
                 ) && record.workspace_root.is_some()
                     && !snapshot.replacement.is_empty() =>
             {
@@ -1819,10 +1902,10 @@ fn read_record_lines(
                 }
                 items = snapshot.replacement.clone();
                 children = next;
-                ancestry.push((HistoryEntry::Snapshot(snapshot), reasoning_effort));
+                ancestry.push((HistoryEntry::Snapshot(snapshot), current_selection()));
             }
-            (None, None, None, None, None) if selection.is_some() => {
-                ancestry.push((HistoryEntry::Settings, reasoning_effort));
+            (None, None, None, None, None) if selects => {
+                ancestry.push((HistoryEntry::Settings, current_selection()));
             }
             _ => {
                 return Err(format!(
@@ -1842,6 +1925,7 @@ fn read_record_lines(
     states.push(items.clone());
     Ok(StoredTranscript::History(TranscriptHistory {
         reasoning_effort,
+        model,
         children: children.into_values().collect(),
         ancestry,
         items,
@@ -2625,6 +2709,7 @@ fn list_ids_in_with(filesystem: &Fs, directory: &Path) -> Result<Vec<String>, St
 
 struct Authority {
     reasoning_effort: Option<Option<crate::ReasoningEffort>>,
+    model: Option<String>,
     children: Vec<DurableChild>,
     items: Vec<Item>,
     historical_items: Vec<Vec<Item>>,
@@ -2650,7 +2735,7 @@ fn history_descends_from(history: &TranscriptHistory, ancestor: &TranscriptHisto
     let mut children: BTreeMap<&str, &DurableChild> = BTreeMap::new();
     // A match must hold at one committed record boundary. In particular, a
     // catalog title seed must never supply transcript ancestry for a snapshot.
-    for (entry, reasoning_effort) in &history.ancestry {
+    for (entry, (reasoning_effort, model)) in &history.ancestry {
         match entry {
             HistoryEntry::Settings => {}
             HistoryEntry::Item(item) => items.push(item),
@@ -2678,6 +2763,7 @@ fn history_descends_from(history: &TranscriptHistory, ancestor: &TranscriptHisto
             || legacy_prefix && items.len() >= ancestor.items.len())
             && items.iter().zip(&ancestor.items).all(|(a, b)| *a == b)
             && *reasoning_effort == ancestor.reasoning_effort
+            && *model == ancestor.model
             && children.len() == ancestor.children.len()
             && children
                 .values()
@@ -2861,7 +2947,8 @@ fn select_authority_with(
             (true, false) => *current = candidate,
             (false, true) => {}
             (true, true)
-                if candidate.history.reasoning_effort == current.history.reasoning_effort =>
+                if candidate.history.reasoning_effort == current.history.reasoning_effort
+                    && candidate.history.model == current.history.model =>
             {
                 if candidate.path == scoped {
                     *current = candidate;
@@ -2881,6 +2968,7 @@ fn select_authority_with(
     }
     Ok(authority.map(|candidate| Authority {
         reasoning_effort: candidate.history.reasoning_effort,
+        model: candidate.history.model,
         children: candidate.history.children,
         items: candidate.history.items,
         historical_items: candidate.history.states,
@@ -3147,9 +3235,22 @@ fn establish_scoped_authority(
     root: &Path,
     items: &[Item],
     children: &[DurableChild],
-    metadata: (Option<&[Item]>, Option<Option<crate::ReasoningEffort>>),
+    metadata: (
+        Option<&[Item]>,
+        Option<Option<crate::ReasoningEffort>>,
+        Option<&str>,
+    ),
 ) -> Result<(), String> {
-    let (title_seed, reasoning_effort) = metadata;
+    let (title_seed, reasoning_effort, model) = metadata;
+    let schema_version = |fallback| {
+        if model.is_some() {
+            MODEL_SCHEMA_VERSION
+        } else if reasoning_effort.is_some() {
+            REASONING_SCHEMA_VERSION
+        } else {
+            fallback
+        }
+    };
     let exists = fs::best_effort_global()
         .try_exists(path)
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
@@ -3157,6 +3258,7 @@ fn establish_scoped_authority(
         match read_records_direct(path, session_id)? {
             StoredTranscript::History(history)
                 if history.reasoning_effort == reasoning_effort
+                    && history.model.as_deref() == model
                     && history.items == items
                     && history.children == children
                     && transcript_workspace(path, session_id)?.as_deref() == Some(root) =>
@@ -3188,11 +3290,7 @@ fn establish_scoped_authority(
             filesystem,
             path,
             &Record {
-                schema_version: if reasoning_effort.is_some() {
-                    REASONING_SCHEMA_VERSION
-                } else {
-                    CHILD_SCHEMA_VERSION
-                },
+                schema_version: schema_version(CHILD_SCHEMA_VERSION),
                 session_id: session_id.into(),
                 generation,
                 workspace_root: Some(root.to_path_buf()),
@@ -3205,6 +3303,7 @@ fn establish_scoped_authority(
                         .map_or("default", crate::ReasoningEffort::as_str)
                         .into()
                 }),
+                model: model.map(str::to_owned),
                 snapshot: Some(ChildSnapshot {
                     replacement: items.to_vec(),
                     children: children.to_vec(),
@@ -3220,11 +3319,7 @@ fn establish_scoped_authority(
             filesystem,
             path,
             &Record {
-                schema_version: if reasoning_effort.is_some() {
-                    REASONING_SCHEMA_VERSION
-                } else {
-                    SCHEMA_VERSION
-                },
+                schema_version: schema_version(SCHEMA_VERSION),
                 session_id: session_id.into(),
                 generation,
                 workspace_root: Some(root.to_path_buf()),
@@ -3237,6 +3332,7 @@ fn establish_scoped_authority(
                         .map_or("default", crate::ReasoningEffort::as_str)
                         .into()
                 }),
+                model: model.map(str::to_owned),
                 snapshot: None,
             },
             create,
@@ -3250,11 +3346,7 @@ fn establish_scoped_authority(
         filesystem,
         path,
         &Record {
-            schema_version: if reasoning_effort.is_some() {
-                REASONING_SCHEMA_VERSION
-            } else {
-                SCHEMA_VERSION
-            },
+            schema_version: schema_version(SCHEMA_VERSION),
             session_id: session_id.into(),
             generation,
             workspace_root: Some(root.to_path_buf()),
@@ -3267,6 +3359,7 @@ fn establish_scoped_authority(
                     .map_or("default", crate::ReasoningEffort::as_str)
                     .into()
             }),
+            model: model.map(str::to_owned),
             snapshot: None,
         },
         create,
@@ -3307,6 +3400,7 @@ fn redirect_legacy_transcript(
             redirect: Some(target),
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         },
         false,
@@ -3670,6 +3764,124 @@ mod tests {
     }
 
     #[test]
+    fn model_survives_resume_and_fork() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "selected",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        assert_eq!(opened.model, None);
+        let original = opened.transcript.clone();
+        opened.observer.set_model("anthropic:first").unwrap();
+        opened.observer.set_model("anthropic:second").unwrap();
+        drop(opened);
+        let resumed = open(root.path(), "selected", true, false, vec![]).unwrap();
+        assert_eq!(resumed.model.as_deref(), Some("anthropic:second"));
+        assert_eq!(resumed.transcript, original);
+        drop(resumed);
+        clone_completed(root.path(), "selected", "fork").unwrap();
+        let fork = open(root.path(), "fork", true, false, vec![]).unwrap();
+        assert_eq!(fork.model.as_deref(), Some("anthropic:second"));
+    }
+
+    #[test]
+    fn unchanged_model_writes_no_record() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "selected",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        opened.observer.set_model("anthropic:same").unwrap();
+        opened.observer.checkpoint().unwrap();
+        let path = transcript_path(root.path(), "selected");
+        let before = fs::read_to_string(&path).unwrap();
+        opened.observer.set_model("anthropic:same").unwrap();
+        opened.observer.checkpoint().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn model_records_validate_schema_and_payload() {
+        let base = json!({"schema_version": SCHEMA_VERSION, "session_id": "abc",
+            "generation": 1, "replacement": [Item::text(ItemKind::System, "system")]});
+        let parse = |record: serde_json::Value| {
+            let bytes = format!("{base}\n{record}\n");
+            read_records_bytes(Path::new("abc.jsonl"), "abc", bytes.as_bytes())
+        };
+        for version in [
+            SCHEMA_VERSION,
+            CHILD_SCHEMA_VERSION,
+            REASONING_SCHEMA_VERSION,
+        ] {
+            assert!(
+                parse(
+                    json!({"schema_version": version, "session_id": "abc", "generation": 2,
+                    "workspace_root": "/workspace", "model": "anthropic:x"})
+                )
+                .is_err()
+            );
+        }
+        for invalid in [
+            json!({"schema_version": MODEL_SCHEMA_VERSION, "session_id": "abc", "generation": 2,
+                "workspace_root": "/workspace", "model": ""}),
+            json!({"schema_version": MODEL_SCHEMA_VERSION, "session_id": "abc", "generation": 2,
+                "workspace_root": "/workspace"}),
+            json!({"schema_version": MODEL_SCHEMA_VERSION, "session_id": "abc", "generation": 2,
+                "model": "anthropic:x"}),
+        ] {
+            assert!(parse(invalid).is_err());
+        }
+        // An id from a removed provider must not make the transcript unreadable.
+        let Ok(StoredTranscript::History(history)) = parse(
+            json!({"schema_version": MODEL_SCHEMA_VERSION, "session_id": "abc",
+                "generation": 2, "workspace_root": "/workspace", "model": "retired:x"}),
+        ) else {
+            panic!("model record should parse");
+        };
+        assert_eq!(history.model.as_deref(), Some("retired:x"));
+    }
+
+    #[test]
+    fn model_migration_preserves_selection_and_ancestry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("abc.jsonl");
+        let items = vec![Item::text(ItemKind::System, "system")];
+        let lock = SessionLock::acquire(path.with_extension("lock"), true).unwrap();
+        let filesystem = lock.filesystem().unwrap();
+        let establish = |model| {
+            establish_scoped_authority(
+                &filesystem,
+                &path,
+                "abc",
+                Path::new("/workspace"),
+                &items,
+                &[],
+                (None, None, model),
+            )
+            .unwrap();
+            let StoredTranscript::History(history) = read_records_direct(&path, "abc").unwrap()
+            else {
+                panic!()
+            };
+            history
+        };
+        let first = establish(Some("anthropic:first"));
+        assert_eq!(first.model.as_deref(), Some("anthropic:first"));
+        let second = establish(Some("anthropic:second"));
+        assert_eq!(second.model.as_deref(), Some("anthropic:second"));
+        assert!(history_descends_from(&second, &first));
+        assert!(!history_descends_from(&first, &second));
+    }
+
+    #[test]
     fn reasoning_effort_migration_preserves_joint_ancestry() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("abc.jsonl");
@@ -3683,7 +3895,7 @@ mod tests {
             Path::new("/workspace"),
             &items,
             &[],
-            (None, Some(Some(crate::ReasoningEffort::High))),
+            (None, Some(Some(crate::ReasoningEffort::High)), None),
         )
         .unwrap();
         let StoredTranscript::History(high) = read_records_direct(&path, "abc").unwrap() else {
@@ -3700,7 +3912,7 @@ mod tests {
             Path::new("/workspace"),
             &items,
             &[],
-            (None, Some(None)),
+            (None, Some(None), None),
         )
         .unwrap();
         let StoredTranscript::History(reset) = read_records_direct(&path, "abc").unwrap() else {
@@ -3716,7 +3928,7 @@ mod tests {
             Path::new("/workspace"),
             &items,
             &[],
-            (None, Some(Some(crate::ReasoningEffort::High))),
+            (None, Some(Some(crate::ReasoningEffort::High)), None),
         )
         .unwrap();
         let StoredTranscript::History(high_again) = read_records_direct(&path, "abc").unwrap()
@@ -3997,6 +4209,7 @@ mod tests {
                     redirect: None,
                     child: None,
                     reasoning_effort: None,
+                    model: None,
                     snapshot: None,
                 })
                 .unwrap()
@@ -4145,7 +4358,7 @@ mod tests {
             Path::new("/workspace"),
             &items,
             &authority.children,
-            (None, None),
+            (None, None, None),
         )
         .unwrap();
         let complete = fs::read_to_string(&path).unwrap();
@@ -4179,7 +4392,7 @@ mod tests {
                 Path::new("/workspace"),
                 &items,
                 &authority.children,
-                (None, None),
+                (None, None, None),
             )
             .unwrap();
             let restored = parsed_child_history(&fs::read(&path).unwrap());
@@ -4433,6 +4646,7 @@ mod tests {
                 redirect: None,
                 child: Some(child.clone()),
                 reasoning_effort: None,
+                model: None,
                 snapshot: None,
             },
             false,
@@ -5085,6 +5299,7 @@ mod tests {
                     redirect: Some(target),
                     child: None,
                     reasoning_effort: None,
+                    model: None,
                     snapshot: None,
                 };
                 let mut contents = fs::read_to_string(&path).unwrap();
@@ -5147,6 +5362,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         fs::write(
@@ -5280,6 +5496,7 @@ mod tests {
             redirect: Some(root.path().join("scoped/abc.jsonl")),
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
 
@@ -5383,7 +5600,7 @@ mod tests {
             &workspace,
             &expected,
             &[],
-            (Some(&expected[..2]), None),
+            (Some(&expected[..2]), None, None),
         )
         .unwrap();
         drop(scoped_lock);
@@ -5450,6 +5667,7 @@ mod tests {
                 redirect: None,
                 child: None,
                 reasoning_effort: None,
+                model: None,
                 snapshot: None,
             },
             false,
@@ -5483,6 +5701,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
@@ -5524,6 +5743,7 @@ mod tests {
             redirect: Some(normalized_absolute(&scoped).unwrap()),
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
@@ -5575,6 +5795,7 @@ mod tests {
                     redirect: None,
                     child: None,
                     reasoning_effort: None,
+                    model: None,
                     snapshot: None,
                 },
                 false,
@@ -5693,6 +5914,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         fs::write(
@@ -6495,6 +6717,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let mut encoded = serde_json::to_vec(&record).unwrap();
@@ -6921,6 +7144,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let original_user = Record {
@@ -6933,6 +7157,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let current = vec![
@@ -6949,6 +7174,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let legacy = super::transcript_path(storage.path(), id);
@@ -7035,6 +7261,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         fs::write(
@@ -7091,6 +7318,7 @@ mod tests {
                 redirect: None,
                 child: None,
                 reasoning_effort: None,
+                model: None,
                 snapshot: None,
             },
             Record {
@@ -7103,6 +7331,7 @@ mod tests {
                 redirect: None,
                 child: None,
                 reasoning_effort: None,
+                model: None,
                 snapshot: None,
             },
         ];
@@ -7154,6 +7383,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         fs::write(
@@ -7296,6 +7526,7 @@ mod tests {
             redirect: None,
             child: None,
             reasoning_effort: None,
+            model: None,
             snapshot: None,
         };
         let unscoped = super::transcript_path(storage.path(), "legacy-id");

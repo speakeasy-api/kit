@@ -729,6 +729,8 @@ pub(crate) struct AcpDriver {
     pub structured_completion: bool,
     pub adapter: SelectableAdapter,
     pub canonical_transcript: Vec<Item>,
+    /// Set when a resumed session's recorded model could not be restored.
+    pub model_fallback: Option<String>,
 }
 
 struct McpInstallSources {
@@ -761,6 +763,7 @@ pub struct Runtime {
     adapter: SelectableAdapter,
     provider: ProviderKind,
     model: String,
+    model_override: bool,
     reasoning_effort: Option<crate::provider::ReasoningEffort>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
@@ -884,6 +887,7 @@ impl Runtime {
             adapter,
             provider,
             model,
+            model_override: false,
             reasoning_effort,
             credential_storage,
             openrouter_api_key,
@@ -1036,6 +1040,38 @@ impl Runtime {
     }
 
     /// Configures compaction before publishing the runtime to any sessions.
+    /// Makes the configured model replace a resumed session's recorded model.
+    pub fn with_model_override(
+        runtime: Arc<Self>,
+        model_override: bool,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure model after runtime was shared".to_string())?;
+        runtime.model_override = model_override;
+        Ok(Arc::new(runtime))
+    }
+
+    async fn restored_selection(&self, recorded: Option<&str>) -> (ModelSelection, Option<String>) {
+        let configured = ModelSelection::new(self.provider, self.model.clone());
+        let Some(recorded) = recorded else {
+            return (configured, None);
+        };
+        if self.model_override || recorded == configured.id() {
+            return (configured, None);
+        }
+        match ModelSelection::from_id(recorded) {
+            Ok(selection) if self.adapter.can_restore(&selection).await => (selection, None),
+            _ => {
+                let notice = format!(
+                    "session model {recorded} is unavailable; using {}",
+                    configured.id()
+                );
+                tracing::warn!("{notice}");
+                (configured, Some(notice))
+            }
+        }
+    }
+
     pub fn with_compaction(
         runtime: Arc<Self>,
         policy: crate::compaction::policy::CompactionConfig,
@@ -1552,6 +1588,7 @@ impl Runtime {
             adapter: self.adapter.clone(),
             provider: self.provider,
             model: self.model.clone(),
+            model_override: self.model_override,
             reasoning_effort: self.reasoning_effort,
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
@@ -2334,12 +2371,23 @@ impl Runtime {
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
-        let (selection, reasoning_effort) = selected.unwrap_or_else(|| {
-            (
-                ModelSelection::new(self.provider, self.model.clone()),
-                opened.reasoning_effort.unwrap_or(self.reasoning_effort),
-            )
-        });
+        let (selection, reasoning_effort, model_fallback) = match selected {
+            Some((selection, reasoning_effort)) => (selection, reasoning_effort, None),
+            None => {
+                let (selection, fallback) = self.restored_selection(opened.model.as_deref()).await;
+                (
+                    selection,
+                    opened.reasoning_effort.unwrap_or(self.reasoning_effort),
+                    fallback,
+                )
+            }
+        };
+        if request.resume && self.model_override {
+            opened
+                .observer
+                .set_model(&selection.id())
+                .map_err(AcpRuntimeError::Loop)?;
+        }
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             selection.provider,
             selection.model,
@@ -2444,6 +2492,7 @@ impl Runtime {
             structured_completion: self.base_depth > 0,
             adapter,
             canonical_transcript,
+            model_fallback,
         };
         Ok(driver)
     }
