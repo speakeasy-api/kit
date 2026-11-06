@@ -30,7 +30,7 @@ use agentkit_core::{FinishReason, Item, ItemKind, Part, ToolOutput, TurnCancella
 use agentkit_loop::LoopError;
 
 pub(crate) use model::{HookedAdapter, HookedSession};
-pub(crate) use prompt::{PromptHook, PromptRecord};
+pub(crate) use prompt::{PromptHook, PromptHookBuilder, PromptRecord};
 pub(crate) use tool::hooked_tools;
 pub(crate) use turn::TurnHook;
 
@@ -281,7 +281,13 @@ fn options() -> Result<HooksOptions, String> {
                 .inject_context(capability::InjectContext::Now),
         ),
         session_end: Some(capability::session_end().observe()),
-        turn_start: Some(capability::turn_start().observe()),
+        turn_start: Some(
+            capability::turn_start()
+                .message()
+                .observe()
+                .deny()
+                .modify_prompt(Modify::Replace),
+        ),
         turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
             capability::user_message_inbound()

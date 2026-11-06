@@ -1,25 +1,66 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use agenthooksprotocol::generated::Event;
-use agenthooksprotocol::inputs::UserMessageInboundInput;
-use agenthooksprotocol::{EventType, UserMessageInboundInputMessage};
+use agenthooksprotocol::inputs::{TurnStartInput, UserMessageInboundInput};
+use agenthooksprotocol::{
+    EventType, TurnStartInputTrigger, TurnStartInputTurn, UserMessageInboundInputMessage,
+    UserMessageInboundInputTurn,
+};
 use agentkit_core::{ItemKind, Part};
-use agentkit_loop::{AgentEvent, LoopCtx, LoopError, LoopMutator, MutationPoint, TranscriptCursor};
+use agentkit_loop::{
+    AgentBuilder, AgentEvent, LoopCtx, LoopError, LoopMutator, ModelAdapter, MutationPoint,
+    TranscriptCursor, TranscriptEvent, TranscriptObserver,
+};
 use async_trait::async_trait;
 
 use super::Hooks;
 use crate::session::{SessionObserver, TransientTranscript};
 
-const ACP_RESOURCE: &str = "acp.resource.uri";
+const ACP_MESSAGE_ID: &str = "dev.kit.acp.message_id";
 
-/// Runs `user.message.inbound` over the prompt a new turn just admitted.
+/// Runs arrival policy before `turn.start` on the effective admitted prompt.
 ///
-/// Removing a denied prompt leaves no pending input, so the loop finishes the
-/// turn without calling the model.
+/// A denied batch is removed and explicitly fails its native turn, so older
+/// unfinished history cannot become pending model input.
 pub(crate) struct PromptHook {
     hooks: Arc<Hooks>,
     channel: &'static str,
     record: PromptRecord,
+    batch: PromptBatch,
+}
+
+/// Counts the unconsumed appended input suffix, not passive transcript history.
+/// The driver serializes callbacks and mutation; no guard spans hook dispatch.
+#[derive(Clone, Default)]
+struct PromptBatch(Arc<AtomicUsize>);
+
+impl TranscriptObserver for PromptBatch {
+    fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        if matches!(
+            event.item.kind,
+            ItemKind::User | ItemKind::Notification | ItemKind::Context
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.0.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Installs both halves of prompt admission so the batch boundary is exact.
+/// Register before transcript-rewriting mutators, including compaction: admission
+/// owns the appended batch before another policy can consume or relocate it.
+pub(crate) trait PromptHookBuilder {
+    fn prompt_hook(self, hook: PromptHook) -> Self;
+}
+
+impl<M: ModelAdapter> PromptHookBuilder for AgentBuilder<M> {
+    fn prompt_hook(self, hook: PromptHook) -> Self {
+        self.transcript_observer(hook.batch.clone()).mutator(hook)
+    }
 }
 
 /// Where the transcript a prompt edit or denial rewrites is recorded.
@@ -46,6 +87,189 @@ impl PromptHook {
             hooks,
             channel,
             record,
+            batch: PromptBatch::default(),
+        }
+    }
+}
+
+impl PromptHook {
+    async fn apply(
+        &self,
+        cursor: &mut TranscriptCursor<'_>,
+        ctx: &LoopCtx<'_>,
+        event_type: EventType,
+        index: Option<usize>,
+        start: usize,
+        trigger: TurnStartInputTrigger,
+    ) -> Result<bool, LoopError> {
+        let message = index.map(|index| super::message(&cursor[index], index));
+        let original: String = message
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                agenthooksprotocol::inputs::PartInput::Text(body) => editable_text(body),
+                _ => None,
+            })
+            .collect();
+        let Some(turn_id) = ctx.turn_id else {
+            return Ok(true);
+        };
+        let result = if event_type == EventType::UserMessageInbound {
+            let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
+                self.channel,
+                Vec::new(),
+                "user",
+            ));
+            input.session = Some(self.hooks.session(&ctx.session_id.to_string()));
+            input.turn = Some(UserMessageInboundInputTurn::new(turn_id.to_string()));
+            super::dispatch(
+                self.hooks.sdk.user_message_inbound(
+                    input
+                        .with_sources()
+                        .with_message_messages(message.into_iter().collect()),
+                ),
+                ctx.cancellation.as_ref(),
+            )
+            .await
+        } else {
+            let items = cursor[start..]
+                .iter()
+                .enumerate()
+                .map(|(offset, item)| super::message(item, start + offset))
+                .collect();
+            let input = TurnStartInput::new(
+                Vec::new(),
+                trigger,
+                TurnStartInputTurn::new(turn_id.to_string()),
+            )
+            .with_session(self.hooks.session(&ctx.session_id.to_string()));
+            // Start delivery owns the session's observation gate until the SDK
+            // finishes. Dropping the admission wait must not drop a start that
+            // has not reached the transport yet, or allow its end to overtake it.
+            let guard = self
+                .hooks
+                .turn_delivery(&ctx.session_id.to_string())
+                .lock_owned()
+                .await;
+            let sdk = Arc::clone(&self.hooks.sdk);
+            let cancellation = ctx.cancellation.clone();
+            let operation = tokio::spawn(async move {
+                let _guard = guard;
+                let input = if cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+                {
+                    input.with_sources()
+                } else {
+                    input.with_sources().with_items(items)
+                };
+                super::dispatch(sdk.turn_start(input), None).await
+            });
+            let operation = async move {
+                operation
+                    .await
+                    .map_err(|error| LoopError::InvalidState(error.to_string()))?
+            };
+            let operation = std::pin::pin!(operation);
+            if let Some(cancellation) = ctx.cancellation.as_ref() {
+                let cancelled = std::pin::pin!(cancellation.cancelled());
+                match futures_util::future::select(cancelled, operation).await {
+                    futures_util::future::Either::Left(_) => Err(LoopError::Cancelled),
+                    futures_util::future::Either::Right((result, _)) => {
+                        if cancellation.is_cancelled() {
+                            Err(LoopError::Cancelled)
+                        } else {
+                            result
+                        }
+                    }
+                }
+            } else {
+                operation.await
+            }
+        };
+        if matches!(&result, Err(LoopError::Cancelled)) {
+            return Err(LoopError::Cancelled);
+        }
+        let edited = match self
+            .hooks
+            .settle(event_type, result, &ctx.session_id.to_string())
+        {
+            Some(outcome) if outcome.outcome.is_denied() => Err(super::denial(&outcome.outcome)),
+            Some(outcome)
+                if event_type == EventType::TurnStart && !super::has_modification(&outcome) =>
+            {
+                return Ok(true);
+            }
+            Some(outcome) => match outcome.event {
+                Event::TurnStart(event) => {
+                    // `prompt` replaces the entire admitted canonical item list,
+                    // not just the final user's text. Reuse model-effect validation
+                    // to retain authorized opaque parts and reject fabricated media.
+                    if index.is_none() {
+                        return Ok(true);
+                    }
+                    let mut replacement = super::model::canonical_items_at(
+                        event.0.items.iter().map(|item| item.0.as_ref()),
+                        &cursor[start..],
+                        start,
+                    )?;
+                    // Canonical IDs belong to the hook; ACP replay identity belongs
+                    // to the host and survives a replacement with a new ID.
+                    if let Some(identity) =
+                        index.and_then(|index| cursor[index].metadata.get(ACP_MESSAGE_ID))
+                        && let Some(user) = replacement
+                            .iter_mut()
+                            .rev()
+                            .find(|item| item.kind == ItemKind::User)
+                    {
+                        user.metadata
+                            .insert(ACP_MESSAGE_ID.into(), identity.clone());
+                    }
+                    cursor.splice(start.., replacement);
+                    self.persist(cursor, ctx);
+                    return Ok(true);
+                }
+                Event::UserMessageInbound(event) => Ok(event
+                    .message
+                    .messages
+                    .iter()
+                    .map(|message| message_text(&message.parts))
+                    .collect::<Vec<_>>()
+                    .join("\n")),
+                _ => return Ok(true),
+            },
+            None => Err("agent hook dispatch failed".into()),
+        };
+        let Some(index) = index else {
+            return Ok(true);
+        };
+        let accepted = edited.is_ok();
+        match edited {
+            Ok(text) => {
+                if text == original {
+                    return Ok(true);
+                }
+                if let Some(prompt) = cursor.get_mut(index) {
+                    prompt.parts.retain(|part| super::part_text(part).is_none());
+                    prompt.parts.insert(0, Part::text(text));
+                }
+            }
+            Err(reason) => {
+                cursor.truncate(start);
+                ctx.emitter.emit(AgentEvent::Warning {
+                    message: format!("prompt blocked by agent hook: {reason}"),
+                });
+            }
+        }
+        self.persist(cursor, ctx);
+        Ok(accepted)
+    }
+
+    fn persist(&self, cursor: &[agentkit_core::Item], ctx: &LoopCtx<'_>) {
+        if let Err(error) = self.record.replace(cursor) {
+            ctx.emitter.emit(AgentEvent::Warning {
+                message: format!("could not persist agent hook prompt edit: {error}"),
+            });
         }
     }
 }
@@ -57,100 +281,107 @@ impl LoopMutator for PromptHook {
         cursor: &mut TranscriptCursor<'_>,
         ctx: LoopCtx<'_>,
     ) -> Result<(), LoopError> {
-        if ctx.point != MutationPoint::AfterTurnEnded {
+        if !matches!(
+            ctx.point,
+            MutationPoint::AfterTurnEnded | MutationPoint::AfterToolResult
+        ) {
             return Ok(());
         }
         self.hooks
             .drain_turn_events(&ctx.session_id.to_string())
             .await;
-        let Some(prompt) = cursor.last().filter(|item| item.kind == ItemKind::User) else {
-            return Ok(());
+        // Consume the append count before awaiting policy, including cancellation.
+        let pending = self.batch.0.swap(0, Ordering::Relaxed);
+        let start = cursor
+            .len()
+            .checked_sub(pending)
+            .ok_or_else(|| LoopError::InvalidState("prompt batch exceeds transcript".into()))?;
+        let index = cursor.len().checked_sub(1).filter(|&index| {
+            index >= start && matches!(cursor[index].kind, ItemKind::User | ItemKind::Notification)
+        });
+        // Arrival and admission are separate boundaries with shared message identity.
+        // A2A and delegated sessions carry agent-originated input; foreground
+        // CLI and ACP expose user prompts. Internal notifications are external.
+        let trigger = if index.is_none_or(|index| cursor[index].kind != ItemKind::User)
+            || self.channel == "a2a"
+            || self.hooks.injections.is_child(&ctx.session_id.to_string())
+        {
+            TurnStartInputTrigger::External
+        } else {
+            TurnStartInputTrigger::User
         };
-        let index = cursor.len().saturating_sub(1);
-        let message = super::message(prompt, index);
-        let original: String = message
-            .parts
-            .iter()
-            .filter_map(|part| match part {
-                agenthooksprotocol::inputs::PartInput::Text(body) => editable_text(body),
-                _ => None,
-            })
-            .collect();
-        let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
-            self.channel,
-            Vec::new(),
-            "user",
-        ));
-        input.session = Some(self.hooks.session(&ctx.session_id.to_string()));
-        input.turn = ctx
-            .turn_id
-            .map(|id| agenthooksprotocol::UserMessageInboundInputTurn::new(id.to_string()));
-        let boundary = self
-            .hooks
-            .sdk
-            .user_message_inbound(input.with_sources().with_message_messages(vec![message]));
-        let result = super::dispatch(boundary, ctx.cancellation.as_ref()).await;
-        if matches!(&result, Err(LoopError::Cancelled)) {
-            return Err(LoopError::Cancelled);
-        }
-        let edited = match self.hooks.settle(
-            EventType::UserMessageInbound,
-            result,
-            &ctx.session_id.to_string(),
-        ) {
-            Some(outcome) if outcome.outcome.is_denied() => Err(super::denial(&outcome.outcome)),
-            Some(outcome) => match outcome.event {
-                Event::UserMessageInbound(event) => Ok(event
-                    .message
-                    .messages
-                    .iter()
-                    .map(|message| {
-                        message
-                            .parts
-                            .iter()
-                            .filter_map(|part| match part.as_ref() {
-                                agenthooksprotocol::ContentItem::TextBodyPart(body) => {
-                                    editable_text(body)
-                                }
-                                _ => None,
-                            })
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")),
-                _ => return Ok(()),
-            },
-            None => Err("agent hook dispatch failed".into()),
+        // Notifications are execution input, not transport arrivals. A user
+        // interjection after tools is an arrival within the existing turn.
+        let arrival = if index.is_some_and(|index| cursor[index].kind == ItemKind::User) {
+            self.apply(
+                cursor,
+                &ctx,
+                EventType::UserMessageInbound,
+                index,
+                start,
+                trigger.clone(),
+            )
+            .await
+        } else {
+            Ok(true)
         };
-        match edited {
-            Ok(text) => {
-                if text == original {
-                    return Ok(());
+        let new_turn = ctx.turn_id.is_some_and(|turn| {
+            self.hooks
+                .claim_turn_start(&ctx.session_id.to_string(), &turn.to_string())
+        });
+        let accepted = matches!(arrival, Ok(true));
+        let index = match arrival {
+            Ok(true) => index,
+            Ok(false) => None,
+            Err(LoopError::Cancelled) => {
+                if new_turn {
+                    // The native turn still ends. Deliver its start without accepting
+                    // effects from the cancelled admission or changing the transcript.
+                    if let Some(turn_id) = ctx.turn_id {
+                        let input = TurnStartInput::new(
+                            Vec::new(),
+                            trigger,
+                            TurnStartInputTurn::new(turn_id.to_string()),
+                        )
+                        .with_session(self.hooks.session(&ctx.session_id.to_string()));
+                        super::settle(
+                            EventType::TurnStart,
+                            super::dispatch(self.hooks.sdk.turn_start(input.with_sources()), None)
+                                .await,
+                        );
+                    }
                 }
-                if let Some(prompt) = cursor.last_mut() {
-                    prompt.parts.retain(|part| super::part_text(part).is_none());
-                    prompt.parts.insert(0, Part::text(text));
-                }
+                return Err(LoopError::Cancelled);
             }
-            Err(reason) => {
-                cursor.pop();
-                while cursor.last().is_some_and(|item| {
-                    item.kind == ItemKind::Context && item.metadata.contains_key(ACP_RESOURCE)
-                }) {
-                    cursor.pop();
-                }
-                ctx.emitter.emit(AgentEvent::Warning {
-                    message: format!("prompt blocked by agent hook: {reason}"),
-                });
+            Err(error) => return Err(error),
+        };
+        if new_turn {
+            // Even rejected input owns a native turn. Report an empty admitted
+            // input rather than inventing a prompt or leaving an unmatched end.
+            let admitted = self
+                .apply(cursor, &ctx, EventType::TurnStart, index, start, trigger)
+                .await?;
+            if !admitted {
+                return Err(LoopError::Mutator("prompt blocked by agent hook".into()));
             }
         }
-        if let Err(error) = self.record.replace(cursor) {
-            ctx.emitter.emit(AgentEvent::Warning {
-                message: format!("could not persist agent hook prompt edit: {error}"),
-            });
+        // Transcript shape is not a finish signal: removing this batch may expose
+        // a failed user prompt, notification, or tool result from an older turn.
+        if !accepted {
+            return Err(LoopError::Mutator("prompt blocked by agent hook".into()));
         }
         Ok(())
     }
+}
+
+fn message_text(parts: &[Box<agenthooksprotocol::ContentItem>]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part.as_ref() {
+            agenthooksprotocol::ContentItem::TextBodyPart(body) => editable_text(body),
+            _ => None,
+        })
+        .collect()
 }
 
 // Reference descriptors describe retained non-text input; do not inject their

@@ -125,7 +125,7 @@ async fn registration_headers_reach_http_hook_requests() {
                         "X-Kit-Test": "configured-header",
                     },
                 },
-                "subscriptions": [intercept(&["user.message.inbound"])],
+                "subscriptions": [intercept(&["turn.start"])],
             }],
         }))
         .unwrap(),
@@ -134,7 +134,7 @@ async fn registration_headers_reach_http_hook_requests() {
     let mut options = options().unwrap();
     options.backend.allow_loopback_http = true;
     let hooks = Arc::new(Hooks::new(read(&path).unwrap().unwrap(), options).unwrap());
-    prompt(&hooks, &Model::default(), "hello").await;
+    prompt(&hooks, &Model::default(), "hello").await.0.unwrap();
     let headers = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
         .await
         .unwrap()
@@ -148,6 +148,7 @@ async fn registration_headers_reach_http_hook_requests() {
 fn every_intercept_event_accepts_observe_subscriptions() {
     for event in [
         "user.message.inbound",
+        "turn.start",
         "model.request.before",
         "tool.before",
         "tool.after",
@@ -160,6 +161,23 @@ fn every_intercept_event_accepts_observe_subscriptions() {
 }
 
 #[test]
+fn turn_start_grants_prompt_effects_without_injection_or_flow() {
+    let grants = options().unwrap().capabilities.to_wire();
+    let start = serde_json::to_value(&grants[&EventType::TurnStart]).unwrap();
+    let capabilities = &start["capabilities"];
+    assert_eq!(
+        capabilities["effects"],
+        json!(["deny", "message", "modify"])
+    );
+    assert_eq!(
+        capabilities["modify"]["prompt"],
+        json!({"replace": true, "merge": false})
+    );
+    assert!(capabilities.get("inject").is_none());
+    assert!(capabilities.get("flow").is_none());
+}
+
+#[test]
 fn every_granted_event_accepts_wildcard_subscriptions() {
     hooks(vec![intercept(&["*"]), observe(&["*"])]);
 }
@@ -167,7 +185,7 @@ fn every_granted_event_accepts_wildcard_subscriptions() {
 #[tokio::test]
 async fn every_lifecycle_event_reports_harness_identity() {
     let (hooks, backend) = hooks(vec![intercept(&["*"]), observe(&["*"])]);
-    prompt(&hooks, &Model::default(), "hello").await;
+    prompt(&hooks, &Model::default(), "hello").await.0.unwrap();
     call(&hooks, &Echo::new(), json!({"text": "hello"})).await;
     hooks
         .session_end("abc", SessionEndInputOutcome::Completed)
@@ -200,7 +218,6 @@ async fn every_lifecycle_event_reports_harness_identity() {
         "session.end",
         "turn.start",
         "turn.end",
-        "user.message.inbound",
         "model.request.before",
         "model.response.after",
         "model.error",
@@ -927,11 +944,27 @@ fn last_user_text(transcript: &[Item]) -> Option<String> {
         .map(|item| item.parts.iter().filter_map(part_text).collect())
 }
 
-async fn prompt(hooks: &Arc<Hooks>, model: &Model, text: &str) -> (LoopStep, Vec<Item>) {
+fn transient_prompt_hook(hooks: &Arc<Hooks>, channel: &'static str) -> PromptHook {
+    PromptHook::new(
+        hooks.clone(),
+        channel,
+        PromptRecord::Transient(crate::session::TransientTranscript::new(vec![])),
+    )
+}
+
+async fn prompt(
+    hooks: &Arc<Hooks>,
+    model: &Model,
+    text: &str,
+) -> (Result<LoopStep, LoopError>, Vec<Item>) {
     admit(hooks, model, vec![Item::text(ItemKind::User, text)]).await
 }
 
-async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep, Vec<Item>) {
+async fn admit(
+    hooks: &Arc<Hooks>,
+    model: &Model,
+    input: Vec<Item>,
+) -> (Result<LoopStep, LoopError>, Vec<Item>) {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("sessions");
     let initial = vec![Item::text(ItemKind::System, "system")];
@@ -944,7 +977,7 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
             Some(hooks.clone()),
             SessionStartInputTrigger::Startup,
         ))
-        .mutator(PromptHook::new(
+        .prompt_hook(PromptHook::new(
             hooks.clone(),
             "cli",
             PromptRecord::Session(opened.observer.clone()),
@@ -957,17 +990,585 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
         .start(SessionConfig::new("abc"))
         .await
         .unwrap();
-    let step = driver.next().await.unwrap();
+    let step = driver.next().await;
     hooks.drain_turn_events("abc").await;
     let persisted = crate::session::load_in(root.path(), &directory, "abc").unwrap();
     (step, persisted)
 }
 
 #[tokio::test]
-async fn prompt_edits_replace_the_submitted_text() {
+async fn turn_start_intercepts_initial_and_subsequent_prompts_with_channel_triggers() {
+    for (channel, trigger) in [("cli", "user"), ("acp", "user"), ("a2a", "external")] {
+        let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+        backend.respond(
+            "turn.start",
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("edited")}]),
+        );
+        let model = Model::default();
+        let recorded = crate::session::TransientTranscript::new(vec![]);
+        let mut driver = Agent::builder()
+            .model(model.clone())
+            .prompt_hook(PromptHook::new(
+                hooks.clone(),
+                channel,
+                PromptRecord::Transient(recorded.clone()),
+            ))
+            .transcript_observer(recorded.clone())
+            .input(vec![Item::text(ItemKind::User, "first")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(channel))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "second")])
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        let starts = backend.events("turn.start");
+        assert_eq!(starts.len(), 2, "{channel}");
+        for (event, submitted) in starts.iter().zip(["first", "second"]) {
+            assert_eq!(event["trigger"], trigger);
+            assert_eq!(event["items"].as_array().unwrap().len(), 1);
+            assert_eq!(event["items"][0]["parts"][0]["text"], submitted);
+            assert_eq!(event["session"]["id"], channel);
+            assert!(event.get("message").is_none());
+        }
+        assert_ne!(starts[0]["turn"]["id"], starts[1]["turn"]["id"]);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(last_user_text(request).as_deref(), Some("edited"));
+        }
+        let users: Vec<_> = recorded
+            .snapshot()
+            .into_iter()
+            .filter(|item| item.kind == ItemKind::User)
+            .collect();
+        assert_eq!(users.len(), 2);
+        for user in users {
+            assert_eq!(user.parts, vec![Part::text("edited")]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn delegated_acp_prompt_uses_external_turn_start_trigger() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    let mut driver = Agent::builder()
+        .model(
+            HookedAdapter::new(
+                Model::default(),
+                Some(hooks.clone()),
+                SessionStartInputTrigger::Startup,
+            )
+            .with_child(true),
+        )
+        .prompt_hook(transient_prompt_hook(&hooks, "acp"))
+        .input(vec![Item::text(ItemKind::User, "delegated task")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("delegated-acp"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.next().await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    let starts = backend.events("turn.start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["trigger"], "external");
+    assert_eq!(
+        starts[0]["session"]["agent"],
+        json!({"id": "delegated-acp"})
+    );
+    assert_eq!(starts[0]["items"][0]["parts"][0]["text"], "delegated task");
+}
+
+#[tokio::test]
+async fn turn_start_contains_attached_resources_and_multimodal_prompt() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    let mut resource = Item::text(ItemKind::Context, "attached resource");
+    resource
+        .metadata
+        .insert("acp.resource.uri".into(), json!("file:///notes.txt"));
+    let image = Part::media(
+        Modality::Image,
+        "image/png",
+        DataRef::uri("file:///image.png"),
+    );
+    let model = Model::default();
+    admit(
+        &hooks,
+        &model,
+        vec![
+            resource,
+            Item::new(ItemKind::User, vec![Part::text("question"), image]),
+        ],
+    )
+    .await
+    .0
+    .unwrap();
+    let starts = backend.events("turn.start");
+    assert_eq!(starts.len(), 1);
+    let items = starts[0]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["parts"][0]["text"], "attached resource");
+    assert_eq!(items[1]["parts"][0]["text"], "question");
+    let descriptor: Value =
+        serde_json::from_str(items[1]["parts"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(descriptor["mediaType"], "image/png");
+    assert_eq!(
+        descriptor["data"],
+        serde_json::to_value(DataRef::uri("file:///image.png")).unwrap()
+    );
+    assert_eq!(
+        last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
+        Some("question")
+    );
+}
+
+#[tokio::test]
+async fn turn_start_replacement_retains_unchanged_native_attachments_by_admitted_identity() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    let image = Part::media(
+        Modality::Image,
+        "image/png",
+        DataRef::uri("file:///image.png"),
+    );
+    // System history occupies index 0; attached context and user are indices 1–2.
+    let mut replacement = text_message("edited");
+    replacement[0]["id"] = json!("item-2");
+    replacement[0]["parts"][0]["id"] = json!("item-2/0");
+    for part in content_parts("item-2/1", &image) {
+        let agenthooksprotocol::inputs::PartInput::Text(body) = part else {
+            panic!("expected URI descriptor");
+        };
+        replacement[0]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(body).unwrap());
+    }
+    backend.respond(
+        "turn.start",
+        json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":replacement}]),
+    );
+    let mut resource = Item::text(ItemKind::Context, "resource");
+    resource
+        .metadata
+        .insert("acp.resource.uri".into(), json!("file:///notes.txt"));
+    let model = Model::default();
+    let (_, persisted) = admit(
+        &hooks,
+        &model,
+        vec![
+            resource,
+            Item::new(ItemKind::User, vec![Part::text("original"), image.clone()]),
+        ],
+    )
+    .await;
+    let requests = model.requests.lock().unwrap();
+    for items in [&persisted, &requests[0]] {
+        let user = items
+            .iter()
+            .find(|item| item.kind == ItemKind::User)
+            .unwrap();
+        assert_eq!(user.parts, vec![Part::text("edited"), image.clone()]);
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.metadata.contains_key("acp.resource.uri"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn turn_start_replacement_replaces_the_whole_admitted_item_list() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("replacement")} ]));
+    let mut resource = Item::text(ItemKind::Context, "original resource");
+    resource
+        .metadata
+        .insert("acp.resource.uri".into(), json!("file:///notes.txt"));
+    let model = Model::default();
+    let (_, persisted) = admit(
+        &hooks,
+        &model,
+        vec![
+            resource,
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("original"),
+                    Part::media(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::uri("file:///image.png"),
+                    ),
+                ],
+            ),
+        ],
+    )
+    .await;
+    let requests = model.requests.lock().unwrap();
+    for items in [&persisted, &requests[0]] {
+        let users: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind == ItemKind::User)
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].parts, vec![Part::text("replacement")]);
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.metadata.contains_key("acp.resource.uri"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn turn_start_owns_prepended_notifications_without_absorbing_history() {
+    for deny in [false, true] {
+        let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+        backend.respond("turn.start", if deny {
+            json!([{"type":"deny", "reason":"blocked"}])
+        } else {
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("replacement")}])
+        });
+        let model = Model::default();
+        let history = vec![
+            Item::text(ItemKind::User, "prior user"),
+            Item::notification("prior notification"),
+        ];
+        let recorded = crate::session::TransientTranscript::new(history.clone());
+        let mut driver = Agent::builder()
+            .model(model.clone())
+            .prompt_hook(PromptHook::new(
+                hooks.clone(),
+                "acp",
+                PromptRecord::Transient(recorded.clone()),
+            ))
+            .transcript_observer(recorded.clone())
+            .transcript(history.clone())
+            .input(vec![
+                Item::notification("voice changed"),
+                Item::text(ItemKind::User, "hello"),
+            ])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("batch"))
+            .await
+            .unwrap();
+        let step = driver.next().await;
+        if deny {
+            assert!(matches!(step, Err(LoopError::Mutator(_))));
+        } else {
+            assert!(matches!(step, Ok(LoopStep::Finished(_))));
+        }
+        let starts = backend.events("turn.start");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(starts[0]["items"][0]["parts"][0]["text"], "voice changed");
+        let persisted = recorded.snapshot();
+        assert_eq!(&persisted[..history.len()], history.as_slice());
+        assert!(
+            !persisted
+                .iter()
+                .any(|item| item.parts == vec![Part::text("voice changed")])
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(!deny));
+        if !deny {
+            assert_eq!(last_user_text(&requests[0]).as_deref(), Some("replacement"));
+            assert_eq!(&requests[0][..history.len()], history.as_slice());
+            assert!(
+                !requests[0]
+                    .iter()
+                    .any(|item| item.parts == vec![Part::text("voice changed")])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_start_admits_manual_compaction_before_the_command_is_consumed() {
+    for deny in [false, true] {
+        let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+        backend.respond("turn.start", if deny {
+            json!([{"type":"deny", "reason":"blocked"}])
+        } else {
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("replacement")}])
+        });
+        let history = vec![
+            Item::text(ItemKind::User, "prior user"),
+            Item::text(ItemKind::Assistant, "prior answer"),
+        ];
+        let recorded = crate::session::TransientTranscript::new(history.clone());
+        let compactor = crate::compaction::automatic(
+            Model::default(),
+            agentkit_loop::TelemetryConfig::default(),
+            None,
+            "compact-admission",
+            "compact-admission",
+            None,
+        )
+        .unwrap()
+        .mirroring(recorded.clone());
+        let model = Model::default();
+        let mut driver = Agent::builder()
+            .model(model.clone())
+            .prompt_hook(PromptHook::new(
+                hooks.clone(),
+                "cli",
+                PromptRecord::Transient(recorded.clone()),
+            ))
+            .mutator(compactor)
+            .transcript_observer(recorded.clone())
+            .transcript(history.clone())
+            .input(vec![Item::text(ItemKind::User, "/compact")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("compact-admission"))
+            .await
+            .unwrap();
+        let step = driver.next().await;
+        if deny {
+            assert!(matches!(step, Err(LoopError::Mutator(_))));
+        } else {
+            assert!(matches!(step, Ok(LoopStep::Finished(_))));
+        }
+        let starts = backend.events("turn.start");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(starts[0]["items"][0]["parts"][0]["text"], "/compact");
+        assert_eq!(&recorded.snapshot()[..history.len()], history.as_slice());
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(!deny));
+        if !deny {
+            assert_eq!(last_user_text(&requests[0]).as_deref(), Some("replacement"));
+            assert_eq!(&requests[0][..history.len()], history.as_slice());
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_start_replacement_preserves_host_acp_replay_identity() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("edited")} ]));
+    let mut user = Item::text(ItemKind::User, "original");
+    user.metadata
+        .insert("dev.kit.acp.message_id".into(), json!("kit-user-live"));
+    let model = Model::default();
+    let (_, persisted) = admit(&hooks, &model, vec![user]).await;
+    let requests = model.requests.lock().unwrap();
+    for items in [&persisted, &requests[0]] {
+        let user = items
+            .iter()
+            .find(|item| item.kind == ItemKind::User)
+            .unwrap();
+        assert_eq!(user.parts, vec![Part::text("edited")]);
+        assert_eq!(
+            user.metadata["dev.kit.acp.message_id"],
+            json!("kit-user-live")
+        );
+    }
+}
+
+#[tokio::test]
+async fn turn_start_messages_reach_the_session_after_inbound_and_before_model() {
+    let (hooks, backend) = hooks(vec![intercept(&["*"]), observe(&["turn.end"])]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let _subscription = hooks.subscribe_messages("abc".into(), move |text| {
+        sender.send(text.to_owned()).is_ok()
+    });
+    backend.respond(
+        "turn.start",
+        json!([{"type":"message", "text":"prompt accepted"}]),
+    );
+    let model = Model::default();
+    let (_, persisted) = prompt(&hooks, &model, "hello").await;
+    assert_eq!(receiver.try_iter().collect::<Vec<_>>(), ["prompt accepted"]);
+    assert_eq!(last_user_text(&persisted).as_deref(), Some("hello"));
+    assert_eq!(
+        last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
+        Some("hello")
+    );
+    let inbound = backend.events("user.message.inbound");
+    let starts = backend.events("turn.start");
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(
+        inbound[0]["message"]["messages"][0]["id"],
+        starts[0]["items"][0]["id"]
+    );
+    let types: Vec<_> = backend
+        .all_events()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "session.start",
+            "user.message.inbound",
+            "turn.start",
+            "model.request.before",
+            "model.response.after",
+            "turn.end"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn inbound_replacement_is_the_effective_turn_start_prompt() {
+    let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound", "turn.start"])]);
+    backend.respond("user.message.inbound", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("inbound edit")}]));
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("turn edit")}]));
+    let model = Model::default();
+    let (_, persisted) = prompt(&hooks, &model, "original").await;
+    let inbound = backend.events("user.message.inbound");
+    let starts = backend.events("turn.start");
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        inbound[0]["message"]["messages"][0]["parts"][0]["text"],
+        "original"
+    );
+    assert_eq!(starts[0]["items"][0]["parts"][0]["text"], "inbound edit");
+    assert_eq!(
+        inbound[0]["message"]["messages"][0]["id"],
+        starts[0]["items"][0]["id"]
+    );
+    assert_eq!(last_user_text(&persisted).as_deref(), Some("turn edit"));
+    assert_eq!(
+        last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
+        Some("turn edit")
+    );
+}
+
+#[tokio::test]
+async fn inbound_only_replacement_still_reaches_model_and_persistence() {
     let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
+    backend.respond("user.message.inbound", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("inbound edit")}]));
+    let model = Model::default();
+    let (_, persisted) = prompt(&hooks, &model, "original").await;
+    assert_eq!(last_user_text(&persisted).as_deref(), Some("inbound edit"));
+    assert_eq!(
+        last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
+        Some("inbound edit")
+    );
+}
+
+#[tokio::test]
+async fn inbound_denial_emits_empty_turn_start_and_finishes_without_model() {
+    let (hooks, backend) = hooks(vec![
+        intercept(&["user.message.inbound", "turn.start"]),
+        observe(&["turn.end"]),
+    ]);
     backend.respond(
         "user.message.inbound",
+        json!([{"type":"deny", "reason":"blocked"}]),
+    );
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not resurrect")} ]));
+    let model = Model::default();
+    let (step, persisted) = prompt(&hooks, &model, "original").await;
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(last_user_text(&persisted), None);
+    assert_eq!(backend.events("user.message.inbound").len(), 1);
+    let starts = backend.events("turn.start");
+    let ends = backend.events("turn.end");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["items"], json!([]));
+    assert_eq!(ends.len(), 1);
+    assert_eq!(starts[0]["turn"], ends[0]["turn"]);
+}
+
+#[tokio::test]
+async fn notification_only_turns_emit_external_boundaries_without_user_inbound() {
+    let (hooks, backend) = hooks(vec![
+        intercept(&["user.message.inbound", "turn.start"]),
+        observe(&["turn.end"]),
+    ]);
+    let model = Model::default();
+    let mut driver = Agent::builder()
+        .model(model.clone())
+        .observer(TurnHook(hooks.clone()))
+        .prompt_hook(transient_prompt_hook(&hooks, "acp"))
+        .input(vec![Item::notification("first notification")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("notifications"))
+        .await
+        .unwrap();
+    for text in ["first notification", "second notification"] {
+        if text == "second notification" {
+            driver.submit_input(vec![Item::notification(text)]).unwrap();
+        }
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        hooks.drain_turn_events("notifications").await;
+    }
+    let starts = backend.events("turn.start");
+    let ends = backend.events("turn.end");
+    assert_eq!(starts.len(), 2);
+    assert_eq!(ends.len(), 2);
+    for ((start, end), text) in starts
+        .iter()
+        .zip(&ends)
+        .zip(["first notification", "second notification"])
+    {
+        assert_eq!(start["trigger"], "external");
+        assert_eq!(start["items"][0]["parts"][0]["text"], text);
+        assert_eq!(start["items"][0]["role"], "user");
+        assert_eq!(start["turn"], end["turn"]);
+    }
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert!(backend.events("user.message.inbound").is_empty());
+}
+
+#[tokio::test]
+async fn notification_turn_start_replacement_reaches_model_and_persistence() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("edited notification")} ]));
+    let model = Model::default();
+    let (_, persisted) = admit(&hooks, &model, vec![Item::notification("autonomous work")]).await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    for items in [&persisted, &requests[0]] {
+        assert_eq!(
+            last_user_text(items).as_deref(),
+            Some("edited notification")
+        );
+        assert!(items.iter().all(|item| item.kind != ItemKind::Notification));
+    }
+}
+
+#[tokio::test]
+async fn notification_turn_start_denial_prevents_model_call() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type":"deny", "reason":"blocked"}]));
+    let model = Model::default();
+    let (step, persisted) =
+        admit(&hooks, &model, vec![Item::notification("autonomous work")]).await;
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert!(persisted.iter().all(|item| item.kind == ItemKind::System));
+    assert_eq!(backend.events("turn.start").len(), 1);
+}
+
+#[tokio::test]
+async fn prompt_edits_replace_the_submitted_text() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond(
+        "turn.start",
         json!([{"type": "modify", "target": "prompt", "operation": "replace", "value": text_message("edited")}]),
     );
     let model = Model::default();
@@ -981,27 +1582,21 @@ async fn prompt_edits_replace_the_submitted_text() {
 
 #[tokio::test]
 async fn denied_prompts_finish_without_a_model_call() {
-    let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
-    backend.respond(
-        "user.message.inbound",
-        json!([{"type": "deny", "reason": "blocked"}]),
-    );
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type": "deny", "reason": "blocked"}]));
     let model = Model::default();
 
     let (step, persisted) = prompt(&hooks, &model, "original").await;
 
-    assert!(matches!(step, LoopStep::Finished(result) if result.items.is_empty()));
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
     assert!(model.requests.lock().unwrap().is_empty());
     assert_eq!(last_user_text(&persisted), None);
 }
 
 #[tokio::test]
-async fn media_only_prompts_reach_the_inbound_hook() {
-    let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
-    backend.respond(
-        "user.message.inbound",
-        json!([{"type": "deny", "reason": "blocked"}]),
-    );
+async fn media_only_prompts_reach_the_turn_start_hook() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type": "deny", "reason": "blocked"}]));
     let model = Model::default();
     let image = Item::new(
         ItemKind::User,
@@ -1014,17 +1609,14 @@ async fn media_only_prompts_reach_the_inbound_hook() {
 
     let (step, _) = admit(&hooks, &model, vec![image]).await;
 
-    assert!(matches!(step, LoopStep::Finished(result) if result.items.is_empty()));
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
     assert!(model.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn denied_prompts_drop_their_attached_resources() {
-    let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
-    backend.respond(
-        "user.message.inbound",
-        json!([{"type": "deny", "reason": "blocked"}]),
-    );
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type": "deny", "reason": "blocked"}]));
     let model = Model::default();
     let mut resource = Item::text(ItemKind::Context, "attached secret");
     resource
@@ -1077,7 +1669,7 @@ async fn session_start_and_model_response_are_observed() {
     let (hooks, backend) = hooks(vec![observe(&["session.start", "model.response.after"])]);
     let model = Model::default();
 
-    prompt(&hooks, &model, "hello").await;
+    prompt(&hooks, &model, "hello").await.0.unwrap();
 
     let started = backend.events("session.start");
     assert_eq!(started.len(), 1);
@@ -1125,6 +1717,7 @@ async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
         let mut driver = Agent::builder()
             .model(Model::default())
             .observer(TurnHook(hooks.clone()))
+            .prompt_hook(transient_prompt_hook(&hooks, "cli"))
             .input(vec![Item::text(ItemKind::User, "one")])
             .build()
             .unwrap()
@@ -1156,6 +1749,218 @@ async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
     assert_eq!(starts[0]["session"]["id"], "first");
     assert_eq!(starts[2]["session"]["id"], "second");
     assert_ne!(starts[0]["turn"]["id"], starts[1]["turn"]["id"]);
+}
+
+/// Holds the intercept response after transport arrival until native cancellation.
+struct HoldTurnStart {
+    event_type: &'static str,
+    events: Arc<super::test_support::Backend>,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnStart {
+    fn call(
+        &self,
+        request: Value,
+        timeout: std::time::Duration,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<Value, agenthooksprotocol::client::HookError>,
+    > {
+        Box::pin(async move {
+            let hold = request["params"]["event"]["type"] == self.event_type;
+            let response = self.events.call(request, timeout).await?;
+            if hold {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            Ok(response)
+        })
+    }
+
+    fn shutdown(
+        &self,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<(), agenthooksprotocol::client::HookError>,
+    > {
+        self.events.shutdown()
+    }
+}
+
+#[tokio::test]
+async fn notification_cancelled_before_start_dispatch_pairs_empty_start_without_edits() {
+    let backend = Arc::new(super::test_support::Backend::default());
+    let hooks = super::test_support::hooks_with_backend(
+        vec![intercept(&["turn.start"]), observe(&["turn.end"])],
+        backend.clone(),
+    );
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
+    let controller = agentkit_core::CancellationController::new();
+    let model = Model::default();
+    let recorded = crate::session::TransientTranscript::new(vec![]);
+    let mut driver = Agent::builder()
+        .model(model.clone())
+        .cancellation(controller.handle())
+        .observer(TurnHook(hooks.clone()))
+        .prompt_hook(PromptHook::new(
+            hooks.clone(),
+            "cli",
+            PromptRecord::Transient(recorded.clone()),
+        ))
+        .transcript_observer(recorded.clone())
+        .input(vec![Item::notification("original notification")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("cancel-before-start"))
+        .await
+        .unwrap();
+    // The real observation gate pauses prompt admission within the native turn,
+    // before the start operation is created or polled.
+    let gate = hooks
+        .turn_delivery("cancel-before-start")
+        .lock_owned()
+        .await;
+    let step = driver.next();
+    let mut step = std::pin::pin!(step);
+    assert!(futures_util::poll!(step.as_mut()).is_pending());
+    assert!(backend.all_events().is_empty());
+    controller.interrupt();
+    drop(gate);
+    let LoopStep::Finished(result) = step.await.unwrap() else {
+        panic!("expected cancelled notification turn");
+    };
+    assert_eq!(result.finish_reason, FinishReason::Cancelled);
+    assert!(recorded.snapshot().iter().any(|item| {
+        item.parts
+            .iter()
+            .any(|part| matches!(part, Part::Text(text) if text.text == "original notification"))
+    }));
+    assert!(model.requests.lock().unwrap().is_empty());
+    hooks.drain_turn_events("cancel-before-start").await;
+    let events = backend.all_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["turn.start", "turn.end"]
+    );
+    assert_eq!(events[0]["turn"], events[1]["turn"]);
+    assert_eq!(events[0]["items"], json!([]));
+    assert_eq!(events[1]["outcome"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancelled_turn_start_preserves_prompt_and_orders_cancelled_end_before_session_end() {
+    cancelled_prompt_hook("turn.start").await;
+}
+
+#[tokio::test]
+async fn cancelled_user_inbound_pairs_turn_start_without_committing_effects() {
+    cancelled_prompt_hook("user.message.inbound").await;
+}
+
+async fn cancelled_prompt_hook(event_type: &'static str) {
+    let backend = Arc::new(HoldTurnStart {
+        event_type,
+        events: Arc::default(),
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    backend.events.respond(event_type, json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
+    backend.events.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
+    let hooks = super::test_support::hooks_with_backend(
+        vec![
+            intercept(if event_type == "turn.start" {
+                &["turn.start"]
+            } else {
+                &["user.message.inbound", "turn.start"]
+            }),
+            observe(&["turn.end", "session.end"]),
+        ],
+        backend.clone(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("sessions");
+    let opened = crate::session::open_in(
+        root.path(),
+        &directory,
+        "cancel-start",
+        false,
+        false,
+        vec![Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    let controller = agentkit_core::CancellationController::new();
+    let model = Model::default();
+    let mut driver = Agent::builder()
+        .model(model.clone())
+        .cancellation(controller.handle())
+        .observer(TurnHook(hooks.clone()))
+        .prompt_hook(PromptHook::new(
+            hooks.clone(),
+            "cli",
+            PromptRecord::Session(opened.observer.clone()),
+        ))
+        .transcript_observer(opened.observer)
+        .transcript(opened.transcript)
+        .input(vec![Item::text(ItemKind::User, "original")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("cancel-start"))
+        .await
+        .unwrap();
+    let cancel = async {
+        backend.reached.notified().await;
+        controller.interrupt();
+        backend.release.notify_one();
+    };
+    let (step, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(driver.next(), cancel)
+    })
+    .await
+    .expect("turn.start did not observe native cancellation");
+    // Native cancellation finishes the turn with interrupted assistant output;
+    // it does not masquerade as hook denial or silently remove admitted input.
+    let LoopStep::Finished(result) = step.unwrap() else {
+        panic!("expected a natively cancelled turn result");
+    };
+    assert_eq!(result.finish_reason, FinishReason::Cancelled);
+    assert!(
+        result
+            .items
+            .iter()
+            .any(|item| item.kind == ItemKind::Assistant
+                && item.metadata.get("agentkit.interrupted") == Some(&json!(true)))
+    );
+    assert!(model.requests.lock().unwrap().is_empty());
+    let persisted = crate::session::load_in(root.path(), &directory, "cancel-start").unwrap();
+    assert_eq!(last_user_text(&persisted).as_deref(), Some("original"));
+    hooks
+        .session_end("cancel-start", SessionEndInputOutcome::Completed)
+        .await;
+    let events = backend.events.all_events();
+    let types: Vec<_> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    let expected = if event_type == "turn.start" {
+        vec!["turn.start", "turn.end", "session.end"]
+    } else {
+        vec![
+            "user.message.inbound",
+            "turn.start",
+            "turn.end",
+            "session.end",
+        ]
+    };
+    assert_eq!(types, expected);
+    let starts = backend.events.events("turn.start");
+    let ends = backend.events.events("turn.end");
+    assert_eq!(ends[0]["outcome"], "cancelled");
+    assert_eq!(starts[0]["turn"], ends[0]["turn"]);
 }
 
 /// Holds `turn.end` at the hook transport until the test releases it.
@@ -1207,6 +2012,7 @@ async fn cancelled_drain_still_delivers_turn_end_before_session_end() {
     let mut driver = Agent::builder()
         .model(Model::default())
         .observer(TurnHook(hooks.clone()))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .input(vec![Item::text(ItemKind::User, "hello")])
         .build()
         .unwrap()
@@ -1251,6 +2057,7 @@ async fn failed_model_request_ends_the_logical_turn() {
             SessionStartInputTrigger::Startup,
         ))
         .observer(TurnHook(hooks.clone()))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .input(vec![Item::text(ItemKind::User, "hello")])
         .build()
         .unwrap()
@@ -1337,6 +2144,101 @@ impl ModelTurn for ToolRoundReply {
     }
 }
 
+#[derive(Clone)]
+struct RecordedToolRoundModel {
+    model: ToolRoundModel,
+    requests: Arc<Mutex<Vec<Vec<Item>>>>,
+}
+
+#[async_trait]
+impl ModelAdapter for RecordedToolRoundModel {
+    type Session = Self;
+    async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+        Ok(self.clone())
+    }
+}
+
+#[async_trait]
+impl ModelSession for RecordedToolRoundModel {
+    type Turn = ToolRoundReply;
+    async fn begin_turn(
+        &mut self,
+        request: TurnRequest,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.transcript.clone());
+        self.model.begin_turn(request, cancellation).await
+    }
+}
+
+#[tokio::test]
+async fn midturn_user_interjection_runs_inbound_without_another_turn_start() {
+    let (hooks, backend) = hooks(vec![
+        intercept(&["user.message.inbound", "turn.start"]),
+        observe(&["turn.end"]),
+    ]);
+    let requests = Arc::new(Mutex::new(vec![]));
+    let mut registry = ToolRegistry::new();
+    registry.register_arc(Echo::new());
+    let mut driver = Agent::builder()
+        .model(RecordedToolRoundModel {
+            model: ToolRoundModel(true),
+            requests: requests.clone(),
+        })
+        .observer(TurnHook(hooks.clone()))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
+        .add_tool_source(registry)
+        .input(vec![Item::text(ItemKind::User, "initial")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("interjection"))
+        .await
+        .unwrap();
+    let LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AfterToolResult(round)) =
+        driver.next().await.unwrap()
+    else {
+        panic!("expected tool-round interjection point");
+    };
+    backend.respond("user.message.inbound", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("edited interjection")}]));
+    round
+        .submit(&mut driver, vec![Item::text(ItemKind::User, "midturn")])
+        .unwrap();
+    assert!(matches!(
+        driver.next().await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    hooks.drain_turn_events("interjection").await;
+    let inbound = backend.events("user.message.inbound");
+    let starts = backend.events("turn.start");
+    let ends = backend.events("turn.end");
+    assert_eq!(inbound.len(), 2);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(ends.len(), 1);
+    assert_eq!(
+        inbound[0]["message"]["messages"][0]["parts"][0]["text"],
+        "initial"
+    );
+    assert_eq!(
+        inbound[1]["message"]["messages"][0]["parts"][0]["text"],
+        "midturn"
+    );
+    assert_eq!(inbound[0]["turn"], inbound[1]["turn"]);
+    assert_eq!(starts[0]["turn"], ends[0]["turn"]);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        last_user_text(&requests[1]).as_deref(),
+        Some("edited interjection")
+    );
+    assert_eq!(
+        last_user_text(&driver.snapshot().transcript).as_deref(),
+        Some("edited interjection")
+    );
+}
+
 #[tokio::test]
 async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() {
     for retire in [false, true] {
@@ -1354,6 +2256,7 @@ async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() 
                 SessionStartInputTrigger::Startup,
             ))
             .observer(TurnHook(hooks.clone()))
+            .prompt_hook(transient_prompt_hook(&hooks, "cli"))
             .add_tool_source(registry)
             .input(vec![Item::text(ItemKind::User, "hello")])
             .build()
@@ -1683,6 +2586,7 @@ async fn turn_end_reports_usage_and_last_assistant_without_invented_continuation
             SessionStartInputTrigger::Startup,
         ))
         .observer(TurnHook(hooks.clone()))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .input(vec![Item::text(ItemKind::User, "hello")])
         .build()
         .unwrap()
@@ -2017,7 +2921,7 @@ async fn child_identity_is_session_local_through_the_hook_lifecycle() {
                     .with_child(child),
                 )
                 .observer(TurnHook(hooks.clone()))
-                .mutator(PromptHook::new(
+                .prompt_hook(PromptHook::new(
                     hooks.clone(),
                     "a2a",
                     PromptRecord::Transient(crate::session::TransientTranscript::new(vec![])),
@@ -2058,6 +2962,9 @@ async fn child_identity_is_session_local_through_the_hook_lifecycle() {
                 .collect();
             assert!(!events.is_empty(), "missing {event_type} for {id}");
             for event in events {
+                if event_type == "turn.start" {
+                    assert_eq!(event["trigger"], "external", "{id}");
+                }
                 if child {
                     assert_eq!(event["session"]["agent"], json!({"id": id}), "{event_type}");
                 } else {
@@ -2207,4 +3114,215 @@ async fn invalid_fork_session_start_preserves_dispatch_cause() {
         error.contains("invalid canonical intercept-request"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn denied_batch_never_retries_failed_history_and_allows_the_next_prompt() {
+    for boundary in ["user.message.inbound", "turn.start"] {
+        for tail in [ItemKind::User, ItemKind::Notification, ItemKind::Tool] {
+            let (hooks, backend) = hooks(vec![
+                intercept(&["user.message.inbound", "turn.start"]),
+                observe(&["turn.end"]),
+            ]);
+            backend.respond(boundary, json!([{"type":"deny", "reason":"blocked"}]));
+            let mut history = vec![Item::text(ItemKind::User, "previous failed prompt")];
+            match tail {
+                ItemKind::Notification => history.push(Item::notification("previous notification")),
+                ItemKind::Tool => {
+                    let call =
+                        agentkit_core::ToolCallPart::new("old-call", "echo", json!({"text":"old"}));
+                    history.push(Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)]));
+                    history.push(Item::new(
+                        ItemKind::Tool,
+                        vec![Part::ToolResult(ToolResultPart {
+                            call_id: ToolCallId::new("old-call"),
+                            output: ToolOutput::Text("previous result".into()),
+                            is_error: false,
+                            metadata: MetadataMap::new(),
+                        })],
+                    ));
+                }
+                _ => {}
+            }
+            let recorded = crate::session::TransientTranscript::new(history.clone());
+            let model = Model::default();
+            let mut driver = Agent::builder()
+                .model(model.clone())
+                .observer(TurnHook(hooks.clone()))
+                .prompt_hook(PromptHook::new(
+                    hooks.clone(),
+                    "acp",
+                    PromptRecord::Transient(recorded.clone()),
+                ))
+                .transcript_observer(recorded.clone())
+                .transcript(history.clone())
+                .input(vec![
+                    Item::notification("new notification"),
+                    Item::text(ItemKind::User, "blocked new prompt"),
+                ])
+                .build()
+                .unwrap()
+                .start(SessionConfig::new("denied-after-error"))
+                .await
+                .unwrap();
+            assert!(matches!(driver.next().await, Err(LoopError::Mutator(_))));
+            assert!(model.requests.lock().unwrap().is_empty());
+            assert_eq!(driver.snapshot().transcript, history);
+            assert_eq!(recorded.snapshot(), history);
+            hooks.drain_turn_events("denied-after-error").await;
+            let starts = backend.events("turn.start");
+            let ends = backend.events("turn.end");
+            assert_eq!(starts.len(), 1);
+            assert_eq!(ends.len(), 1);
+            assert_eq!(starts[0]["turn"], ends[0]["turn"]);
+            assert_eq!(ends[0]["outcome"], "failed");
+            assert_eq!(
+                starts[0]["items"].as_array().unwrap().len(),
+                if boundary == "turn.start" { 2 } else { 0 }
+            );
+
+            backend.respond(boundary, json!([]));
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "allowed next prompt")])
+                .unwrap();
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Finished(_)
+            ));
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(&requests[0][..history.len()], history.as_slice());
+            assert_eq!(
+                last_user_text(&requests[0]).as_deref(),
+                Some("allowed next prompt")
+            );
+        }
+    }
+}
+
+struct DelayedBackgroundApproval {
+    spec: ToolSpec,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl Tool for DelayedBackgroundApproval {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        _: ToolRequest,
+        _: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Internal(
+            "approval requires invoke_outcome".into(),
+        ))
+    }
+
+    async fn invoke_outcome(
+        &self,
+        request: ToolRequest,
+        _: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        self.release.acquire().await.unwrap().forget();
+        ToolExecutionOutcome::Interrupted(agentkit_tools_core::ToolInterruption::ApprovalRequired(
+            agentkit_tools_core::ApprovalRequest {
+                task_id: None,
+                call_id: None,
+                id: "delayed-approval".into(),
+                request_kind: "test.approval".into(),
+                reason: agentkit_tools_core::ApprovalReason::PolicyRequiresConfirmation,
+                summary: "background approval".into(),
+                metadata: request.metadata,
+            },
+        ))
+    }
+}
+
+#[tokio::test]
+async fn idle_background_approval_pairs_its_own_turn_on_resume_or_cancellation() {
+    use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager};
+    for cancel in [false, true] {
+        let (hooks, backend) = hooks(vec![observe(&["turn.start", "turn.end"])]);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let tasks = AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background);
+        let handle = tasks.handle();
+        let mut driver = Agent::builder()
+            .model(ToolRoundModel(true))
+            .observer(TurnHook(hooks.clone()))
+            .prompt_hook(transient_prompt_hook(&hooks, "cli"))
+            .add_tool_source(ToolRegistry::new().with(DelayedBackgroundApproval {
+                spec: Echo::new().spec.clone(),
+                release: release.clone(),
+            }))
+            .task_manager(tasks)
+            .input(vec![Item::text(ItemKind::User, "start background work")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("background-approval"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AwaitingInput(_))
+        ));
+        hooks.drain_turn_events("background-approval").await;
+        assert_eq!(backend.events("turn.start").len(), 1);
+        assert_eq!(backend.events("turn.end").len(), 1);
+
+        release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_for_idle())
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(agentkit_loop::LoopInterrupt::ApprovalRequest(_))
+        ));
+        if cancel {
+            assert!(matches!(
+                driver.cancel_pending_approvals().await.unwrap(),
+                Some(LoopStep::Finished(_))
+            ));
+        } else {
+            driver
+                .resolve_approval(agentkit_tools_core::ApprovalDecision::Deny {
+                    reason: Some("not allowed".into()),
+                })
+                .unwrap();
+            while matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AfterToolResult(_))
+            ) {}
+        }
+        hooks.drain_turn_events("background-approval").await;
+        let starts = backend.events("turn.start");
+        let ends = backend.events("turn.end");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(ends.len(), 2);
+        assert_ne!(starts[0]["turn"], starts[1]["turn"]);
+        assert_eq!(starts[1]["turn"], ends[1]["turn"]);
+        assert_eq!(starts[1]["trigger"], "external");
+        if cancel {
+            assert_eq!(starts[1]["items"], json!([]));
+        } else {
+            // Resolving the approval contributes a new background-result
+            // notification, not the originating turn's user prompt.
+            let items = starts[1]["items"].as_array().unwrap();
+            assert_eq!(items.len(), 1);
+            assert!(
+                items[0]["parts"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not allowed")
+            );
+        }
+        let types: Vec<_> = backend
+            .all_events()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(types, ["turn.start", "turn.end", "turn.start", "turn.end"]);
+    }
 }
