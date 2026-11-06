@@ -30,7 +30,7 @@ use agentkit_core::{FinishReason, Item, ItemKind, Part, ToolOutput, TurnCancella
 use agentkit_loop::LoopError;
 
 pub(crate) use model::{HookedAdapter, HookedSession};
-pub(crate) use prompt::{PromptHook, PromptRecord};
+pub(crate) use prompt::{PromptHook, PromptHookBuilder, PromptRecord};
 pub(crate) use tool::hooked_tools;
 pub(crate) use turn::TurnHook;
 

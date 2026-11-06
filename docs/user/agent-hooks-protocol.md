@@ -72,10 +72,10 @@ need client-defined routing and failure policies.
 | Event | Where Kit emits it | Hook authority |
 | --- | --- | --- |
 | `session.start` | A session's model connection opens | Inject context |
-| `turn.start` | A logical agent-loop turn starts, with native session and turn IDs | Observe |
+| `turn.start` | A logical agent-loop turn admits its input, with native session and turn IDs | Deny, replace the admitted prompt |
 | `turn.end` | That logical turn completes, fails, or is cancelled | Observe |
 | `session.end` | A prompt run finishes or an ACP session closes | Observe |
-| `user.message.inbound` | A new turn admits a user prompt | Deny, replace the prompt |
+| `user.message.inbound` | A user prompt arrives, including an interjection during a turn | Deny, replace the prompt |
 | `model.request.before` | Before each model call, with the transcript | Deny, replace messages, supply a response, inject context |
 | `model.response.after` | A model call finishes, with its output | Replace messages, block response |
 | `model.error` | A model call fails | Observe |
@@ -92,10 +92,19 @@ Model message edits accept text replacements and preserve unchanged native
 items. Response interception withholds streaming output until hooks finish.
 A compaction denial fails the turn without replacing the transcript.
 
-A denied prompt is removed, together with resources attached to it, and the
-turn ends without a model call. A denied
-model request fails the turn. A denied tool call returns a permission error to
-the model.
+`user.message.inbound` applies arrival policy before `turn.start`. The latter's
+`items` contain the effective admitted input, including attachments and
+notifications submitted with it, not prior-turn history. A `modify` effect with
+target `prompt` and operation `replace` on `turn.start` replaces this entire
+canonical item list. Retain the supplied opaque part identities to preserve
+attachments; edits cannot fabricate media. Both events support user-facing
+`message` effects. An interjection during an active turn emits
+`user.message.inbound` without another `turn.start`.
+
+A denied prompt is removed together with its admitted resources and
+notifications. At turn admission, denial ends the turn without a model call;
+a denied interjection does not cancel the active turn. A denied model request
+fails the turn. A denied tool call returns a permission error to the model.
 
 Kit checks edited tool input against the tool's input schema before the tool
 runs; an edit that does not match counts as a hook failure. An edit that the

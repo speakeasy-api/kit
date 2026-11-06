@@ -969,7 +969,7 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
             Some(hooks.clone()),
             SessionStartInputTrigger::Startup,
         ))
-        .mutator(PromptHook::new(
+        .prompt_hook(PromptHook::new(
             hooks.clone(),
             "cli",
             PromptRecord::Session(opened.observer.clone()),
@@ -1000,7 +1000,7 @@ async fn turn_start_intercepts_initial_and_subsequent_prompts_with_channel_trigg
         let recorded = crate::session::TransientTranscript::new(vec![]);
         let mut driver = Agent::builder()
             .model(model.clone())
-            .mutator(PromptHook::new(
+            .prompt_hook(PromptHook::new(
                 hooks.clone(),
                 channel,
                 PromptRecord::Transient(recorded.clone()),
@@ -1062,7 +1062,7 @@ async fn delegated_acp_prompt_uses_external_turn_start_trigger() {
             )
             .with_child(true),
         )
-        .mutator(transient_prompt_hook(&hooks, "acp"))
+        .prompt_hook(transient_prompt_hook(&hooks, "acp"))
         .input(vec![Item::text(ItemKind::User, "delegated task")])
         .build()
         .unwrap()
@@ -1223,6 +1223,153 @@ async fn turn_start_replacement_replaces_the_whole_admitted_item_list() {
 }
 
 #[tokio::test]
+async fn turn_start_owns_prepended_notifications_without_absorbing_history() {
+    for deny in [false, true] {
+        let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+        backend.respond("turn.start", if deny {
+            json!([{"type":"deny", "reason":"blocked"}])
+        } else {
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("replacement")}])
+        });
+        let model = Model::default();
+        let mut history = vec![
+            Item::text(ItemKind::User, "prior user"),
+            Item::notification("prior notification"),
+        ];
+        if deny {
+            history.push(Item::text(ItemKind::Assistant, "prior answer"));
+        }
+        let recorded = crate::session::TransientTranscript::new(history.clone());
+        let mut driver = Agent::builder()
+            .model(model.clone())
+            .prompt_hook(PromptHook::new(
+                hooks.clone(),
+                "acp",
+                PromptRecord::Transient(recorded.clone()),
+            ))
+            .transcript_observer(recorded.clone())
+            .transcript(history.clone())
+            .input(vec![
+                Item::notification("voice changed"),
+                Item::text(ItemKind::User, "hello"),
+            ])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("batch"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        let starts = backend.events("turn.start");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(starts[0]["items"][0]["parts"][0]["text"], "voice changed");
+        let persisted = recorded.snapshot();
+        assert_eq!(&persisted[..history.len()], history.as_slice());
+        assert!(
+            !persisted
+                .iter()
+                .any(|item| item.parts == vec![Part::text("voice changed")])
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(!deny));
+        if !deny {
+            assert_eq!(last_user_text(&requests[0]).as_deref(), Some("replacement"));
+            assert_eq!(&requests[0][..history.len()], history.as_slice());
+            assert!(
+                !requests[0]
+                    .iter()
+                    .any(|item| item.parts == vec![Part::text("voice changed")])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_start_admits_manual_compaction_before_the_command_is_consumed() {
+    for deny in [false, true] {
+        let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+        backend.respond("turn.start", if deny {
+            json!([{"type":"deny", "reason":"blocked"}])
+        } else {
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("replacement")}])
+        });
+        let history = vec![
+            Item::text(ItemKind::User, "prior user"),
+            Item::text(ItemKind::Assistant, "prior answer"),
+        ];
+        let recorded = crate::session::TransientTranscript::new(history.clone());
+        let compactor = crate::compaction::automatic(
+            Model::default(),
+            agentkit_loop::TelemetryConfig::default(),
+            None,
+            "compact-admission",
+            "compact-admission",
+            None,
+        )
+        .unwrap()
+        .mirroring(recorded.clone());
+        let model = Model::default();
+        let mut driver = Agent::builder()
+            .model(model.clone())
+            .prompt_hook(PromptHook::new(
+                hooks.clone(),
+                "cli",
+                PromptRecord::Transient(recorded.clone()),
+            ))
+            .mutator(compactor)
+            .transcript_observer(recorded.clone())
+            .transcript(history.clone())
+            .input(vec![Item::text(ItemKind::User, "/compact")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("compact-admission"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        let starts = backend.events("turn.start");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(starts[0]["items"][0]["parts"][0]["text"], "/compact");
+        assert_eq!(&recorded.snapshot()[..history.len()], history.as_slice());
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(!deny));
+        if !deny {
+            assert_eq!(last_user_text(&requests[0]).as_deref(), Some("replacement"));
+            assert_eq!(&requests[0][..history.len()], history.as_slice());
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_start_replacement_preserves_host_acp_replay_identity() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("edited")} ]));
+    let mut user = Item::text(ItemKind::User, "original");
+    user.metadata
+        .insert("dev.kit.acp.message_id".into(), json!("kit-user-live"));
+    let model = Model::default();
+    let (_, persisted) = admit(&hooks, &model, vec![user]).await;
+    let requests = model.requests.lock().unwrap();
+    for items in [&persisted, &requests[0]] {
+        let user = items
+            .iter()
+            .find(|item| item.kind == ItemKind::User)
+            .unwrap();
+        assert_eq!(user.parts, vec![Part::text("edited")]);
+        assert_eq!(
+            user.metadata["dev.kit.acp.message_id"],
+            json!("kit-user-live")
+        );
+    }
+}
+
+#[tokio::test]
 async fn turn_start_messages_reach_the_session_after_inbound_and_before_model() {
     let (hooks, backend) = hooks(vec![intercept(&["*"]), observe(&["turn.end"])]);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -1341,7 +1488,7 @@ async fn notification_only_turns_emit_external_boundaries_without_user_inbound()
     let mut driver = Agent::builder()
         .model(model.clone())
         .observer(TurnHook(hooks.clone()))
-        .mutator(transient_prompt_hook(&hooks, "acp"))
+        .prompt_hook(transient_prompt_hook(&hooks, "acp"))
         .input(vec![Item::notification("first notification")])
         .build()
         .unwrap()
@@ -1559,7 +1706,7 @@ async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
         let mut driver = Agent::builder()
             .model(Model::default())
             .observer(TurnHook(hooks.clone()))
-            .mutator(transient_prompt_hook(&hooks, "cli"))
+            .prompt_hook(transient_prompt_hook(&hooks, "cli"))
             .input(vec![Item::text(ItemKind::User, "one")])
             .build()
             .unwrap()
@@ -1595,6 +1742,7 @@ async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
 
 /// Holds the intercept response after transport arrival until native cancellation.
 struct HoldTurnStart {
+    event_type: &'static str,
     events: Arc<super::test_support::Backend>,
     reached: tokio::sync::Notify,
 }
@@ -1609,7 +1757,7 @@ impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnStart 
         Result<Value, agenthooksprotocol::client::HookError>,
     > {
         Box::pin(async move {
-            let hold = request["params"]["event"]["type"] == "turn.start";
+            let hold = request["params"]["event"]["type"] == self.event_type;
             let response = self.events.call(request, timeout).await?;
             if hold {
                 self.reached.notify_one();
@@ -1631,14 +1779,29 @@ impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnStart 
 
 #[tokio::test]
 async fn cancelled_turn_start_preserves_prompt_and_orders_cancelled_end_before_session_end() {
+    cancelled_prompt_hook("turn.start").await;
+}
+
+#[tokio::test]
+async fn cancelled_user_inbound_pairs_turn_start_without_committing_effects() {
+    cancelled_prompt_hook("user.message.inbound").await;
+}
+
+async fn cancelled_prompt_hook(event_type: &'static str) {
     let backend = Arc::new(HoldTurnStart {
+        event_type,
         events: Arc::default(),
         reached: tokio::sync::Notify::new(),
     });
+    backend.events.respond(event_type, json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
     backend.events.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
     let hooks = super::test_support::hooks_with_backend(
         vec![
-            intercept(&["turn.start"]),
+            intercept(if event_type == "turn.start" {
+                &["turn.start"]
+            } else {
+                &["user.message.inbound", "turn.start"]
+            }),
             observe(&["turn.end", "session.end"]),
         ],
         backend.clone(),
@@ -1660,7 +1823,7 @@ async fn cancelled_turn_start_preserves_prompt_and_orders_cancelled_end_before_s
         .model(model.clone())
         .cancellation(controller.handle())
         .observer(TurnHook(hooks.clone()))
-        .mutator(PromptHook::new(
+        .prompt_hook(PromptHook::new(
             hooks.clone(),
             "cli",
             PromptRecord::Session(opened.observer.clone()),
@@ -1706,9 +1869,21 @@ async fn cancelled_turn_start_preserves_prompt_and_orders_cancelled_end_before_s
         .iter()
         .map(|event| event["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["turn.start", "turn.end", "session.end"]);
-    assert_eq!(events[1]["outcome"], "cancelled");
-    assert_eq!(events[0]["turn"], events[1]["turn"]);
+    let expected = if event_type == "turn.start" {
+        vec!["turn.start", "turn.end", "session.end"]
+    } else {
+        vec![
+            "user.message.inbound",
+            "turn.start",
+            "turn.end",
+            "session.end",
+        ]
+    };
+    assert_eq!(types, expected);
+    let starts = backend.events.events("turn.start");
+    let ends = backend.events.events("turn.end");
+    assert_eq!(ends[0]["outcome"], "cancelled");
+    assert_eq!(starts[0]["turn"], ends[0]["turn"]);
 }
 
 /// Holds `turn.end` at the hook transport until the test releases it.
@@ -1760,7 +1935,7 @@ async fn cancelled_drain_still_delivers_turn_end_before_session_end() {
     let mut driver = Agent::builder()
         .model(Model::default())
         .observer(TurnHook(hooks.clone()))
-        .mutator(transient_prompt_hook(&hooks, "cli"))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .input(vec![Item::text(ItemKind::User, "hello")])
         .build()
         .unwrap()
@@ -1805,7 +1980,7 @@ async fn failed_model_request_ends_the_logical_turn() {
             SessionStartInputTrigger::Startup,
         ))
         .observer(TurnHook(hooks.clone()))
-        .mutator(transient_prompt_hook(&hooks, "cli"))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .input(vec![Item::text(ItemKind::User, "hello")])
         .build()
         .unwrap()
@@ -1937,7 +2112,7 @@ async fn midturn_user_interjection_runs_inbound_without_another_turn_start() {
             requests: requests.clone(),
         })
         .observer(TurnHook(hooks.clone()))
-        .mutator(transient_prompt_hook(&hooks, "cli"))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .add_tool_source(registry)
         .input(vec![Item::text(ItemKind::User, "initial")])
         .build()
@@ -2004,7 +2179,7 @@ async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() 
                 SessionStartInputTrigger::Startup,
             ))
             .observer(TurnHook(hooks.clone()))
-            .mutator(transient_prompt_hook(&hooks, "cli"))
+            .prompt_hook(transient_prompt_hook(&hooks, "cli"))
             .add_tool_source(registry)
             .input(vec![Item::text(ItemKind::User, "hello")])
             .build()
@@ -2334,7 +2509,7 @@ async fn turn_end_reports_usage_and_last_assistant_without_invented_continuation
             SessionStartInputTrigger::Startup,
         ))
         .observer(TurnHook(hooks.clone()))
-        .mutator(transient_prompt_hook(&hooks, "cli"))
+        .prompt_hook(transient_prompt_hook(&hooks, "cli"))
         .input(vec![Item::text(ItemKind::User, "hello")])
         .build()
         .unwrap()
@@ -2669,7 +2844,7 @@ async fn child_identity_is_session_local_through_the_hook_lifecycle() {
                     .with_child(child),
                 )
                 .observer(TurnHook(hooks.clone()))
-                .mutator(PromptHook::new(
+                .prompt_hook(PromptHook::new(
                     hooks.clone(),
                     "a2a",
                     PromptRecord::Transient(crate::session::TransientTranscript::new(vec![])),

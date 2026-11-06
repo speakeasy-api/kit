@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use agenthooksprotocol::generated::Event;
 use agenthooksprotocol::inputs::{TurnStartInput, UserMessageInboundInput};
@@ -7,13 +10,16 @@ use agenthooksprotocol::{
     UserMessageInboundInputTurn,
 };
 use agentkit_core::{ItemKind, Part};
-use agentkit_loop::{AgentEvent, LoopCtx, LoopError, LoopMutator, MutationPoint, TranscriptCursor};
+use agentkit_loop::{
+    AgentBuilder, AgentEvent, LoopCtx, LoopError, LoopMutator, ModelAdapter, MutationPoint,
+    TranscriptCursor, TranscriptEvent, TranscriptObserver,
+};
 use async_trait::async_trait;
 
 use super::Hooks;
 use crate::session::{SessionObserver, TransientTranscript};
 
-const ACP_RESOURCE: &str = "acp.resource.uri";
+const ACP_MESSAGE_ID: &str = "dev.kit.acp.message_id";
 
 /// Runs arrival policy before `turn.start` on the effective admitted prompt.
 ///
@@ -23,6 +29,38 @@ pub(crate) struct PromptHook {
     hooks: Arc<Hooks>,
     channel: &'static str,
     record: PromptRecord,
+    batch: PromptBatch,
+}
+
+/// Counts the unconsumed appended input suffix, not passive transcript history.
+/// The driver serializes callbacks and mutation; no guard spans hook dispatch.
+#[derive(Clone, Default)]
+struct PromptBatch(Arc<AtomicUsize>);
+
+impl TranscriptObserver for PromptBatch {
+    fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        if matches!(
+            event.item.kind,
+            ItemKind::User | ItemKind::Notification | ItemKind::Context
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.0.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Installs both halves of prompt admission so the batch boundary is exact.
+/// Register before transcript-rewriting mutators, including compaction: admission
+/// owns the appended batch before another policy can consume or relocate it.
+pub(crate) trait PromptHookBuilder {
+    fn prompt_hook(self, hook: PromptHook) -> Self;
+}
+
+impl<M: ModelAdapter> PromptHookBuilder for AgentBuilder<M> {
+    fn prompt_hook(self, hook: PromptHook) -> Self {
+        self.transcript_observer(hook.batch.clone()).mutator(hook)
+    }
 }
 
 /// Where the transcript a prompt edit or denial rewrites is recorded.
@@ -49,6 +87,7 @@ impl PromptHook {
             hooks,
             channel,
             record,
+            batch: PromptBatch::default(),
         }
     }
 }
@@ -60,6 +99,7 @@ impl PromptHook {
         ctx: &LoopCtx<'_>,
         event_type: EventType,
         index: Option<usize>,
+        start: usize,
         trigger: TurnStartInputTrigger,
     ) -> Result<bool, LoopError> {
         let message = index.map(|index| super::message(&cursor[index], index));
@@ -74,14 +114,6 @@ impl PromptHook {
         let Some(turn_id) = ctx.turn_id else {
             return Ok(true);
         };
-        let mut start = index.unwrap_or(cursor.len());
-        while start > 0
-            && index.is_some()
-            && cursor[start - 1].kind == ItemKind::Context
-            && cursor[start - 1].metadata.contains_key(ACP_RESOURCE)
-        {
-            start -= 1;
-        }
         let result = if event_type == EventType::UserMessageInbound {
             let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
                 self.channel,
@@ -140,11 +172,23 @@ impl PromptHook {
                     if index.is_none() {
                         return Ok(true);
                     }
-                    let replacement = super::model::canonical_items_at(
+                    let mut replacement = super::model::canonical_items_at(
                         event.0.items.iter().map(|item| item.0.as_ref()),
                         &cursor[start..],
                         start,
                     )?;
+                    // Canonical IDs belong to the hook; ACP replay identity belongs
+                    // to the host and survives a replacement with a new ID.
+                    if let Some(identity) =
+                        index.and_then(|index| cursor[index].metadata.get(ACP_MESSAGE_ID))
+                        && let Some(user) = replacement
+                            .iter_mut()
+                            .rev()
+                            .find(|item| item.kind == ItemKind::User)
+                    {
+                        user.metadata
+                            .insert(ACP_MESSAGE_ID.into(), identity.clone());
+                    }
                     cursor.splice(start.., replacement);
                     self.persist(cursor, ctx);
                     return Ok(true);
@@ -175,12 +219,7 @@ impl PromptHook {
                 }
             }
             Err(reason) => {
-                cursor.pop();
-                while cursor.last().is_some_and(|item| {
-                    item.kind == ItemKind::Context && item.metadata.contains_key(ACP_RESOURCE)
-                }) {
-                    cursor.pop();
-                }
+                cursor.truncate(start);
                 ctx.emitter.emit(AgentEvent::Warning {
                     message: format!("prompt blocked by agent hook: {reason}"),
                 });
@@ -215,10 +254,15 @@ impl LoopMutator for PromptHook {
         self.hooks
             .drain_turn_events(&ctx.session_id.to_string())
             .await;
-        let index = cursor
+        // Consume the append count before awaiting policy, including cancellation.
+        let pending = self.batch.0.swap(0, Ordering::Relaxed);
+        let start = cursor
             .len()
-            .checked_sub(1)
-            .filter(|&index| matches!(cursor[index].kind, ItemKind::User | ItemKind::Notification));
+            .checked_sub(pending)
+            .ok_or_else(|| LoopError::InvalidState("prompt batch exceeds transcript".into()))?;
+        let index = cursor.len().checked_sub(1).filter(|&index| {
+            index >= start && matches!(cursor[index].kind, ItemKind::User | ItemKind::Notification)
+        });
         // Arrival and admission are separate boundaries with shared message identity.
         // A2A and delegated sessions carry agent-originated input; foreground
         // CLI and ACP expose user prompts. Internal notifications are external.
@@ -232,25 +276,48 @@ impl LoopMutator for PromptHook {
         };
         // Notifications are execution input, not transport arrivals. A user
         // interjection after tools is an arrival within the existing turn.
-        let index = if index.is_some_and(|index| cursor[index].kind == ItemKind::User)
-            && !self
-                .apply(
-                    cursor,
-                    &ctx,
-                    EventType::UserMessageInbound,
-                    index,
-                    trigger.clone(),
-                )
-                .await?
-        {
-            None
+        let arrival = if index.is_some_and(|index| cursor[index].kind == ItemKind::User) {
+            self.apply(
+                cursor,
+                &ctx,
+                EventType::UserMessageInbound,
+                index,
+                start,
+                trigger.clone(),
+            )
+            .await
         } else {
-            index
+            Ok(true)
+        };
+        let index = match arrival {
+            Ok(true) => index,
+            Ok(false) => None,
+            Err(LoopError::Cancelled) => {
+                if ctx.point == MutationPoint::AfterTurnEnded {
+                    // The native turn still ends. Deliver its start without accepting
+                    // effects from the cancelled admission or changing the transcript.
+                    if let Some(turn_id) = ctx.turn_id {
+                        let input = TurnStartInput::new(
+                            Vec::new(),
+                            trigger,
+                            TurnStartInputTurn::new(turn_id.to_string()),
+                        )
+                        .with_session(self.hooks.session(&ctx.session_id.to_string()));
+                        super::settle(
+                            EventType::TurnStart,
+                            super::dispatch(self.hooks.sdk.turn_start(input.with_sources()), None)
+                                .await,
+                        );
+                    }
+                }
+                return Err(LoopError::Cancelled);
+            }
+            Err(error) => return Err(error),
         };
         if ctx.point == MutationPoint::AfterTurnEnded {
             // Even rejected input owns a native turn. Report an empty admitted
             // input rather than inventing a prompt or leaving an unmatched end.
-            self.apply(cursor, &ctx, EventType::TurnStart, index, trigger)
+            self.apply(cursor, &ctx, EventType::TurnStart, index, start, trigger)
                 .await?;
         }
         Ok(())

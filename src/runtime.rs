@@ -37,7 +37,7 @@ use tracing::Instrument as _;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
-    ahp::{HookedAdapter, HookedSession},
+    ahp::{HookedAdapter, HookedSession, PromptHookBuilder as _},
     provider::{
         ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
     },
@@ -1982,17 +1982,17 @@ impl Runtime {
                     background_jobs.clone(),
                     skills,
                 ))
-                .task_manager(task_manager)
-                .mutator(compactor);
+                .task_manager(task_manager);
             if let Some(hooks) = &self.hooks {
                 builder = builder.observer(crate::ahp::TurnHook(Arc::clone(hooks)));
-                builder = builder.mutator(crate::ahp::PromptHook::new(
+                builder = builder.prompt_hook(crate::ahp::PromptHook::new(
                     Arc::clone(hooks),
                     "cli",
                     crate::ahp::PromptRecord::Session(opened.observer.clone()),
                 ));
             }
             let agent = builder
+                .mutator(compactor)
                 .transcript_observer(opened.observer)
                 .transcript(opened.transcript)
                 .input(vec![Item::text(ItemKind::User, prompt)])
@@ -2166,12 +2166,11 @@ impl Runtime {
                 BackgroundJobs::default(),
                 skills,
             ))
-            .task_manager(background_task_manager())
-            .mutator(compactor);
+            .task_manager(background_task_manager());
         let builder = match &self.hooks {
             Some(hooks) => builder
                 .observer(crate::ahp::TurnHook(Arc::clone(hooks)))
-                .mutator(crate::ahp::PromptHook::new(
+                .prompt_hook(crate::ahp::PromptHook::new(
                     Arc::clone(hooks),
                     "a2a",
                     crate::ahp::PromptRecord::Transient(recorded.clone()),
@@ -2179,6 +2178,7 @@ impl Runtime {
             None => builder,
         };
         let builder = builder
+            .mutator(compactor)
             .transcript_observer(recorded)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)])
@@ -2412,11 +2412,10 @@ impl Runtime {
                 skills,
                 mcp,
             ))
-            .task_manager(task_manager)
-            .mutator(compactor);
+            .task_manager(task_manager);
         if let Some(hooks) = &self.hooks {
             builder = builder.observer(crate::ahp::TurnHook(Arc::clone(hooks)));
-            builder = builder.mutator(crate::ahp::PromptHook::new(
+            builder = builder.prompt_hook(crate::ahp::PromptHook::new(
                 Arc::clone(hooks),
                 "acp",
                 crate::ahp::PromptRecord::Session(opened.observer.clone()),
@@ -2425,6 +2424,7 @@ impl Runtime {
         // User interaction remains foreground-only, outside backgroundable compose.
         builder = builder.add_tool_source(self.user_question_tools(context.ask_user));
         let driver = builder
+            .mutator(compactor)
             .observer(context.integration.as_ref().clone())
             .observer(crate::fatal::RetryLog)
             .transcript_observer(opened.observer)
