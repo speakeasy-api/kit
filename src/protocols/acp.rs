@@ -2460,6 +2460,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
+                                let before = driver.snapshot().transcript;
                                 let marker = model_switch::compact_marker();
                                 let marker_id = marker.id.clone();
                                 driver.submit_input(vec![marker]).map_err(|error| {
@@ -2479,10 +2480,15 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                         |reason| Some(reason.clone()),
                                     )
                                     .await
-                                    .map_err(sdk_error)?;
+                                    .map_err(|_| {
+                                        model_switch::error(
+                                            "compaction did not complete; model unchanged",
+                                        )
+                                    })?;
                                 if !model_switch::compaction_completed(
                                     &reason,
                                     &marker_id,
+                                    &before,
                                     &driver.snapshot().transcript,
                                     cancellation.is_cancelled_since(cancellation_generation),
                                 ) {

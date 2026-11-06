@@ -140,6 +140,7 @@ pub(super) fn compact_marker() -> Item {
 pub(super) fn compaction_completed(
     reason: &FinishReason,
     marker: &Option<MessageId>,
+    before: &[Item],
     transcript: &[Item],
     cancelled: bool,
 ) -> bool {
@@ -147,6 +148,9 @@ pub(super) fn compaction_completed(
         && *reason == FinishReason::Completed
         && marker.is_some()
         && !transcript.iter().any(|item| &item.id == marker)
+        && transcript
+            .iter()
+            .any(|item| crate::compaction::is_compaction_summary(item) && !before.contains(item))
 }
 
 #[cfg(test)]
@@ -329,20 +333,40 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_compaction_requires_exact_consumed_marker_and_success() {
+    fn model_switch_compaction_requires_new_persisted_summary_and_consumed_marker() {
         let marker = compact_marker();
-        let other = compact_marker();
-        assert_ne!(marker.id, other.id);
-        assert!(!compaction_completed(
-            &FinishReason::Completed,
-            &marker.id,
-            std::slice::from_ref(&marker),
+        let mut summary = Item::text(ItemKind::Developer, "compacted history");
+        summary.metadata.insert(
+            crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
+            true.into(),
+        );
+        let check = |reason: FinishReason, before: &[Item], after: &[Item], cancelled| {
+            compaction_completed(&reason, &marker.id, before, after, cancelled)
+        };
+        assert!(check(
+            FinishReason::Completed,
+            &[],
+            std::slice::from_ref(&summary),
             false
         ));
-        assert!(compaction_completed(
-            &FinishReason::Completed,
-            &marker.id,
-            &[other],
+        // Denial or replacement can remove the marker without compacting. An
+        // existing checkpoint must not authorize the switch either.
+        for after in [
+            vec![],
+            vec![Item::text(ItemKind::User, "replacement")],
+            vec![summary.clone()],
+        ] {
+            assert!(!check(
+                FinishReason::Completed,
+                std::slice::from_ref(&summary),
+                &after,
+                false
+            ));
+        }
+        assert!(!check(
+            FinishReason::Completed,
+            &[],
+            &[marker.clone(), summary.clone()],
             false
         ));
         for reason in [
@@ -351,18 +375,19 @@ mod tests {
             FinishReason::MaxTokens,
             FinishReason::Blocked,
         ] {
-            assert!(!compaction_completed(&reason, &marker.id, &[], false));
+            assert!(!check(reason, &[], std::slice::from_ref(&summary), false));
         }
-        assert!(!compaction_completed(
-            &FinishReason::Completed,
-            &marker.id,
+        assert!(!check(
+            FinishReason::Completed,
             &[],
+            std::slice::from_ref(&summary),
             true
         ));
         assert!(!compaction_completed(
             &FinishReason::Completed,
             &None,
             &[],
+            &[summary],
             false
         ));
     }

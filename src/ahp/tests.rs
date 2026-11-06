@@ -134,7 +134,7 @@ async fn registration_headers_reach_http_hook_requests() {
     let mut options = options().unwrap();
     options.backend.allow_loopback_http = true;
     let hooks = Arc::new(Hooks::new(read(&path).unwrap().unwrap(), options).unwrap());
-    prompt(&hooks, &Model::default(), "hello").await;
+    prompt(&hooks, &Model::default(), "hello").await.0.unwrap();
     let headers = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
         .await
         .unwrap()
@@ -185,7 +185,7 @@ fn every_granted_event_accepts_wildcard_subscriptions() {
 #[tokio::test]
 async fn every_lifecycle_event_reports_harness_identity() {
     let (hooks, backend) = hooks(vec![intercept(&["*"]), observe(&["*"])]);
-    prompt(&hooks, &Model::default(), "hello").await;
+    prompt(&hooks, &Model::default(), "hello").await.0.unwrap();
     call(&hooks, &Echo::new(), json!({"text": "hello"})).await;
     hooks
         .session_end("abc", SessionEndInputOutcome::Completed)
@@ -952,11 +952,19 @@ fn transient_prompt_hook(hooks: &Arc<Hooks>, channel: &'static str) -> PromptHoo
     )
 }
 
-async fn prompt(hooks: &Arc<Hooks>, model: &Model, text: &str) -> (LoopStep, Vec<Item>) {
+async fn prompt(
+    hooks: &Arc<Hooks>,
+    model: &Model,
+    text: &str,
+) -> (Result<LoopStep, LoopError>, Vec<Item>) {
     admit(hooks, model, vec![Item::text(ItemKind::User, text)]).await
 }
 
-async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep, Vec<Item>) {
+async fn admit(
+    hooks: &Arc<Hooks>,
+    model: &Model,
+    input: Vec<Item>,
+) -> (Result<LoopStep, LoopError>, Vec<Item>) {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("sessions");
     let initial = vec![Item::text(ItemKind::System, "system")];
@@ -982,7 +990,7 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
         .start(SessionConfig::new("abc"))
         .await
         .unwrap();
-    let step = driver.next().await.unwrap();
+    let step = driver.next().await;
     hooks.drain_turn_events("abc").await;
     let persisted = crate::session::load_in(root.path(), &directory, "abc").unwrap();
     (step, persisted)
@@ -1104,7 +1112,9 @@ async fn turn_start_contains_attached_resources_and_multimodal_prompt() {
             Item::new(ItemKind::User, vec![Part::text("question"), image]),
         ],
     )
-    .await;
+    .await
+    .0
+    .unwrap();
     let starts = backend.events("turn.start");
     assert_eq!(starts.len(), 1);
     let items = starts[0]["items"].as_array().unwrap();
@@ -1232,13 +1242,10 @@ async fn turn_start_owns_prepended_notifications_without_absorbing_history() {
             json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("replacement")}])
         });
         let model = Model::default();
-        let mut history = vec![
+        let history = vec![
             Item::text(ItemKind::User, "prior user"),
             Item::notification("prior notification"),
         ];
-        if deny {
-            history.push(Item::text(ItemKind::Assistant, "prior answer"));
-        }
         let recorded = crate::session::TransientTranscript::new(history.clone());
         let mut driver = Agent::builder()
             .model(model.clone())
@@ -1258,10 +1265,12 @@ async fn turn_start_owns_prepended_notifications_without_absorbing_history() {
             .start(SessionConfig::new("batch"))
             .await
             .unwrap();
-        assert!(matches!(
-            driver.next().await.unwrap(),
-            LoopStep::Finished(_)
-        ));
+        let step = driver.next().await;
+        if deny {
+            assert!(matches!(step, Err(LoopError::Mutator(_))));
+        } else {
+            assert!(matches!(step, Ok(LoopStep::Finished(_))));
+        }
         let starts = backend.events("turn.start");
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0]["items"].as_array().unwrap().len(), 2);
@@ -1328,10 +1337,12 @@ async fn turn_start_admits_manual_compaction_before_the_command_is_consumed() {
             .start(SessionConfig::new("compact-admission"))
             .await
             .unwrap();
-        assert!(matches!(
-            driver.next().await.unwrap(),
-            LoopStep::Finished(_)
-        ));
+        let step = driver.next().await;
+        if deny {
+            assert!(matches!(step, Err(LoopError::Mutator(_))));
+        } else {
+            assert!(matches!(step, Ok(LoopStep::Finished(_))));
+        }
         let starts = backend.events("turn.start");
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0]["items"].as_array().unwrap().len(), 1);
@@ -1466,7 +1477,7 @@ async fn inbound_denial_emits_empty_turn_start_and_finishes_without_model() {
     backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not resurrect")} ]));
     let model = Model::default();
     let (step, persisted) = prompt(&hooks, &model, "original").await;
-    assert!(matches!(step, LoopStep::Finished(result) if result.items.is_empty()));
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
     assert!(model.requests.lock().unwrap().is_empty());
     assert_eq!(last_user_text(&persisted), None);
     assert_eq!(backend.events("user.message.inbound").len(), 1);
@@ -1547,7 +1558,7 @@ async fn notification_turn_start_denial_prevents_model_call() {
     let model = Model::default();
     let (step, persisted) =
         admit(&hooks, &model, vec![Item::notification("autonomous work")]).await;
-    assert!(matches!(step, LoopStep::Finished(result) if result.items.is_empty()));
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
     assert!(model.requests.lock().unwrap().is_empty());
     assert!(persisted.iter().all(|item| item.kind == ItemKind::System));
     assert_eq!(backend.events("turn.start").len(), 1);
@@ -1577,7 +1588,7 @@ async fn denied_prompts_finish_without_a_model_call() {
 
     let (step, persisted) = prompt(&hooks, &model, "original").await;
 
-    assert!(matches!(step, LoopStep::Finished(result) if result.items.is_empty()));
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
     assert!(model.requests.lock().unwrap().is_empty());
     assert_eq!(last_user_text(&persisted), None);
 }
@@ -1598,7 +1609,7 @@ async fn media_only_prompts_reach_the_turn_start_hook() {
 
     let (step, _) = admit(&hooks, &model, vec![image]).await;
 
-    assert!(matches!(step, LoopStep::Finished(result) if result.items.is_empty()));
+    assert!(matches!(step, Err(LoopError::Mutator(_))));
     assert!(model.requests.lock().unwrap().is_empty());
 }
 
@@ -1658,7 +1669,7 @@ async fn session_start_and_model_response_are_observed() {
     let (hooks, backend) = hooks(vec![observe(&["session.start", "model.response.after"])]);
     let model = Model::default();
 
-    prompt(&hooks, &model, "hello").await;
+    prompt(&hooks, &model, "hello").await.0.unwrap();
 
     let started = backend.events("session.start");
     assert_eq!(started.len(), 1);
@@ -3037,4 +3048,215 @@ async fn invalid_fork_session_start_preserves_dispatch_cause() {
         error.contains("invalid canonical intercept-request"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn denied_batch_never_retries_failed_history_and_allows_the_next_prompt() {
+    for boundary in ["user.message.inbound", "turn.start"] {
+        for tail in [ItemKind::User, ItemKind::Notification, ItemKind::Tool] {
+            let (hooks, backend) = hooks(vec![
+                intercept(&["user.message.inbound", "turn.start"]),
+                observe(&["turn.end"]),
+            ]);
+            backend.respond(boundary, json!([{"type":"deny", "reason":"blocked"}]));
+            let mut history = vec![Item::text(ItemKind::User, "previous failed prompt")];
+            match tail {
+                ItemKind::Notification => history.push(Item::notification("previous notification")),
+                ItemKind::Tool => {
+                    let call =
+                        agentkit_core::ToolCallPart::new("old-call", "echo", json!({"text":"old"}));
+                    history.push(Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)]));
+                    history.push(Item::new(
+                        ItemKind::Tool,
+                        vec![Part::ToolResult(ToolResultPart {
+                            call_id: ToolCallId::new("old-call"),
+                            output: ToolOutput::Text("previous result".into()),
+                            is_error: false,
+                            metadata: MetadataMap::new(),
+                        })],
+                    ));
+                }
+                _ => {}
+            }
+            let recorded = crate::session::TransientTranscript::new(history.clone());
+            let model = Model::default();
+            let mut driver = Agent::builder()
+                .model(model.clone())
+                .observer(TurnHook(hooks.clone()))
+                .prompt_hook(PromptHook::new(
+                    hooks.clone(),
+                    "acp",
+                    PromptRecord::Transient(recorded.clone()),
+                ))
+                .transcript_observer(recorded.clone())
+                .transcript(history.clone())
+                .input(vec![
+                    Item::notification("new notification"),
+                    Item::text(ItemKind::User, "blocked new prompt"),
+                ])
+                .build()
+                .unwrap()
+                .start(SessionConfig::new("denied-after-error"))
+                .await
+                .unwrap();
+            assert!(matches!(driver.next().await, Err(LoopError::Mutator(_))));
+            assert!(model.requests.lock().unwrap().is_empty());
+            assert_eq!(driver.snapshot().transcript, history);
+            assert_eq!(recorded.snapshot(), history);
+            hooks.drain_turn_events("denied-after-error").await;
+            let starts = backend.events("turn.start");
+            let ends = backend.events("turn.end");
+            assert_eq!(starts.len(), 1);
+            assert_eq!(ends.len(), 1);
+            assert_eq!(starts[0]["turn"], ends[0]["turn"]);
+            assert_eq!(ends[0]["outcome"], "failed");
+            assert_eq!(
+                starts[0]["items"].as_array().unwrap().len(),
+                if boundary == "turn.start" { 2 } else { 0 }
+            );
+
+            backend.respond(boundary, json!([]));
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "allowed next prompt")])
+                .unwrap();
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Finished(_)
+            ));
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(&requests[0][..history.len()], history.as_slice());
+            assert_eq!(
+                last_user_text(&requests[0]).as_deref(),
+                Some("allowed next prompt")
+            );
+        }
+    }
+}
+
+struct DelayedBackgroundApproval {
+    spec: ToolSpec,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl Tool for DelayedBackgroundApproval {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        _: ToolRequest,
+        _: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Internal(
+            "approval requires invoke_outcome".into(),
+        ))
+    }
+
+    async fn invoke_outcome(
+        &self,
+        request: ToolRequest,
+        _: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        self.release.acquire().await.unwrap().forget();
+        ToolExecutionOutcome::Interrupted(agentkit_tools_core::ToolInterruption::ApprovalRequired(
+            agentkit_tools_core::ApprovalRequest {
+                task_id: None,
+                call_id: None,
+                id: "delayed-approval".into(),
+                request_kind: "test.approval".into(),
+                reason: agentkit_tools_core::ApprovalReason::PolicyRequiresConfirmation,
+                summary: "background approval".into(),
+                metadata: request.metadata,
+            },
+        ))
+    }
+}
+
+#[tokio::test]
+async fn idle_background_approval_pairs_its_own_turn_on_resume_or_cancellation() {
+    use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager};
+    for cancel in [false, true] {
+        let (hooks, backend) = hooks(vec![observe(&["turn.start", "turn.end"])]);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let tasks = AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background);
+        let handle = tasks.handle();
+        let mut driver = Agent::builder()
+            .model(ToolRoundModel(true))
+            .observer(TurnHook(hooks.clone()))
+            .prompt_hook(transient_prompt_hook(&hooks, "cli"))
+            .add_tool_source(ToolRegistry::new().with(DelayedBackgroundApproval {
+                spec: Echo::new().spec.clone(),
+                release: release.clone(),
+            }))
+            .task_manager(tasks)
+            .input(vec![Item::text(ItemKind::User, "start background work")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("background-approval"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AwaitingInput(_))
+        ));
+        hooks.drain_turn_events("background-approval").await;
+        assert_eq!(backend.events("turn.start").len(), 1);
+        assert_eq!(backend.events("turn.end").len(), 1);
+
+        release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_for_idle())
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(agentkit_loop::LoopInterrupt::ApprovalRequest(_))
+        ));
+        if cancel {
+            assert!(matches!(
+                driver.cancel_pending_approvals().await.unwrap(),
+                Some(LoopStep::Finished(_))
+            ));
+        } else {
+            driver
+                .resolve_approval(agentkit_tools_core::ApprovalDecision::Deny {
+                    reason: Some("not allowed".into()),
+                })
+                .unwrap();
+            while matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AfterToolResult(_))
+            ) {}
+        }
+        hooks.drain_turn_events("background-approval").await;
+        let starts = backend.events("turn.start");
+        let ends = backend.events("turn.end");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(ends.len(), 2);
+        assert_ne!(starts[0]["turn"], starts[1]["turn"]);
+        assert_eq!(starts[1]["turn"], ends[1]["turn"]);
+        assert_eq!(starts[1]["trigger"], "external");
+        if cancel {
+            assert_eq!(starts[1]["items"], json!([]));
+        } else {
+            // Resolving the approval contributes a new background-result
+            // notification, not the originating turn's user prompt.
+            let items = starts[1]["items"].as_array().unwrap();
+            assert_eq!(items.len(), 1);
+            assert!(
+                items[0]["parts"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not allowed")
+            );
+        }
+        let types: Vec<_> = backend
+            .all_events()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(types, ["turn.start", "turn.end", "turn.start", "turn.end"]);
+    }
 }

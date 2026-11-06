@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agenthooksprotocol::inputs::TurnEndInput;
@@ -18,10 +18,21 @@ pub(crate) struct TurnHook(pub(crate) Arc<Hooks>);
 #[derive(Default)]
 pub(super) struct SessionTurns {
     pending: VecDeque<AgentEvent>,
+    started: HashSet<String>,
     delivery: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Hooks {
+    /// Claims the one start delivery for a native turn. The serialized driver is
+    /// the only admission writer; completion draining removes the claim.
+    pub(super) fn claim_turn_start(&self, session: &str, turn: &str) -> bool {
+        lock(&self.turn_events)
+            .entry(session.to_owned())
+            .or_default()
+            .started
+            .insert(turn.to_owned())
+    }
+
     /// Delivers the turn observations queued for `session`, in order.
     pub(crate) async fn drain_turn_events(&self, session: &str) {
         let delivery = Arc::clone(
@@ -44,7 +55,21 @@ impl Hooks {
         // A cancelled caller must not abandon an observation the SDK has begun delivering.
         let delivered = tokio::spawn(async move {
             let _guard = guard;
-            while let Some(event) = next(&queues, &session) {
+            while let Some((event, needs_start)) = next(&queues, &session) {
+                // Idle background approvals can be cancelled before any mutator
+                // runs. Pair their completion without admitting historical input.
+                if needs_start && let AgentEvent::TurnFinished(result) = &event {
+                    let input = agenthooksprotocol::inputs::TurnStartInput::new(
+                        Vec::new(),
+                        agenthooksprotocol::TurnStartInputTrigger::External,
+                        agenthooksprotocol::TurnStartInputTurn::new(result.turn_id.to_string()),
+                    )
+                    .with_session(owner.clone());
+                    super::settle(
+                        EventType::TurnStart,
+                        super::dispatch(sdk.turn_start(input.with_sources()), None).await,
+                    );
+                }
                 deliver(&sdk, owner.clone(), event).await;
             }
         });
@@ -61,12 +86,19 @@ impl Hooks {
 fn lock(queues: &TurnQueues) -> MutexGuard<'_, HashMap<String, SessionTurns>> {
     // Writers insert complete queues, enqueue native completion values, or pop/remove
     // them. No callbacks or awaits run under this guard; poisoning cannot leave a
-    // partially delivered value in the queue. Delivery is serialized separately.
+    // partially delivered value in the queue. Start claims are complete string
+    // insertions/removals with no external work under the lock; delivery is
+    // serialized separately and cancellation cannot abandon a claimed delivery.
     queues.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn next(queues: &TurnQueues, session: &str) -> Option<AgentEvent> {
-    lock(queues).get_mut(session)?.pending.pop_front()
+fn next(queues: &TurnQueues, session: &str) -> Option<(AgentEvent, bool)> {
+    let mut queues = lock(queues);
+    let turns = queues.get_mut(session)?;
+    let event = turns.pending.pop_front()?;
+    let needs_start = matches!(&event, AgentEvent::TurnFinished(result)
+        if !turns.started.remove(&result.turn_id.to_string()));
+    Some((event, needs_start))
 }
 
 async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: AgentEvent) {

@@ -2440,8 +2440,9 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
     cancellation_generation: u64,
     activity: &SessionActivity,
 ) -> Result<(), agent_client_protocol::Error> {
-    // Only a successful, persisted standard compaction consumes this marker.
+    // Require a new persisted summary as well as consumption of this marker.
     // Runtime telemetry cannot acknowledge a pending model switch.
+    let before = driver.snapshot().transcript;
     let marker = model_switch::compact_marker();
     let marker_id = marker.id.clone();
     driver
@@ -2463,10 +2464,11 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
         ExecutionOrigin::Prompt,
     )
     .await
-    .map_err(sdk_error)?;
+    .map_err(|_| model_switch::error("compaction did not complete; model unchanged"))?;
     if !model_switch::compaction_completed(
         &reason,
         &marker_id,
+        &before,
         &driver.snapshot().transcript,
         handle
             .cancellation_handle()
@@ -3505,6 +3507,8 @@ pub(crate) fn component(
     clippy::disallowed_macros
 )]
 mod tests {
+    use crate::ahp::PromptHookBuilder as _;
+
     include!("v2/identity_tests.rs");
     #[test]
     fn catalog_matches_providers_detects_logins_and_logouts() {
@@ -8875,7 +8879,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn model_switch_compacts_with_original_model_before_selecting_and_keeps_it_on_failure_or_cancel()
      {
-        for mode in ["success", "failure", "cancel"] {
+        for mode in ["success", "failure", "cancel", "deny", "replace"] {
             let integration = AcpIntegration::default();
             let sink = ResponseReplacementSink::new(RecordingSink::default());
             let session_id = wire::SessionId::new(format!("switch-{mode}"));
@@ -8909,12 +8913,32 @@ for line in sys.stdin:
                 None,
             )
             .unwrap();
+            let (hooks, backend) = crate::ahp::test_support::hooks(vec![
+                crate::ahp::test_support::intercept(&["turn.start"]),
+            ]);
+            if mode == "deny" {
+                backend.respond("turn.start", json!([{"type": "deny", "reason": "blocked"}]));
+            } else if mode == "replace" {
+                backend.respond(
+                    "turn.start",
+                    json!([{
+                        "type": "modify", "target": "prompt", "operation": "replace",
+                        "value": crate::ahp::test_support::text_message("ordinary text"),
+                    }]),
+                );
+            }
+            let recorded = crate::session::TransientTranscript::new(vec![]);
             let mut driver = Agent::builder()
                 .model(TestAdapter {
                     outcome: TestOutcome::Content,
                     turns: Arc::new(AtomicU64::new(0)),
                     interrupt: None,
                 })
+                .prompt_hook(crate::ahp::PromptHook::new(
+                    hooks,
+                    "acp",
+                    crate::ahp::PromptRecord::Transient(recorded),
+                ))
                 .mutator(compactor)
                 .cancellation(handle.cancellation_handle())
                 .transcript(vec![
@@ -8940,7 +8964,17 @@ for line in sys.stdin:
             )
             .await;
             assert_eq!(selection.selection().unwrap().model, "gpt-5.4");
-            assert_eq!(*seen.lock().unwrap(), ["gpt-5.4"]);
+            if matches!(mode, "deny" | "replace") {
+                assert!(seen.lock().unwrap().is_empty(), "{mode}");
+                assert!(
+                    compacted.as_ref().unwrap_err().data.as_ref()
+                        == Some(&json!("compaction did not complete; model unchanged")),
+                    "{mode}: {compacted:?}"
+                );
+                assert_eq!(backend.events("turn.start").len(), 1);
+            } else {
+                assert_eq!(*seen.lock().unwrap(), ["gpt-5.4"]);
+            }
             let catalog = [crate::provider::ModelGroup {
                 provider: ProviderKind::OpenAiSubscription,
                 models: vec!["gpt-5.4-mini".into()],

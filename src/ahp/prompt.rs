@@ -23,8 +23,8 @@ const ACP_MESSAGE_ID: &str = "dev.kit.acp.message_id";
 
 /// Runs arrival policy before `turn.start` on the effective admitted prompt.
 ///
-/// Removing a denied prompt leaves no pending input, so the loop finishes the
-/// turn without calling the model.
+/// A denied batch is removed and explicitly fails its native turn, so older
+/// unfinished history cannot become pending model input.
 pub(crate) struct PromptHook {
     hooks: Arc<Hooks>,
     channel: &'static str,
@@ -289,11 +289,16 @@ impl LoopMutator for PromptHook {
         } else {
             Ok(true)
         };
+        let new_turn = ctx.turn_id.is_some_and(|turn| {
+            self.hooks
+                .claim_turn_start(&ctx.session_id.to_string(), &turn.to_string())
+        });
+        let accepted = matches!(arrival, Ok(true));
         let index = match arrival {
             Ok(true) => index,
             Ok(false) => None,
             Err(LoopError::Cancelled) => {
-                if ctx.point == MutationPoint::AfterTurnEnded {
+                if new_turn {
                     // The native turn still ends. Deliver its start without accepting
                     // effects from the cancelled admission or changing the transcript.
                     if let Some(turn_id) = ctx.turn_id {
@@ -314,11 +319,20 @@ impl LoopMutator for PromptHook {
             }
             Err(error) => return Err(error),
         };
-        if ctx.point == MutationPoint::AfterTurnEnded {
+        if new_turn {
             // Even rejected input owns a native turn. Report an empty admitted
             // input rather than inventing a prompt or leaving an unmatched end.
-            self.apply(cursor, &ctx, EventType::TurnStart, index, start, trigger)
+            let admitted = self
+                .apply(cursor, &ctx, EventType::TurnStart, index, start, trigger)
                 .await?;
+            if !admitted {
+                return Err(LoopError::Mutator("prompt blocked by agent hook".into()));
+            }
+        }
+        // Transcript shape is not a finish signal: removing this batch may expose
+        // a failed user prompt, notification, or tool result from an older turn.
+        if !accepted {
+            return Err(LoopError::Mutator("prompt blocked by agent hook".into()));
         }
         Ok(())
     }

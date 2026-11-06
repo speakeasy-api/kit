@@ -102,9 +102,10 @@ attachments; edits cannot fabricate media. Both events support user-facing
 `user.message.inbound` without another `turn.start`.
 
 A denied prompt is removed together with its admitted resources and
-notifications. At turn admission, denial ends the turn without a model call;
-a denied interjection does not cancel the active turn. A denied model request
-fails the turn. A denied tool call returns a permission error to the model.
+notifications. Denial fails the current turn without a further model call,
+including when the denied input is an interjection. Prior-turn history is
+preserved. A denied model request fails the turn. A denied tool call returns
+a permission error to the model.
 
 Kit checks edited tool input against the tool's input schema before the tool
 runs; an edit that does not match counts as a hook failure. An edit that the
