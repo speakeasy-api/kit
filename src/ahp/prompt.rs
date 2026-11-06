@@ -143,13 +143,49 @@ impl PromptHook {
                 TurnStartInputTurn::new(turn_id.to_string()),
             )
             .with_session(self.hooks.session(&ctx.session_id.to_string()));
-            super::dispatch(
-                self.hooks
-                    .sdk
-                    .turn_start(input.with_sources().with_items(items)),
-                ctx.cancellation.as_ref(),
-            )
-            .await
+            // Start delivery owns the session's observation gate until the SDK
+            // finishes. Dropping the admission wait must not drop a start that
+            // has not reached the transport yet, or allow its end to overtake it.
+            let guard = self
+                .hooks
+                .turn_delivery(&ctx.session_id.to_string())
+                .lock_owned()
+                .await;
+            let sdk = Arc::clone(&self.hooks.sdk);
+            let cancellation = ctx.cancellation.clone();
+            let operation = tokio::spawn(async move {
+                let _guard = guard;
+                let input = if cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+                {
+                    input.with_sources()
+                } else {
+                    input.with_sources().with_items(items)
+                };
+                super::dispatch(sdk.turn_start(input), None).await
+            });
+            let operation = async move {
+                operation
+                    .await
+                    .map_err(|error| LoopError::InvalidState(error.to_string()))?
+            };
+            let operation = std::pin::pin!(operation);
+            if let Some(cancellation) = ctx.cancellation.as_ref() {
+                let cancelled = std::pin::pin!(cancellation.cancelled());
+                match futures_util::future::select(cancelled, operation).await {
+                    futures_util::future::Either::Left(_) => Err(LoopError::Cancelled),
+                    futures_util::future::Either::Right((result, _)) => {
+                        if cancellation.is_cancelled() {
+                            Err(LoopError::Cancelled)
+                        } else {
+                            result
+                        }
+                    }
+                }
+            } else {
+                operation.await
+            }
         };
         if matches!(&result, Err(LoopError::Cancelled)) {
             return Err(LoopError::Cancelled);

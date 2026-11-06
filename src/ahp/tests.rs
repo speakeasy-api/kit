@@ -1756,6 +1756,7 @@ struct HoldTurnStart {
     event_type: &'static str,
     events: Arc<super::test_support::Backend>,
     reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnStart {
@@ -1772,7 +1773,7 @@ impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnStart 
             let response = self.events.call(request, timeout).await?;
             if hold {
                 self.reached.notify_one();
-                std::future::pending::<()>().await;
+                self.release.notified().await;
             }
             Ok(response)
         })
@@ -1786,6 +1787,69 @@ impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnStart 
     > {
         self.events.shutdown()
     }
+}
+
+#[tokio::test]
+async fn notification_cancelled_before_start_dispatch_pairs_empty_start_without_edits() {
+    let backend = Arc::new(super::test_support::Backend::default());
+    let hooks = super::test_support::hooks_with_backend(
+        vec![intercept(&["turn.start"]), observe(&["turn.end"])],
+        backend.clone(),
+    );
+    backend.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
+    let controller = agentkit_core::CancellationController::new();
+    let model = Model::default();
+    let recorded = crate::session::TransientTranscript::new(vec![]);
+    let mut driver = Agent::builder()
+        .model(model.clone())
+        .cancellation(controller.handle())
+        .observer(TurnHook(hooks.clone()))
+        .prompt_hook(PromptHook::new(
+            hooks.clone(),
+            "cli",
+            PromptRecord::Transient(recorded.clone()),
+        ))
+        .transcript_observer(recorded.clone())
+        .input(vec![Item::notification("original notification")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("cancel-before-start"))
+        .await
+        .unwrap();
+    // The real observation gate pauses prompt admission within the native turn,
+    // before the start operation is created or polled.
+    let gate = hooks
+        .turn_delivery("cancel-before-start")
+        .lock_owned()
+        .await;
+    let step = driver.next();
+    let mut step = std::pin::pin!(step);
+    assert!(futures_util::poll!(step.as_mut()).is_pending());
+    assert!(backend.all_events().is_empty());
+    controller.interrupt();
+    drop(gate);
+    let LoopStep::Finished(result) = step.await.unwrap() else {
+        panic!("expected cancelled notification turn");
+    };
+    assert_eq!(result.finish_reason, FinishReason::Cancelled);
+    assert!(recorded.snapshot().iter().any(|item| {
+        item.parts
+            .iter()
+            .any(|part| matches!(part, Part::Text(text) if text.text == "original notification"))
+    }));
+    assert!(model.requests.lock().unwrap().is_empty());
+    hooks.drain_turn_events("cancel-before-start").await;
+    let events = backend.all_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["turn.start", "turn.end"]
+    );
+    assert_eq!(events[0]["turn"], events[1]["turn"]);
+    assert_eq!(events[0]["items"], json!([]));
+    assert_eq!(events[1]["outcome"], "cancelled");
 }
 
 #[tokio::test]
@@ -1803,6 +1867,7 @@ async fn cancelled_prompt_hook(event_type: &'static str) {
         event_type,
         events: Arc::default(),
         reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
     });
     backend.events.respond(event_type, json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
     backend.events.respond("turn.start", json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":text_message("must not commit")}]));
@@ -1850,6 +1915,7 @@ async fn cancelled_prompt_hook(event_type: &'static str) {
     let cancel = async {
         backend.reached.notified().await;
         controller.interrupt();
+        backend.release.notify_one();
     };
     let (step, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::join!(driver.next(), cancel)

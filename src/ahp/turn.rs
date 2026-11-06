@@ -23,8 +23,9 @@ pub(super) struct SessionTurns {
 }
 
 impl Hooks {
-    /// Claims the one start delivery for a native turn. The serialized driver is
-    /// the only admission writer; completion draining removes the claim.
+    /// Claims ownership of one start operation for a native turn. The serialized
+    /// driver is the only admission writer; completion draining removes the claim.
+    /// The operation must survive cancellation and hold the delivery gate.
     pub(super) fn claim_turn_start(&self, session: &str, turn: &str) -> bool {
         lock(&self.turn_events)
             .entry(session.to_owned())
@@ -33,15 +34,18 @@ impl Hooks {
             .insert(turn.to_owned())
     }
 
-    /// Delivers the turn observations queued for `session`, in order.
-    pub(crate) async fn drain_turn_events(&self, session: &str) {
-        let delivery = Arc::clone(
+    pub(super) fn turn_delivery(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
             &lock(&self.turn_events)
                 .entry(session.to_owned())
                 .or_default()
                 .delivery,
-        );
-        let guard = delivery.lock_owned().await;
+        )
+    }
+
+    /// Delivers the turn observations queued for `session`, in order.
+    pub(crate) async fn drain_turn_events(&self, session: &str) {
+        let guard = self.turn_delivery(session).lock_owned().await;
         if lock(&self.turn_events)
             .get(session)
             .is_none_or(|turns| turns.pending.is_empty())
