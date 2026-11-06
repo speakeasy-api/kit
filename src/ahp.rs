@@ -281,7 +281,13 @@ fn options() -> Result<HooksOptions, String> {
                 .inject_context(capability::InjectContext::Now),
         ),
         session_end: Some(capability::session_end().observe()),
-        turn_start: Some(capability::turn_start().observe()),
+        turn_start: Some(
+            capability::turn_start()
+                .message()
+                .observe()
+                .deny()
+                .modify_prompt(Modify::Replace),
+        ),
         turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
             capability::user_message_inbound()

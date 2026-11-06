@@ -615,9 +615,19 @@ fn canonical_items<'a>(
     messages: impl IntoIterator<Item = &'a CanonicalMessage>,
     originals: &[Item],
 ) -> Result<Vec<Item>, LoopError> {
+    canonical_items_at(messages, originals, 0)
+}
+
+/// Keep synthesized identities at their transcript offsets while limiting
+/// opaque-part authority to the supplied original message scope.
+pub(super) fn canonical_items_at<'a>(
+    messages: impl IntoIterator<Item = &'a CanonicalMessage>,
+    originals: &[Item],
+    offset: usize,
+) -> Result<Vec<Item>, LoopError> {
     let mut by_id = HashMap::with_capacity(originals.len());
     for (index, item) in originals.iter().enumerate() {
-        let id = super::item_id(item, index);
+        let id = super::item_id(item, offset + index);
         let original = OriginalMessage::new(item, &id);
         if by_id.insert(id, original).is_some() {
             return Err(invalid("duplicate original model message identity"));
