@@ -1275,7 +1275,7 @@ fn compaction_reason(transcript: &[Item]) -> Option<CompactionReason> {
     configured_reason(transcript, &CompactionConfig::default())
 }
 
-fn context_window(transcript: &[Item]) -> Option<u64> {
+pub(crate) fn context_window(transcript: &[Item]) -> Option<u64> {
     transcript
         .iter()
         .rev()

@@ -729,6 +729,17 @@ pub(crate) struct AcpDriver {
     pub structured_completion: bool,
     pub adapter: SelectableAdapter,
     pub canonical_transcript: Vec<Item>,
+    /// Set when a resumed session's recorded model could not be restored.
+    pub model_fallback: Option<String>,
+    /// Usage without a producing model predates model records, so it can only be
+    /// attributed to the default when the session has no record or override.
+    pub unattributed_usage_applies: bool,
+}
+
+struct RestoredModel {
+    selection: ModelSelection,
+    fallback: Option<String>,
+    unattributed_usage_applies: bool,
 }
 
 struct McpInstallSources {
@@ -761,6 +772,7 @@ pub struct Runtime {
     adapter: SelectableAdapter,
     provider: ProviderKind,
     model: String,
+    model_override: bool,
     reasoning_effort: Option<crate::provider::ReasoningEffort>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
@@ -884,6 +896,7 @@ impl Runtime {
             adapter,
             provider,
             model,
+            model_override: false,
             reasoning_effort,
             credential_storage,
             openrouter_api_key,
@@ -1036,6 +1049,52 @@ impl Runtime {
     }
 
     /// Configures compaction before publishing the runtime to any sessions.
+    /// Makes the configured model replace a resumed session's recorded model.
+    pub fn with_model_override(
+        runtime: Arc<Self>,
+        model_override: bool,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure model after runtime was shared".to_string())?;
+        runtime.model_override = model_override;
+        Ok(Arc::new(runtime))
+    }
+
+    async fn restored_model(
+        &self,
+        opened: &crate::session::OpenSession,
+        resume: bool,
+    ) -> Result<RestoredModel, String> {
+        let configured = ModelSelection::new(self.provider, self.model.clone());
+        let recorded = opened.model.as_deref();
+        let (selection, fallback) = match recorded {
+            Some(recorded) if !self.model_override && recorded != configured.id() => {
+                match ModelSelection::from_id(recorded) {
+                    Ok(selection) if self.adapter.can_restore(&selection).await => {
+                        (selection, None)
+                    }
+                    _ => {
+                        let notice = format!(
+                            "session model {recorded} is unavailable; using {}",
+                            configured.id()
+                        );
+                        tracing::warn!("{notice}");
+                        (configured, Some(notice))
+                    }
+                }
+            }
+            _ => (configured, None),
+        };
+        if resume && self.model_override {
+            opened.observer.set_model(&selection.id())?;
+        }
+        Ok(RestoredModel {
+            selection,
+            fallback,
+            unattributed_usage_applies: recorded.is_none() && !self.model_override,
+        })
+    }
+
     pub fn with_compaction(
         runtime: Arc<Self>,
         policy: crate::compaction::policy::CompactionConfig,
@@ -1552,6 +1611,7 @@ impl Runtime {
             adapter: self.adapter.clone(),
             provider: self.provider,
             model: self.model.clone(),
+            model_override: self.model_override,
             reasoning_effort: self.reasoning_effort,
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
@@ -1914,7 +1974,10 @@ impl Runtime {
                     error,
                 )
             })?;
-            let selection = self.adapter.selection()?;
+            let selection = self
+                .restored_model(&opened, request.resume)
+                .await?
+                .selection;
             let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
                 selection.provider,
                 selection.model,
@@ -2334,12 +2397,22 @@ impl Runtime {
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
-        let (selection, reasoning_effort) = selected.unwrap_or_else(|| {
-            (
-                ModelSelection::new(self.provider, self.model.clone()),
-                opened.reasoning_effort.unwrap_or(self.reasoning_effort),
-            )
-        });
+        let (selection, reasoning_effort, model_fallback, unattributed_usage_applies) =
+            match selected {
+                Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, false),
+                None => {
+                    let restored = self
+                        .restored_model(&opened, request.resume)
+                        .await
+                        .map_err(AcpRuntimeError::Loop)?;
+                    (
+                        restored.selection,
+                        opened.reasoning_effort.unwrap_or(self.reasoning_effort),
+                        restored.fallback,
+                        restored.unattributed_usage_applies,
+                    )
+                }
+            };
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             selection.provider,
             selection.model,
@@ -2444,6 +2517,8 @@ impl Runtime {
             structured_completion: self.base_depth > 0,
             adapter,
             canonical_transcript,
+            model_fallback,
+            unattributed_usage_applies,
         };
         Ok(driver)
     }

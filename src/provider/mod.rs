@@ -15,11 +15,11 @@ pub mod usage;
 #[doc(hidden)]
 pub use typesafe_auth::{TypeSafeAuthCommand, execute_typesafe_auth};
 
-pub(crate) use adapter::authentication_method_id;
 pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,
 };
+pub(crate) use adapter::{USAGE_MODEL_METADATA_KEY, authentication_method_id};
 
 /// An OpenRouter API key that is redacted in diagnostics and zeroized on drop.
 #[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]

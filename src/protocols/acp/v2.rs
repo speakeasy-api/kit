@@ -1292,6 +1292,13 @@ impl Server {
             .map_err(AcpRuntimeError::Loop)?;
         let catalog = driver.adapter.model_catalog(&current).await;
         let config_options = v2_config_options(&current, reasoning, &catalog);
+        let model_fallback = driver.model_fallback.clone();
+        let restored_context = super::usage::restored_context(
+            &driver.canonical_transcript,
+            &catalog,
+            &current,
+            driver.unattributed_usage_applies,
+        );
         let canonical_transcript = driver.canonical_transcript;
         // Validate before spawning or publishing the attachment. BindingGuard and
         // the uncommitted claim release ownership on rejection.
@@ -1348,6 +1355,21 @@ impl Server {
                 let sink = actor.sink.clone();
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
+                if let Some((used, size)) = restored_context {
+                    let _ = sink.update(wire::UpdateSessionNotification::new(
+                        session_id.clone(),
+                        wire::SessionUpdate::UsageUpdate(wire::UsageUpdate::new(used, size)),
+                    ));
+                }
+                if let Some(notice) = model_fallback {
+                    let _ = sink.update(wire::UpdateSessionNotification::new(
+                        session_id.clone(),
+                        wire::SessionUpdate::Notice(wire::Notice::new(
+                            wire::NoticeSeverity::Warning,
+                            notice,
+                        )),
+                    ));
+                }
                 let actor = std::pin::pin!(super::subagents::with_updates(
                     session_actor(actor),
                     Some(subagent_updates),
@@ -1899,6 +1921,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     cancellation_generation,
                 }) => {
                     let span = crate::telemetry::incoming::operation(request.meta.as_ref());
+                    let model_change = request.config_id.to_string() == super::MODEL_CONFIG_ID;
                     let result = async {
                         if handle
                             .cancellation_handle()
@@ -1975,6 +1998,22 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         ))
                     {
                         tracing::debug!(%error, "failed to queue ACP v2 config options update");
+                    }
+                    if result.is_ok()
+                        && model_change
+                        && let Ok(selection) = adapter.selection()
+                        && let Some((used, size)) = super::usage::restored_context(
+                            &driver.snapshot().transcript,
+                            &catalog,
+                            &selection,
+                            false,
+                        )
+                        && let Err(error) = sink.update(wire::UpdateSessionNotification::new(
+                            session_id.clone(),
+                            wire::SessionUpdate::UsageUpdate(wire::UsageUpdate::new(used, size)),
+                        ))
+                    {
+                        tracing::debug!(%error, "failed to queue ACP v2 usage update");
                     }
                     let _ = reply.send(result);
                 }
@@ -7688,6 +7727,78 @@ mod tests {
         result
             .expect("snapshot client timed out")
             .expect("snapshot client failed");
+    }
+
+    #[tokio::test]
+    async fn v2_resume_reports_recorded_context_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let source = crate::session::new_id();
+        let mut usage = agentkit_core::Usage::new(agentkit_core::TokenUsage::new(90, 10));
+        usage.metadata = MetadataMap::from([("context_window".into(), json!(1000))]);
+        drop(
+            crate::session::open(
+                &workspace,
+                &source,
+                false,
+                false,
+                vec![
+                    Item::text(ItemKind::System, "system"),
+                    Item::text(ItemKind::Assistant, "remembered").with_usage(usage),
+                ],
+            )
+            .unwrap(),
+        );
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            &workspace,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+        agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |notification: wire::UpdateSessionNotification, _cx| {
+                    let _ = updates_tx.send(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |cx| {
+                cx.send_request(wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("usage-test", "0"),
+                ))
+                .block_task()
+                .await?;
+                cx.send_request(wire::ResumeSessionRequest::new(source.clone(), workspace))
+                    .block_task()
+                    .await?;
+                loop {
+                    let update = timeout(Duration::from_secs(10), updates_rx.recv())
+                        .await
+                        .expect("usage update timed out")
+                        .unwrap();
+                    if let wire::SessionUpdate::UsageUpdate(usage) = update {
+                        assert_eq!((usage.used, usage.size), (100, 1000));
+                        break;
+                    }
+                }
+                cx.send_request(wire::CloseSessionRequest::new(wire::SessionId::new(source)))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

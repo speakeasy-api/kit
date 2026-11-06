@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use agent_client_protocol::schema::v1::UsageUpdate;
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agenthooksprotocol::SessionEndInputOutcome;
 use agentkit_acp::{
@@ -1966,6 +1967,13 @@ impl Server {
             .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
         let catalog = driver.adapter.model_catalog(&current).await;
         let config_options = config_options(&current, reasoning_effort, &catalog);
+        let model_fallback = driver.model_fallback.clone();
+        let restored_context = usage::restored_context(
+            &driver.canonical_transcript,
+            &catalog,
+            &current,
+            driver.unattributed_usage_applies,
+        );
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
         let structured_completion = driver.structured_completion;
@@ -2015,6 +2023,20 @@ impl Server {
             if activated.await.is_ok() {
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
+                // Clients discard non-transcript updates during replay, so these
+                // follow the response rather than joining the replay stream.
+                if let Some((used, size)) = restored_context {
+                    let _ = connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
+                    ));
+                }
+                if let Some(notice) = model_fallback.filter(|_| notices_supported) {
+                    let _ = connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::Notice(Notice::new(NoticeSeverity::Warning, notice)),
+                    ));
+                }
                 let actor = std::pin::pin!(subagents::with_updates(
                     session_actor(actor),
                     subagent_updates,
@@ -2432,6 +2454,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     cancellation_generation,
                 }) => {
                     let span = crate::telemetry::incoming::operation(request.meta.as_ref());
+                    let model_change = request.config_id.to_string() == MODEL_CONFIG_ID;
                     let result = async {
                         let cancellation = integration
                             .cancellation_handle(&session_id)
@@ -2439,7 +2462,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         if cancellation.is_cancelled_since(cancellation_generation) {
                             return Err(model_switch::error("model change cancelled"));
                         }
-                        if request.config_id.to_string() == MODEL_CONFIG_ID {
+                        if model_change {
                             let target = request.value.as_value_id().ok_or_else(|| {
                                 model_switch::error("selection requires an id value")
                             })?;
@@ -2518,6 +2541,22 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         ))
                     {
                         tracing::debug!(%error, "failed to queue ACP config options update");
+                    }
+                    if result.is_ok()
+                        && model_change
+                        && let Ok(selection) = adapter.selection()
+                        && let Some((used, size)) = usage::restored_context(
+                            &driver.snapshot().transcript,
+                            &catalog,
+                            &selection,
+                            false,
+                        )
+                        && let Err(error) = client.notify_session(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
+                        ))
+                    {
+                        tracing::debug!(%error, "failed to queue ACP usage update");
                     }
                     let _ = reply.send(result);
                 }
@@ -7653,6 +7692,79 @@ pub(super) mod tests {
         assert_eq!(adapter.reasoning_effort().unwrap(), None);
         let options = serde_json::to_value(response.config_options).unwrap();
         assert_eq!(options[1]["currentValue"], "default");
+    }
+
+    #[tokio::test]
+    async fn load_reports_recorded_context_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = crate::session::new_id();
+        let mut usage = agentkit_core::Usage::new(agentkit_core::TokenUsage::new(90, 10));
+        usage.metadata = agentkit_core::MetadataMap::from([("context_window".into(), 1000.into())]);
+        drop(
+            crate::session::open(
+                root.path(),
+                &session_id,
+                false,
+                false,
+                vec![
+                    Item::text(ItemKind::System, "system"),
+                    Item::text(ItemKind::User, "remember me"),
+                    Item::text(ItemKind::Assistant, "remembered").with_usage(usage),
+                ],
+            )
+            .unwrap(),
+        );
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            None,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+        let workspace = root.path().to_path_buf();
+        agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    let _ = updates_tx.send(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(LoadSessionRequest::new(session_id.clone(), workspace))
+                    .block_task()
+                    .await?;
+                loop {
+                    let update = timeout(Duration::from_secs(10), updates_rx.recv())
+                        .await
+                        .expect("usage update timed out")
+                        .unwrap();
+                    if let SessionUpdate::UsageUpdate(usage) = update {
+                        assert_eq!((usage.used, usage.size), (100, 1000));
+                        break;
+                    }
+                }
+                connection
+                    .send_request(CloseSessionRequest::new(session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

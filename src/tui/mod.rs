@@ -964,6 +964,7 @@ fn agent_command_for_launch(
     session_id: &str,
     resume: bool,
     force: bool,
+    model_override: bool,
 ) -> std::io::Result<tokio::process::Command> {
     let mut command = crate::acp_child::serve_command(
         root,
@@ -984,6 +985,10 @@ fn agent_command_for_launch(
     credential_storage.append_cli_args(&mut command);
     if force {
         command.arg("--force");
+    }
+    // The TUI always forwards its resolved model, so the server cannot infer intent.
+    if !model_override {
+        command.arg("--prefer-session-model");
     }
     Ok(command)
 }
@@ -1375,6 +1380,7 @@ pub async fn run_with_reasoning_effort(
         resume,
         force,
         false,
+        false,
         &mut Stop::new()?,
     )
     .await
@@ -1395,6 +1401,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     resume: Option<&str>,
     force: bool,
     voice_enabled: bool,
+    model_override: bool,
     stop: &mut Stop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_client(
@@ -1410,6 +1417,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         resume,
         force,
         voice_enabled,
+        model_override,
         stop,
         None,
     )
@@ -1475,6 +1483,7 @@ pub async fn run_remote(
         None,
         false,
         false,
+        false,
         stop,
         Some(remote),
     )
@@ -1496,6 +1505,7 @@ async fn run_client(
     resume: Option<&str>,
     force: bool,
     voice_enabled: bool,
+    model_override: bool,
     stop: &mut Stop,
     remote: Option<&crate::gateway::Remote>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1555,6 +1565,7 @@ async fn run_client(
                 launch_session_id,
                 resume_session_id.is_some(),
                 force,
+                model_override,
             )?
         };
         let child_mcp_config = mcp_config.clone();
@@ -4847,9 +4858,15 @@ mod tests {
             "B",
             true,
             false,
+            false,
         )
         .unwrap();
         let resumed_args = command_args(&resumed);
+        assert!(
+            resumed_args
+                .iter()
+                .any(|arg| arg == "--prefer-session-model")
+        );
         assert!(
             resumed_args
                 .windows(2)
@@ -4884,9 +4901,11 @@ mod tests {
             "C",
             false,
             false,
+            true,
         )
         .unwrap();
         let new_args = command_args(&new_session);
+        assert!(!new_args.iter().any(|arg| arg == "--prefer-session-model"));
         assert!(
             new_args
                 .windows(2)

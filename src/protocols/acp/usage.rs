@@ -128,6 +128,39 @@ impl SessionUsage {
     }
 }
 
+/// Context occupancy for a session whose window is known without a new response.
+/// A recorded window describes only the model that produced the latest usage.
+pub(super) fn restored_context(
+    transcript: &[agentkit_core::Item],
+    catalog: &[crate::provider::ModelGroup],
+    selection: &crate::provider::ModelSelection,
+    unattributed_usage_applies: bool,
+) -> Option<(u64, u64)> {
+    let used = crate::compaction::latest_context_tokens(transcript)?;
+    let advertised = catalog
+        .iter()
+        .find(|group| group.provider == selection.provider)
+        .and_then(|group| group.context_windows.get(&selection.model))
+        .copied()
+        .filter(|window| *window > 0);
+    let recorded = || {
+        let producer = transcript
+            .iter()
+            .rev()
+            .find_map(|item| item.usage.as_ref())?
+            .metadata
+            .get(crate::provider::USAGE_MODEL_METADATA_KEY);
+        let applies = match producer {
+            Some(producer) => producer.as_str() == Some(selection.id().as_str()),
+            None => unattributed_usage_applies,
+        };
+        applies
+            .then(|| crate::compaction::context_window(transcript))
+            .flatten()
+    };
+    Some((used, advertised.or_else(recorded)?))
+}
+
 #[derive(Clone)]
 pub(crate) enum Accounting {
     Main(SessionActivity),
@@ -383,6 +416,77 @@ mod tests {
             model: None,
             response_id: None,
         })
+    }
+
+    #[test]
+    fn restored_context_prefers_the_advertised_window_of_the_selected_model() {
+        let mut usage = Usage::new(agentkit_core::TokenUsage::new(90, 10));
+        usage.metadata = MetadataMap::from([("context_window".into(), 1000.into())]);
+        let transcript = vec![
+            agentkit_core::Item::text(agentkit_core::ItemKind::Assistant, "done").with_usage(usage),
+        ];
+        let selection =
+            crate::provider::ModelSelection::new(crate::ProviderKind::OpenRouter, "selected/model");
+        let catalog = |windows: Vec<(String, u64)>| {
+            vec![crate::provider::ModelGroup {
+                provider: crate::ProviderKind::OpenRouter,
+                models: vec!["selected/model".into()],
+                context_windows: windows.into_iter().collect(),
+            }]
+        };
+        assert_eq!(
+            restored_context(&transcript, &catalog(vec![]), &selection, true),
+            Some((100, 1000))
+        );
+        assert_eq!(
+            restored_context(
+                &transcript,
+                &catalog(vec![("selected/model".into(), 2000)]),
+                &selection,
+                true
+            ),
+            Some((100, 2000))
+        );
+        assert_eq!(
+            restored_context(&transcript, &catalog(vec![]), &selection, false),
+            None
+        );
+        let stamped = |producer: &str| {
+            let mut usage = Usage::new(agentkit_core::TokenUsage::new(90, 10));
+            usage.metadata = MetadataMap::from([
+                ("context_window".into(), 1000.into()),
+                (
+                    crate::provider::USAGE_MODEL_METADATA_KEY.into(),
+                    producer.into(),
+                ),
+            ]);
+            vec![
+                agentkit_core::Item::text(agentkit_core::ItemKind::Assistant, "done")
+                    .with_usage(usage),
+            ]
+        };
+        assert_eq!(
+            restored_context(
+                &stamped(&selection.id()),
+                &catalog(vec![]),
+                &selection,
+                false
+            ),
+            Some((100, 1000))
+        );
+        assert_eq!(
+            restored_context(
+                &stamped("openrouter:other/model"),
+                &catalog(vec![]),
+                &selection,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            restored_context(&[], &catalog(vec![]), &selection, true),
+            None
+        );
     }
 
     fn start(activity: &SessionActivity) {
