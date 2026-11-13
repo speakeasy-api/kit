@@ -150,6 +150,8 @@ pub struct ModelGroup {
     pub context_windows: std::collections::HashMap<String, u64>,
 }
 
+pub(crate) const USAGE_MODEL_METADATA_KEY: &str = "kit.model";
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -279,6 +281,7 @@ impl SelectableAdapter {
     ) -> Result<Self, String> {
         if persist_initial {
             observer.set_reasoning_effort(self.reasoning_effort()?)?;
+            observer.set_model(&self.selection()?.id())?;
         }
         self.session_observer = Some(observer);
         Ok(self)
@@ -358,6 +361,7 @@ impl SelectableAdapter {
             .map(|catalog| DiscoveredModels {
                 models: catalog.visible_models().to_vec(),
                 context_windows: catalog.context_windows().clone(),
+                hidden_models: catalog.known_models().clone(),
             })
             .unwrap_or_default()
     }
@@ -406,6 +410,55 @@ impl SelectableAdapter {
         providers
     }
 
+    /// False only on evidence: no credentials, or a successful listing that omits
+    /// the model. A failed lookup proves nothing, so the selection is kept.
+    pub(crate) async fn can_restore(&self, selection: &ModelSelection) -> bool {
+        if self.inference.get(selection.provider).is_some() {
+            return true;
+        }
+        if !self.catalog_providers().contains(&selection.provider) {
+            return false;
+        }
+        match selection.provider {
+            ProviderKind::OpenAiSubscription => {
+                listed(&self.discovered_openai_models().await, &selection.model)
+            }
+            ProviderKind::OpenRouter => {
+                let url = match std::env::var_os("OPENROUTER_BASE_URL") {
+                    None => catalog_models_url(None),
+                    Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
+                };
+                match url {
+                    Some(url) => fetch_model_ids(&url)
+                        .await
+                        .map_or(true, |models| listed(&models, &selection.model)),
+                    None => true,
+                }
+            }
+            ProviderKind::Speakeasy => fetch_model_ids(OPENROUTER_MODELS_URL)
+                .await
+                .map_or(true, |models| listed(&models, &selection.model)),
+            ProviderKind::Anthropic => {
+                let models = discover_anthropic(&self.credential_storage).await;
+                if models.is_empty() || models.iter().any(|model| model.id == selection.model) {
+                    return true;
+                }
+                // Listings carry canonical ids, but aliases are callable too.
+                let Ok(Some(credentials)) =
+                    super::anthropic_auth::credentials(&self.credential_storage)
+                else {
+                    return true;
+                };
+                !super::anthropic_catalog::confirmed_missing(
+                    super::anthropic_catalog::MODELS_URL,
+                    credentials.api_key(),
+                    &selection.model,
+                )
+                .await
+            }
+        }
+    }
+
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
@@ -424,6 +477,10 @@ impl SelectableAdapter {
             .selection
             .lock()
             .map_err(|_| "session selection lock is poisoned")?;
+        // Same lock order and failure semantics as `select_reasoning_effort`.
+        if let Some(observer) = &self.session_observer {
+            observer.set_model(&selection.id())?;
+        }
         current.model = selection;
         current.revision = current.revision.wrapping_add(1);
         Ok(())
@@ -537,7 +594,7 @@ fn expose_background_call_ids(request: &mut TurnRequest) {
 
 #[async_trait]
 impl ModelSession for SelectableSession {
-    type Turn = KitTurn;
+    type Turn = SelectableTurn;
 
     fn set_retry_observer(&mut self, observer: Option<Arc<dyn agentkit_loop::RetryObserver>>) {
         self.inner.set_retry_observer(observer.clone());
@@ -570,7 +627,11 @@ impl ModelSession for SelectableSession {
             self.replace_active(selected, replacement)?;
         }
         expose_background_call_ids(&mut request);
-        self.inner.begin_turn(request, cancellation).await
+        let inner = self.inner.begin_turn(request, cancellation).await?;
+        Ok(SelectableTurn {
+            inner,
+            model: self.active.model.id(),
+        })
     }
 
     fn model_name(&self) -> Option<&str> {
@@ -580,6 +641,36 @@ impl ModelSession for SelectableSession {
     fn provider_name(&self) -> Option<&str> {
         Some(self.active.model.provider.as_str())
     }
+}
+
+/// Records which model produced each usage, since the selection can later change.
+pub struct SelectableTurn {
+    inner: KitTurn,
+    model: String,
+}
+
+#[async_trait]
+impl ModelTurn for SelectableTurn {
+    fn on_cancelled(&mut self) {
+        self.inner.on_cancelled();
+    }
+
+    async fn next_event(
+        &mut self,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError> {
+        let mut event = self.inner.next_event(cancellation).await?;
+        stamp_usage_model(&mut event, &self.model);
+        Ok(event)
+    }
+}
+
+fn stamp_usage_model(event: &mut Option<ModelTurnEvent>, model: &str) {
+    stamp_event_usage(event, |usage| {
+        usage
+            .metadata
+            .insert(USAGE_MODEL_METADATA_KEY.into(), model.into());
+    });
 }
 
 impl SelectableSession {
@@ -1535,14 +1626,17 @@ pub(super) fn stamp_context_window(
     context_window: u64,
     provider_key: &'static str,
 ) {
-    let stamp = |usage: &mut Usage| {
+    stamp_event_usage(event, |usage| {
         usage
             .metadata
             .insert("context_window".into(), context_window.into());
         usage
             .metadata
             .insert(provider_key.into(), context_window.into());
-    };
+    });
+}
+
+fn stamp_event_usage(event: &mut Option<ModelTurnEvent>, stamp: impl Fn(&mut Usage)) {
     match event {
         Some(ModelTurnEvent::Usage(usage)) => stamp(usage),
         Some(ModelTurnEvent::Finished(result)) => {
@@ -1938,6 +2032,13 @@ fn openrouter_fallback() -> Vec<String> {
 struct DiscoveredModels {
     models: Vec<String>,
     context_windows: std::collections::HashMap<String, u64>,
+    hidden_models: std::collections::HashSet<String>,
+}
+
+fn listed(discovered: &DiscoveredModels, model: &str) -> bool {
+    discovered.models.is_empty()
+        || discovered.models.iter().any(|listed| listed == model)
+        || discovered.hidden_models.contains(model)
 }
 
 fn fallback_catalog() -> DiscoveredModels {
@@ -2006,6 +2107,7 @@ fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
     Ok(DiscoveredModels {
         models,
         context_windows,
+        ..Default::default()
     })
 }
 
@@ -2265,6 +2367,54 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.contains("cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn usage_records_the_model_that_produced_it() {
+        use agentkit_core::{FinishReason, MetadataMap, TokenUsage, Usage};
+        use agentkit_loop::{ModelTurnEvent, ModelTurnResult};
+        let stamped = |usage: &Usage| usage.metadata.get(super::USAGE_MODEL_METADATA_KEY).cloned();
+        let usage = Usage::new(TokenUsage::new(1, 1));
+        let mut event = Some(ModelTurnEvent::Usage(usage.clone()));
+        super::stamp_usage_model(&mut event, "openrouter:a");
+        let Some(ModelTurnEvent::Usage(result)) = &event else {
+            panic!("usage event");
+        };
+        assert_eq!(stamped(result), Some("openrouter:a".into()));
+        let mut event = Some(ModelTurnEvent::Finished(ModelTurnResult {
+            finish_reason: FinishReason::Completed,
+            output_items: vec![Item::text(ItemKind::Assistant, "done").with_usage(usage.clone())],
+            usage: Some(usage),
+            metadata: MetadataMap::new(),
+            model: None,
+            response_id: None,
+        }));
+        super::stamp_usage_model(&mut event, "openrouter:b");
+        let Some(ModelTurnEvent::Finished(result)) = &event else {
+            panic!("finished event");
+        };
+        assert_eq!(
+            stamped(result.usage.as_ref().unwrap()),
+            Some("openrouter:b".into())
+        );
+        assert_eq!(
+            stamped(result.output_items[0].usage.as_ref().unwrap()),
+            Some("openrouter:b".into())
+        );
+    }
+
+    #[test]
+    fn only_a_successful_listing_can_prove_a_model_unavailable() {
+        use super::{DiscoveredModels, listed};
+        assert!(listed(&DiscoveredModels::default(), "any"));
+        let discovered = DiscoveredModels {
+            models: vec!["visible".into()],
+            hidden_models: ["hidden".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(listed(&discovered, "visible"));
+        assert!(listed(&discovered, "hidden"));
+        assert!(!listed(&discovered, "retired"));
     }
 
     #[test]

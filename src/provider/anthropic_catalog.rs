@@ -62,6 +62,13 @@ pub(super) async fn retrieve(url: &str, key: &str, model: &str) -> Result<Model,
     .map_err(|_| "Anthropic model discovery timed out".to_owned())?
 }
 
+/// Only a 404 proves a model is gone; any other failure is inconclusive.
+pub(super) async fn confirmed_missing(url: &str, key: &str, model: &str) -> bool {
+    retrieve(url, key, model)
+        .await
+        .is_err_and(|error| error.contains("HTTP 404"))
+}
+
 async fn read_model_response(
     client: &reqwest::Client,
     url: reqwest::Url,
@@ -204,6 +211,20 @@ mod tests {
         assert!(requests[0].contains("x-api-key: alias-key"));
         assert!(requests[0].contains("anthropic-version: 2023-06-01"));
         assert!(!requests[0].contains("limit="));
+    }
+
+    #[tokio::test]
+    async fn only_a_not_found_response_confirms_a_model_is_missing() {
+        for (status, body, missing) in [
+            (404, "{}".to_owned(), true),
+            (401, "{}".to_owned(), false),
+            (500, "{}".to_owned(), false),
+            (200, json!({"id":"canonical-id"}).to_string(), false),
+        ] {
+            let (url, handle) = server(vec![(status, body)]);
+            assert_eq!(confirmed_missing(&url, "test", "alias").await, missing);
+            let _ = handle.join();
+        }
     }
 
     #[tokio::test]
