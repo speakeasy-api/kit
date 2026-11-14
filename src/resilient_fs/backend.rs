@@ -669,9 +669,35 @@ mod native {
         file.set_permissions(permissions)
     }
     pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
-        let _p = parent(&path.join(".kit-sync-anchor"))?;
-        // Windows does not support FlushFileBuffers on directory handles.
-        Ok(())
+        // FlushFileBuffers works on a directory handle only when the handle
+        // has write access; a read/listing handle fails with
+        // ERROR_ACCESS_DENIED. BACKUP_SEMANTICS is what opens a directory at
+        // all, and REPARSE keeps the no-reparse-follow stance of every other
+        // open here. The pinned walk covers the ancestors; the directory
+        // itself is opened for write, so it must not also be pinned
+        // read-only (the walk's share_mode(1) would deny the write access
+        // this flush needs, which is why the anchor form is not used).
+        let absolute: PathBuf = if path.is_absolute() {
+            path.components().collect()
+        } else {
+            std::env::current_dir()?.join(path).components().collect()
+        };
+        let target = match absolute.file_name() {
+            // a named directory: resolve it through the pinned walk like
+            // every other mutation here
+            Some(_) => parent(&absolute)?.path,
+            // a volume root: nothing above it to pin
+            None => absolute,
+        };
+        let dir = OpenOptions::new()
+            .write(true)
+            .custom_flags(REPARSE | BACKUP)
+            .open(&target)?;
+        let m = dir.metadata()?;
+        if !m.is_dir() || m.file_attributes() & REPARSE_ATTRIBUTE != 0 {
+            return Err(denied());
+        }
+        dir.sync_all()
     }
     pub(super) fn open_beneath(root: &Path, relative: &Path) -> io::Result<File> {
         if relative.as_os_str().is_empty()
@@ -1262,5 +1288,29 @@ mod tests {
         assert!(DiskBackend.acquire_lease(&request).is_err());
         assert_eq!(fs::read(&request.path).unwrap(), b"public");
         assert_eq!(fs::metadata(&request.path).unwrap().mode() & 0o777, 0o644);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    // No Windows runner in CI; this runs for local `cargo test --target
+    // x86_64-pc-windows-*` and asserts the call path (open for write +
+    // FlushFileBuffers) succeeds where the old no-op also returned Ok, and
+    // that errors propagate like they do on POSIX.
+    #[test]
+    fn sync_directory_succeeds_on_a_real_directory() {
+        let dir = std::env::temp_dir().join(format!("kit-sync-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        DiskBackend.sync_directory(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_directory_propagates_missing_directory() {
+        let missing = std::env::temp_dir().join("kit-sync-no-such-dir");
+        assert!(DiskBackend.sync_directory(&missing).is_err());
     }
 }
