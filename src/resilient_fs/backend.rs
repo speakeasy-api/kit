@@ -557,11 +557,14 @@ mod native {
         })
     }
     fn directory(path: &Path) -> io::Result<File> {
-        // Denying write/delete sharing pins every ancestor against rename and
-        // reparse-point modification until the operation has completed.
+        // Denying delete sharing pins every ancestor against rename and
+        // replacement until the operation has completed. Write sharing is
+        // allowed so `sync_directory` can open a pinned directory for write
+        // (FlushFileBuffers requires GENERIC_WRITE); sharing does not grant
+        // access, the ACL still decides.
         let f = OpenOptions::new()
             .read(true)
-            .share_mode(1)
+            .share_mode(1 | 2)
             .custom_flags(REPARSE | BACKUP)
             .open(path)?;
         let m = f.metadata()?;
@@ -673,26 +676,28 @@ mod native {
         // has write access; a read/listing handle fails with
         // ERROR_ACCESS_DENIED. BACKUP_SEMANTICS is what opens a directory at
         // all, and REPARSE keeps the no-reparse-follow stance of every other
-        // open here. The pinned walk covers the ancestors; the directory
-        // itself is opened for write, so it must not also be pinned
-        // read-only (the walk's share_mode(1) would deny the write access
-        // this flush needs, which is why the anchor form is not used).
+        // open here. The pinned ancestor walk protects the ancestors only;
+        // the target itself is opened for write, so it must not also be
+        // pinned read-only (hence the separate anchor-free open).
         let absolute: PathBuf = if path.is_absolute() {
             path.components().collect()
         } else {
             std::env::current_dir()?.join(path).components().collect()
         };
-        let target = match absolute.file_name() {
-            // a named directory: resolve it through the pinned walk like
-            // every other mutation here
-            Some(_) => parent(&absolute)?.path,
-            // a volume root: nothing above it to pin
-            None => absolute,
+        // Keep the parent pin alive through the open, metadata checks and
+        // flush. Dropping it before opening would leave the ancestors
+        // replaceable (OPEN_REPARSE_POINT only covers the final component).
+        // A volume root has no ancestors to pin.
+        let pinned = if absolute.file_name().is_some() {
+            Some(parent(&absolute)?)
+        } else {
+            None
         };
+        let target = pinned.as_ref().map_or(&absolute, |p| &p.path);
         let dir = OpenOptions::new()
             .write(true)
             .custom_flags(REPARSE | BACKUP)
-            .open(&target)?;
+            .open(target)?;
         let m = dir.metadata()?;
         if !m.is_dir() || m.file_attributes() & REPARSE_ATTRIBUTE != 0 {
             return Err(denied());
@@ -1296,10 +1301,9 @@ mod windows_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    // No Windows runner in CI; this runs for local `cargo test --target
-    // x86_64-pc-windows-*` and asserts the call path (open for write +
-    // FlushFileBuffers) succeeds where the old no-op also returned Ok, and
-    // that errors propagate like they do on POSIX.
+    // These run on a Windows GitHub Actions runner: the flush must work with
+    // a live session lease holding the directory pinned, and the relaxed
+    // share mode must still reject a rename of that pinned directory.
     #[test]
     fn sync_directory_succeeds_on_a_real_directory() {
         let dir = std::env::temp_dir().join(format!("kit-sync-{}", std::process::id()));
@@ -1312,5 +1316,38 @@ mod windows_tests {
     fn sync_directory_propagates_missing_directory() {
         let missing = std::env::temp_dir().join("kit-sync-no-such-dir");
         assert!(DiskBackend.sync_directory(&missing).is_err());
+    }
+
+    #[test]
+    fn sync_directory_coexists_with_a_held_session_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = DiskBackend
+            .acquire_lease(&LeaseRequest {
+                path: dir.path().join("session.lock"),
+                scope: dir.path().to_owned(),
+                mode: LeaseMode::CreateNew,
+                remove_on_drop: true,
+            })
+            .unwrap();
+        DiskBackend.sync_directory(dir.path()).unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn pinned_directory_still_resists_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = DiskBackend
+            .acquire_lease(&LeaseRequest {
+                path: dir.path().join("session.lock"),
+                scope: dir.path().to_owned(),
+                mode: LeaseMode::CreateNew,
+                remove_on_drop: true,
+            })
+            .unwrap();
+        let moved = dir.path().with_extension("moved");
+        assert!(fs::rename(dir.path(), &moved).is_err());
+        DiskBackend.sync_directory(dir.path()).unwrap();
+        drop(lease);
+        let _ = fs::remove_dir_all(&moved);
     }
 }
