@@ -35,7 +35,7 @@ impl App {
             return;
         }
         if session == root {
-            self.apply_session_message(&session, notification.update);
+            // Inter-session traffic belongs in child views, not the main transcript.
             return;
         }
         self.ensure_child_view(&session);
@@ -570,30 +570,55 @@ mod tests {
     }
 
     #[test]
+    fn root_session_messages_do_not_echo_into_transcript() {
+        let mut app = app();
+        announce(&mut app, "root", "child");
+        for (sender, recipient) in [("root", "child"), ("child", "root")] {
+            send(
+                &mut app,
+                "root",
+                json!({"sessionUpdate":"session_message", "messageId":"m", "senderSessionId":sender, "recipientSessionId":recipient, "content":[{"type":"text", "text":"private delegation"}]}),
+            );
+            send(
+                &mut app,
+                "root",
+                json!({"sessionUpdate":"session_message_chunk", "messageId":"m", "content":{"type":"text", "text":"streamed delegation"}}),
+            );
+        }
+        assert!(app.blocks.is_empty());
+        assert!(app.session_messages.is_empty());
+        chunk(&mut app, "root", "ordinary response");
+        assert!(matches!(&app.blocks[0], Block::Agent(text) if text == "ordinary response"));
+    }
+
+    #[test]
     fn messages_allow_chunks_before_identity_and_metadata_only_patches() {
         let mut app = app();
+        announce(&mut app, "root", "child");
         send(
             &mut app,
-            "root",
+            "child",
             json!({"sessionUpdate":"session_message_chunk", "messageId":"m", "content":{"type":"text", "text":"hello"}}),
         );
         send(
             &mut app,
-            "root",
+            "child",
             json!({"sessionUpdate":"session_message", "messageId":"m", "senderSessionId":"root", "recipientSessionId":"child"}),
         );
         assert_eq!(
-            serde_json::to_value(&app.session_messages["m"]).unwrap()["content"][0]["text"],
+            serde_json::to_value(&app.child_views["child"].app.session_messages["m"]).unwrap()["content"]
+                [0]["text"],
             "hello"
         );
-        assert_eq!(app.blocks.len(), 1);
+        assert_eq!(app.child_views["child"].app.blocks.len(), 1);
+        assert!(app.blocks.is_empty());
         send(
             &mut app,
-            "root",
+            "child",
             json!({"sessionUpdate":"session_message", "messageId":"m", "content":null}),
         );
         assert!(matches!(
-            app.session_messages["m"].content,
+            app.child_views["child"].app.session_messages["m"].content,
             MaybeUndefined::Null
         ));
     }
