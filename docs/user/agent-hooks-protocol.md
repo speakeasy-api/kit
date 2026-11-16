@@ -138,7 +138,13 @@ Events include the owning session ID and Kit's configured working directory
 and workspace root. Model and tool events also include their native turn ID.
 Compaction events identify the conversation being compacted, not the separate
 summarizer session. The SDK supplies event IDs, timestamps, source, harness
-identity, and the session-start manifest.
+identity, and the session-start manifest, except that Kit chooses each
+`tool.before` event's ID itself.
+
+A subagent session's `session.start` carries `parentEventId`: the ID of the
+parent session's `tool.before` event for the `subagent` call that started it.
+A backend can follow it to nest subagent sessions under their parent at any
+depth. A top-level session and a fork have none.
 
 Model responses report the provider's resolved model and available token,
 cache, and cost usage. Turn-end usage is the loop's aggregate. Missing usage

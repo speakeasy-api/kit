@@ -29,6 +29,7 @@ pub(crate) struct HookedAdapter<A> {
     trigger: SessionStartInputTrigger,
     child: bool,
     resumed_from: Option<String>,
+    parent_event: Option<String>,
 }
 
 impl<A> HookedAdapter<A> {
@@ -43,7 +44,15 @@ impl<A> HookedAdapter<A> {
             trigger,
             child: false,
             resumed_from: None,
+            parent_event: None,
         }
+    }
+
+    /// The parent's `tool.before` event that started this session, when it
+    /// is a subagent's; its `session.start` names it as `parentEventId`.
+    pub(crate) fn with_parent_event(mut self, event: Option<String>) -> Self {
+        self.parent_event = event;
+        self
     }
 
     pub(crate) fn with_resumed_from(mut self, source: Option<String>) -> Self {
@@ -74,6 +83,7 @@ impl<A: ModelAdapter> ModelAdapter for HookedAdapter<A> {
                         inner.model_name(),
                         self.child,
                         self.resumed_from.as_deref(),
+                        self.parent_event.as_deref(),
                     )
                     .await
                     .map_err(LoopError::InvalidState)?,

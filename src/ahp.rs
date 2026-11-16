@@ -36,6 +36,29 @@ pub(crate) use turn::TurnHook;
 
 const SOURCE: &str = "urn:dev:kit:harness";
 const CONFIG_FILE: &str = "hooks.json";
+/// Tool request metadata naming the call's `tool.before` event, for a tool
+/// that starts another session under it (a subagent).
+const TOOL_EVENT_METADATA: &str = "kit/ahp/toolBeforeEventId";
+
+/// A source-unique event id Kit chooses itself, so it is known before the
+/// event is dispatched.
+fn event_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("ahp-{}-{nanos}-kit-{next}", std::process::id())
+}
+
+/// The `tool.before` event of a hooked tool call, if hooks saw it.
+pub(crate) fn tool_event(request: &agentkit_tools_core::ToolRequest) -> Option<String> {
+    request
+        .metadata
+        .get(TOOL_EVENT_METADATA)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
 
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
@@ -130,6 +153,7 @@ impl Hooks {
         model: Option<&str>,
         child: bool,
         resumed_from: Option<&str>,
+        parent_event: Option<&str>,
     ) -> Result<injection::SessionLease, String> {
         let lease = self.injections.open(session, child)?;
         let producer = self.injections.producer(session);
@@ -145,6 +169,8 @@ impl Hooks {
         if let Some(source) = resumed_from {
             input.resumed_from = Some(SessionStartInputResumedFrom::new(source));
         }
+        // A subagent's session names the parent's tool call that started it.
+        input.parent_event_id = parent_event.map(str::to_owned);
         let outcome = dispatch(self.sdk.session_start(input), None)
             .await
             .map_err(|error| format!("session.start hook dispatch failed: {error}"))?;

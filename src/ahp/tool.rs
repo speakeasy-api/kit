@@ -81,6 +81,8 @@ impl HookedTool {
             ToolBeforeInputOrigin::Native,
         );
         input.session = Some(self.hooks.session(&request.session_id.to_string()));
+        let event = super::event_id();
+        input.id = Some(event.clone());
         input.turn = Some(agenthooksprotocol::ToolBeforeInputTurn::new(
             request.turn_id.to_string(),
         ));
@@ -139,6 +141,9 @@ impl HookedTool {
         if reauthorize && let Some(outcome) = self.authorize(&request, context) {
             return Before::Return(outcome);
         }
+        request
+            .metadata
+            .insert(super::TOOL_EVENT_METADATA.into(), Value::String(event));
         Before::Run(request)
     }
 

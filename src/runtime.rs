@@ -783,6 +783,9 @@ pub struct Runtime {
     /// The explicitly selected session is consumed by the first ACP session.
     /// Later ACP sessions receive their own persisted ids.
     session: Mutex<SessionSelection>,
+    /// The parent's `tool.before` event that started this subagent process,
+    /// named by the `session.start` of the session it was started for.
+    hook_parent_event: Mutex<Option<String>>,
     mcp: crate::tools::mcp::McpRuntime,
     eager_mcp_initialization: bool,
     plugin_runtime: Option<crate::plugins::PluginRuntime>,
@@ -888,6 +891,7 @@ impl Runtime {
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         });
         Ok(Arc::new(Self {
             ask_user_enabled: true,
@@ -906,6 +910,7 @@ impl Runtime {
             base_depth: 0,
             subagents,
             session: Mutex::new(SessionSelection::default()),
+            hook_parent_event: Mutex::new(None),
             mcp: crate::tools::mcp::empty(),
             eager_mcp_initialization: true,
             plugin_runtime: None,
@@ -1012,6 +1017,19 @@ impl Runtime {
     }
 
     /// Sets the inherited nesting depth for an ACP subprocess.
+    /// Names the parent's `tool.before` event that started this subagent
+    /// process, for its first new session's `session.start`.
+    pub fn with_hook_parent_event(
+        runtime: Arc<Self>,
+        event: Option<String>,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
+            "could not configure the hook parent event after the runtime was shared".to_string()
+        })?;
+        runtime.hook_parent_event = Mutex::new(event);
+        Ok(Arc::new(runtime))
+    }
+
     pub fn with_depth(runtime: Arc<Self>, depth: usize) -> Result<Arc<Self>, String> {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
@@ -1543,6 +1561,7 @@ impl Runtime {
             parent_name: previous.parent_name,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         });
         Ok(Arc::new(runtime))
     }
@@ -1620,6 +1639,7 @@ impl Runtime {
             base_depth: self.base_depth,
             subagents: Subagents::new(self.subagents.child_config().with_root(root.clone())),
             session: Mutex::new(SessionSelection::default()),
+            hook_parent_event: Mutex::new(None),
             mcp,
             eager_mcp_initialization: self.eager_mcp_initialization,
             plugin_runtime: None,
@@ -2353,6 +2373,16 @@ impl Runtime {
         // remains a top-level session.
         let hook_child = self.base_depth > 0 || parent_context.is_some();
         let is_fork = forked_transcript.is_some();
+        // The session this subagent process was started for is the parent
+        // call's child, whether it starts fresh or from an inherited
+        // transcript; it is the process's first session, so the event is
+        // taken once. A fork made later in the same process is not.
+        let hook_parent_event = self
+            .hook_parent_event
+            .lock()
+            .ok()
+            .and_then(|mut event| event.take())
+            .filter(|_| !is_fork);
         let initial = if let Some(mut transcript) = forked_transcript {
             if request.resume {
                 return Err(AcpRuntimeError::Loop(
@@ -2474,7 +2504,8 @@ impl Runtime {
                     enabled: context.response_attempt_replacement,
                     inner: HookedAdapter::new(adapter.clone(), self.hooks.clone(), trigger)
                         .with_child(hook_child)
-                        .with_resumed_from(fork_source),
+                        .with_resumed_from(fork_source)
+                        .with_parent_event(hook_parent_event),
                 },
             })
             .telemetry(self.agentkit_telemetry())

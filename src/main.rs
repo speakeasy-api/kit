@@ -1003,7 +1003,7 @@ impl Command {
                     .hide(true)
                     .requires("subagent_parent_name"),
             );
-            command.arg(
+            let command = command.arg(
                 clap::Arg::new("subagent_parent_name")
                     .long("subagent-parent-name")
                     .value_name("SUBAGENT_PARENT_NAME")
@@ -1011,6 +1011,14 @@ impl Command {
                     .action(clap::ArgAction::Set)
                     .hide(true)
                     .requires("subagent_parent_id"),
+            );
+            command.arg(
+                clap::Arg::new("ahp_parent_event_id")
+                    .long("ahp-parent-event-id")
+                    .value_name("AHP_PARENT_EVENT_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .hide(true),
             )
         });
         let command = command.subcommand({
@@ -1219,6 +1227,7 @@ impl Command {
                 subagent_depth: required_arg(matches, "subagent_depth")?,
                 subagent_parent_id: optional_arg(matches, "subagent_parent_id")?,
                 subagent_parent_name: optional_arg(matches, "subagent_parent_name")?,
+                ahp_parent_event_id: optional_arg(matches, "ahp_parent_event_id")?,
             }),
             "prompt" => Ok(Self::Prompt {
                 root: optional_arg(matches, "root")?,
@@ -1821,6 +1830,8 @@ enum Command {
         subagent_parent_id: Option<String>,
 
         subagent_parent_name: Option<String>,
+
+        ahp_parent_event_id: Option<String>,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
@@ -2450,6 +2461,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             subagent_depth,
             subagent_parent_id,
             subagent_parent_name,
+            ahp_parent_event_id,
         } => {
             let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             if let Some(provider) = terminal_auth_provider {
@@ -2508,6 +2520,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 runtime,
                 subagent_parent_id.zip(subagent_parent_name),
             )?;
+            let runtime = kit::Runtime::with_hook_parent_event(runtime, ahp_parent_event_id)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = if matches!(protocol_version, AcpProtocolVersion::V2) {
@@ -4951,12 +4964,15 @@ review = "opus"
             "s-parent",
             "--subagent-parent-name",
             "偵察 🦀",
+            "--ahp-parent-event-id",
+            "ahp-1-2-kit-3",
         ])
         .unwrap();
         let Command::Acp {
             mcp,
             subagent_parent_id,
             subagent_parent_name,
+            ahp_parent_event_id,
             ..
         } = cli.command
         else {
@@ -4968,6 +4984,7 @@ review = "opus"
         );
         assert_eq!(subagent_parent_id.as_deref(), Some("s-parent"));
         assert_eq!(subagent_parent_name.as_deref(), Some("偵察 🦀"));
+        assert_eq!(ahp_parent_event_id.as_deref(), Some("ahp-1-2-kit-3"));
 
         let cli = Cli::try_parse_from(["kit", "acp", "--internal-no-mcp-config"]).unwrap();
         let Command::Acp { mcp, .. } = cli.command else {
