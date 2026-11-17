@@ -8131,9 +8131,16 @@ mod tests {
     fn completion_keys_select_and_dismiss_before_normal_editor_actions() {
         let mut app = app();
         app.paste("/");
-        app.handle_key(press(KeyCode::Down));
+        let index = app
+            .command_completions()
+            .iter()
+            .position(|command| command.name == "/resume")
+            .unwrap();
+        for _ in 0..index {
+            app.handle_key(press(KeyCode::Down));
+        }
         app.handle_key(press(KeyCode::Tab));
-        assert_eq!(app.editor.text(), "/clear");
+        assert_eq!(app.editor.text(), "/resume");
 
         app.editor.clear();
         app.paste("/m");
