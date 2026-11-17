@@ -152,7 +152,7 @@ An HTTP server requires a non-empty `url`. Optional fields are `description`, `h
 
 Unless machine authentication is configured explicitly, OAuth is inferred reactively for every remote Streamable HTTP server. Kit first connects normally, records a `WWW-Authenticate` Bearer challenge, and uses that challenge for protected-resource discovery and dynamic client registration when `auth` is called. No `auth` block is required. Stdio servers never use this OAuth path.
 
-An explicit `auth` block is an optional fallback or override. Set `auth.type` to the exact value `oauth`. `scopes` supplies fallback scopes in addition to challenge and server metadata. Use `clientId` to override dynamic registration with a pre-registered OAuth client. Optional `clientMetadataUrl` supplies a client metadata document during registration.
+An explicit `auth` block is an optional fallback or override. Set `auth.type` to the exact value `oauth`. `scopes` supplies fallback scopes in addition to challenge and server metadata. Use `clientId` to override dynamic registration with a pre-registered OAuth client. Optional `clientMetadataUrl` replaces the client metadata document Kit offers during registration. By default Kit offers `https://kitagent.dev/oauth/client.json` to servers that accept URL client IDs, and registers dynamically with the rest.
 
 ```json
 {

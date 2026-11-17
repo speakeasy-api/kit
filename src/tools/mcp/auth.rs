@@ -13,6 +13,10 @@ use tokio::{
 use super::CredentialStorage;
 
 pub const FLOW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Kit's published client ID metadata document. Servers that accept URL
+/// client IDs read Kit's name, site and logo from it; the others fall back
+/// to dynamic registration.
+const CLIENT_METADATA_URL: &str = "https://kitagent.dev/oauth/client.json";
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Deserialize)]
@@ -133,9 +137,12 @@ pub async fn begin(
         let mut request = AuthorizationRequest::new(&redirect_uri)
             .with_scopes(scopes)
             .with_client_name("Kit");
-        if let Some(url) = config.client_metadata_url.as_deref() {
-            request = request.with_client_metadata_url(url);
-        }
+        request = request.with_client_metadata_url(
+            config
+                .client_metadata_url
+                .as_deref()
+                .unwrap_or(CLIENT_METADATA_URL),
+        );
         AuthorizationSession::new(manager, request)
             .await
             .map_err(|(_, error)| format!("OAuth client registration failed: {error}"))?
