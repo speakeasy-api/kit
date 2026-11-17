@@ -468,6 +468,12 @@ pub(super) enum ClipboardMode {
     ImageOnly,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPresentation {
+    Welcome,
+    Conversation,
+}
+
 pub enum Action {
     SteerChild {
         id: String,
@@ -491,7 +497,10 @@ pub enum Action {
     RevokeSteer {
         id: String,
     },
-    New(Option<String>),
+    New {
+        prompt: Option<String>,
+        presentation: SessionPresentation,
+    },
     ListSessions,
     RenameSession {
         session_id: String,
@@ -905,6 +914,7 @@ pub struct App {
     /// Session currently associated with the ordered runtime side channel.
     runtime_session_id: Option<String>,
     pub blocks: Vec<Block>,
+    pub session_presentation: SessionPresentation,
     tool_indices: HashMap<String, usize>,
     /// Reverse ACP edges also retain children waiting for an unseen parent.
     tool_dependents: HashMap<String, BTreeSet<usize>>,
@@ -1215,6 +1225,7 @@ impl App {
             session_id: None,
             runtime_session_id: None,
             blocks: Vec::new(),
+            session_presentation: SessionPresentation::Welcome,
             tool_indices: HashMap::new(),
             tool_dependents: HashMap::new(),
             tool_owners: HashMap::new(),
@@ -3206,6 +3217,15 @@ impl App {
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.start_session_with_presentation(session_id, SessionPresentation::Welcome);
+    }
+
+    pub fn start_session_with_presentation(
+        &mut self,
+        session_id: String,
+        presentation: SessionPresentation,
+    ) {
+        self.session_presentation = presentation;
         self.elicitations.clear();
         self.model_switch = None;
         self.cancel_steer_edit();
@@ -4780,7 +4800,14 @@ impl App {
                 return match parse(&input, !self.auth_methods.is_empty()) {
                     Parsed::Usage { provider } => Action::Usage(provider.map(str::to_owned)),
                     Parsed::Voice { control } => Action::Voice(control.unwrap_or("").to_owned()),
-                    Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
+                    Parsed::New { prompt } => Action::New {
+                        prompt: prompt.map(str::to_string),
+                        presentation: SessionPresentation::Welcome,
+                    },
+                    Parsed::Clear { prompt } => Action::New {
+                        prompt: prompt.map(str::to_string),
+                        presentation: SessionPresentation::Conversation,
+                    },
                     Parsed::Resume {
                         session_id: Some(session_id),
                     } => Action::Resume(session_id.to_string()),
@@ -5541,8 +5568,8 @@ mod tests {
 
     use super::{
         Action, AgentPart, App, Attachment, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
-        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, MessageRole, Phase, Update,
-        UserImage, replace_image_uri_on_line,
+        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, MessageRole, Phase,
+        SessionPresentation, Update, UserImage, replace_image_uri_on_line,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -7907,7 +7934,7 @@ mod tests {
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
         assert!(matches!(
             app.handle_key(press(KeyCode::Enter)),
-            Action::New(Some(prompt)) if prompt == "begin fresh"
+            Action::New { prompt: Some(prompt), presentation: SessionPresentation::Welcome } if prompt == "begin fresh"
         ));
     }
 
@@ -8106,7 +8133,7 @@ mod tests {
         app.paste("/");
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Tab));
-        assert_eq!(app.editor.text(), "/resume");
+        assert_eq!(app.editor.text(), "/clear");
 
         app.editor.clear();
         app.paste("/m");
@@ -8137,14 +8164,34 @@ mod tests {
     }
 
     #[test]
-    fn clear_command_starts_a_new_session_without_a_model_prompt() {
-        let mut app = app();
-        app.paste("/clear");
-        app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::New(None)
-        ));
+    fn fresh_session_commands_select_their_presentation_and_optional_prompt() {
+        for (input, expected_prompt, expected_presentation) in [
+            ("/clear", None, SessionPresentation::Conversation),
+            (
+                "/clear next task",
+                Some("next task"),
+                SessionPresentation::Conversation,
+            ),
+            ("/new", None, SessionPresentation::Welcome),
+            (
+                "/new next task",
+                Some("next task"),
+                SessionPresentation::Welcome,
+            ),
+        ] {
+            let mut app = app();
+            app.paste(input);
+            app.last_key = Some(Instant::now() - Duration::from_millis(500));
+            let Action::New {
+                prompt,
+                presentation,
+            } = app.handle_key(press(KeyCode::Enter))
+            else {
+                panic!("expected a fresh session for {input}");
+            };
+            assert_eq!(prompt.as_deref(), expected_prompt);
+            assert_eq!(presentation, expected_presentation);
+        }
     }
 
     #[test]
@@ -8152,7 +8199,11 @@ mod tests {
         let mut app = app();
         app.paste("/new begin fresh");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        let Action::New(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+        let Action::New {
+            prompt,
+            presentation: SessionPresentation::Welcome,
+        } = app.handle_key(press(KeyCode::Enter))
+        else {
             panic!("expected a new session");
         };
         assert_eq!(prompt.as_deref(), Some("begin fresh"));

@@ -9,6 +9,7 @@ use std::ops::Range;
 enum Kind {
     Usage,
     New,
+    Clear,
     Resume,
     Sessions,
     Close,
@@ -64,7 +65,7 @@ const LOCAL_COMMANDS: &[Spec] = &[
     Spec {
         token: "/clear",
         description: "Clear conversation context and start a new session",
-        kind: Kind::New,
+        kind: Kind::Clear,
     },
     Spec {
         token: "/resume",
@@ -112,6 +113,7 @@ const LOCAL_COMMANDS: &[Spec] = &[
 pub enum Parsed<'a> {
     Usage { provider: Option<&'a str> },
     New { prompt: Option<&'a str> },
+    Clear { prompt: Option<&'a str> },
     Resume { session_id: Option<&'a str> },
     Sessions,
     Close,
@@ -155,6 +157,7 @@ pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
             control: prompt.map(str::trim),
         },
         Kind::New => Parsed::New { prompt },
+        Kind::Clear => Parsed::Clear { prompt },
         Kind::Resume => Parsed::Resume { session_id: prompt },
         Kind::Sessions => Parsed::Sessions,
         Kind::Close => Parsed::Close,
@@ -308,11 +311,11 @@ mod tests {
 
     #[test]
     fn clear_starts_a_fresh_session_and_uses_exact_token_boundaries() {
-        assert_eq!(parse("/clear"), Parsed::New { prompt: None });
-        assert_eq!(parse("/clear  "), Parsed::New { prompt: None });
+        assert_eq!(parse("/clear"), Parsed::Clear { prompt: None });
+        assert_eq!(parse("/clear  "), Parsed::Clear { prompt: None });
         assert_eq!(
             parse("/clear next task"),
-            Parsed::New {
+            Parsed::Clear {
                 prompt: Some("next task")
             }
         );
