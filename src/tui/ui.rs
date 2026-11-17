@@ -2702,8 +2702,10 @@ fn agent_lines(
     first.extend(right);
     let first = Line::from(first);
 
-    let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
-    let elapsed = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
+    let elapsed = (row.generation_started_at_unix_ms > 0).then(|| {
+        let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
+        agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms))
+    });
     let second_prefix = truncate_to_width(&second_prefix, width);
     let prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
     let idle = matches!(row.status, SubagentStatus::Idle) && !failed;
@@ -2734,7 +2736,7 @@ fn agent_lines(
         third.extend(agent_gauge(usage.used, usage.size));
         tail.push(compact(usage.used));
     }
-    if !idle {
+    if !idle && let Some(elapsed) = elapsed {
         tail.push(elapsed);
     }
     if let Some(cost) = &row.cost {

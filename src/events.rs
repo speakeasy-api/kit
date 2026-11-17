@@ -99,6 +99,24 @@ pub enum SubagentActivity {
     },
 }
 
+/// ACP `_meta` key carrying [`SubagentRuntime`] on subagent announcements.
+pub const SUBAGENT_RUNTIME_META: &str = "kit/subagent/runtime";
+
+/// Identity and timing a subagent announcement carries across ACP layers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRuntime {
+    pub harness: String,
+    #[serde(default)]
+    pub vendor: HarnessVendor,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub generation_started_at_unix_ms: u64,
+    #[serde(default)]
+    pub generation_finished_at_unix_ms: Option<u64>,
+}
+
 /// Sanitized observational accounting, not a second model/tool result.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderRetryProgress {

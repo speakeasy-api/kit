@@ -4505,6 +4505,7 @@ for line in sys.stdin:
                 "task",
                 crate::events::SubagentStatus::Working,
                 1,
+                &crate::events::SubagentRuntime::default(),
             );
             transcripts.start("child", 1);
             let mut rx = transcripts.stream.subscribe("parent".into(), false);
