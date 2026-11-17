@@ -274,6 +274,11 @@ mod native {
             "expected a file name",
         ))
     }
+    // POSIX has no share modes to relax; the lease walks ancestors exactly
+    // like any other operation.
+    pub(super) fn parent_leased(path: &Path) -> io::Result<Parent> {
+        parent(path)
+    }
     impl Parent {
         pub(super) fn open(&self, o: &DiskOpenOptions) -> io::Result<File> {
             if !(o.read || o.write || o.append)
@@ -557,11 +562,36 @@ mod native {
         })
     }
     fn directory(path: &Path) -> io::Result<File> {
-        // Denying delete sharing pins every ancestor against rename and
-        // replacement until the operation has completed. Write sharing is
-        // allowed so `sync_directory` can open a pinned directory for write
-        // (FlushFileBuffers requires GENERIC_WRITE); sharing does not grant
-        // access, the ACL still decides.
+        // Denying write/delete sharing pins every ancestor against rename and
+        // reparse-point modification until the operation has completed.
+        let f = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .custom_flags(REPARSE | BACKUP)
+            .open(path)?;
+        let m = f.metadata()?;
+        if !m.is_dir() || m.file_attributes() & REPARSE_ATTRIBUTE != 0 {
+            return Err(denied());
+        }
+        Ok(f)
+    }
+    fn directory_leased(path: &Path) -> io::Result<File> {
+        // The lease's ancestor pins live for the whole session, and
+        // `sync_directory` must flush those directories while they are
+        // pinned. FlushFileBuffers needs a write-data handle: measured on
+        // Windows, only GENERIC_WRITE, FILE_WRITE_DATA and FILE_APPEND_DATA
+        // flush (FILE_WRITE_ATTRIBUTES opens but its flush fails with
+        // ERROR_ACCESS_DENIED), and every one of them carries the
+        // write-share bit, which conflicts with share_mode(1). Sharing
+        // cannot tell kit's flush open from any other process's, so the
+        // lease pins share write. Delete sharing stays denied and sharing
+        // is not access, so rename protection and the ACL are unchanged. A
+        // junction conversion, if it ever happened, is still caught
+        // fail-closed by the identity and reparse checks on every later
+        // open. Transient per-operation pins keep share_mode(1): a write
+        // open is all FSCTL_SET_REPARSE_POINT needs to turn an empty pinned
+        // directory into a junction in place, so ordinary mutations never
+        // share write.
         let f = OpenOptions::new()
             .read(true)
             .share_mode(1 | 2)
@@ -578,6 +608,12 @@ mod native {
         _ancestors: Vec<File>,
     }
     pub(super) fn parent(path: &Path) -> io::Result<Parent> {
+        ancestor_walk(path, directory)
+    }
+    pub(super) fn parent_leased(path: &Path) -> io::Result<Parent> {
+        ancestor_walk(path, directory_leased)
+    }
+    fn ancestor_walk(path: &Path, open: fn(&Path) -> io::Result<File>) -> io::Result<Parent> {
         let absolute = if path.is_absolute() {
             path.to_owned()
         } else {
@@ -593,7 +629,7 @@ mod native {
                 Component::Prefix(_) => prefix.push(part.as_os_str()),
                 Component::RootDir | Component::Normal(_) => {
                     prefix.push(part.as_os_str());
-                    ancestors.push(directory(&prefix)?);
+                    ancestors.push(open(&prefix)?);
                 }
                 Component::CurDir => {}
                 _ => return Err(denied()),
@@ -810,7 +846,7 @@ fn acquire_lease(request: &LeaseRequest) -> io::Result<Box<dyn BackendLease>> {
         token[i * 2] = b"0123456789abcdef"[(byte >> 4) as usize];
         token[i * 2 + 1] = b"0123456789abcdef"[(byte & 15) as usize];
     }
-    let parent = native::parent(&request.path)?;
+    let parent = native::parent_leased(&request.path)?;
     let mut options = DiskOpenOptions {
         read: true,
         write: true,
@@ -1308,8 +1344,9 @@ mod windows_tests {
     use super::*;
 
     // These run on a Windows GitHub Actions runner: the flush must work with
-    // a live session lease holding the directory pinned, and the relaxed
-    // share mode must still reject a rename of that pinned directory.
+    // a live session lease holding the directory pinned, a transient
+    // per-operation pin must still deny a write open, and the lease pin
+    // must still reject a rename of that pinned directory.
     #[test]
     fn sync_directory_succeeds_on_a_real_directory() {
         let dir = std::env::temp_dir().join(format!("kit-sync-{}", std::process::id()));
@@ -1355,5 +1392,37 @@ mod windows_tests {
         DiskBackend.sync_directory(dir.path()).unwrap();
         drop(lease);
         let _ = fs::remove_dir_all(&moved);
+    }
+
+    #[test]
+    fn transient_pin_denies_write_open() {
+        // A write open is all FSCTL_SET_REPARSE_POINT needs to turn an empty
+        // pinned directory into a junction in place, so a per-operation pin
+        // must keep denying it for the operation's duration.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = native::parent(&dir.path().join("child")).unwrap();
+        let attempted = OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir.path());
+        let error = attempted.expect_err("transient pin must deny a write open");
+        assert_eq!(error.raw_os_error(), Some(32));
+        drop(pinned);
+    }
+
+    #[test]
+    fn sync_directory_rejects_a_reparse_point() {
+        // The write open uses OPEN_REPARSE_POINT and the metadata check
+        // rejects a reparse directory, so a junction conversion is caught
+        // fail-closed instead of being flushed through.
+        use std::os::windows::fs::symlink_dir;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        symlink_dir(&real, &link).unwrap();
+        assert!(DiskBackend.sync_directory(&link).is_err());
     }
 }
