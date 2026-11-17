@@ -162,19 +162,22 @@ fn every_intercept_event_accepts_observe_subscriptions() {
 }
 
 #[test]
-fn turn_start_grants_prompt_effects_without_injection_or_flow() {
+fn turn_start_grants_prompt_effects_and_immediate_context_without_flow() {
     let grants = options().unwrap().capabilities.to_wire();
     let start = serde_json::to_value(&grants[&EventType::TurnStart]).unwrap();
     let capabilities = &start["capabilities"];
     assert_eq!(
         capabilities["effects"],
-        json!(["deny", "message", "modify"])
+        json!(["deny", "inject", "message", "modify"])
     );
     assert_eq!(
         capabilities["modify"]["prompt"],
         json!({"replace": true, "merge": false})
     );
-    assert!(capabilities.get("inject").is_none());
+    assert_eq!(
+        capabilities["inject"],
+        json!({"context": {"append": true, "deliverAt": ["now"]}})
+    );
     assert!(capabilities.get("flow").is_none());
 }
 
@@ -806,6 +809,82 @@ async fn session_and_tool_context_wait_for_the_next_request() {
         .session_end("session", SessionEndInputOutcome::Completed)
         .await;
     assert!(hooks.injections.claim("session").is_err());
+}
+
+#[tokio::test]
+async fn turn_start_context_reaches_the_turns_model_request_without_entering_the_transcript() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    backend.respond("turn.start", json!([context_injection("turn context")]));
+    let model = Model::default();
+    let (step, persisted) = prompt(&hooks, &model, "hello").await;
+    assert!(matches!(step.unwrap(), LoopStep::Finished(_)));
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let texts: Vec<_> = requests[0]
+        .iter()
+        .flat_map(|item| item.parts.iter().filter_map(part_text))
+        .collect();
+    assert_eq!(texts, ["system", "hello", "turn context"]);
+    assert!(
+        persisted
+            .iter()
+            .flat_map(|item| item.parts.iter().filter_map(part_text))
+            .all(|text| text != "turn context")
+    );
+}
+
+#[tokio::test]
+async fn turn_context_is_discarded_with_a_rejected_replacement_and_when_the_turn_ends() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    // Valid context, then a replacement that fabricates media: the whole
+    // response is rejected, its context with it.
+    backend.respond(
+        "turn.start",
+        json!([context_injection("old turn"), {"type":"modify","target":"prompt","operation":"replace","value":[
+            {"id":"fake","role":"user","parts":[{"id":"fake/a","kind":"attachment","category":"image","mediaType":"image/png","selection":"metadata","contentRef":{"id":"x"}}]}
+        ]}]),
+    );
+    let model = Model::default();
+    let (step, _) = prompt(&hooks, &model, "first").await;
+    assert!(step.is_err() || model.requests.lock().unwrap().is_empty());
+    assert!(
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .flat_map(|item| item.parts.iter().filter_map(part_text))
+            .all(|text| text != "old turn")
+    );
+}
+
+#[test]
+fn a_finished_turn_discards_its_undelivered_context() {
+    let (hooks, _backend) = hooks(vec![intercept(&["turn.start"])]);
+    let _owner = hooks.injections.open("abc", false).unwrap();
+    hooks
+        .injections
+        .producer("abc")
+        .unwrap()
+        .enqueue_turn(&super::injection::text_outcome("stale"))
+        .unwrap();
+    agentkit_loop::LoopObserver::handle_event(
+        &TurnHook(hooks.clone()),
+        agentkit_loop::ObservedEvent {
+            session_id: Arc::new(SessionId::new("abc")),
+            event: agentkit_loop::AgentEvent::TurnFinished(agentkit_loop::TurnResult {
+                turn_id: agentkit_core::TurnId::new("t"),
+                finish_reason: FinishReason::Error,
+                items: Vec::new(),
+                usage: None,
+                metadata: MetadataMap::new(),
+            }),
+        },
+    );
+    let mut items = Vec::new();
+    hooks.injections.claim("abc").unwrap().append_to(&mut items);
+    assert!(items.is_empty());
 }
 
 #[tokio::test]

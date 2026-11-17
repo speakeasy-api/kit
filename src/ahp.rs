@@ -312,7 +312,8 @@ fn options() -> Result<HooksOptions, String> {
                 .message()
                 .observe()
                 .deny()
-                .modify_prompt(Modify::Replace),
+                .modify_prompt(Modify::Replace)
+                .inject_context(capability::InjectContext::Now),
         ),
         turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
