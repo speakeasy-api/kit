@@ -62,6 +62,11 @@ const LOCAL_COMMANDS: &[Spec] = &[
         kind: Kind::New,
     },
     Spec {
+        token: "/clear",
+        description: "Clear conversation context and start a new session",
+        kind: Kind::New,
+    },
+    Spec {
         token: "/resume",
         description: "Resume a session by ID",
         kind: Kind::Resume,
@@ -302,6 +307,30 @@ mod tests {
     }
 
     #[test]
+    fn clear_starts_a_fresh_session_and_uses_exact_token_boundaries() {
+        assert_eq!(parse("/clear"), Parsed::New { prompt: None });
+        assert_eq!(parse("/clear  "), Parsed::New { prompt: None });
+        assert_eq!(
+            parse("/clear next task"),
+            Parsed::New {
+                prompt: Some("next task")
+            }
+        );
+        for input in ["/clearer", "/clear/path", " /clear", "/Clear"] {
+            assert_eq!(parse(input), Parsed::Prompt(input));
+        }
+        assert_eq!(known_token("/clear", &[]), Some(0..6));
+        let matches = completions("/cle", 4, &[Command::new("clear", "Agent clear")]);
+        assert_eq!(
+            matches,
+            [Command::new(
+                "/clear",
+                "Clear conversation context and start a new session"
+            )]
+        );
+    }
+
+    #[test]
     fn parses_commands_with_or_without_a_following_prompt() {
         assert_eq!(parse("/new"), Parsed::New { prompt: None });
         assert_eq!(
@@ -421,6 +450,7 @@ mod tests {
             [
                 "/voice",
                 "/new",
+                "/clear",
                 "/resume",
                 "/sessions",
                 "/close",

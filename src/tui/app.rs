@@ -8137,6 +8137,17 @@ mod tests {
     }
 
     #[test]
+    fn clear_command_starts_a_new_session_without_a_model_prompt() {
+        let mut app = app();
+        app.paste("/clear");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::New(None)
+        ));
+    }
+
+    #[test]
     fn new_command_carries_an_optional_first_prompt() {
         let mut app = app();
         app.paste("/new begin fresh");
