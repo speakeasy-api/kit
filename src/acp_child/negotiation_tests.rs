@@ -75,6 +75,7 @@ fn config(root: &std::path::Path, mode: &str) -> ChildConfig {
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        ahp_parent_event: None,
     }
 }
 

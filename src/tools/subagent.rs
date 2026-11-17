@@ -431,6 +431,9 @@ struct CreateOptions {
     model: Option<String>,
     cwd: Option<PathBuf>,
     inherit: Option<String>,
+    /// The parent's `tool.before` event for this call, which the child's
+    /// `session.start` names as its `parentEventId`.
+    parent_event: Option<String>,
 }
 
 struct ForkSuccess {
@@ -612,6 +615,7 @@ impl Subagents {
             model,
             cwd,
             inherit,
+            parent_event,
         } = options;
         let root = self.resolve_root(cwd)?;
         let cache_key = inherit
@@ -698,6 +702,7 @@ impl Subagents {
             .with_root(root)
             .with_tree_slots(tree_slot_directory(&self.tree_slots)?.clone())
             .with_cache_lineage(cache_key)
+            .with_ahp_parent_event(parent_event)
             .with_parent_context(id.clone(), state.lock().await.name.clone());
         {
             let locked = state.lock().await;
@@ -2817,6 +2822,7 @@ impl Tool for SubagentTool {
         let input: Input = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let contract = input.output_schema.map(OutputContract::new).transpose()?;
+        let parent_event = crate::ahp::tool_event(&request);
         result(
             request,
             self.manager
@@ -2828,6 +2834,7 @@ impl Tool for SubagentTool {
                         model: input.model,
                         cwd: input.cwd,
                         inherit: None,
+                        parent_event,
                     },
                     self.depth,
                     cancellation(context),
@@ -2902,6 +2909,7 @@ impl Tool for ForkTool {
                             model: None,
                             cwd: None,
                             inherit: Some(source),
+                            parent_event: None,
                         },
                         self.depth,
                         cancellation(context),
@@ -2958,6 +2966,7 @@ mod steer_tests {
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         });
         let state = Arc::new(AsyncMutex::new(State {
             name: "Scout".into(),

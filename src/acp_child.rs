@@ -328,6 +328,9 @@ impl AcpHarnesses {
                 .arg(parent_id)
                 .arg(format!("--subagent-parent-name={parent_name}"));
         }
+        if let Some(event) = &config.ahp_parent_event {
+            command.arg(format!("--ahp-parent-event-id={event}"));
+        }
         if resume {
             command.arg("--resume");
         }
@@ -435,6 +438,9 @@ pub(crate) struct ChildConfig {
     pub tree_slots: Option<PathBuf>,
     /// Prompt cache key shared by every session in one delegation tree.
     pub prompt_cache_key: Option<String>,
+    /// The parent's `tool.before` event that started this child, passed to a
+    /// Kit child so its `session.start` can name it as `parentEventId`.
+    pub ahp_parent_event: Option<String>,
 }
 
 impl ChildConfig {
@@ -461,6 +467,11 @@ impl ChildConfig {
 
     pub(crate) fn with_cache_lineage(mut self, key: Option<String>) -> Self {
         self.prompt_cache_key = key;
+        self
+    }
+
+    pub(crate) fn with_ahp_parent_event(mut self, event: Option<String>) -> Self {
+        self.ahp_parent_event = event;
         self
     }
 
@@ -2876,6 +2887,7 @@ mod tests {
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         for resume in [false, true] {
             let command = harnesses
@@ -2912,6 +2924,33 @@ mod tests {
                     .any(|pair| pair == ["--request-budget-seconds", "300"])
             );
         }
+        // A subagent started by a hooked tool call names that call's event.
+        let mut child = config.clone();
+        child.ahp_parent_event = Some("ahp-1-2-kit-3".into());
+        let args = harnesses
+            .kit_command(&child, Some(("session", false)), 1)
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.contains(&"--ahp-parent-event-id=ahp-1-2-kit-3".to_owned()),
+            "{args:?}"
+        );
+        let args = harnesses
+            .kit_command(&config, Some(("session", false)), 1)
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--ahp-parent-event-id")),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -2981,6 +3020,7 @@ mod tests {
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -3361,6 +3401,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             };
             let result = ChildSession::start(
                 config,
@@ -3449,6 +3490,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let result = ChildSession::start(
             config,
@@ -3515,6 +3557,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
 
         let error = match ChildSession::start(
@@ -3576,6 +3619,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -3632,6 +3676,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -3768,6 +3813,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let starts = (0..64)
             .map(|_| {
@@ -3838,6 +3884,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let base = ChildSession::start(
             config,
@@ -3919,6 +3966,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             };
             let base = ChildSession::start(
                 config,
@@ -4085,6 +4133,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             };
             ChildSession::start(
                 config,
@@ -4432,6 +4481,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             };
             let (child, _) = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -4532,6 +4582,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let base = ChildSession::start(
             config.clone(),
@@ -4802,6 +4853,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            ahp_parent_event: None,
         };
         let base = ChildSession::start(
             config,
@@ -4934,6 +4986,7 @@ for line in sys.stdin:
                     parent_name: None,
                     tree_slots: None,
                     prompt_cache_key: None,
+                    ahp_parent_event: None,
                 },
                 "acp.mock".into(),
                 None,
@@ -5077,6 +5130,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             };
             let base = ChildSession::start(
                 config,
@@ -5535,6 +5589,7 @@ for line in sys.stdin:
                 parent_name: parent_name.map(str::to_owned),
                 tree_slots: None,
                 prompt_cache_key: None,
+                ahp_parent_event: None,
             }
         }
 

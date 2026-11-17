@@ -73,6 +73,7 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -295,6 +296,7 @@ struct Echo {
     spec: ToolSpec,
     current: Mutex<Option<ToolSpec>>,
     received: Mutex<Vec<Value>>,
+    metadata: Mutex<Vec<MetadataMap>>,
 }
 
 impl Echo {
@@ -312,6 +314,7 @@ impl Echo {
             ),
             current: Mutex::default(),
             received: Mutex::default(),
+            metadata: Mutex::default(),
         })
     }
 }
@@ -352,6 +355,7 @@ impl Tool for Echo {
     ) -> Result<ToolResult, ToolError> {
         tokio::task::yield_now().await;
         self.received.lock().unwrap().push(request.input.clone());
+        self.metadata.lock().unwrap().push(request.metadata.clone());
         let text = request.input["text"]
             .as_str()
             .unwrap_or_default()
@@ -408,6 +412,63 @@ fn denial_message(outcome: ToolExecutionOutcome) -> String {
         }
         other => panic!("expected a denied call, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_subagent_session_names_the_tool_call_that_started_it() {
+    let (hooks, backend) = hooks(vec![observe(&["tool.before", "session.start"])]);
+    let echo = Echo::new();
+    call(&hooks, &echo, json!({"text": "start a subagent"})).await;
+    // The tool sees the id of its own tool.before event.
+    let before = backend.events("tool.before");
+    let id = before[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        echo.metadata.lock().unwrap()[0].get(super::TOOL_EVENT_METADATA),
+        Some(&json!(id))
+    );
+    // The child's session.start names it as its parent.
+    let _lease = hooks
+        .session_start(
+            "child",
+            SessionStartInputTrigger::Startup,
+            None,
+            true,
+            None,
+            Some(&id),
+        )
+        .await
+        .unwrap();
+    let started = backend.events("session.start");
+    assert_eq!(started[0]["parentEventId"], json!(id));
+    // Ids Kit chooses stay unique.
+    call(&hooks, &echo, json!({"text": "again"})).await;
+    let ids: std::collections::HashSet<_> = backend
+        .events("tool.before")
+        .iter()
+        .map(|event| event["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test]
+async fn a_top_level_session_has_no_parent_event() {
+    let (hooks, backend) = hooks(vec![observe(&["session.start"])]);
+    let _lease = hooks
+        .session_start(
+            "top",
+            SessionStartInputTrigger::Startup,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        backend.events("session.start")[0]
+            .get("parentEventId")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -723,6 +784,7 @@ async fn session_and_tool_context_wait_for_the_next_request() {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -755,6 +817,7 @@ async fn failed_tools_can_inject_recovery_context_without_becoming_successful() 
             SessionStartInputTrigger::Startup,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -3101,6 +3164,7 @@ async fn invalid_fork_session_start_preserves_dispatch_cause() {
             SessionStartInputTrigger::Fork,
             None,
             false,
+            None,
             None,
         )
         .await
