@@ -2,6 +2,11 @@ name: release
 
 on:
   workflow_dispatch:
+    inputs:
+      sign_macos:
+        description: Sign and notarize macOS artifacts (requires accepted Apple agreements)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -239,6 +244,11 @@ jobs:
         id: signing
         shell: bash
         run: |
+          if [[ '${{ inputs.sign_macos }}' != true ]]; then
+            echo "::warning::Apple signing and notarization disabled; publishing unsigned macOS artifacts."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           credentials=(
             MACOS_CERTIFICATE_P12_BASE64
             MACOS_CERTIFICATE_PASSWORD
@@ -356,6 +366,11 @@ jobs:
         id: signing
         shell: bash
         run: |
+          if [[ '${{ inputs.sign_macos }}' != true ]]; then
+            echo "::warning::Apple signing and notarization disabled; publishing unsigned macOS artifacts."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           credentials=(
             MACOS_CERTIFICATE_P12_BASE64
             MACOS_CERTIFICATE_PASSWORD
