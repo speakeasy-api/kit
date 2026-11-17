@@ -7,8 +7,11 @@ GitHub Actions builds and publishes release artifacts on demand.
 ## Publish a release
 
 Ordinary pull requests do not update release versions. In GitHub, open
-**Actions > release**, select **Run workflow** on `main`, and run it. Do not create
-or push the release tag first.
+**Actions > release**, select **Run workflow** on `main`, and run it. Leave
+`sign_macos` disabled to publish unsigned, unnotarized macOS artifacts without
+contacting Apple. Enable it only when Apple credentials are configured and an
+admin has accepted the required Apple agreements in App Store Connect. Do not
+create or push the release tag first.
 
 The workflow verifies that the version in `Cargo.toml` matches the latest release
 tag, then examines commits since that tag. Any breaking commit advances the minor
@@ -88,7 +91,12 @@ if posting succeeded but verification failed, a rerun can produce a duplicate.
 
 ## macOS signing and notarization
 
-The release workflow signs the standalone Mach-O executable with the code-signing
+By default, the release workflow publishes unsigned, unnotarized macOS artifacts,
+even when Apple credentials are configured. macOS may require users to explicitly
+allow these downloads in security settings. This default allows releases to
+proceed while an admin accepts pending Apple agreements.
+
+With `sign_macos` enabled, the workflow signs the standalone Mach-O executable with the code-signing
 identifier `com.speakeasy.kit`. It also archives `Kit.app`, signs its bundled helper
 first with `com.speakeasy.kit`, and then signs the outer app with
 `com.speakeasy.kit.desktop`. Both signatures enable the Hardened Runtime and use
@@ -137,10 +145,11 @@ printf %s 'KEYID' | gh secret set APPLE_API_KEY_ID -R "$repo"
 printf %s 'issuer-uuid' | gh secret set APPLE_API_ISSUER_ID -R "$repo"
 ```
 
-The workflow fails on a partial configuration rather than silently publishing
-an unsigned build. With none of these secrets configured, it still publishes the
-standalone archive and Kit.app ZIP unsigned and unnotarized, and identifies the
-release as such in the release notes. XcodeGen 2.45.4 is downloaded with a pinned
+With `sign_macos` enabled, the workflow fails on a partial credential configuration
+or a signing or notarization error. If none of these secrets are configured, it
+still publishes the standalone archive and Kit.app ZIP unsigned and unnotarized.
+With `sign_macos` disabled, credential checks and Apple signing and notarization
+are skipped. XcodeGen 2.45.4 is downloaded with a pinned
 SHA-256 before the app archive is generated; the checked-in project is independently
 regenerated and drift-checked in CI.
 
