@@ -149,7 +149,7 @@ mise run sign                  # macOS only: sign before using the Keychain cred
 
 `mise tasks` lists the rest: `macos:run` builds and opens the desktop app (see [macos/README.md](macos/README.md)), and `docker:build` builds a container flavor with `docker buildx`.
 
-Release binaries for macOS are signed and notarized under `com.speakeasy.kit`; the outer desktop app uses `com.speakeasy.kit.desktop`. See [Releasing](docs/releasing.md).
+macOS release artifacts are unsigned and unnotarized by default. Maintainers can enable signing and notarization with the `sign_macos` release workflow input; the CLI uses `com.speakeasy.kit` and the outer desktop app uses `com.speakeasy.kit.desktop`. See [Releasing](docs/releasing.md).
 
 ## Quick start
 
