@@ -1298,7 +1298,13 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )]
     use super::*;
 
     // These run on a Windows GitHub Actions runner: the flush must work with
