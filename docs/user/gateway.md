@@ -85,7 +85,7 @@ kit tui --remote http://127.0.0.1:7766 \
 
 This option requires an existing session ID. The TUI marks **History unavailable**; an empty historical pane is not a claim that the session has no history. The attachment still requires the authoritative current configuration and active/idle state before enabling control. The durable transcript stays on the host, and in-flight work is not restarted. For direct ACP clients, see the [resume and replay contract](../reference/gateway-protocol.md#connect-over-httpsse).
 
-To start another session, exit and omit `--remote-session` on the next invocation. To switch sessions, exit, list them, and supply the desired ID. In-place `/new`, session listing/resume/rename commands, local provider login/usage, and voice are disabled in a remote attachment. The remote TUI has no session deletion or close command. To end resident work through an ACP client, see [Close a session](#close-a-session).
+To start another session, exit and omit `--remote-session` on the next invocation. To switch sessions, exit, list them, and supply the desired ID. In-place `/new`, `/clear`, session listing/resume/rename commands, local provider login/usage, and voice are disabled in a remote attachment. The remote TUI has no session deletion or close command. To end resident work through an ACP client, see [Close a session](#close-a-session).
 
 ## Close a session
 

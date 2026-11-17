@@ -15,6 +15,7 @@ fn command_name(name: &str) -> bool {
             "compact"
                 | "voice"
                 | "new"
+                | "clear"
                 | "resume"
                 | "sessions"
                 | "close"
@@ -392,7 +393,12 @@ mod tests {
     fn slash_commands_filter_collisions_and_expand_current_instructions() {
         let mut current = skill("review", "Current instructions");
         current.resources.push(current.base_dir.join("guide.md"));
-        let skills = vec![skill("compact", "wrong"), skill("new", "wrong"), current];
+        let skills = vec![
+            skill("compact", "wrong"),
+            skill("new", "wrong"),
+            skill("clear", "wrong"),
+            current,
+        ];
         assert_eq!(
             commands(&skills)
                 .iter()
@@ -413,6 +419,7 @@ mod tests {
             "/removed args",
             "/compact",
             "/new",
+            "/clear",
             "Explain /review",
             "/review-other",
         ] {

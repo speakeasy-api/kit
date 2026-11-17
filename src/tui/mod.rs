@@ -2273,7 +2273,7 @@ async fn run_client(
                                     app.toast("Gateway reconnecting; mutations disabled. Previous acceptance may be unknown.");
                                 }
                                 Action::Usage(_) | Action::Voice(_) | Action::Login(_)
-                                | Action::New(_) | Action::ListSessions | Action::RenameSession { .. }
+                                | Action::New { .. } | Action::ListSessions | Action::RenameSession { .. }
                                 | Action::Resume(_) if is_remote => {
                                     app.note("This action is unavailable in a remote attachment. Use kit gateway list, then restart kit tui with --remote-session to switch; omit --remote-session to create. Configure provider authentication on the gateway host.");
                                 }
@@ -2422,7 +2422,7 @@ async fn run_client(
                                             .map(|_| ())
                                     });
                                 }
-                                Action::New(first_prompt) => {
+                                Action::New { prompt: first_prompt, presentation } => {
                                     voice.stop();
                                     voice.notify_state(&connection, &session_id);
                                     connection
@@ -2452,7 +2452,7 @@ async fn run_client(
                                     })?;
                                     transition_route(&transition_session, persisted_id.clone());
                                     images.clear();
-                                    app.start_session(persisted_id);
+                                    app.start_session_with_presentation(persisted_id, presentation);
                                     refresh_config_state(&mut app, Some(&config_options));
                                     if let Some(prompt) = first_prompt {
                                         let outcome = connection
@@ -3400,7 +3400,7 @@ fn recovery_mutation(action: &Action) -> bool {
             | Action::Cancel
             | Action::DetachCompose(_)
             | Action::CancelBackground(_)
-            | Action::New(_)
+            | Action::New { .. }
             | Action::Resume(_)
             | Action::RenameSession { .. }
             | Action::Login(_)

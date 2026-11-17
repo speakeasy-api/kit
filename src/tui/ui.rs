@@ -121,6 +121,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     let show_start = frame.area().width >= 20
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
         && !app.agents_keyboard_focus
+        && app.session_presentation == super::app::SessionPresentation::Welcome
         && app.blocks.is_empty()
         && app.pending_steers.is_empty()
         && !app.editing_steer()
@@ -1214,7 +1215,9 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         app.row_calls.clear();
         app.row_links.clear();
         app.row_code.clear();
-        frame.render_widget(welcome_logo(), inner);
+        if app.session_presentation == super::app::SessionPresentation::Welcome {
+            frame.render_widget(welcome_logo(), inner);
+        }
         return;
     }
 
@@ -7291,6 +7294,42 @@ mod tests {
         assert!(rows[input - 1].starts_with('╭'));
         assert!(rows[input + 1].starts_with('╰'));
         assert!(!frame.contains('▜'));
+    }
+
+    #[test]
+    fn clear_session_keeps_an_empty_conversation_and_new_restores_welcome() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.blocks.push(Block::Agent("old conversation".into()));
+        assert!(render(&mut app, 90, 24).contains("old conversation"));
+
+        app.start_session_with_presentation(
+            "cleared-session".into(),
+            super::super::app::SessionPresentation::Conversation,
+        );
+        assert_eq!(app.session_id.as_deref(), Some("cleared-session"));
+        assert!(app.blocks.is_empty());
+        for (width, height) in [(90, 24), (120, 40), (40, 12)] {
+            let frame = render(&mut app, width, height);
+            assert!(!frame.contains("old conversation"));
+            assert!(!frame.contains("by Speakeasy"));
+            assert!(
+                frame
+                    .lines()
+                    .position(|line| line.contains("message kit"))
+                    .unwrap()
+                    > usize::from(height / 2),
+                "composer should stay at the bottom"
+            );
+        }
+
+        app.start_session("new-session".into());
+        assert!(app.blocks.is_empty());
+        assert!(render(&mut app, 90, 24).contains("by Speakeasy"));
     }
 
     #[test]
