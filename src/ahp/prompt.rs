@@ -118,6 +118,12 @@ impl PromptHook {
         };
         // Capture before dispatch so a late outcome cannot reach a resumed session.
         let producer = self.hooks.injections.producer(&ctx.session_id.to_string());
+        // A new turn starts clean of any context an earlier turn left undelivered.
+        if event_type == EventType::TurnStart
+            && let Some(producer) = &producer
+        {
+            producer.discard_turn();
+        }
         let result = if event_type == EventType::UserMessageInbound {
             let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
                 self.channel,
@@ -198,17 +204,29 @@ impl PromptHook {
             .hooks
             .settle(event_type, result, &ctx.session_id.to_string())
             .map(Ok);
-        // Injected context is request-local: it waits for this turn's first model
-        // request and never enters the admitted prompt. Rejected input starts no
-        // model request, so its turn cannot leave context for a later turn.
+        // Injected context is request-local and turn-scoped: it waits for this
+        // turn's first model request, never enters the admitted prompt, and is
+        // discarded if the turn ends without one (see `TurnHook`). Rejected
+        // input starts no model request, so it queues nothing.
         if event_type == EventType::TurnStart
             && admitted
             && let Some(Ok(outcome)) = &settled
             && !outcome.outcome.is_denied()
-            && let Err(error) = super::enqueue_injections(producer.as_ref(), &outcome.outcome)
+            && !outcome.outcome.injections.is_empty()
         {
-            settled = Some(Err(error));
+            let queued = producer
+                .as_ref()
+                .ok_or_else(|| "injection session is closed".to_owned())
+                .and_then(|producer| producer.enqueue_turn(&outcome.outcome));
+            if let Err(error) = queued {
+                settled = Some(Err(error));
+            }
         }
+        let discard = || {
+            if let Some(producer) = &producer {
+                producer.discard_turn();
+            }
+        };
         let edited = match settled {
             Some(Err(error)) => Err(error),
             Some(Ok(outcome)) if outcome.outcome.is_denied() => {
@@ -227,11 +245,18 @@ impl PromptHook {
                     if index.is_none() {
                         return Ok(true);
                     }
-                    let mut replacement = super::model::canonical_items_at(
+                    let mut replacement = match super::model::canonical_items_at(
                         event.0.items.iter().map(|item| item.0.as_ref()),
                         &cursor[start..],
                         start,
-                    )?;
+                    ) {
+                        Ok(replacement) => replacement,
+                        Err(error) => {
+                            // The whole response is rejected, its context too.
+                            discard();
+                            return Err(error);
+                        }
+                    };
                     // Canonical IDs belong to the hook; ACP replay identity belongs
                     // to the host and survives a replacement with a new ID.
                     if let Some(identity) =
@@ -274,6 +299,7 @@ impl PromptHook {
                 }
             }
             Err(reason) => {
+                discard();
                 cursor.truncate(start);
                 ctx.emitter.emit(AgentEvent::Warning {
                     message: format!("prompt blocked by agent hook: {reason}"),

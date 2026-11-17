@@ -21,6 +21,14 @@ pub(super) struct Injections {
 struct Pending {
     items: Vec<Item>,
     bytes: usize,
+    // Context for the current turn only (`turn.start`). It is discarded when
+    // the turn ends or the next one starts, so a turn that never reaches a
+    // model request cannot leave it for a later turn.
+    turn: Vec<Item>,
+    turn_bytes: usize,
+    // Counts discards, so a delivery claimed before one cannot put back
+    // context for a turn that has since ended.
+    turn_generation: u64,
     in_flight_items: usize,
     closed: bool,
     // Immutable for this active generation, including after delivery retires.
@@ -79,6 +87,14 @@ impl Injections {
             .ok_or_else(|| "injection session is closed".into())
     }
 
+    /// Drop the current turn's undelivered context. Session-scoped context
+    /// (`session.start`, tool and model boundaries) is kept.
+    pub(super) fn discard_turn(&self, session: &str) {
+        if let Ok(queue) = self.queue(session) {
+            discard_turn(&queue);
+        }
+    }
+
     /// Take with rollback. Dropping the model-request future cannot lose
     /// the pending context; only successful adapter acceptance consumes it.
     /// HookedSession::begin_turn(&mut self) is the sole production consumer;
@@ -90,13 +106,19 @@ impl Injections {
             return Err("injection session is closed".into());
         }
         let items = std::mem::take(&mut pending.items);
+        let turn = std::mem::take(&mut pending.turn);
         let bytes = pending.bytes;
-        pending.in_flight_items = items.len();
+        let turn_bytes = pending.turn_bytes;
+        let turn_generation = pending.turn_generation;
+        pending.in_flight_items = items.len() + turn.len();
         drop(pending);
         Ok(Delivery {
             queue,
             items,
             bytes,
+            turn,
+            turn_bytes,
+            turn_generation,
             committed: false,
         })
     }
@@ -111,6 +133,21 @@ impl Producer {
     /// Accept only settled injections; raw subscription responses are not effects.
     /// A rejected batch leaves the existing queue unchanged.
     pub(super) fn enqueue<C, P>(&self, outcome: &ProtocolOutcome<C, P>) -> Result<(), String> {
+        self.push(outcome, false)
+    }
+
+    /// Like [`Self::enqueue`], for context that belongs to the current turn
+    /// only: see [`Injections::discard_turn`].
+    pub(super) fn enqueue_turn<C, P>(&self, outcome: &ProtocolOutcome<C, P>) -> Result<(), String> {
+        self.push(outcome, true)
+    }
+
+    /// Drop this generation's undelivered turn context.
+    pub(super) fn discard_turn(&self) {
+        discard_turn(&self.queue);
+    }
+
+    fn push<C, P>(&self, outcome: &ProtocolOutcome<C, P>, turn: bool) -> Result<(), String> {
         let mut items = Vec::new();
         let mut bytes = 0usize;
         for injection in &outcome.injections {
@@ -146,13 +183,19 @@ impl Producer {
         if pending.closed {
             return Err("injection session is closed".into());
         }
-        if pending.items.len() + pending.in_flight_items + items.len() > MAX_MESSAGES
-            || pending.bytes + bytes > MAX_BYTES
+        if pending.items.len() + pending.turn.len() + pending.in_flight_items + items.len()
+            > MAX_MESSAGES
+            || pending.bytes + pending.turn_bytes + bytes > MAX_BYTES
         {
             return Err("pending injected context limit reached".into());
         }
-        pending.items.extend(items);
-        pending.bytes += bytes;
+        if turn {
+            pending.turn.extend(items);
+            pending.turn_bytes += bytes;
+        } else {
+            pending.items.extend(items);
+            pending.bytes += bytes;
+        }
         Ok(())
     }
 }
@@ -175,24 +218,37 @@ impl Drop for SessionLease {
     }
 }
 
+fn discard_turn(queue: &Queue) {
+    let mut pending = queue.lock().unwrap_or_else(PoisonError::into_inner);
+    pending.turn.clear();
+    pending.turn_bytes = 0;
+    pending.turn_generation = pending.turn_generation.wrapping_add(1);
+}
+
 // Retired producer handles retain only an empty queue, not pending payloads.
 fn retire(queue: &Queue) {
     let mut pending = queue.lock().unwrap_or_else(PoisonError::into_inner);
     pending.closed = true;
     pending.bytes = 0;
     pending.items.clear();
+    pending.turn_bytes = 0;
+    pending.turn.clear();
 }
 
 pub(super) struct Delivery {
     queue: Queue,
     items: Vec<Item>,
     bytes: usize,
+    turn: Vec<Item>,
+    turn_bytes: usize,
+    turn_generation: u64,
     committed: bool,
 }
 
 impl Delivery {
     pub(super) fn append_to(&self, transcript: &mut Vec<Item>) {
         transcript.extend(self.items.iter().cloned());
+        transcript.extend(self.turn.iter().cloned());
     }
 
     /// Call synchronously immediately after inner.begin_turn returns Ok.
@@ -206,6 +262,9 @@ impl Delivery {
             return Ok(());
         }
         pending.bytes -= self.bytes;
+        if pending.turn_generation == self.turn_generation {
+            pending.turn_bytes -= self.turn_bytes;
+        }
         pending.in_flight_items = 0;
         self.committed = true;
         Ok(())
@@ -220,9 +279,45 @@ impl Drop for Delivery {
                 // The in-flight count keeps this append within MAX_MESSAGES.
                 self.items.append(&mut pending.items);
                 pending.items = std::mem::take(&mut self.items);
+                if pending.turn_generation == self.turn_generation {
+                    self.turn.append(&mut pending.turn);
+                    pending.turn = std::mem::take(&mut self.turn);
+                }
             }
             pending.in_flight_items = 0;
         }
+    }
+}
+
+/// A settled outcome injecting `text`, for tests.
+#[cfg(test)]
+pub(super) fn text_outcome(text: &str) -> ProtocolOutcome {
+    use agenthooksprotocol::client::Permission;
+    use agenthooksprotocol::{
+        CanonicalMessage, CanonicalMessageRole, CanonicalMessages, InjectEffect, TextBodyPart,
+    };
+    let message = CanonicalMessage::new(
+        "context",
+        vec![Box::new(ContentItem::TextBodyPart(Box::new(
+            TextBodyPart::new("text", text),
+        )))],
+        CanonicalMessageRole::User,
+    );
+    ProtocolOutcome {
+        messages: vec![],
+        injections: vec![InjectEffect::new(
+            InjectEffectDeliverAt::Now,
+            Box::new(CanonicalMessages(vec![Box::new(message)])),
+        )],
+        responses: vec![],
+        settled_candidate: None,
+        decision: Permission::Allow,
+        stopped: false,
+        continuation_requested: false,
+        instructions: vec![],
+        approval_invalidated: false,
+        authorized: true,
+        failures: vec![],
     }
 }
 
@@ -236,35 +331,9 @@ impl Drop for Delivery {
 )]
 mod tests {
     use super::*;
-    use agenthooksprotocol::client::Permission;
-    use agenthooksprotocol::{
-        CanonicalMessage, CanonicalMessageRole, CanonicalMessages, InjectEffect, TextBodyPart,
-    };
 
     fn outcome(text: &str) -> ProtocolOutcome {
-        let message = CanonicalMessage::new(
-            "context",
-            vec![Box::new(ContentItem::TextBodyPart(Box::new(
-                TextBodyPart::new("text", text),
-            )))],
-            CanonicalMessageRole::User,
-        );
-        ProtocolOutcome {
-            messages: vec![],
-            injections: vec![InjectEffect::new(
-                InjectEffectDeliverAt::Now,
-                Box::new(CanonicalMessages(vec![Box::new(message)])),
-            )],
-            responses: vec![],
-            settled_candidate: None,
-            decision: Permission::Allow,
-            stopped: false,
-            continuation_requested: false,
-            instructions: vec![],
-            approval_invalidated: false,
-            authorized: true,
-            failures: vec![],
-        }
+        text_outcome(text)
     }
 
     fn enqueue(queues: &Injections, session: &str, text: &str) {
@@ -300,6 +369,46 @@ mod tests {
         assert_eq!(texts(&delivery), ["first", "second"]);
         delivery.commit().unwrap();
         assert!(texts(&queues.claim("a").unwrap()).is_empty());
+    }
+
+    fn enqueue_turn(queues: &Injections, session: &str, text: &str) {
+        queues
+            .producer(session)
+            .unwrap()
+            .enqueue_turn(&outcome(text))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_turn_that_ends_undelivered_leaves_its_context_behind_but_not_the_sessions() {
+        let queues = Injections::default();
+        let _owner = queues.open("a", false).unwrap();
+        enqueue(&queues, "a", "session");
+        enqueue_turn(&queues, "a", "old turn");
+        queues.discard_turn("a");
+        enqueue_turn(&queues, "a", "new turn");
+        assert_eq!(texts(&queues.claim("a").unwrap()), ["session", "new turn"]);
+    }
+
+    #[test]
+    fn a_failed_request_cannot_put_back_context_for_a_turn_that_has_ended() {
+        let queues = Injections::default();
+        let _owner = queues.open("a", false).unwrap();
+        enqueue(&queues, "a", "session");
+        enqueue_turn(&queues, "a", "old turn");
+        let delivery = queues.claim("a").unwrap();
+        queues.discard_turn("a");
+        // The request failed after its turn ended: session context returns,
+        // the turn's does not.
+        drop(delivery);
+        let delivery = queues.claim("a").unwrap();
+        assert_eq!(texts(&delivery), ["session"]);
+        // Committing after a discard does not miscount what is pending.
+        enqueue_turn(&queues, "a", "new turn");
+        queues.discard_turn("a");
+        delivery.commit().unwrap();
+        enqueue_turn(&queues, "a", "next");
+        assert_eq!(texts(&queues.claim("a").unwrap()), ["next"]);
     }
 
     #[test]

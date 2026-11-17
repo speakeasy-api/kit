@@ -166,6 +166,11 @@ async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: Ag
 impl LoopObserver for TurnHook {
     fn handle_event(&self, observed: ObservedEvent) {
         if matches!(observed.event, AgentEvent::TurnFinished(_)) {
+            // Context for this turn that never reached a model request (the
+            // turn failed, was cancelled or blocked) must not reach the next.
+            self.0
+                .injections
+                .discard_turn(&observed.session_id.to_string());
             lock(&self.0.turn_events)
                 .entry(observed.session_id.to_string())
                 .or_default()

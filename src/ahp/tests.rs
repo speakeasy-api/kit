@@ -834,6 +834,60 @@ async fn turn_start_context_reaches_the_turns_model_request_without_entering_the
 }
 
 #[tokio::test]
+async fn turn_context_is_discarded_with_a_rejected_replacement_and_when_the_turn_ends() {
+    let (hooks, backend) = hooks(vec![intercept(&["turn.start"])]);
+    // Valid context, then a replacement that fabricates media: the whole
+    // response is rejected, its context with it.
+    backend.respond(
+        "turn.start",
+        json!([context_injection("old turn"), {"type":"modify","target":"prompt","operation":"replace","value":[
+            {"id":"fake","role":"user","parts":[{"id":"fake/a","kind":"attachment","category":"image","mediaType":"image/png","selection":"metadata","contentRef":{"id":"x"}}]}
+        ]}]),
+    );
+    let model = Model::default();
+    let (step, _) = prompt(&hooks, &model, "first").await;
+    assert!(step.is_err() || model.requests.lock().unwrap().is_empty());
+    assert!(
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .flat_map(|item| item.parts.iter().filter_map(part_text))
+            .all(|text| text != "old turn")
+    );
+}
+
+#[test]
+fn a_finished_turn_discards_its_undelivered_context() {
+    let (hooks, _backend) = hooks(vec![intercept(&["turn.start"])]);
+    let _owner = hooks.injections.open("abc", false).unwrap();
+    hooks
+        .injections
+        .producer("abc")
+        .unwrap()
+        .enqueue_turn(&super::injection::text_outcome("stale"))
+        .unwrap();
+    agentkit_loop::LoopObserver::handle_event(
+        &TurnHook(hooks.clone()),
+        agentkit_loop::ObservedEvent {
+            session_id: Arc::new(SessionId::new("abc")),
+            event: agentkit_loop::AgentEvent::TurnFinished(agentkit_loop::TurnResult {
+                turn_id: agentkit_core::TurnId::new("t"),
+                finish_reason: FinishReason::Error,
+                items: Vec::new(),
+                usage: None,
+                metadata: MetadataMap::new(),
+            }),
+        },
+    );
+    let mut items = Vec::new();
+    hooks.injections.claim("abc").unwrap().append_to(&mut items);
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
 async fn failed_tools_can_inject_recovery_context_without_becoming_successful() {
     let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
     let _lease = hooks
