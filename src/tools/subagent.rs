@@ -546,12 +546,26 @@ impl Subagents {
             status,
             name,
             task,
+            harness,
+            vendor,
+            model,
+            created_at_unix_ms,
+            generation_started_at_unix_ms,
+            generation_finished_at_unix_ms,
             ..
         } = &event
         {
+            let runtime = events::SubagentRuntime {
+                harness: harness.clone(),
+                vendor: *vendor,
+                model: model.clone(),
+                created_at_unix_ms: *created_at_unix_ms,
+                generation_started_at_unix_ms: *generation_started_at_unix_ms,
+                generation_finished_at_unix_ms: *generation_finished_at_unix_ms,
+            };
             self.transcripts
                 .stream
-                .announce(id, name, task, *status, *generation);
+                .announce(id, name, task, *status, *generation, &runtime);
             self.transcripts.start(id, *generation);
             if matches!(status, SubagentStatus::Removed)
                 && let Ok(transcript) = self.transcripts.get(id, *generation)

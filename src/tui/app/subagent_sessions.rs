@@ -222,6 +222,13 @@ impl App {
         let state = snapshot.state.value().cloned();
         let title = snapshot.title.value().cloned();
         let description = snapshot.description.value().cloned();
+        let runtime = snapshot
+            .meta
+            .value()
+            .and_then(|meta| meta.get(crate::events::SUBAGENT_RUNTIME_META))
+            .and_then(|value| {
+                serde_json::from_value::<crate::events::SubagentRuntime>(value.clone()).ok()
+            });
         if self.child_roster_retired(&id) {
             if let Some(view) = self.child_views.get_mut(&id) {
                 view.disable("Child removed; retained transcript is read-only");
@@ -250,6 +257,14 @@ impl App {
         });
         row.name = title.unwrap_or_else(|| id.clone());
         row.task = description.unwrap_or_default();
+        if let Some(runtime) = runtime {
+            row.harness = runtime.harness;
+            row.vendor = runtime.vendor;
+            row.model = runtime.model;
+            row.created_at_unix_ms = runtime.created_at_unix_ms;
+            row.generation_started_at_unix_ms = runtime.generation_started_at_unix_ms;
+            row.generation_finished_at_unix_ms = runtime.generation_finished_at_unix_ms;
+        }
         if state_changed {
             row.status = work_status(state.as_ref());
             if row.status != SubagentStatus::Working {
@@ -438,6 +453,33 @@ mod tests {
             json!({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": text}}),
         );
     }
+    #[test]
+    fn nested_announcements_carry_runtime_identity_across_meta_patches() {
+        let mut app = app();
+        announce(&mut app, "root", "child");
+        send(
+            &mut app,
+            "child",
+            json!({"sessionUpdate":"subagent_update", "sessionId":"nested", "title":"audit", "state":{"state":"running"}, "_meta":{
+                "kit/subagent/steer":{"generation":1,"canSteer":false},
+                "kit/subagent/runtime":{"harness":"acp.kit","vendor":"kit","model":"gpt","createdAtUnixMs":10,"generationStartedAtUnixMs":20,"generationFinishedAtUnixMs":null}
+            }}),
+        );
+        send(
+            &mut app,
+            "child",
+            json!({"sessionUpdate":"subagent_update", "sessionId":"nested", "_meta":{"kit/subagent/steer":{"generation":1,"canSteer":false}}}),
+        );
+        let row = &app.agents["nested"];
+        assert_eq!(row.harness, "acp.kit");
+        assert_eq!(row.vendor, HarnessVendor::Kit);
+        assert_eq!(row.model.as_deref(), Some("gpt"));
+        assert_eq!(row.created_at_unix_ms, 10);
+        assert_eq!(row.generation_started_at_unix_ms, 20);
+        assert_eq!(row.generation_finished_at_unix_ms, None);
+        assert_eq!(row.parent_id.as_deref(), Some("child"));
+    }
+
     #[test]
     fn associations_auto_open_agents_only_once() {
         let mut app = app();

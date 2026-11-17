@@ -101,6 +101,7 @@ impl Stream {
         task: &str,
         status: crate::events::SubagentStatus,
         generation: u64,
+        runtime: &crate::events::SubagentRuntime,
     ) {
         let activity = match status {
             crate::events::SubagentStatus::Starting | crate::events::SubagentStatus::Working => {
@@ -145,6 +146,9 @@ impl Stream {
             active: matches!(status, crate::events::SubagentStatus::Working),
         };
         update["_meta"] = steering.meta();
+        if let Ok(runtime) = serde_json::to_value(runtime) {
+            update["_meta"][crate::events::SUBAGENT_RUNTIME_META] = runtime;
+        }
         state.steering.insert(id.to_owned(), steering);
         Self::publish(&mut state, "", update);
     }
@@ -682,12 +686,40 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn announcement_runtime_identity_survives_capability_patches_on_replay() {
+        let stream = Stream::default();
+        let runtime = crate::events::SubagentRuntime {
+            harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
+            model: Some("gpt".into()),
+            created_at_unix_ms: 10,
+            generation_started_at_unix_ms: 20,
+            generation_finished_at_unix_ms: Some(30),
+        };
+        stream.announce("child", "worker", "task", SubagentStatus::Idle, 1, &runtime);
+        stream.capabilities("child", 1, true);
+        let mut replay = stream.subscribe("parent".into(), false);
+        let snapshot = replay.try_recv().unwrap().1;
+        assert_eq!(
+            snapshot["_meta"][crate::events::SUBAGENT_RUNTIME_META],
+            json!({"harness":"acp.kit","vendor":"kit","model":"gpt","createdAtUnixMs":10,"generationStartedAtUnixMs":20,"generationFinishedAtUnixMs":30})
+        );
+    }
+
+    #[test]
     fn announcement_precedes_messages_and_survives_generations() {
         let stream = Stream::default();
         let mut rx = stream.subscribe("parent".into(), true);
         stream.forward("child", json!({"sessionUpdate":"agent_thought_chunk"}));
         assert!(rx.try_recv().is_err());
-        stream.announce("child", "worker", "task", SubagentStatus::Starting, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Starting,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         stream.directed(
             "child",
             json!({"sessionUpdate":"session_message","messageId":"m"}),
@@ -697,7 +729,14 @@ mod tests {
         assert_eq!(announcement.1["sessionId"], "child");
         assert_eq!(rx.try_recv().unwrap().0, "child");
         assert_eq!(rx.try_recv().unwrap().0, "parent");
-        stream.announce("child", "worker", "again", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "again",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         assert_eq!(rx.try_recv().unwrap().1["sessionId"], "child");
         let mut replay = stream.subscribe("parent".into(), true);
         assert_eq!(replay.try_recv().unwrap().1["description"], "again");
@@ -710,7 +749,14 @@ mod tests {
     #[test]
     fn ownership_is_immutable_and_replay_is_parent_first() {
         let stream = Stream::default();
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         stream.forward(
             "child",
             json!({"sessionUpdate":"subagent_update","sessionId":"nested","title":"nested"}),
@@ -731,7 +777,14 @@ mod tests {
     fn oversized_updates_are_rejected_without_poisoning_stream() {
         let stream = Stream::default();
         let mut rx = stream.subscribe("parent".into(), true);
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         rx.try_recv().unwrap();
         stream.forward("child", json!({"content":"x".repeat(FRAME_BYTES)}));
         assert!(rx.try_recv().is_err());
@@ -749,6 +802,7 @@ mod tests {
                 "task",
                 SubagentStatus::Idle,
                 1,
+                &crate::events::SubagentRuntime::default(),
             );
         }
         let mut rx = stream.subscribe("parent".into(), true);
@@ -767,9 +821,14 @@ mod tests {
         let mut rx = transcripts.stream.subscribe("parent".into(), true);
         let routes = Routes::default();
         for child in ["a", "b"] {
-            transcripts
-                .stream
-                .announce(child, child, "task", SubagentStatus::Working, 1);
+            transcripts.stream.announce(
+                child,
+                child,
+                "task",
+                SubagentStatus::Working,
+                1,
+                &crate::events::SubagentRuntime::default(),
+            );
             transcripts.start(child, 1);
             routes.register(child, child, 1, transcripts.get(child, 1).unwrap());
         }
@@ -813,7 +872,14 @@ mod tests {
     fn steering_requires_current_generation_support_and_live_work() {
         let stream = Stream::default();
         let mut rx = stream.subscribe("parent".into(), true);
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         assert_eq!(
             rx.try_recv().unwrap().1["_meta"]["kit/subagent/steer"],
             json!({"generation":1,"canSteer":false})
@@ -823,18 +889,39 @@ mod tests {
             rx.try_recv().unwrap().1["_meta"]["kit/subagent/steer"]["canSteer"],
             true
         );
-        stream.announce("child", "worker", "task", SubagentStatus::Idle, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Idle,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         assert_eq!(
             rx.try_recv().unwrap().1["_meta"]["kit/subagent/steer"]["canSteer"],
             false
         );
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 2);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            2,
+            &crate::events::SubagentRuntime::default(),
+        );
         assert_eq!(
             rx.try_recv().unwrap().1["_meta"]["kit/subagent/steer"],
             json!({"generation":2,"canSteer":false})
         );
         stream.capabilities("child", 1, true);
-        stream.announce("child", "worker", "old", SubagentStatus::Idle, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "old",
+            SubagentStatus::Idle,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         assert!(rx.try_recv().is_err());
         stream.capabilities("child", 2, true);
         assert_eq!(
@@ -852,7 +939,14 @@ mod tests {
     fn reconnect_replays_bounded_ordered_history_without_duplicating_live_chunks() {
         let stream = Stream::default();
         let mut live = stream.subscribe("parent".into(), true);
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         live.try_recv().unwrap();
         for sequence in 0..HISTORY + 3 {
             stream.forward("child", json!({"sessionUpdate":"session_message_chunk", "messageId":"m", "content":{"type":"text","text":sequence.to_string()}}));
@@ -878,7 +972,14 @@ mod tests {
     #[test]
     fn history_byte_budget_evicts_old_frames_without_regressing_current_state() {
         let stream = Stream::default();
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         let text = "x".repeat(FRAME_BYTES / 2);
         for sequence in 0..HISTORY {
             stream.forward("child", json!({"sessionUpdate":"session_message_chunk","messageId":sequence.to_string(),"content":{"type":"text","text":text}}));
@@ -887,7 +988,14 @@ mod tests {
             "child",
             json!({"sessionUpdate":"state_update","state":"running"}),
         );
-        stream.announce("child", "worker", "task", SubagentStatus::Idle, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Idle,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         let mut replay = stream.subscribe("parent".into(), true);
         let announcement = replay.try_recv().unwrap();
         assert_eq!(
@@ -908,7 +1016,14 @@ mod tests {
     #[test]
     fn nested_current_state_is_replayed_in_ownership_snapshot() {
         let stream = Stream::default();
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         stream.forward(
             "child",
             json!({"sessionUpdate":"subagent_update","sessionId":"nested"}),
@@ -930,9 +1045,14 @@ mod tests {
     fn nested_kit_steering_grants_do_not_authorize_the_direct_child_rpc() {
         let transcripts = super::super::transcript::Transcripts::default();
         let mut rx = transcripts.stream.subscribe("parent".into(), true);
-        transcripts
-            .stream
-            .announce("child", "worker", "task", SubagentStatus::Working, 1);
+        transcripts.stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         transcripts.start("child", 1);
         let routes = Routes::default();
         routes.register("remote", "child", 1, transcripts.get("child", 1).unwrap());
@@ -948,7 +1068,14 @@ mod tests {
     fn no_history_resume_announces_ownership_without_old_content_or_grants() {
         let stream = Stream::default();
         let mut live = stream.subscribe("parent".into(), false);
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         stream.capabilities("child", 1, true);
         stream.forward("child", json!({"sessionUpdate":"session_message_chunk", "messageId":"m", "content":{"type":"text","text":"old"}}));
         for _ in 0..3 {
@@ -976,7 +1103,14 @@ mod tests {
     #[test]
     fn replay_revokes_cached_standard_and_kit_mutation_grants() {
         let stream = Stream::default();
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         stream.forward("child", json!({"sessionUpdate":"subagent_update", "sessionId":"nested", "capabilities":{"cancel":{}}, "_meta":{"kit/subagent/steer":{"generation":3,"canSteer":true}}}));
         for replay_history in [false, true] {
             let mut rx = stream.subscribe("parent".into(), replay_history);
@@ -994,7 +1128,14 @@ mod tests {
     fn metadata_key_patches_match_live_and_reconnect_snapshots() {
         let stream = Stream::default();
         let mut live = stream.subscribe("parent".into(), false);
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         live.try_recv().unwrap();
         let mut observed = serde_json::Map::new();
         for patch in [
@@ -1030,9 +1171,14 @@ mod tests {
     #[test]
     fn resume_tail_eviction_preserves_associations_and_metadata() {
         let transcripts = super::super::transcript::Transcripts::default();
-        transcripts
-            .stream
-            .announce("child", "worker", "task", SubagentStatus::Working, 1);
+        transcripts.stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         transcripts.start("child", 1);
         let mut rx = transcripts.stream.subscribe("parent".into(), false);
         rx.try_recv().unwrap();
@@ -1070,9 +1216,14 @@ mod tests {
     fn resume_descendant_state_survives_tail_eviction_and_respects_newer_associations() {
         for newer_association in [false, true] {
             let transcripts = super::super::transcript::Transcripts::default();
-            transcripts
-                .stream
-                .announce("child", "worker", "task", SubagentStatus::Working, 1);
+            transcripts.stream.announce(
+                "child",
+                "worker",
+                "task",
+                SubagentStatus::Working,
+                1,
+                &crate::events::SubagentRuntime::default(),
+            );
             transcripts.start("child", 1);
             let mut rx = transcripts.stream.subscribe("parent".into(), false);
             rx.try_recv().unwrap();
@@ -1116,9 +1267,14 @@ mod tests {
     fn directed_message_views_preserve_omission_null_and_replacement_content() {
         for kind in ["agent_message", "user_message"] {
             let transcripts = super::super::transcript::Transcripts::default();
-            transcripts
-                .stream
-                .announce("child", "worker", "task", SubagentStatus::Working, 1);
+            transcripts.stream.announce(
+                "child",
+                "worker",
+                "task",
+                SubagentStatus::Working,
+                1,
+                &crate::events::SubagentRuntime::default(),
+            );
             transcripts.start("child", 1);
             let mut rx = transcripts.stream.subscribe("parent".into(), false);
             rx.try_recv().unwrap();
@@ -1181,7 +1337,14 @@ mod tests {
     fn live_descendant_state_has_parent_addressed_v1_association_patch() {
         let stream = Stream::default();
         let mut rx = stream.subscribe("root".into(), false);
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         stream.forward("child", json!({"sessionUpdate":"subagent_update","sessionId":"grandchild","state":{"state":"running"}}));
         stream.forward(
             "grandchild",
@@ -1238,7 +1401,14 @@ mod tests {
             let _guard = stream.state.lock().unwrap();
             panic!("abandoned transition");
         });
-        stream.announce("child", "worker", "task", SubagentStatus::Working, 1);
+        stream.announce(
+            "child",
+            "worker",
+            "task",
+            SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
         assert!(rx.try_recv().is_err());
     }
 }
