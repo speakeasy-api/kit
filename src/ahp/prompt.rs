@@ -93,6 +93,7 @@ impl PromptHook {
 }
 
 impl PromptHook {
+    #[allow(clippy::too_many_arguments)]
     async fn apply(
         &self,
         cursor: &mut TranscriptCursor<'_>,
@@ -101,6 +102,7 @@ impl PromptHook {
         index: Option<usize>,
         start: usize,
         trigger: TurnStartInputTrigger,
+        admitted: bool,
     ) -> Result<bool, LoopError> {
         let message = index.map(|index| super::message(&cursor[index], index));
         let original: String = message
@@ -114,6 +116,8 @@ impl PromptHook {
         let Some(turn_id) = ctx.turn_id else {
             return Ok(true);
         };
+        // Capture before dispatch so a late outcome cannot reach a resumed session.
+        let producer = self.hooks.injections.producer(&ctx.session_id.to_string());
         let result = if event_type == EventType::UserMessageInbound {
             let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
                 self.channel,
@@ -190,17 +194,32 @@ impl PromptHook {
         if matches!(&result, Err(LoopError::Cancelled)) {
             return Err(LoopError::Cancelled);
         }
-        let edited = match self
+        let mut settled = self
             .hooks
             .settle(event_type, result, &ctx.session_id.to_string())
+            .map(Ok);
+        // Injected context is request-local: it waits for this turn's first model
+        // request and never enters the admitted prompt. Rejected input starts no
+        // model request, so its turn cannot leave context for a later turn.
+        if event_type == EventType::TurnStart
+            && admitted
+            && let Some(Ok(outcome)) = &settled
+            && !outcome.outcome.is_denied()
+            && let Err(error) = super::enqueue_injections(producer.as_ref(), &outcome.outcome)
         {
-            Some(outcome) if outcome.outcome.is_denied() => Err(super::denial(&outcome.outcome)),
-            Some(outcome)
+            settled = Some(Err(error));
+        }
+        let edited = match settled {
+            Some(Err(error)) => Err(error),
+            Some(Ok(outcome)) if outcome.outcome.is_denied() => {
+                Err(super::denial(&outcome.outcome))
+            }
+            Some(Ok(outcome))
                 if event_type == EventType::TurnStart && !super::has_modification(&outcome) =>
             {
                 return Ok(true);
             }
-            Some(outcome) => match outcome.event {
+            Some(Ok(outcome)) => match outcome.event {
                 Event::TurnStart(event) => {
                     // `prompt` replaces the entire admitted canonical item list,
                     // not just the final user's text. Reuse model-effect validation
@@ -320,6 +339,7 @@ impl LoopMutator for PromptHook {
                 index,
                 start,
                 trigger.clone(),
+                true,
             )
             .await
         } else {
@@ -359,7 +379,15 @@ impl LoopMutator for PromptHook {
             // Even rejected input owns a native turn. Report an empty admitted
             // input rather than inventing a prompt or leaving an unmatched end.
             let admitted = self
-                .apply(cursor, &ctx, EventType::TurnStart, index, start, trigger)
+                .apply(
+                    cursor,
+                    &ctx,
+                    EventType::TurnStart,
+                    index,
+                    start,
+                    trigger,
+                    accepted,
+                )
                 .await?;
             if !admitted {
                 return Err(LoopError::Mutator("prompt blocked by agent hook".into()));

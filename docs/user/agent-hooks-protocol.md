@@ -72,7 +72,7 @@ need client-defined routing and failure policies.
 | Event | Where Kit emits it | Hook authority |
 | --- | --- | --- |
 | `session.start` | A session's model connection opens | Inject context |
-| `turn.start` | A logical agent-loop turn admits its input, with native session and turn IDs | Deny, replace the admitted prompt |
+| `turn.start` | A logical agent-loop turn admits its input, with native session and turn IDs | Deny, replace the admitted prompt, inject context |
 | `turn.end` | That logical turn completes, fails, or is cancelled | Observe |
 | `session.end` | A prompt run finishes or an ACP session closes | Observe |
 | `user.message.inbound` | A user prompt arrives, including an interjection during a turn | Deny, replace the prompt |
@@ -99,7 +99,9 @@ target `prompt` and operation `replace` on `turn.start` replaces this entire
 canonical item list. Retain the supplied opaque part identities to preserve
 attachments; edits cannot fabricate media. Both events support user-facing
 `message` effects. An interjection during an active turn emits
-`user.message.inbound` without another `turn.start`.
+`user.message.inbound` without another `turn.start`. Context injected at
+`turn.start` reaches the turn's first model request; it is discarded when the
+prompt is denied.
 
 A denied prompt is removed together with its admitted resources and
 notifications. Denial fails the current turn without a further model call,
