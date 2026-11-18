@@ -514,6 +514,14 @@ pub(crate) fn subagent_usage(owner: &str, update: &Value) -> Option<crate::event
     })
 }
 
+/// A child's hook sign-in hint is for its user, never the parent's model:
+/// it is not captured, inspected or forwarded.
+fn user_only(update: &Value) -> bool {
+    update["_meta"]
+        .get(crate::ahp::auth::HOOK_AUTH_META)
+        .is_some()
+}
+
 fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActivity> {
     use crate::events::SubagentActivity;
     use agent_client_protocol::schema::MaybeUndefined;
@@ -980,6 +988,11 @@ impl ChildOutput {
     }
 
     fn record(&mut self, update: SessionUpdate) {
+        if let Ok(value) = serde_json::to_value(&update)
+            && user_only(&value)
+        {
+            return;
+        }
         if let SessionUpdate::AgentMessageChunk(chunk) = &update
             && let ContentBlock::Text(text) = &chunk.content
         {
@@ -1580,6 +1593,7 @@ async fn run(
                 if message.method != "session/update" { return Ok(()); }
                 let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
                 let mut params = message.params;
+                if user_only(&params["update"]) { return Ok(()); }
                 protocol::normalize_config_options(&mut params["update"]);
                 let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
                 if let Some(notification) = &notification
@@ -3063,6 +3077,28 @@ mod tests {
         assert_eq!(output.updates[1]["sessionUpdate"], "tool_call");
         assert_eq!(output.updates[2]["sessionUpdate"], "plan");
         assert!(!output.updates_truncated);
+    }
+
+    #[test]
+    fn a_child_hook_sign_in_hint_never_reaches_the_parent_model() {
+        let link = "https://auth.example/authorize?state=child";
+        let notice = json!({"sessionUpdate": "notice", "severity": "info",
+            "title": format!("Hook backend `x` needs you to sign in. Open {link} to approve Kit."),
+            "_meta": {"kit/hooks/auth": {"backend": "x", "url": link, "cleared": false}}});
+        assert!(user_only(&notice));
+        let mut output = ChildOutput::default();
+        output.record(update(notice));
+        output.record(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "done"}
+        })));
+        assert!(output.updates.is_empty());
+        assert_eq!(output.text, "done");
+        assert!(
+            !serde_json::to_string(&output.updates)
+                .unwrap()
+                .contains(link)
+        );
     }
 
     #[test]

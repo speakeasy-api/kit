@@ -33,7 +33,7 @@ use agenthooksprotocol::{
 use serde_json::Value;
 
 use crate::credentials::CredentialStorage;
-pub(crate) use login::{AuthHint, HintSubscription, notices};
+pub(crate) use login::{AuthHint, HOOK_AUTH_META, HintSubscription, notices};
 
 /// The credential namespace of Kit's hook grants.
 const NAMESPACE: &str = "kit";

@@ -26,7 +26,25 @@ pub(crate) struct AuthHint {
     pub signed_in: bool,
 }
 
+/// The `_meta` key that marks a sign-in hint, on a notice or Kit's own
+/// notification. A hint is for a person: a parent Kit never passes a child's
+/// hint to its model.
+pub(crate) const HOOK_AUTH_META: &str = "kit/hooks/auth";
+
 impl AuthHint {
+    /// `_meta` for a notice carrying this hint.
+    pub(crate) fn meta(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::from_iter([(
+            HOOK_AUTH_META.to_owned(),
+            serde_json::json!({
+                "backend": self.backend,
+                "url": self.url,
+                "expiresAt": self.expires_at_ms,
+                "cleared": self.cleared,
+            }),
+        )])
+    }
+
     /// Plain text for a client without Kit's status line: once for a new
     /// link and once when sign-in finishes. An expired link says nothing;
     /// the next turn shows its replacement.
@@ -545,7 +563,7 @@ async fn respond(stream: &mut tokio::net::TcpStream, success: bool) {
 /// Adapts `notify` to a client without Kit's status line: one notice per new
 /// link, and one when a backend whose link it showed finishes signing in.
 pub(crate) fn notices(
-    notify: impl Fn(String) + Send + Sync + 'static,
+    notify: impl Fn(&AuthHint, String) + Send + Sync + 'static,
 ) -> impl Fn(&AuthHint) + Send + Sync + 'static {
     let shown: Mutex<HashSet<String>> = Mutex::default();
     move |hint: &AuthHint| {
@@ -568,7 +586,7 @@ pub(crate) fn notices(
             hint.notice()
         };
         if let Some(text) = text {
-            notify(text);
+            notify(hint, text);
         }
     }
 }

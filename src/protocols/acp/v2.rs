@@ -82,7 +82,7 @@ pub(crate) struct HookAuthNotification {
 }
 
 /// The capability `_meta` key a client sets to receive [`HookAuthNotification`].
-pub(crate) const HOOK_AUTH_META: &str = "kit/hooks/auth";
+pub(crate) const HOOK_AUTH_META: &str = crate::ahp::auth::HOOK_AUTH_META;
 
 fn client_mcp_servers(
     mcp_servers: Vec<wire::McpServer>,
@@ -606,13 +606,12 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
             }),
             None => {
                 let sink = self.sink.inner.clone();
-                hooks.subscribe_auth_hints(crate::ahp::auth::notices(move |text| {
+                hooks.subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
                     let _ = sink.update(wire::UpdateSessionNotification::new(
                         session.clone(),
-                        wire::SessionUpdate::Notice(wire::Notice::new(
-                            wire::NoticeSeverity::Info,
-                            text,
-                        )),
+                        wire::SessionUpdate::Notice(
+                            wire::Notice::new(wire::NoticeSeverity::Info, text).meta(hint.meta()),
+                        ),
                     ));
                 }))
             }
@@ -3975,7 +3974,11 @@ mod tests {
         let titles: Vec<_> = updates
             .iter()
             .map(|update| match &update.update {
-                wire::SessionUpdate::Notice(notice) => notice.title.clone(),
+                wire::SessionUpdate::Notice(notice) => {
+                    // Tagged, so a parent Kit never hands it to its model.
+                    assert!(notice.meta.as_ref().unwrap().contains_key(HOOK_AUTH_META));
+                    notice.title.clone()
+                }
                 other => panic!("sign-in hints must be notices, got {other:?}"),
             })
             .collect();

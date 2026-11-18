@@ -1404,10 +1404,12 @@ impl ResponseInterruptionNoticeObserver {
         let auth_client = self.client.clone();
         let auth_session = self.session_id.clone();
         self.hook_auth = hooks
-            .subscribe_auth_hints(crate::ahp::auth::notices(move |text| {
+            .subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
                 let _ = auth_client.notify_session(SessionNotification::new(
                     auth_session.clone(),
-                    SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text)),
+                    SessionUpdate::Notice(
+                        Notice::new(NoticeSeverity::Info, text).meta(hint.meta()),
+                    ),
                 ));
             }))
             .map(Arc::new);

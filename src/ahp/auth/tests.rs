@@ -412,7 +412,7 @@ async fn a_fail_closed_backend_without_a_grant_denies() {
 fn notices_show_each_link_once_and_completion_once() {
     let shown = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&shown);
-    let sink = notices(move |text| recorded.lock().unwrap().push(text));
+    let sink = notices(move |_, text| recorded.lock().unwrap().push(text));
     let pending = AuthHint {
         backend: "test.notice".into(),
         url: Some("https://auth.example/authorize?state=1".into()),
