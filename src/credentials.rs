@@ -751,6 +751,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_same_entry_in_another_storage_is_locked_independently() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let first = CredentialStorage::Filesystem(first.path().to_path_buf());
+        let second = CredentialStorage::Filesystem(second.path().to_path_buf());
+        let later = std::time::Instant::now() + Duration::from_secs(5);
+        let _held = first.lock_entry("test-locks", "same", later).await.unwrap();
+        let soon = std::time::Instant::now() + Duration::from_millis(200);
+        assert!(second.lock_entry("test-locks", "same", soon).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn entry_locks_are_exclusive_per_entry_and_released_on_drop() {
         let directory = tempfile::tempdir().unwrap();
         for storage in [

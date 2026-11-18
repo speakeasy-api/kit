@@ -81,8 +81,8 @@ pub(super) struct Login {
     pub(super) oauth: Arc<ManagedOAuth>,
     pub(super) context: AuthContext,
     pub(super) state: String,
-    url: String,
-    expires_at: SystemTime,
+    pub(super) url: String,
+    pub(super) expires_at: SystemTime,
     /// Where the login is recorded for listeners in other processes.
     pub(super) storage: crate::credentials::CredentialStorage,
     pub(super) client: super::network::ClientBuilder,
@@ -360,7 +360,7 @@ impl Registry {
 
     /// Every pending login whose callback arrives on `port`, and the latest
     /// expiry among them. Expired logins are dropped and their hints cleared.
-    fn logins(&self, port: u16) -> Option<(Vec<Login>, SystemTime)> {
+    pub(super) fn logins(&self, port: u16) -> Option<(Vec<Login>, SystemTime)> {
         let now = SystemTime::now();
         let (expired, live) = {
             let mut state = self.lock();
@@ -432,6 +432,22 @@ impl Registry {
             },
             None => cleared(&login.scope, &login.context.backend_id, true),
         });
+    }
+
+    /// Stops listening on `port` unless a login was offered for it since
+    /// the listener last looked: checked under the lock `offer` takes, so a
+    /// login is never left without a listener.
+    fn stop_if_idle(&self, port: u16) -> bool {
+        let mut state = self.lock();
+        let now = SystemTime::now();
+        let waiting = state
+            .pending
+            .values()
+            .any(|pending| pending.port == port && pending.expires_at > now);
+        if !waiting {
+            state.listening.remove(&port);
+        }
+        !waiting
     }
 
     fn stopped(&self, port: u16) {
@@ -534,7 +550,11 @@ pub(super) async fn bind(port: u16) -> Option<TcpListener> {
 /// Receives sign-in callbacks on a fixed loopback port until no pending
 /// login of this process uses it.
 pub(super) async fn listen(port: u16) {
-    if let Some(listener) = bind(port).await {
+    let Some(listener) = bind(port).await else {
+        registry().stopped(port);
+        return;
+    };
+    loop {
         serve(
             &listener,
             port,
@@ -542,8 +562,10 @@ pub(super) async fn listen(port: u16) {
             |login| registry().completed(login),
         )
         .await;
+        if registry().stop_if_idle(port) {
+            return;
+        }
     }
-    registry().stopped(port);
 }
 
 /// Completes pending logins from callbacks on `listener`, routed by

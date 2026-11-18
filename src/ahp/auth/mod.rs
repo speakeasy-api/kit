@@ -603,8 +603,13 @@ impl HookAuth {
                 "authentication".into(),
                 login.context.authentication.clone().unwrap_or(Value::Null),
             ),
+            ("expiresAt".into(), login::unix_ms(login.expires_at).into()),
         ]));
         let store = store::Store::new(self.0.storage.clone(), &backend.scope);
+        let now = login::unix_ms(std::time::SystemTime::now());
+        if let Err(error) = store.prune_pending(now, budget()).await {
+            tracing::debug!(code = ?error.auth_code(), "could not prune expired hook sign-ins");
+        }
         if store
             .remember(store::PENDING, &login.state, budget())
             .await

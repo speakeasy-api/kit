@@ -120,6 +120,39 @@ impl Store {
         Ok(())
     }
 
+    /// Drops this backend's pending-login records that expired by `now_ms`
+    /// (Unix milliseconds), and their index entries, so neither grows with
+    /// each new link.
+    pub(super) async fn prune_pending(
+        &self,
+        now_ms: u64,
+        budget: OperationBudget,
+    ) -> Result<(), HookError> {
+        let _lock = self.lock(INDEX, &self.backend, budget).await?;
+        let mut index = self.index().await?;
+        let mut pruned = false;
+        for (namespace, identity) in index.clone() {
+            if namespace != PENDING {
+                continue;
+            }
+            let entry = self.storage.entry(PENDING, &identity);
+            let bytes = blocking(move || entry.load()).await?;
+            let expires_at = bytes
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|record| record["expiresAt"].as_u64());
+            if expires_at.is_none_or(|expires_at| expires_at <= now_ms) {
+                let entry = self.storage.entry(PENDING, &identity);
+                blocking(move || entry.delete()).await?;
+                index.remove(&(namespace, identity));
+                pruned = true;
+            }
+        }
+        if pruned {
+            self.save_index(&index).await?;
+        }
+        Ok(())
+    }
+
     /// Deletes every record and secret this backend wrote, returning how
     /// many existed. Records are
     /// deleted under their own locks, so a concurrent writer finishes first.
@@ -307,6 +340,30 @@ mod tests {
         assert_eq!(first.forget(budget()).await.unwrap(), 1);
         let mut guard = second.acquire(key("cas"), budget()).await.unwrap();
         assert!(guard.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_pending_logins_are_pruned_from_storage_and_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let store = Store::new(storage.clone(), "test#prune");
+        for (state, expires_at) in [("old", 1_000_u64), ("live", u64::MAX)] {
+            store.remember(PENDING, state, budget()).await.unwrap();
+            storage
+                .entry(PENDING, state)
+                .save(
+                    serde_json::json!({"expiresAt": expires_at})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+        }
+        store.prune_pending(2_000, budget()).await.unwrap();
+        assert!(storage.entry(PENDING, "old").load().unwrap().is_none());
+        assert!(storage.entry(PENDING, "live").load().unwrap().is_some());
+        let index = store.index().await.unwrap();
+        assert!(!index.contains(&(PENDING.to_owned(), "old".to_owned())));
+        assert!(index.contains(&(PENDING.to_owned(), "live".to_owned())));
     }
 
     #[tokio::test]

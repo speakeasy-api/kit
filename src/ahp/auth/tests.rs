@@ -310,11 +310,34 @@ async fn sign_in(auth: &HookAuth, id: &str, port: u16) {
         assert!(approve(&url, port).await);
     });
     let signed_in = auth
-        .login(Some(id), |_, url| tx.send(url.clone()).unwrap())
+        .login(Some(id), |_, url| {
+            // Kit listens before it shows the link, so it can be opened at once.
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+                "the link was shown before Kit listened for its callback"
+            );
+            tx.send(url.clone()).unwrap();
+        })
         .await
         .unwrap();
     assert_eq!(signed_in, [id]);
     browser.await.unwrap();
+}
+
+/// The pending logins on `port`, once there are `count` of them.
+async fn wait_for_logins(port: u16, count: usize) -> Vec<login::Login> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some((logins, _)) = login::registry().logins(port)
+                && logins.len() >= count
+            {
+                return logins;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending logins")
 }
 
 async fn next_hint(hints: &mut mpsc::UnboundedReceiver<AuthHint>) -> AuthHint {
@@ -738,18 +761,21 @@ async fn finishing_one_target_keeps_the_others_link() {
         assert!(credential(&auth, target.clone()).await.is_err());
     }
     auth.turn_started();
-    let mut shown = next_hint(&mut hints).await;
-    while let Ok(hint) = tokio::time::timeout(Duration::from_millis(500), hints.recv()).await {
-        shown = hint.unwrap();
-    }
-    let first = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
-    assert!(approve(&first, port).await);
+    // Wait until both targets' logins are pending.
+    let logins = wait_for_logins(port, 2).await;
+    let (first, second) = (&logins[0], &logins[1]);
+    assert_ne!(first.url, second.url);
+    assert!(approve(&url::Url::parse(&first.url).unwrap(), port).await);
     // The other target's link is shown next, not cleared.
-    let next = next_hint(&mut hints).await;
+    let next = loop {
+        let hint = next_hint(&mut hints).await;
+        if hint.url.as_deref() != Some(first.url.as_str()) {
+            break hint;
+        }
+    };
     assert!(!next.cleared, "{next:?}");
-    let second = url::Url::parse(next.url.as_deref().unwrap()).unwrap();
-    assert_ne!(first, second);
-    assert!(approve(&second, port).await);
+    assert_eq!(next.url.as_deref(), Some(second.url.as_str()));
+    assert!(approve(&url::Url::parse(&second.url).unwrap(), port).await);
     assert!(next_hint(&mut hints).await.signed_in);
     assert!(credential(&auth, event).await.unwrap().is_some());
     assert!(credential(&auth, upload).await.unwrap().is_some());
@@ -908,4 +934,34 @@ async fn an_exchange_whose_request_was_sent_commits_after_the_caller_leaves() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(issuer.exchanges(), 1);
     assert!(credential(&auth, target).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_listener_completes_a_login_offered_after_it_started_waiting() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.late", port)]);
+    let event = context(&auth, "test.late");
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/late-uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/late-uploads", issuer.origin)}));
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The listener starts for the event login and waits for a callback.
+    let early = auth.prepare(&event, &[]).await.unwrap().unwrap();
+    wait_for_logins(port, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A login offered while it waits is completed by it, as its own: the
+    // hint moves back to the event's link.
+    let late = auth.prepare(&upload, &[]).await.unwrap().unwrap();
+    while next_hint(&mut hints).await.url.as_deref() != Some(late.as_str()) {}
+    assert!(approve(&late, port).await);
+    assert_eq!(
+        next_hint(&mut hints).await.url.as_deref(),
+        Some(early.as_str())
+    );
+    assert!(credential(&auth, upload).await.unwrap().is_some());
 }
