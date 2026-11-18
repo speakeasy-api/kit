@@ -1466,3 +1466,49 @@ async fn a_problem_with_one_target_keeps_the_others_link() {
         "{notice}"
     );
 }
+
+#[test]
+fn a_replayed_link_reaches_a_new_subscriber_before_its_completion() {
+    let scope = "test#test.replay-order".to_owned();
+    let link = AuthHint {
+        scope: scope.clone(),
+        backend: "test.replay-order".into(),
+        url: Some("https://auth.example/replay".into()),
+        expires_at_ms: None,
+        cleared: false,
+        signed_in: false,
+        problem: None,
+    };
+    login::registry().publish(link.clone());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let completer = Arc::new(Mutex::new(None));
+    let _subscription = login::registry().subscribe(HashSet::from([scope.clone()]), {
+        let (seen, completer, scope) = (Arc::clone(&seen), Arc::clone(&completer), scope.clone());
+        move |hint: &AuthHint| {
+            if hint.url.is_some() {
+                // While the link is replayed, the login completes elsewhere.
+                let scope = scope.clone();
+                *completer.lock().unwrap() = Some(std::thread::spawn(move || {
+                    login::registry().publish(AuthHint {
+                        scope,
+                        backend: "test.replay-order".into(),
+                        url: None,
+                        expires_at_ms: None,
+                        cleared: true,
+                        signed_in: true,
+                        problem: None,
+                    });
+                }));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            seen.lock().unwrap().push(hint.cleared);
+        }
+    });
+    let completer = completer.lock().unwrap().take().unwrap();
+    completer.join().unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [false, true],
+        "the completion overtook the replayed link"
+    );
+}

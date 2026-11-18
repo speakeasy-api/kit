@@ -238,21 +238,38 @@ impl Registry {
         scopes: HashSet<String>,
         sink: impl Fn(&AuthHint) + Send + Sync + 'static,
     ) -> HintSubscription {
-        let sink: Arc<Sink> = Arc::new(sink);
-        let current: Vec<_> = {
+        // One subscriber's deliveries are serialized: live updates wait
+        // until the snapshot below is replayed, so a completion can never
+        // arrive before the link it clears. Sinks still run outside the
+        // registry lock.
+        let inner: Arc<Sink> = Arc::new(sink);
+        let gate = Arc::new(Mutex::new(()));
+        let sink: Arc<Sink> = Arc::new({
+            let (inner, gate) = (Arc::clone(&inner), Arc::clone(&gate));
+            move |hint: &AuthHint| {
+                let _turn = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+                inner(hint);
+            }
+        });
+        let (current, turn) = {
             let mut state = self.lock();
             state.sinks.push((scopes.clone(), Arc::downgrade(&sink)));
-            state
+            let current: Vec<_> = state
                 .hints
                 .values()
                 .filter(|hint| scopes.contains(&hint.scope))
                 .cloned()
-                .collect()
+                .collect();
+            // Taken before the registry lock is released (registry, then
+            // gate; never the reverse).
+            let turn = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+            (current, turn)
         };
         // A session attached after a link was shown still sees it.
         for hint in &current {
-            sink(hint);
+            inner(hint);
         }
+        drop(turn);
         HintSubscription { _sink: sink }
     }
 
