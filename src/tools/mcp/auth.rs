@@ -26,8 +26,28 @@ pub struct InteractiveConfig {
     client_id: Option<String>,
     #[serde(rename = "clientMetadataUrl")]
     client_metadata_url: Option<String>,
+    /// Registers dynamically instead of offering a client metadata
+    /// document, for issuers that advertise both but cannot fetch one.
+    #[serde(rename = "dynamicRegistration", default)]
+    dynamic_registration: bool,
     #[serde(default)]
     scopes: Vec<String>,
+}
+
+impl InteractiveConfig {
+    /// The client metadata document offered during registration, if any.
+    fn metadata_url(&self) -> Result<Option<&str>, String> {
+        match (
+            self.dynamic_registration,
+            self.client_metadata_url.as_deref(),
+        ) {
+            (true, Some(_)) => {
+                Err("`dynamicRegistration` and `clientMetadataUrl` cannot be combined".into())
+            }
+            (true, None) => Ok(None),
+            (false, url) => Ok(Some(url.unwrap_or(CLIENT_METADATA_URL))),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -46,6 +66,7 @@ impl Default for Config {
         Self::Oauth(InteractiveConfig {
             client_id: None,
             client_metadata_url: None,
+            dynamic_registration: false,
             scopes: Vec::new(),
         })
     }
@@ -137,12 +158,9 @@ pub async fn begin(
         let mut request = AuthorizationRequest::new(&redirect_uri)
             .with_scopes(scopes)
             .with_client_name("Kit");
-        request = request.with_client_metadata_url(
-            config
-                .client_metadata_url
-                .as_deref()
-                .unwrap_or(CLIENT_METADATA_URL),
-        );
+        if let Some(url) = config.metadata_url()? {
+            request = request.with_client_metadata_url(url);
+        }
         AuthorizationSession::new(manager, request)
             .await
             .map_err(|(_, error)| format!("OAuth client registration failed: {error}"))?
@@ -795,5 +813,97 @@ mod tests {
             url.query_pairs()
                 .any(|(name, value)| name == "scope" && value.contains("challenge.scope"))
         );
+    }
+
+    /// An issuer that accepts both URL client IDs and dynamic registration,
+    /// registering every client as `dcr-client`.
+    async fn dual_registration_issuer() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = if path == "/resource-metadata" {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"resource":"{server_base}/mcp","authorization_servers":["{server_base}"]}}"#
+                        ),
+                    )
+                } else if path == "/register" {
+                    ("201 Created", r#"{"client_id":"dcr-client","redirect_uris":["http://127.0.0.1/callback"]}"#.to_owned())
+                } else {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"issuer":"{server_base}","authorization_endpoint":"{server_base}/authorize","token_endpoint":"{server_base}/token","registration_endpoint":"{server_base}/register","response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"client_id_metadata_document_supported":true}}"#
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (base, server)
+    }
+
+    async fn authorization_client_id(config: serde_json::Value) -> String {
+        let (base, server) = dual_registration_issuer().await;
+        let config: Config = serde_json::from_value(config).unwrap();
+        let challenge = format!(r#"Bearer resource_metadata="{base}/resource-metadata""#);
+        let pending = begin(
+            &format!("{base}/mcp"),
+            &config,
+            &CredentialStorage::Memory,
+            None,
+            Some(&challenge),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let url = url::Url::parse(&pending.url).unwrap();
+        url.query_pairs()
+            .find(|(name, _)| name == "client_id")
+            .unwrap()
+            .1
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn sign_in_offers_kits_metadata_document_by_default() {
+        assert_eq!(
+            authorization_client_id(serde_json::json!({"type":"oauth"})).await,
+            super::CLIENT_METADATA_URL
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_opts_out_of_the_metadata_document() {
+        assert_eq!(
+            authorization_client_id(
+                serde_json::json!({"type":"oauth", "dynamicRegistration": true})
+            )
+            .await,
+            "dcr-client"
+        );
+    }
+
+    #[test]
+    fn dynamic_registration_cannot_name_a_metadata_document() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "type": "oauth",
+            "dynamicRegistration": true,
+            "clientMetadataUrl": "https://client.example/metadata.json"
+        }))
+        .unwrap();
+        assert!(config.interactive().unwrap().metadata_url().is_err());
     }
 }

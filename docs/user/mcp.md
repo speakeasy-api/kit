@@ -152,7 +152,7 @@ An HTTP server requires a non-empty `url`. Optional fields are `description`, `h
 
 Unless machine authentication is configured explicitly, OAuth is inferred reactively for every remote Streamable HTTP server. Kit first connects normally, records a `WWW-Authenticate` Bearer challenge, and uses that challenge for protected-resource discovery and dynamic client registration when `auth` is called. No `auth` block is required. Stdio servers never use this OAuth path.
 
-An explicit `auth` block is an optional fallback or override. Set `auth.type` to the exact value `oauth`. `scopes` supplies fallback scopes in addition to challenge and server metadata. Use `clientId` to override dynamic registration with a pre-registered OAuth client. Optional `clientMetadataUrl` replaces the client metadata document Kit offers during registration. By default Kit offers `https://kitagent.dev/oauth/client.json` to servers that accept URL client IDs, and registers dynamically with the rest.
+An explicit `auth` block is an optional fallback or override. Set `auth.type` to the exact value `oauth`. `scopes` supplies fallback scopes in addition to challenge and server metadata. Use `clientId` to override dynamic registration with a pre-registered OAuth client. Optional `clientMetadataUrl` replaces the client metadata document Kit offers during registration. By default Kit offers `https://kitagent.dev/oauth/client.json` to servers that accept URL client IDs, and registers dynamically with the rest. Set `dynamicRegistration` to `true` to always register dynamically, for a server that advertises URL client IDs but cannot fetch Kit's document; it cannot be combined with `clientMetadataUrl`.
 
 ```json
 {
@@ -380,7 +380,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 ### Configuration file errors
 
 - **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional; creating it takes effect on the next `tool_search` or `auth` call.
-- **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
+- **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, `clientMetadataUrl`, and `dynamicRegistration`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
 - **Plugin server missing**: an SSE declaration, an unsupported `cwd`, a `./` command outside the plugin root, or a name already declared by a lexically earlier plugin alias leaves that server unavailable. Migrate SSE to `streamable-http` and fix or rename the declaration.
 - **MCP server status `error`**: Kit tolerates initialization failures—startup continues and the per-server diagnostic is included in `tool_search`. Run a failing stdio command directly to check that it exists and speaks MCP over stdio; for HTTP, check DNS, HTTPS, proxy/firewall access, authentication settings, headers, and the endpoint URL. The connection timeout is 20 seconds.
