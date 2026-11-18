@@ -69,6 +69,13 @@ pub enum Update {
     },
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
+    /// A hook backend's sign-in link, or that it no longer needs one.
+    HookSignIn {
+        backend: String,
+        url: Option<String>,
+        expires_at_ms: Option<u64>,
+        cleared: bool,
+    },
     /// Result of listing sessions without blocking the terminal event loop.
     SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
     FileMatches {
@@ -873,6 +880,8 @@ pub struct App {
     pub(super) gateway_epoch: u64,
     pub(super) gateway_blocked: bool,
     pub(super) gateway_status: Option<String>,
+    /// Pending hook sign-in links by backend, with their Unix-ms expiry.
+    hook_sign_ins: std::collections::BTreeMap<String, (String, Option<u64>)>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1183,11 +1192,35 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 }
 
 impl App {
+    /// The status-line hint for hook backends waiting for sign-in, while
+    /// their links last. Only the user sees it; the model never does.
+    pub(super) fn hook_sign_in_status(&self) -> Option<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let live: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|(_, (_, expiry))| expiry.is_none_or(|expiry| u128::from(expiry) > now))
+            .collect();
+        match live.as_slice() {
+            [] => None,
+            [(backend, (url, _))] => Some(format!("sign in to hook {backend}: {url}")),
+            [(backend, (url, _)), rest @ ..] => Some(format!(
+                "sign in to hook {backend}: {url} (+{} more)",
+                rest.len()
+            )),
+        }
+    }
+}
+
+impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
             gateway_epoch: 0,
             gateway_blocked: false,
             gateway_status: None,
+            hook_sign_ins: Default::default(),
             gateway_candidate: None,
             child_focus: None,
             session_messages: HashMap::new(),
@@ -2340,6 +2373,19 @@ impl App {
             Update::OpenUserImage(_) => {}
             Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
+            Update::HookSignIn {
+                backend,
+                url,
+                expires_at_ms,
+                cleared,
+            } => match url {
+                Some(url) if !cleared => {
+                    self.hook_sign_ins.insert(backend, (url, expires_at_ms));
+                }
+                _ => {
+                    self.hook_sign_ins.remove(&backend);
+                }
+            },
             Update::SessionCatalog(result) => {
                 self.session_catalog_pending = false;
                 match result {

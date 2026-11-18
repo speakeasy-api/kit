@@ -3309,6 +3309,12 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(theme::warn_color()),
         )];
     }
+    if let Some(sign_in) = app.hook_sign_in_status() {
+        left.push(Span::styled(
+            format!(" · {sign_in}"),
+            Style::default().fg(theme::warn_color()),
+        ));
+    }
     let counts = app.agent_counts();
     let active_agents = counts.starting + counts.working;
     if active_agents > 0 {
@@ -5207,6 +5213,43 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn hook_sign_in_link_stays_in_the_status_line_until_cleared() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let later = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 600_000;
+        let hint = |url: Option<&str>, cleared| crate::tui::app::Update::HookSignIn {
+            backend: "com.example".into(),
+            url: url.map(str::to_owned),
+            expires_at_ms: Some(later),
+            cleared,
+        };
+        app.apply(hint(Some("https://a.example/s"), false));
+        let screen = render(&mut app, 120, 12);
+        assert!(
+            screen.contains("sign in to hook com.example: https://a.example/s"),
+            "{screen}"
+        );
+        app.apply(hint(None, true));
+        assert!(!render(&mut app, 120, 12).contains("sign in to hook"));
+        // An expired link is not shown, even before it is cleared.
+        app.apply(crate::tui::app::Update::HookSignIn {
+            backend: "com.example".into(),
+            url: Some("https://a.example/s".into()),
+            expires_at_ms: Some(1),
+            cleared: false,
+        });
+        assert!(!render(&mut app, 120, 12).contains("sign in to hook"));
     }
 
     #[test]

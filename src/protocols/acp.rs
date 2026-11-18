@@ -153,6 +153,25 @@ pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] 
     TERMINAL_AUTH_METHODS
 }
 
+/// The single terminal method that signs in to each hook backend needing it.
+pub(crate) const HOOK_AUTH_METHOD: &str = "hooks";
+
+fn hook_terminal_auth_method(
+    capabilities: &agentkit_acp::ClientCapabilities,
+    available: bool,
+) -> Option<AuthMethod> {
+    (available && !terminal_auth_methods(capabilities, |_| true).is_empty()).then(|| {
+        AuthMethod::Terminal(
+            AuthMethodTerminal::new(HOOK_AUTH_METHOD, "Sign in to hooks")
+                .description("Sign in to the hook backends of this project that need it")
+                .args(vec![
+                    "--terminal-auth-login".into(),
+                    HOOK_AUTH_METHOD.into(),
+                ]),
+        )
+    })
+}
+
 fn terminal_auth_methods(
     capabilities: &agentkit_acp::ClientCapabilities,
     provider_available: impl Fn(ProviderKind) -> bool,
@@ -1328,6 +1347,7 @@ struct ResponseInterruptionNoticeObserver {
     retry: Option<retry_projection::Projection>,
     compaction: Option<compaction_projection::Projection>,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
+    hook_auth: Option<Arc<crate::ahp::auth::HintSubscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1345,6 +1365,7 @@ impl ResponseInterruptionNoticeObserver {
             retry: None,
             compaction: None,
             hook_messages: None,
+            hook_auth: None,
             activity,
             inner,
             client,
@@ -1379,6 +1400,17 @@ impl ResponseInterruptionNoticeObserver {
                     .is_ok()
             },
         ));
+        // Sign-in links are for the user only, never the transcript.
+        let auth_client = self.client.clone();
+        let auth_session = self.session_id.clone();
+        self.hook_auth = hooks
+            .subscribe_auth_hints(crate::ahp::auth::notices(move |text| {
+                let _ = auth_client.notify_session(SessionNotification::new(
+                    auth_session.clone(),
+                    SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text)),
+                ));
+            }))
+            .map(Arc::new);
         self
     }
 }
@@ -1566,9 +1598,10 @@ impl Server {
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, agent_client_protocol::Error> {
         let method_id = request.method_id.0.as_ref();
-        let detail = if terminal_auth_method_specs()
-            .iter()
-            .any(|method| method.method_id == method_id)
+        let detail = if method_id == HOOK_AUTH_METHOD
+            || terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == method_id)
         {
             "terminal authentication methods must be launched as a separate agent invocation"
         } else {
@@ -1680,10 +1713,17 @@ impl Server {
         let logout_authentication = self.runtime.supports_logout_authentication();
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
             .agent_capabilities(capabilities(logout_authentication))
-            .auth_methods(terminal_auth_methods(
-                &request.client_capabilities,
-                |provider| self.runtime.supports_terminal_authentication(provider),
-            ))
+            .auth_methods(
+                terminal_auth_methods(&request.client_capabilities, |provider| {
+                    self.runtime.supports_terminal_authentication(provider)
+                })
+                .into_iter()
+                .chain(hook_terminal_auth_method(
+                    &request.client_capabilities,
+                    self.runtime.supports_hook_authentication(),
+                ))
+                .collect(),
+            )
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
                 self.integration.version().to_string(),

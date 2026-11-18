@@ -64,6 +64,26 @@ struct UpdateMcpRequest {
 )]
 struct UpdateMcpResponse {}
 
+/// Kit-private notification to clients that declare `kit/hooks/auth` in
+/// their capabilities `_meta` (the bundled TUI): a hook backend's sign-in
+/// link for a status line, or that it cleared. Other clients get a notice.
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcNotification,
+)]
+#[serde(rename_all = "camelCase")]
+#[notification(method = "kit/hooks/auth")]
+pub(crate) struct HookAuthNotification {
+    pub session_id: wire::SessionId,
+    pub backend: String,
+    pub url: Option<String>,
+    /// Unix milliseconds.
+    pub expires_at: Option<u64>,
+    pub cleared: bool,
+}
+
+/// The capability `_meta` key a client sets to receive [`HookAuthNotification`].
+pub(crate) const HOOK_AUTH_META: &str = "kit/hooks/auth";
+
 fn client_mcp_servers(
     mcp_servers: Vec<wire::McpServer>,
 ) -> Result<Vec<agentkit_acp::McpServer>, AcpRuntimeError> {
@@ -136,6 +156,26 @@ fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
             .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
         None => agent_client_protocol::util::internal_error(detail),
     }
+}
+
+fn hook_terminal_auth_method(
+    capabilities: &wire::ClientCapabilities,
+    available: bool,
+) -> Option<wire::AuthMethod> {
+    let hooks = super::HOOK_AUTH_METHOD;
+    (available
+        && capabilities
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.terminal.as_ref())
+            .is_some())
+    .then(|| {
+        wire::AuthMethod::Terminal(
+            wire::AuthMethodTerminal::new(hooks, "Sign in to hooks")
+                .description("Sign in to the hook backends of this project that need it")
+                .args(vec!["--terminal-auth-login".into(), hooks.into()]),
+        )
+    })
 }
 
 fn terminal_auth_methods(
@@ -484,6 +524,7 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
 struct ResponseReplacementObserver<S> {
     retry: super::retry_projection::Projection,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
+    hook_auth: Option<Arc<crate::ahp::auth::HintSubscription>>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
     compaction: super::compaction_projection::Projection,
@@ -502,6 +543,7 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
             retry: super::retry_projection::Projection::default(),
             compaction: super::compaction_projection::Projection::default(),
             hook_messages: None,
+            hook_auth: None,
             inner,
             sink,
             activity,
@@ -535,6 +577,47 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
                     .is_ok()
             },
         ));
+        self
+    }
+}
+
+impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
+    /// Hook sign-in links go to the user only, never the transcript: to a
+    /// client's status line through [`HookAuthNotification`] when it asked
+    /// for them, else as one notice per link.
+    fn with_hook_auth(
+        mut self,
+        hooks: Option<&crate::ahp::Hooks>,
+        notifications: Option<V2ConnectionTo<Client>>,
+    ) -> Self {
+        let Some(hooks) = hooks else {
+            return self;
+        };
+        let session = self.session_id.clone();
+        self.hook_auth = match notifications {
+            Some(connection) => hooks.subscribe_auth_hints(move |hint| {
+                let _ = connection.send_notification(HookAuthNotification {
+                    session_id: session.clone(),
+                    backend: hint.backend.clone(),
+                    url: hint.url.clone(),
+                    expires_at: hint.expires_at_ms,
+                    cleared: hint.cleared,
+                });
+            }),
+            None => {
+                let sink = self.sink.inner.clone();
+                hooks.subscribe_auth_hints(crate::ahp::auth::notices(move |text| {
+                    let _ = sink.update(wire::UpdateSessionNotification::new(
+                        session.clone(),
+                        wire::SessionUpdate::Notice(wire::Notice::new(
+                            wire::NoticeSeverity::Info,
+                            text,
+                        )),
+                    ));
+                }))
+            }
+        }
+        .map(Arc::new);
         self
     }
 }
@@ -822,6 +905,7 @@ struct SessionSetup {
 struct Server {
     // Connection-local negotiated snapshot; only initialize writes it.
     form_elicitation: AtomicBool,
+    hook_auth_notifications: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -850,6 +934,7 @@ impl Server {
     fn new(runtime: Arc<Runtime>, registry: SessionRegistry) -> Self {
         Self {
             form_elicitation: AtomicBool::new(false),
+            hook_auth_notifications: AtomicBool::new(false),
             runtime,
             integration: Arc::new(AcpIntegration::default()),
             registry,
@@ -875,9 +960,10 @@ impl Server {
         request: wire::LoginAuthRequest,
     ) -> Result<wire::LoginAuthResponse, agent_client_protocol::Error> {
         let method_id = request.method_id.0.as_ref();
-        let detail = if terminal_auth_method_specs()
-            .iter()
-            .any(|method| method.method_id == method_id)
+        let detail = if method_id == super::HOOK_AUTH_METHOD
+            || terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == method_id)
         {
             "terminal authentication methods must be launched as a separate agent invocation"
         } else {
@@ -975,6 +1061,14 @@ impl Server {
                 .is_some_and(|value| value.form.is_some()),
             Ordering::Release,
         );
+        self.hook_auth_notifications.store(
+            request
+                .capabilities
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(HOOK_AUTH_META)),
+            Ordering::Release,
+        );
         // This handler only speaks v2. Initialization must return our supported
         // version even when the requested version is unsupported; the client
         // then disconnects if it cannot speak v2. It does not switch wire schemas.
@@ -1018,13 +1112,21 @@ impl Server {
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
         .capabilities(capabilities)
-        .auth_methods(if self.runtime.supports_logout_authentication() {
-            terminal_auth_methods(&request.capabilities, |provider| {
-                self.runtime.supports_terminal_authentication(provider)
-            })
-        } else {
-            Vec::new()
-        }))
+        .auth_methods(
+            if self.runtime.supports_logout_authentication() {
+                terminal_auth_methods(&request.capabilities, |provider| {
+                    self.runtime.supports_terminal_authentication(provider)
+                })
+            } else {
+                Vec::new()
+            }
+            .into_iter()
+            .chain(hook_terminal_auth_method(
+                &request.capabilities,
+                self.runtime.supports_hook_authentication(),
+            ))
+            .collect(),
+        ))
     }
 
     async fn new_session(
@@ -1272,7 +1374,13 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
-        .with_hook_messages(runtime.hooks());
+        .with_hook_messages(runtime.hooks())
+        .with_hook_auth(
+            runtime.hooks(),
+            self.hook_auth_notifications
+                .load(Ordering::Acquire)
+                .then(|| connection.clone()),
+        );
         let context = AcpDriverContext {
             activity: activity.clone(),
             ask_user,
@@ -3831,6 +3939,99 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn hook_sign_in_links_reach_the_user_not_the_transcript() {
+        let (_root, hooks) = crate::ahp::auth::test_support::hooks("test.v2-sign-in");
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("v2-hook-sign-in");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let _observer = ResponseReplacementObserver::new(
+            AcpIntegration::default(),
+            sink,
+            session_id.clone(),
+            activity,
+        )
+        .with_hook_auth(Some(&hooks), None);
+        let pending = crate::ahp::auth::AuthHint {
+            backend: "test.v2-sign-in".into(),
+            url: Some("https://auth.example/authorize?state=v2".into()),
+            expires_at_ms: Some(u64::MAX),
+            cleared: false,
+            signed_in: false,
+        };
+        // Repeated turns repeat the link; the client sees it once.
+        crate::ahp::auth::test_support::publish(pending.clone());
+        crate::ahp::auth::test_support::publish(pending.clone());
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::AuthHint {
+            url: None,
+            cleared: true,
+            signed_in: true,
+            ..pending
+        });
+        let updates = recording.updates.lock().unwrap();
+        let titles: Vec<_> = updates
+            .iter()
+            .map(|update| match &update.update {
+                wire::SessionUpdate::Notice(notice) => notice.title.clone(),
+                other => panic!("sign-in hints must be notices, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Hook backend `test.v2-sign-in` needs you to sign in. Open https://auth.example/authorize?state=v2 to approve Kit.",
+                "Hook backend `test.v2-sign-in` is signed in.",
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_sign_in_is_advertised_only_for_http_hooks_with_durable_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let agents = root.path().join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            json!({"protocolVersion": "draft", "hooks": [{
+                "id": "test.advertised",
+                "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "subscriptions": [crate::ahp::test_support::observe(&["session.start"])],
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        for (storage, expected) in [
+            (crate::credentials::CredentialStorage::Memory, false),
+            (
+                crate::credentials::CredentialStorage::Filesystem(credentials.path().into()),
+                true,
+            ),
+        ] {
+            let runtime = Runtime::with_hooks(
+                Runtime::new_with_provider_and_credentials(
+                    root.path(),
+                    "gpt-5.4",
+                    crate::ProviderKind::OpenAiSubscription,
+                    storage,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let server = Server::new(runtime, SessionRegistry::new());
+            let response = server
+                .initialize(terminal_auth_initialize_request())
+                .unwrap();
+            let methods = response.auth_methods.iter().filter(|method| {
+                matches!(method, wire::AuthMethod::Terminal(method)
+                    if method.method_id.0.as_ref() == "hooks"
+                        && method.args == ["--terminal-auth-login", "hooks"])
+            });
+            assert_eq!(methods.count() == 1, expected);
+        }
     }
 
     #[tokio::test]
