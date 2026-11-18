@@ -3393,11 +3393,17 @@ impl App {
         self.selection = None;
         self.press = None;
         // The new session's pending sign-in links, including ones that
-        // arrived while it attached.
+        // arrived while it attached; an expired link is not shown again.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
         let links: Vec<_> = self
             .hook_sign_ins
             .iter()
-            .filter(|((owner, _), _)| self.session_id.as_deref() == Some(owner.as_str()))
+            .filter(|((owner, _), (_, expiry))| {
+                self.session_id.as_deref() == Some(owner.as_str())
+                    && expiry.is_none_or(|expiry| u128::from(expiry) > now)
+            })
             .map(|((_, backend), (url, _))| (backend.clone(), url.clone()))
             .collect();
         for (backend, url) in links {

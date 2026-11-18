@@ -223,9 +223,6 @@ impl HookAuth {
         })
     }
 
-    /// Bearer, OAuth and unbound routes. A route is chosen by the binding, so
-    /// a backend that needs sign-in stays registered and its deliveries fail
-    /// under its own failure policy.
     /// `backend`'s hooks/configuration needs a sign-in. The need is this
     /// workspace's declaration of it, never another workspace's with the
     /// same id; a more precise target already recorded is kept.
@@ -233,13 +230,18 @@ impl HookAuth {
         let Some(backend) = self.0.backends.get(backend) else {
             return;
         };
+        // A backend authenticated by its Authorization header never signs in.
         if let Some(context) = backend.context()
+            && !backend.header_authorization
             && !login::registry().has_needs(&backend.scope)
         {
             login::registry().needs_login(&backend.scope, &context, &[]);
         }
     }
 
+    /// Bearer, OAuth and unbound routes. A route is chosen by the binding, so
+    /// a backend that needs sign-in stays registered and its deliveries fail
+    /// under its own failure policy.
     pub(crate) fn providers(&self) -> AuthProviders {
         let provider: Arc<dyn AuthProvider> = Arc::new(Provider(self.clone()));
         AuthProviders::builder()

@@ -1262,6 +1262,21 @@ async fn a_configuration_need_is_this_workspaces_only() {
     assert!(!login::registry().has_needs(&second.0.backends["test.same-id"].scope));
 }
 
+#[test]
+fn a_backend_with_an_authorization_header_never_needs_a_login() {
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            json!({"id": "test.header-auth", "transport": {"type": "http",
+            "url": "https://hooks.example/ahp", "headers": {"Authorization": "Bearer fixed"}},
+            "oauth": {"issuer": "https://auth.example"}}),
+        ],
+    );
+    auth.configuration_needs_login("test.header-auth");
+    assert!(!login::registry().has_needs(&auth.0.backends["test.header-auth"].scope));
+}
+
 #[tokio::test]
 async fn status_for_one_backend_checks_only_that_backend() {
     let (first, second) = (Issuer::start().await, Issuer::start().await);
@@ -1281,11 +1296,13 @@ async fn status_for_one_backend_checks_only_that_backend() {
         0,
         "another backend's issuer was contacted"
     );
+    // The named backend itself was checked.
+    let checked = first.hits.load(Ordering::SeqCst);
+    assert!(checked > 0, "the named backend was not checked");
+    // A typo is refused before any credential check.
     assert!(auth.status(Some("test.typo")).await.is_err());
-    assert_eq!(
-        first.hits.load(Ordering::SeqCst) + second.hits.load(Ordering::SeqCst),
-        first.hits.load(Ordering::SeqCst)
-    );
+    assert_eq!(first.hits.load(Ordering::SeqCst), checked);
+    assert_eq!(second.hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

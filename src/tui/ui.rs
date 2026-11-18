@@ -5351,6 +5351,18 @@ mod tests {
             "{screen}"
         );
         assert!(!screen.contains("auth.example/next"), "{screen}");
+        // An expired link is not shown again when its session returns.
+        app.apply(crate::tui::app::Update::HookSignIn {
+            session_id: "next".into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: Some("https://auth.example/next-expired".into()),
+            expires_at_ms: Some(1),
+            cleared: false,
+        });
+        app.start_session("next".into());
+        assert!(!flat(&mut app).contains("next-expired"));
+        app.start_session("first".into());
         // A problem is shown once, as a notice.
         let problem = || crate::tui::app::Update::HookSignIn {
             session_id: "first".into(),
