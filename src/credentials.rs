@@ -136,6 +136,97 @@ impl CredentialStorage {
             .map_err(|value| error(format!("credential refresh lock task failed: {value}")))?
     }
 
+    /// Exclusive ownership of one entry, across tasks and across Kit
+    /// processes sharing this storage. Unlike [`Self::lock_refresh`], locks for
+    /// different entries are independent, so holders may nest them. Waiting
+    /// ends at `deadline`; dropping the future or the guard releases it.
+    pub(crate) async fn lock_entry(
+        &self,
+        namespace: &str,
+        identity: &str,
+        deadline: Instant,
+    ) -> Result<CredentialEntryLock, CredentialStoreError> {
+        let entry = self.entry(namespace, identity);
+        let local = {
+            let mut locks = ENTRY_LOCKS
+                .lock()
+                .map_err(|_| error("credential entry lock registry is poisoned"))?;
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            match locks.get(&entry.key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(entry.key.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let local = tokio::time::timeout_at(deadline.into(), local.lock_owned())
+            .await
+            .map_err(|_| error("timed out waiting for a credential entry lock"))?;
+        let directory = match self {
+            Self::Memory => {
+                return Ok(CredentialEntryLock {
+                    _scope: None,
+                    _file: None,
+                    _local: local,
+                });
+            }
+            Self::Keychain => keychain_refresh_lock_path()?
+                .parent()
+                .map(|parent| parent.join("entry-locks"))
+                .ok_or_else(|| error("credential lock path has no directory"))?,
+            Self::Filesystem(directory) => directory.clone(),
+        };
+        let lock_directory = match self {
+            Self::Filesystem(directory) => directory.join(".entry-locks"),
+            _ => directory.clone(),
+        };
+        let path = lock_directory.join(format!("{}.lock", entry.key));
+        let scope = directory.clone();
+        let lease = loop {
+            let (path, scope, lock_directory) =
+                (path.clone(), scope.clone(), lock_directory.clone());
+            let attempt = tokio::task::spawn_blocking(move || {
+                prepare_directory(&scope, true)?;
+                prepare_directory(&lock_directory, true)?;
+                fs::global()
+                    .acquire_lease(&path, &scope, fs::LeaseMode::ExistingOrNew)
+                    .map_err(|value| (value.kind() == ErrorKind::WouldBlock, value))
+                    .map_err(|(busy, value)| {
+                        if busy {
+                            error(BUSY)
+                        } else {
+                            context("could not acquire a credential entry lock", value)
+                        }
+                    })
+            })
+            .await
+            .map_err(|value| error(format!("credential lock task failed: {value}")))?;
+            match attempt {
+                Ok(lease) => break lease,
+                Err(value) if value.0 == BUSY && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(value) if value.0 == BUSY => {
+                    return Err(error("timed out waiting for a credential entry lock"));
+                }
+                Err(value) => return Err(value),
+            }
+        };
+        // Writes to this entry are made under its own lease, never the shared
+        // refresh lock.
+        let scope = match entry.filesystem_path() {
+            Some(file) => Some(CredentialFilesystemScope::register(&lease, file)?),
+            None => None,
+        };
+        Ok(CredentialEntryLock {
+            _scope: scope,
+            _file: Some(lease),
+            _local: local,
+        })
+    }
+
     pub fn cli_name(&self) -> &'static str {
         match self {
             Self::Memory => "memory",
@@ -242,6 +333,20 @@ impl CredentialEntry {
             EntryBackend::Filesystem(path) => filesystem_delete(path),
         }
     }
+}
+
+const BUSY: &str = "credential entry lock is busy";
+
+/// In-process owners of [`CredentialStorage::lock_entry`] by entry key.
+static ENTRY_LOCKS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Held by [`CredentialStorage::lock_entry`]; dropping it releases the entry.
+pub(crate) struct CredentialEntryLock {
+    // Field order releases the scope before the lease it is guarded by.
+    _scope: Option<Arc<CredentialFilesystemScope>>,
+    _file: Option<fs::Lease>,
+    _local: tokio::sync::OwnedMutexGuard<()>,
 }
 
 pub(crate) struct CredentialRefreshLock {
