@@ -7610,6 +7610,7 @@ mod tests {
     fn keyboard_protocol_disambiguates_shortcuts_without_encoding_text() {
         let flags = keyboard_enhancement_flags();
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 
