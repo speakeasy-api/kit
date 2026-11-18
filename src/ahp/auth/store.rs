@@ -177,21 +177,24 @@ impl Store {
         };
         let mut deleted = 0;
         for (namespace, identity) in &index {
-            let _lock = self.lock(namespace, identity, budget).await?;
+            // The record and its index entry go together, under the record's
+            // lock (taken before the index, as everywhere): a writer that
+            // recreates the record afterwards also re-indexes it.
+            let _record = self.lock(namespace, identity, budget).await?;
             let entry = self.storage.entry(namespace, identity);
             if blocking(move || entry.delete()).await? {
                 deleted += 1;
             }
-        }
-        let _lock = self.lock(INDEX, &self.backend, budget).await?;
-        let mut current = self.index().await?;
-        current.retain(|item| !index.contains(item));
-        if current.is_empty() {
-            let entry = self.storage.entry(INDEX, &self.backend);
-            blocking(move || entry.delete()).await?;
-            self.list_scope(false, budget).await?;
-        } else {
-            self.save_index(&current).await?;
+            let _index = self.lock(INDEX, &self.backend, budget).await?;
+            let mut current = self.index().await?;
+            current.remove(&(namespace.clone(), identity.clone()));
+            if current.is_empty() {
+                let entry = self.storage.entry(INDEX, &self.backend);
+                blocking(move || entry.delete()).await?;
+                self.list_scope(false, budget).await?;
+            } else {
+                self.save_index(&current).await?;
+            }
         }
         Ok(deleted)
     }
@@ -419,6 +422,44 @@ mod tests {
         let index = store.index().await.unwrap();
         assert!(!index.contains(&(PENDING.to_owned(), "old".to_owned())));
         assert!(index.contains(&(PENDING.to_owned(), "live".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn logout_unindexes_a_record_before_releasing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let store = Store::new(storage.clone(), "test#forget-order");
+        store.remember(RECORDS, "grant", budget()).await.unwrap();
+        storage.entry(RECORDS, "grant").save(b"{}").unwrap();
+        // Logout waits for the record; then the index is held too.
+        let record = store.lock(RECORDS, "grant", budget()).await.unwrap();
+        let forgetting = tokio::spawn({
+            let store = store.clone();
+            async move { store.forget(budget()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let index = store
+            .lock(INDEX, "test#forget-order", budget())
+            .await
+            .unwrap();
+        drop(record);
+        // Logout deletes the record, then waits for the index while still
+        // holding the record: no writer can recreate it unindexed meanwhile.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while storage.entry(RECORDS, "grant").load().unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the record is deleted");
+        let short = OperationBudget::until(Instant::now() + Duration::from_millis(200));
+        assert!(
+            store.lock(RECORDS, "grant", short).await.is_err(),
+            "the record was released before it left the index"
+        );
+        drop(index);
+        assert_eq!(forgetting.await.unwrap().unwrap(), 1);
+        assert!(store.index().await.unwrap().is_empty());
     }
 
     #[tokio::test]
