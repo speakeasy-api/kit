@@ -400,7 +400,7 @@ impl Registry {
 
     /// `login` completed. The scope's other targets (an upload on another
     /// resource, say) keep their logins, and the hint moves on to the next.
-    fn completed(&self, login: &Login) {
+    pub(super) fn completed(&self, login: &Login) {
         let next = {
             let mut state = self.lock();
             if let Some(needs) = state.needs.get_mut(&login.scope) {
@@ -437,7 +437,7 @@ impl Registry {
     /// Stops listening on `port` unless a login was offered for it since
     /// the listener last looked: checked under the lock `offer` takes, so a
     /// login is never left without a listener.
-    fn stop_if_idle(&self, port: u16) -> bool {
+    pub(super) fn stop_if_idle(&self, port: u16) -> bool {
         let mut state = self.lock();
         let now = SystemTime::now();
         let waiting = state

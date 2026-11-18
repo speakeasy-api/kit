@@ -120,6 +120,20 @@ impl Store {
         Ok(())
     }
 
+    /// Stores a pending-login record, then indexes it. In that order, a
+    /// concurrent [`Self::prune_pending`] never finds an indexed login
+    /// without its record and drops it.
+    pub(super) async fn record_pending(
+        &self,
+        state: &str,
+        record: Vec<u8>,
+        budget: OperationBudget,
+    ) -> Result<(), HookError> {
+        let entry = self.storage.entry(PENDING, state);
+        blocking(move || entry.save(&record)).await?;
+        self.remember(PENDING, state, budget).await
+    }
+
     /// Drops this backend's pending-login records that expired by `now_ms`
     /// (Unix milliseconds), and their index entries, so neither grows with
     /// each new link.
@@ -340,6 +354,47 @@ mod tests {
         assert_eq!(first.forget(budget()).await.unwrap(), 1);
         let mut guard = second.acquire(key("cas"), budget()).await.unwrap();
         assert!(guard.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pending_login_is_stored_before_it_is_indexed() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let store = Store::new(storage.clone(), "test#record-order");
+        // Hold the index, as a concurrent prune would.
+        let index = store
+            .lock(INDEX, "test#record-order", budget())
+            .await
+            .unwrap();
+        let recording = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let record = serde_json::json!({"expiresAt": u64::MAX}).to_string();
+                store
+                    .record_pending("live", record.into_bytes(), budget())
+                    .await
+            }
+        });
+        // While indexing waits, the record already exists, so a prune that
+        // holds the index cannot see the key without its record.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while storage.entry(PENDING, "live").load().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the record is stored before indexing");
+        drop(index);
+        recording.await.unwrap().unwrap();
+        store.prune_pending(1, budget()).await.unwrap();
+        assert!(storage.entry(PENDING, "live").load().unwrap().is_some());
+        assert!(
+            store
+                .index()
+                .await
+                .unwrap()
+                .contains(&(PENDING.to_owned(), "live".to_owned()))
+        );
     }
 
     #[tokio::test]

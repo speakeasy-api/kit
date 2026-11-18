@@ -610,16 +610,10 @@ impl HookAuth {
         if let Err(error) = store.prune_pending(now, budget()).await {
             tracing::debug!(code = ?error.auth_code(), "could not prune expired hook sign-ins");
         }
-        if store
-            .remember(store::PENDING, &login.state, budget())
-            .await
-            .is_err()
+        if let Ok(bytes) = serde_json::to_vec(&record)
+            && let Err(error) = store.record_pending(&login.state, bytes, budget()).await
         {
-            return;
-        }
-        let entry = self.0.storage.entry(store::PENDING, &login.state);
-        if let Ok(bytes) = serde_json::to_vec(&record) {
-            let _ = tokio::task::spawn_blocking(move || entry.save(&bytes)).await;
+            tracing::debug!(code = ?error.auth_code(), "could not record a hook sign-in");
         }
     }
 

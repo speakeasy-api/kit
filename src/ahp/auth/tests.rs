@@ -965,3 +965,54 @@ async fn a_listener_completes_a_login_offered_after_it_started_waiting() {
     );
     assert!(credential(&auth, upload).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn a_listener_keeps_serving_a_login_offered_as_it_stops() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.stopping", port)]);
+    let event = context(&auth, "test.stopping");
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/stopping-uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/stopping-uploads", issuer.origin)}));
+    let scope = auth.0.backends["test.stopping"].scope.clone();
+    let mut logins = Vec::new();
+    for target in [&event, &upload] {
+        let manager = auth.manager(target).unwrap();
+        let Preparation::InteractionRequired(pending) = manager
+            .prepare(with_deadline(target), budget())
+            .await
+            .unwrap()
+        else {
+            panic!("a login is needed");
+        };
+        let login = login::Login::new(
+            &scope,
+            manager,
+            target,
+            &pending,
+            &auth.0.storage,
+            trusting_client,
+        );
+        logins.push((login, pending));
+    }
+    let registry = login::registry();
+    // The first login starts a listener (this test plays it).
+    let (first, first_pending) = &logins[0];
+    assert!(registry.offer(first.clone(), first_pending, port));
+    // It completes, so the listener's serve loop finds nothing and returns;
+    // before it stops, the second login is offered, which sees a listener.
+    registry.completed(first);
+    let (second, second_pending) = &logins[1];
+    assert!(!registry.offer(second.clone(), second_pending, port));
+    // So the listener must not stop: the second login has no other.
+    assert!(
+        !registry.stop_if_idle(port),
+        "a pending login was left without a listener"
+    );
+    registry.completed(second);
+    assert!(registry.stop_if_idle(port));
+}
