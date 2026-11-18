@@ -149,6 +149,8 @@ type Sink = dyn Fn(&AuthHint) + Send + Sync;
 struct State {
     needs: HashMap<String, Vec<Need>>,
     preparing: HashSet<String>,
+    /// States of pending logins a watcher follows behind a Kit peer.
+    watching: HashSet<String>,
     pending: HashMap<String, Pending>,
     /// Ports this process is listening on.
     listening: HashSet<u16>,
@@ -504,6 +506,45 @@ impl Registry {
         !waiting
     }
 
+    /// Claims the right to watch the login with `state`; one at a time.
+    pub(super) fn begin_watching(&self, state: &str) -> Option<Watching> {
+        self.lock()
+            .watching
+            .insert(state.to_owned())
+            .then(|| Watching(state.to_owned()))
+    }
+
+    /// `login`'s link expired: it is withdrawn, and the scope's hint moves to
+    /// another pending link or clears.
+    pub(super) fn expired(&self, login: &Login) {
+        let next = {
+            let mut state = self.lock();
+            let remaining = state.pending.get_mut(&login.scope).and_then(|pending| {
+                pending.logins.retain(|other| other.state != login.state);
+                let next = pending.logins.first()?.clone();
+                pending.url = next.url.clone();
+                pending.expires_at = next.expires_at;
+                Some(next)
+            });
+            if remaining.is_none() {
+                state.pending.remove(&login.scope);
+            }
+            remaining
+        };
+        self.publish(match next {
+            Some(next) => AuthHint {
+                scope: next.scope.clone(),
+                backend: next.context.backend_id.clone(),
+                url: Some(next.url.clone()),
+                expires_at_ms: Some(unix_ms(next.expires_at)),
+                cleared: false,
+                signed_in: false,
+                problem: None,
+            },
+            None => cleared(&login.scope, &login.context.backend_id, false),
+        });
+    }
+
     /// Whether `login` is still waiting for its callback.
     pub(super) fn is_pending(&self, login: &Login) -> bool {
         self.lock()
@@ -548,6 +589,14 @@ fn headless_line(printed: &mut HashSet<String>, hint: &AuthHint) -> Option<Strin
         return None;
     }
     hint.notice().map(|text| format!("kit: {text}"))
+}
+
+pub(super) struct Watching(String);
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        registry().lock().watching.remove(&self.0);
+    }
 }
 
 pub(super) struct Preparing(String);
@@ -660,8 +709,17 @@ pub(super) async fn listen_on(listener: TcpListener, port: u16) {
 /// its grant, and this process takes the port over (same link) if the peer
 /// stops listening first.
 pub(super) async fn watch_peer(login: Login, port: u16) {
+    // Later turns offer the same login again; one watcher follows it.
+    let Some(_watching) = registry().begin_watching(&login.state) else {
+        return;
+    };
     loop {
-        if SystemTime::now() >= login.expires_at || !registry().is_pending(&login) {
+        if !registry().is_pending(&login) {
+            return;
+        }
+        if SystemTime::now() >= login.expires_at {
+            // Its link no longer works: withdraw it.
+            registry().expired(&login);
             return;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

@@ -1547,3 +1547,48 @@ async fn a_scope_outside_the_allowed_set_is_explained_not_signed_in() {
     );
     assert!(!login::registry().has_needs(&auth.0.backends["test.ceiling"].scope));
 }
+
+#[tokio::test]
+async fn one_watcher_follows_a_login_behind_a_peer_and_withdraws_it_at_expiry() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let peer = kit_peer(holder);
+    let mut backend = issuer.backend("test.peer-expires", port);
+    // A link that lasts under two seconds.
+    backend["oauth"]["loginLifetimeMinutes"] = json!(0.03);
+    let auth = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, "test.peer-expires");
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    assert!(shown.url.is_some());
+    // Another turn's watcher for the same login stops at once.
+    let scope = auth.0.backends["test.peer-expires"].scope.clone();
+    let manager = auth.manager(&target).unwrap();
+    let Preparation::InteractionRequired(pending) = manager
+        .prepare(with_deadline(&target), budget())
+        .await
+        .unwrap()
+    else {
+        panic!("a login is needed");
+    };
+    let again = login::Login::new(
+        &scope,
+        manager,
+        &target,
+        &pending,
+        &auth.0.storage,
+        trusting_client,
+    );
+    tokio::time::timeout(Duration::from_millis(500), login::watch_peer(again, port))
+        .await
+        .expect("a second watcher for the same login stops at once");
+    // At expiry the link is withdrawn, not left clickable.
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+    peer.abort();
+}
