@@ -35,18 +35,24 @@ pub struct InteractiveConfig {
 }
 
 impl InteractiveConfig {
-    /// The client metadata document offered during registration, if any.
-    fn metadata_url(&self) -> Result<Option<&str>, String> {
-        match (
-            self.dynamic_registration,
-            self.client_metadata_url.as_deref(),
-        ) {
-            (true, Some(_)) => {
-                Err("`dynamicRegistration` and `clientMetadataUrl` cannot be combined".into())
-            }
-            (true, None) => Ok(None),
-            (false, url) => Ok(Some(url.unwrap_or(CLIENT_METADATA_URL))),
+    /// Rejects options that contradict each other.
+    fn validate(&self) -> Result<(), String> {
+        if self.dynamic_registration && self.client_metadata_url.is_some() {
+            return Err("`dynamicRegistration` and `clientMetadataUrl` cannot be combined".into());
         }
+        Ok(())
+    }
+
+    /// The client metadata document offered during registration, if any.
+    fn metadata_url(&self) -> Option<&str> {
+        if self.dynamic_registration {
+            return None;
+        }
+        Some(
+            self.client_metadata_url
+                .as_deref()
+                .unwrap_or(CLIENT_METADATA_URL),
+        )
     }
 }
 
@@ -88,7 +94,7 @@ impl Config {
 
     fn interactive(&self) -> Result<&InteractiveConfig, String> {
         match self {
-            Self::Oauth(config) => Ok(config),
+            Self::Oauth(config) => config.validate().map(|()| config),
             Self::Machine(_) | Self::Workload(_) => {
                 Err("machine MCP authentication does not support interactive authorization".into())
             }
@@ -158,7 +164,7 @@ pub async fn begin(
         let mut request = AuthorizationRequest::new(&redirect_uri)
             .with_scopes(scopes)
             .with_client_name("Kit");
-        if let Some(url) = config.metadata_url()? {
+        if let Some(url) = config.metadata_url() {
             request = request.with_client_metadata_url(url);
         }
         AuthorizationSession::new(manager, request)
@@ -268,13 +274,21 @@ fn legacy_credential_identity(resource_url: &str, config: &InteractiveConfig) ->
 }
 
 fn credential_identity(resource_url: &str, config: &InteractiveConfig) -> Result<String, String> {
-    Ok(format!(
+    let identity = format!(
         "{resource_url}\0{}\0{}\0{}",
         config.client_id.as_deref().unwrap_or_default(),
         config.client_metadata_url.as_deref().unwrap_or_default(),
         serde_json::to_string(&config.scopes)
             .map_err(|error| format!("could not encode OAuth scopes: {error}"))?
-    ))
+    );
+    // Opting out keeps its own credentials, so a sign-in made with Kit's
+    // metadata document is not restored for it and a new one is asked for.
+    // Other identities are unchanged.
+    Ok(if config.dynamic_registration {
+        format!("{identity}\0dynamic")
+    } else {
+        identity
+    })
 }
 
 pub async fn finish(
@@ -824,18 +838,20 @@ mod tests {
         let server = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0; 8192];
-                let read = stream.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]).into_owned();
-                let path = request.split_whitespace().nth(1).unwrap_or_default();
-                let (status, body) = if path == "/resource-metadata" {
+                let request = read_request(&mut stream).await;
+                let mut line = request.split_whitespace();
+                let target = (
+                    line.next().unwrap_or_default().to_owned(),
+                    line.next().unwrap_or_default().to_owned(),
+                );
+                let (status, body) = if target == ("GET".into(), "/resource-metadata".into()) {
                     (
                         "200 OK",
                         format!(
                             r#"{{"resource":"{server_base}/mcp","authorization_servers":["{server_base}"]}}"#
                         ),
                     )
-                } else if path == "/register" {
+                } else if target == ("POST".into(), "/register".into()) {
                     ("201 Created", r#"{"client_id":"dcr-client","redirect_uris":["http://127.0.0.1/callback"]}"#.to_owned())
                 } else {
                     (
@@ -853,6 +869,35 @@ mod tests {
             }
         });
         (base, server)
+    }
+
+    /// Reads one whole HTTP request: its headers and any body they declare.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&bytes);
+            let Some(end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let length = text[..end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     async fn authorization_client_id(config: serde_json::Value) -> String {
@@ -904,6 +949,43 @@ mod tests {
             "clientMetadataUrl": "https://client.example/metadata.json"
         }))
         .unwrap();
-        assert!(config.interactive().unwrap().metadata_url().is_err());
+        assert!(config.interactive().is_err());
+    }
+
+    #[tokio::test]
+    async fn conflicting_registration_options_fail_before_discovery() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "type": "oauth",
+            "clientId": "registered",
+            "dynamicRegistration": true,
+            "clientMetadataUrl": "https://client.example/metadata.json"
+        }))
+        .unwrap();
+        // Nothing listens here: discovery would fail with another error.
+        let error = begin(
+            "http://127.0.0.1:9/mcp",
+            &config,
+            &CredentialStorage::Memory,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("cannot be combined"), "{error}");
+    }
+
+    #[test]
+    fn opting_out_keeps_separate_credentials() {
+        let identity = |config: serde_json::Value| {
+            let config: Config = serde_json::from_value(config).unwrap();
+            credential_identity("https://mcp.example/mcp", config.interactive().unwrap()).unwrap()
+        };
+        let default = identity(serde_json::json!({"type":"oauth"}));
+        assert_eq!(default, "https://mcp.example/mcp\0\0\0[]");
+        assert_ne!(
+            identity(serde_json::json!({"type":"oauth", "dynamicRegistration": true})),
+            default
+        );
     }
 }
