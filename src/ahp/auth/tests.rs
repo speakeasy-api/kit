@@ -330,6 +330,23 @@ async fn event_and_upload_endpoints_share_one_consent() {
 }
 
 #[tokio::test]
+async fn logout_from_another_process_always_finds_the_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let backends = || vec![issuer.backend("test.relogin", port)];
+    let live = hook_auth(&storage, backends());
+    for round in 0..2 {
+        sign_in(&live, "test.relogin", port).await;
+        // A separate process, sharing the storage, logs out.
+        let other = hook_auth(&storage, backends());
+        assert!(other.logout("test.relogin").await.unwrap(), "round {round}");
+        let status: BTreeMap<_, _> = other.status().await.into_iter().collect();
+        assert_eq!(status["test.relogin"], "needs-login", "round {round}");
+    }
+}
+
+#[tokio::test]
 async fn logout_and_status_are_per_backend() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();

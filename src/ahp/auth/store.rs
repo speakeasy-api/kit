@@ -38,7 +38,6 @@ async fn blocking<T: Send + 'static>(
 pub(super) struct Store {
     storage: CredentialStorage,
     backend: String,
-    remembered: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl Store {
@@ -46,7 +45,6 @@ impl Store {
         Self {
             storage,
             backend: backend.into(),
-            remembered: Default::default(),
         }
     }
 
@@ -109,7 +107,6 @@ impl Store {
             blocking(move || entry.delete()).await?;
         }
         let _lock = self.lock(INDEX, &self.backend, budget).await?;
-        self.remembered.lock().map_err(|_| unavailable())?.clear();
         let mut current = self.index().await?;
         current.retain(|item| !index.contains(item));
         if current.is_empty() {
@@ -136,19 +133,9 @@ impl CredentialStore for Store {
             let identity = key.as_str().to_owned();
             let lock = self.lock(RECORDS, &identity, budget).await?;
             // Indexed before any write: a commit may outlive the caller's
-            // budget, and must then never wait on the index.
-            let known = self
-                .remembered
-                .lock()
-                .map_err(|_| unavailable())?
-                .contains(&identity);
-            if !known {
-                self.remember(RECORDS, &identity, budget).await?;
-                self.remembered
-                    .lock()
-                    .map_err(|_| unavailable())?
-                    .insert(identity.clone());
-            }
+            // budget, and must then never wait on the index. Checked every
+            // time, since another process's logout may have removed it.
+            self.remember(RECORDS, &identity, budget).await?;
             Ok(Box::new(Guard {
                 store: self.clone(),
                 identity,
