@@ -129,9 +129,15 @@ and uses it only if `oauth.issuer` names it or `oauth.trustAdvertisedIssuer`
 is `true`.
 Put further settings in an `oauth` object on the backend, beside its
 `authentication`. Other AHP harness adapters read the same object, and AHP
-receivers ignore it. All settings are optional. Where a setting and the preset
-both name a value, the setting wins, except `scopes`, which add to the
-preset's:
+receivers ignore it. All settings are optional. Alongside a preset:
+
+- `scopes` add to the preset's scopes.
+- `issuer` and `clientId` must agree with the preset's `issuer` and
+  `clientId`. Kit checks a preset's values exactly, so a different value
+  makes sign-in fail rather than replace the preset's.
+- `flow` applies only to a backend without a preset; a preset's `flow`
+  always applies to it.
+- The other settings have no preset counterpart.
 
 ```json
 {
