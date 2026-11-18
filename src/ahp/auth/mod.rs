@@ -101,8 +101,9 @@ impl Backend {
     }
 }
 
-/// Backend id, whether the flow is PKCE, and the preset's client.
-type ManagerKey = (String, bool, Option<String>);
+/// Backend scope, whether the flow is PKCE, the preset's client, and the
+/// target's sorted scopes.
+type ManagerKey = (String, bool, Option<String>, Vec<String>);
 
 /// Where hook credentials live: Kit's credential storage.
 #[derive(Clone)]
@@ -268,7 +269,20 @@ impl HookAuth {
             _ => return Err(fail(AuthErrorCode::UnsupportedBinding)),
         };
         let pkce = flow == OAuthFlow::AuthorizationCodePkce;
-        let key = (backend.scope.clone(), pkce, preset_client.clone());
+        let policy = policy::Policy {
+            settings: settings.clone(),
+        };
+        // The target's own scopes set the manager's request and ceiling, so
+        // targets with different scopes (an event and an upload binding,
+        // say) never share one. They still share the backend's grant.
+        let mut scopes = policy.requested(&target);
+        scopes.sort();
+        let key = (
+            backend.scope.clone(),
+            pkce,
+            preset_client.clone(),
+            scopes.clone(),
+        );
         let mut managers = self
             .0
             .managers
@@ -313,10 +327,6 @@ impl HookAuth {
                 config
             }
         };
-        let policy = policy::Policy {
-            settings: settings.clone(),
-        };
-        let scopes = policy.requested(&target);
         config = config
             .redirect_uri(redirect)
             .grant_partition(&backend.scope)

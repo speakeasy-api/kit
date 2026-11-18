@@ -1325,3 +1325,26 @@ async fn a_sign_in_that_cannot_be_prepared_says_why() {
         "{notice}"
     );
 }
+
+#[tokio::test]
+async fn event_and_upload_targets_with_different_scopes_each_get_their_own_ceiling() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let mut backend = issuer.backend("test.scoped-targets", port);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    let event = context(&auth, "test.scoped-targets");
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/ahp/uploads", issuer.origin);
+    let mut binding = event.authentication.clone().unwrap();
+    binding["scopes"] = json!(["hooks:upload"]);
+    upload.authentication = Some(binding);
+    // The event target builds its manager first.
+    assert!(credential(&auth, event).await.is_err());
+    // The upload target's own scope is requested, not refused against the
+    // event target's ceiling.
+    let url = auth.prepare(&upload, &[]).await.unwrap().unwrap();
+    assert_eq!(query(&url, "scope"), "hooks:upload");
+}
