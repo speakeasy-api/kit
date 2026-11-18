@@ -743,6 +743,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn entry_locks_are_exclusive_per_entry_and_released_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        for storage in [
+            CredentialStorage::Memory,
+            CredentialStorage::Filesystem(directory.path().to_path_buf()),
+        ] {
+            let soon = || std::time::Instant::now() + Duration::from_millis(200);
+            let later = || std::time::Instant::now() + Duration::from_secs(5);
+            let held = storage
+                .lock_entry("test-locks", "a", later())
+                .await
+                .unwrap();
+            assert!(storage.lock_entry("test-locks", "a", soon()).await.is_err());
+            // Other entries, and the refresh lock, stay available.
+            let other = storage
+                .lock_entry("test-locks", "b", later())
+                .await
+                .unwrap();
+            drop(storage.lock_refresh().await.unwrap());
+            drop(held);
+            let again = storage
+                .lock_entry("test-locks", "a", later())
+                .await
+                .unwrap();
+            drop((other, again));
+        }
+        // Writes to a locked entry go through its own lease.
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let _held = storage
+            .lock_entry(
+                "test-locks",
+                "c",
+                std::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let entry = storage.entry("test-locks", "c");
+        entry.save(b"value").unwrap();
+        assert_eq!(entry.load().unwrap().unwrap().as_slice(), b"value");
+    }
+
     #[test]
     fn refresh_lock_serializes_independent_open_files() {
         let directory = tempfile::tempdir().unwrap();

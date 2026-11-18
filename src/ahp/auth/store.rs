@@ -185,3 +185,103 @@ impl CredentialGuard for Guard {
         })
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn record(version: &str) -> SessionRecord {
+        serde_json::from_value(serde_json::json!({
+            "version": version,
+            "metadata": {"resource": "https://hooks.example/ahp", "issuer": "https://auth.example",
+                "authorization_endpoint": null, "authorization_response_iss_parameter_supported": false,
+                "token_endpoint": "https://auth.example/token", "grant_types_supported": [],
+                "token_endpoint_auth_methods_supported": [], "code_challenge_methods_supported": []},
+            "client_id": "kit", "flow": "authorization_code_pkce", "configured_binding": true,
+            "resource_metadata_hint": null, "token": null, "pending": null
+        }))
+        .unwrap()
+    }
+
+    fn budget() -> OperationBudget {
+        OperationBudget::until(Instant::now() + Duration::from_secs(5))
+    }
+
+    /// A storage key as the SDK persists one.
+    fn key(backend: &str) -> SessionKey {
+        serde_json::from_value(serde_json::json!({
+            "storage_key": format!("ahp.oauth.binding:test:{backend}"),
+            "namespace": "kit", "backend_id": backend,
+            "destination": "https://hooks.example/ahp", "purpose": "event"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compare_and_swap_honours_the_expected_version_across_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let first = Store::new(storage.clone(), "test#cas");
+        let second = Store::new(storage, "test#cas");
+        {
+            let mut guard = first.acquire(key("cas"), budget()).await.unwrap();
+            assert!(guard.load().await.unwrap().is_none());
+            // Expecting a record that does not exist fails.
+            assert!(
+                !guard
+                    .compare_and_swap(Some("v0".into()), record("v1"))
+                    .await
+                    .unwrap()
+            );
+            assert!(guard.compare_and_swap(None, record("v1")).await.unwrap());
+            // Expecting absence once a record exists fails.
+            assert!(!guard.compare_and_swap(None, record("v2")).await.unwrap());
+        }
+        // Another instance (another process) sees the write, and a stale
+        // expectation cannot overwrite it.
+        let mut guard = second.acquire(key("cas"), budget()).await.unwrap();
+        assert_eq!(guard.load().await.unwrap().unwrap().version(), "v1");
+        assert!(
+            !guard
+                .compare_and_swap(Some("v0".into()), record("v2"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            guard
+                .compare_and_swap(Some("v1".into()), record("v2"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(guard.load().await.unwrap().unwrap().version(), "v2");
+        drop(guard);
+        // Logout through either instance removes it.
+        assert_eq!(first.forget(budget()).await.unwrap(), 1);
+        let mut guard = second.acquire(key("cas"), budget()).await.unwrap();
+        assert!(guard.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_record_is_owned_by_one_guard_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            CredentialStorage::Filesystem(directory.path().to_path_buf()),
+            "test#owned",
+        );
+        let held = store.acquire(key("owned"), budget()).await.unwrap();
+        let short = OperationBudget::until(Instant::now() + Duration::from_millis(200));
+        assert!(store.acquire(key("owned"), short).await.is_err());
+        // Another record is independent, so the SDK may nest them.
+        let other = store.acquire(key("other"), budget()).await.unwrap();
+        drop((held, other));
+        assert!(store.acquire(key("owned"), budget()).await.is_ok());
+    }
+}

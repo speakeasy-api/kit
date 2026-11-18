@@ -8,7 +8,10 @@
     clippy::disallowed_macros
 )]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use agenthooksprotocol::adapters::registered::AuthPurpose;
 use serde_json::json;
@@ -97,7 +100,7 @@ impl Issuer {
                     let Ok(mut stream) = acceptor.accept(socket).await else {
                         return;
                     };
-                    let (head, _body) = read_request(&mut stream).await;
+                    let (head, request_body) = read_request(&mut stream).await;
                     let path = head
                         .split_whitespace()
                         .nth(1)
@@ -113,19 +116,23 @@ impl Issuer {
                             "code_challenge_methods_supported": ["S256"],
                             "token_endpoint_auth_methods_supported": ["none"],
                         })
-                    } else if path == "/token" {
+                    } else if path == "/token" && verified(&request_body) {
                         let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
                         json!({"access_token": format!("token-{n}"), "token_type": "Bearer",
                             "expires_in": 3600, "refresh_token": format!("refresh-{n}")})
+                    } else if path == "/token" {
+                        json!({"error": "invalid_grant"})
                     } else {
                         json!({"error": "not_found"})
                     };
-                    let body = body.to_string();
-                    let status = if path.contains("well-known") || path == "/token" {
+                    let status = if body.get("error").is_none() {
                         "200 OK"
+                    } else if path == "/token" {
+                        "400 Bad Request"
                     } else {
                         "404 Not Found"
                     };
+                    let body = body.to_string();
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -196,22 +203,69 @@ fn trusting_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder().tls_certs_only([reqwest::Certificate::from_pem(CA).unwrap()])
 }
 
-/// Plays the browser: approves the login at `url` by calling back.
-async fn approve(url: &url::Url, port: u16) -> bool {
-    let state = url
-        .query_pairs()
-        .find(|(key, _)| key == "state")
+/// Codes the fake authorization server issued, with their PKCE challenge.
+static AUTHORIZATIONS: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Whether a token request redeems an issued code with its PKCE verifier,
+/// or presents a refresh token. A code is redeemed once.
+fn verified(body: &str) -> bool {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let form: BTreeMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    match form.get("grant_type").map(String::as_str) {
+        Some("refresh_token") => form.contains_key("refresh_token"),
+        Some("authorization_code") => {
+            let (Some(code), Some(verifier)) = (form.get("code"), form.get("code_verifier")) else {
+                return false;
+            };
+            let Some(challenge) = AUTHORIZATIONS.lock().unwrap().remove(code) else {
+                return false;
+            };
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(verifier.as_bytes()))
+                == challenge
+        }
+        _ => false,
+    }
+}
+
+fn query(url: &url::Url, name: &str) -> String {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
         .unwrap()
         .1
-        .into_owned();
-    call_back(port, &state).await
+        .into_owned()
+}
+
+/// Plays the browser: the user approves the login at `url`, the server
+/// issues a code bound to its PKCE challenge, and the browser calls back.
+async fn approve(url: &url::Url, port: u16) -> bool {
+    assert_eq!(query(url, "code_challenge_method"), "S256");
+    let code = format!("code-{}", next_code());
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert(code.clone(), query(url, "code_challenge"));
+    call_back_with(port, &query(url, "state"), &code).await
+}
+
+fn next_code() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
 async fn call_back(port: u16, state: &str) -> bool {
+    call_back_with(port, state, "never-issued").await
+}
+
+async fn call_back_with(port: u16, state: &str, code: &str) -> bool {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     stream
         .write_all(
-            format!("GET /callback?code=granted&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            format!("GET /callback?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
                 .as_bytes(),
         )
         .await
@@ -396,28 +450,52 @@ async fn logout_and_status_are_per_backend() {
     assert!(auth.logout("test.missing").await.is_err());
 }
 
+/// A protected resource that rejects every request as unauthorized, and
+/// counts the requests it received.
+async fn rejecting_resource() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/ahp",
+        listener.local_addr().unwrap().port()
+    );
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&received);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    (url, received, task)
+}
+
 #[tokio::test]
 async fn a_fail_closed_backend_without_a_grant_denies() {
-    let root = tempfile::tempdir().unwrap();
+    let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join(".agents")).unwrap();
-    std::fs::write(
-        root.path().join(".agents/hooks.json"),
-        json!({"protocolVersion": "draft", "hooks": [{
-            "id": "test.closed",
-            "transport": {"type": "http", "url": "https://127.0.0.1:9/ahp"},
-            "authentication": {"type": "oauth", "flow": "authorization_code_pkce",
-                "issuer": "https://127.0.0.1:9", "clientId": "kit", "resource": "https://127.0.0.1:9/ahp"},
-            "subscriptions": [crate::ahp::test_support::intercept(&["context.compact.before"])],
-        }]})
-        .to_string(),
-    )
-    .unwrap();
-    let hooks = crate::ahp::Hooks::load(
-        root.path(),
-        &CredentialStorage::Filesystem(storage.path().to_path_buf()),
-    )
-    .expect("the backend stays registered");
+    let (url, received, task) = rejecting_resource().await;
+    let backend = json!({
+        "id": "test.closed",
+        "transport": {"type": "http", "url": url},
+        "authentication": {"type": "oauth", "flow": "authorization_code_pkce",
+            "issuer": issuer.origin, "clientId": "kit", "resource": url},
+        "oauth": {"allowPrivateNetwork": true},
+        "subscriptions": [crate::ahp::test_support::intercept(&["context.compact.before"])],
+    });
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let registration =
+        serde_json::from_value(json!({"protocolVersion": "draft", "hooks": [backend]})).unwrap();
+    let mut options = crate::ahp::options().unwrap();
+    options.backend.allow_loopback_http = true;
+    options.backend.auth_provider = Some(Arc::new(auth.providers()));
+    let hooks = crate::ahp::Hooks::new(registration, options).unwrap();
     let items = [agentkit_core::Item::text(
         agentkit_core::ItemKind::User,
         "old",
@@ -429,6 +507,9 @@ async fn a_fail_closed_backend_without_a_grant_denies() {
         matches!(compaction, Some(crate::ahp::Compaction::Denied(_))),
         "a backend that cannot authenticate must deny"
     );
+    // The event was never sent without its credential.
+    assert_eq!(received.load(Ordering::SeqCst), 0);
+    task.abort();
 }
 
 #[test]
@@ -588,6 +669,36 @@ fn an_advertised_issuer_is_trusted_only_on_opt_in() {
     assert!(
         policy(json!({"trustAdvertisedIssuer": true, "flow": "client_credentials"}))
             .select(&target, &resource, &[])
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_callback_the_server_rejects_completes_nothing() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.rejected", port)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.rejected")).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The right state, but a code issued for another PKCE challenge.
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert("stolen-code".into(), "another-challenge".into());
+    assert!(!call_back_with(port, &query(&url, "state"), "stolen-code").await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        hints.try_recv().is_err(),
+        "a rejected exchange is not a sign-in"
+    );
+    assert_eq!(issuer.exchanges(), 0);
+    assert!(
+        credential(&auth, context(&auth, "test.rejected"))
+            .await
             .is_err()
     );
 }
