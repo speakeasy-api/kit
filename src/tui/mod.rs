@@ -1747,8 +1747,11 @@ async fn run_client(
         )
         .on_receive_notification(
             async move |notification: crate::protocols::acp::v2::HookAuthNotification, _cx| {
+                // Kept per session: the app shows only the current session's.
                 let _ = hook_sign_ins.send(QueuedUpdate::global(Update::HookSignIn {
+                    session_id: notification.session_id.to_string(),
                     backend: notification.backend,
+                    problem: notification.problem,
                     url: notification.url,
                     expires_at_ms: notification.expires_at,
                     cleared: notification.cleared,

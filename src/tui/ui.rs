@@ -5270,8 +5270,11 @@ mod tests {
             "c".repeat(64)
         );
         assert!(url.len() > 300);
+        app.start_session("current".into());
         let hint = |url: Option<&str>, cleared| crate::tui::app::Update::HookSignIn {
+            session_id: "current".into(),
             backend: "com.example".into(),
+            problem: None,
             url: url.map(str::to_owned),
             expires_at_ms: Some(later),
             cleared,
@@ -5291,12 +5294,76 @@ mod tests {
         assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
         // An expired link is not shown in the status line, even before it is cleared.
         app.apply(crate::tui::app::Update::HookSignIn {
+            session_id: "current".into(),
             backend: "com.example".into(),
+            problem: None,
             url: Some(url.clone()),
             expires_at_ms: Some(1),
             cleared: false,
         });
         assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
+    }
+
+    #[test]
+    fn hook_sign_in_links_follow_their_session() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let hint = |session: &str, url: &str| crate::tui::app::Update::HookSignIn {
+            session_id: session.into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: Some(url.into()),
+            expires_at_ms: None,
+            cleared: false,
+        };
+        let flat = |app: &mut App| {
+            render(app, 80, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        app.start_session("first".into());
+        app.apply(hint("first", "https://auth.example/first"));
+        // The next session's link arrives while it attaches, before it is
+        // the current session; the first session's arrives late.
+        app.apply(hint("next", "https://auth.example/next"));
+        app.start_session("next".into());
+        app.apply(hint("first", "https://auth.example/first-again"));
+        let screen = flat(&mut app);
+        assert!(screen.contains("https://auth.example/next"), "{screen}");
+        assert!(
+            screen.contains("sign in to hook com.example needed"),
+            "{screen}"
+        );
+        assert!(!screen.contains("auth.example/first"), "{screen}");
+        // Replaying the same link does not duplicate it.
+        app.apply(hint("next", "https://auth.example/next"));
+        assert_eq!(flat(&mut app).matches("open the sign-in page").count(), 1);
+        // Returning to the first session restores its link.
+        app.start_session("first".into());
+        let screen = flat(&mut app);
+        assert!(
+            screen.contains("https://auth.example/first-again"),
+            "{screen}"
+        );
+        assert!(!screen.contains("auth.example/next"), "{screen}");
+        // A problem is shown once, as a notice.
+        let problem = || crate::tui::app::Update::HookSignIn {
+            session_id: "first".into(),
+            backend: "com.example".into(),
+            problem: Some("untrusted_destination. Check oauth.issuer.".into()),
+            url: None,
+            expires_at_ms: None,
+            cleared: false,
+        };
+        app.apply(problem());
+        app.apply(problem());
+        let screen = flat(&mut app);
+        assert_eq!(screen.matches("could not start it").count(), 1, "{screen}");
     }
 
     #[test]

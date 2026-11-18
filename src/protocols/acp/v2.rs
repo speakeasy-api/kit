@@ -79,6 +79,9 @@ pub(crate) struct HookAuthNotification {
     /// Unix milliseconds.
     pub expires_at: Option<u64>,
     pub cleared: bool,
+    /// Why Kit could not prepare a needed sign-in, with what to check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// The capability `_meta` key a client sets to receive [`HookAuthNotification`].
@@ -602,6 +605,7 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
                     url: hint.url.clone(),
                     expires_at: hint.expires_at_ms,
                     cleared: hint.cleared,
+                    problem: hint.problem.clone(),
                 });
             }),
             None => {
