@@ -1433,3 +1433,36 @@ async fn a_session_learns_when_the_peer_completed_its_login() {
     assert!(next_hint(&mut hints).await.signed_in);
     peer.abort();
 }
+
+#[tokio::test]
+async fn a_problem_with_one_target_keeps_the_others_link() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let auth = hook_auth(
+        &storage,
+        vec![issuer.backend("test.link-and-problem", port)],
+    );
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let event = context(&auth, "test.link-and-problem");
+    let url = auth.prepare(&event, &[]).await.unwrap().unwrap();
+    assert_eq!(
+        next_hint(&mut hints).await.url.as_deref(),
+        Some(url.as_str())
+    );
+    // Another target of the backend fails to prepare.
+    let scope = auth.0.backends["test.link-and-problem"].scope.clone();
+    login::registry().problem(&scope, "test.link-and-problem", "access_denied.".into());
+    let hint = next_hint(&mut hints).await;
+    assert_eq!(
+        hint.url.as_deref(),
+        Some(url.as_str()),
+        "the live link was dropped"
+    );
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains(url.as_str()) && notice.contains("access_denied"),
+        "{notice}"
+    );
+}

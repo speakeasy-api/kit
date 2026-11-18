@@ -54,11 +54,20 @@ impl AuthHint {
     /// link and once when sign-in finishes. An expired link says nothing;
     /// the next turn shows its replacement.
     pub(crate) fn notice(&self) -> Option<String> {
-        if let Some(problem) = self.problem.as_ref().filter(|_| !self.cleared) {
-            return Some(format!(
-                "Hook backend `{}` needs you to sign in, but Kit could not start it: {problem}",
-                self.backend
-            ));
+        match (&self.url, &self.problem) {
+            (Some(url), Some(problem)) if !self.cleared => {
+                return Some(format!(
+                    "Hook backend `{}` needs you to sign in. Open {url} to approve Kit. Another of its endpoints could not be prepared: {problem}",
+                    self.backend
+                ));
+            }
+            (None, Some(problem)) if !self.cleared => {
+                return Some(format!(
+                    "Hook backend `{}` needs you to sign in, but Kit could not start it: {problem}",
+                    self.backend
+                ));
+            }
+            _ => {}
         }
         match (&self.url, self.signed_in) {
             (Some(url), _) if !self.cleared => Some(format!(
@@ -365,12 +374,20 @@ impl Registry {
     }
 
     /// Shows why a sign-in the scope needs could not be prepared.
+    /// A link already shown for the scope stays: the problem is added to it.
     pub(super) fn problem(&self, scope: &str, backend: &str, problem: String) {
+        let link = {
+            let state = self.lock();
+            state
+                .pending
+                .get(scope)
+                .map(|pending| (pending.url.clone(), unix_ms(pending.expires_at)))
+        };
         self.publish(AuthHint {
             scope: scope.to_owned(),
             backend: backend.to_owned(),
-            url: None,
-            expires_at_ms: None,
+            url: link.as_ref().map(|(url, _)| url.clone()),
+            expires_at_ms: link.map(|(_, expires_at)| expires_at),
             cleared: false,
             signed_in: false,
             problem: Some(problem),
@@ -866,8 +883,12 @@ pub(crate) fn notices(
         let text = {
             let mut shown = shown.lock().unwrap_or_else(|poison| poison.into_inner());
             match (&hint.url, &hint.problem) {
-                (Some(url), _) if !hint.cleared => {
-                    if !shown.insert(format!("{}\n{url}", hint.backend)) {
+                (Some(url), problem) if !hint.cleared => {
+                    let key = match problem {
+                        Some(problem) => format!("{}\n{url}\n{problem}", hint.backend),
+                        None => format!("{}\n{url}", hint.backend),
+                    };
+                    if !shown.insert(key) {
                         return;
                     }
                 }
