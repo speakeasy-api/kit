@@ -37,6 +37,10 @@ pub(super) struct Policy {
 
 impl OAuthPolicy for Policy {
     fn approve_endpoints(&self, context: EndpointTrust<'_>) -> Result<(), HookError> {
+        // A pin the operator wrote but got wrong is never treated as absent.
+        if self.settings.invalid_issuer {
+            return Err(denied());
+        }
         let metadata = context.metadata;
         let issuer = https(&metadata.issuer)?;
         let resource = https(&metadata.resource)?;
@@ -75,6 +79,9 @@ impl OAuthPolicy for Policy {
         resource: &ResourceMetadata,
         challenge_scopes: &[String],
     ) -> Result<TrustDecision, HookError> {
+        if self.settings.invalid_issuer {
+            return Err(denied());
+        }
         let destination = target.destination();
         if https(&resource.resource)?.origin() != destination.origin() {
             return Err(denied());
@@ -126,11 +133,16 @@ impl Policy {
         flow == Some(agenthooksprotocol::auth::OAuthFlow::ClientCredentials)
     }
 
-    /// The scopes the backend's settings name, else its preset's.
+    /// The preset's scopes and those the backend's settings add: the preset's
+    /// are requirements the SDK enforces on every operation, so settings can
+    /// widen the request but never drop them.
     pub(super) fn requested(&self, target: &AuthTarget) -> Vec<String> {
-        self.settings
-            .scopes
-            .clone()
-            .unwrap_or_else(|| target.scopes().to_vec())
+        let mut scopes = target.scopes().to_vec();
+        for scope in self.settings.scopes.iter().flatten() {
+            if !scopes.contains(scope) {
+                scopes.push(scope.clone());
+            }
+        }
+        scopes
     }
 }

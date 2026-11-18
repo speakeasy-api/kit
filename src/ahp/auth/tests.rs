@@ -37,6 +37,8 @@ struct Issuer {
     delay_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Token requests received, answered or not.
     received: Arc<AtomicUsize>,
+    /// Every request received.
+    hits: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -98,6 +100,8 @@ impl Issuer {
         let served_delay = Arc::clone(&delay_ms);
         let received = Arc::new(AtomicUsize::new(0));
         let served_received = Arc::clone(&received);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served_hits = Arc::clone(&hits);
         let task = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
@@ -106,11 +110,13 @@ impl Issuer {
                 let counter = Arc::clone(&counter);
                 let delay = Duration::from_millis(served_delay.load(Ordering::SeqCst));
                 let received = Arc::clone(&served_received);
+                let hit = Arc::clone(&served_hits);
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(socket).await else {
                         return;
                     };
                     let (head, request_body) = read_request(&mut stream).await;
+                    hit.fetch_add(1, Ordering::SeqCst);
                     let path = head
                         .split_whitespace()
                         .nth(1)
@@ -161,6 +167,7 @@ impl Issuer {
             exchanges,
             delay_ms,
             received,
+            hits,
             task,
         }
     }
@@ -457,7 +464,7 @@ async fn logout_from_another_process_always_finds_the_grant() {
         // A separate process, sharing the storage, logs out.
         let other = hook_auth(&storage, backends());
         assert!(other.logout("test.relogin").await.unwrap(), "round {round}");
-        let status: BTreeMap<_, _> = other.status().await.into_iter().collect();
+        let status: BTreeMap<_, _> = other.status(None).await.unwrap().into_iter().collect();
         assert_eq!(status["test.relogin"], "needs-login", "round {round}");
     }
 }
@@ -481,7 +488,7 @@ async fn logout_and_status_are_per_backend() {
     sign_in(&auth, "test.second", second).await;
     assert!(auth.logout("test.first").await.unwrap());
     assert!(!auth.logout("test.first").await.unwrap());
-    let status: BTreeMap<_, _> = auth.status().await.into_iter().collect();
+    let status: BTreeMap<_, _> = auth.status(None).await.unwrap().into_iter().collect();
     assert_eq!(status["test.first"], "needs-login");
     assert_eq!(status["test.second"], "authorized");
     assert_eq!(status["test.stdio"], "no authentication (stdio)");
@@ -563,6 +570,7 @@ fn notices_show_each_link_once_and_completion_once() {
         expires_at_ms: Some(1),
         cleared: false,
         signed_in: false,
+        problem: None,
     };
     sink(&pending);
     sink(&pending);
@@ -617,7 +625,10 @@ async fn one_port_serves_two_workspaces_by_state() {
         "workspaces never share a pending login"
     );
     // One listener holds the port; it answers Kit's probe.
-    assert!(super::login::bind(port).await.is_none());
+    assert!(matches!(
+        super::login::bind(port).await,
+        super::login::Bound::Peer
+    ));
 
     // A callback with an unknown state completes nothing.
     assert!(!call_back(port, "forged-state").await);
@@ -636,8 +647,8 @@ async fn one_port_serves_two_workspaces_by_state() {
     assert_eq!(issuer.exchanges(), 2);
     // Logging out of one workspace's backend leaves the other's.
     assert!(first.logout("test.shared").await.unwrap());
-    let first_status: BTreeMap<_, _> = first.status().await.into_iter().collect();
-    let second_status: BTreeMap<_, _> = second.status().await.into_iter().collect();
+    let first_status: BTreeMap<_, _> = first.status(None).await.unwrap().into_iter().collect();
+    let second_status: BTreeMap<_, _> = second.status(None).await.unwrap().into_iter().collect();
     assert_eq!(first_status["test.shared"], "needs-login");
     assert_eq!(second_status["test.shared"], "authorized");
 }
@@ -652,7 +663,10 @@ async fn a_port_held_by_another_program_is_not_mistaken_for_kit() {
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
             .await;
     });
-    assert!(super::login::bind(port).await.is_none());
+    assert!(matches!(
+        super::login::bind(port).await,
+        super::login::Bound::Foreign
+    ));
     answer.await.unwrap();
 }
 
@@ -701,6 +715,12 @@ fn an_advertised_issuer_is_trusted_only_on_opt_in() {
     // A configured issuer the backend does not advertise is refused.
     assert!(
         policy(json!({"issuer": "https://other.example"}))
+            .select(&target, &resource, &[])
+            .is_err()
+    );
+    // A pin that is not an https URL refuses OAuth rather than unpinning it.
+    assert!(
+        policy(json!({"issuer": "http://auth.example", "trustAdvertisedIssuer": true}))
             .select(&target, &resource, &[])
             .is_err()
     );
@@ -814,7 +834,7 @@ async fn logout_all_workspaces_finds_grants_of_a_moved_project() {
             .unwrap(),
         0
     );
-    let status: BTreeMap<_, _> = old.status().await.into_iter().collect();
+    let status: BTreeMap<_, _> = old.status(None).await.unwrap().into_iter().collect();
     assert_eq!(status["test.moved"], "needs-login");
 }
 
@@ -1112,5 +1132,179 @@ async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session(
     assert_eq!(
         server.events.lock().unwrap()[0]["type"],
         "context.compact.before"
+    );
+}
+
+#[tokio::test]
+async fn scope_settings_add_to_the_presets_scopes() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let mut backend = issuer.backend("test.scopes", port);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    backend["oauth"]["scopes"] = json!(["hooks:upload"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    let target = context(&auth, "test.scopes");
+    let url = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    let mut requested: Vec<_> = query(&url, "scope").split(' ').map(str::to_owned).collect();
+    requested.sort();
+    assert_eq!(requested, ["hooks:invoke", "hooks:upload"]);
+    // And the grant satisfies the preset's requirement.
+    assert!(approve(&url, port).await);
+    assert!(credential(&auth, target).await.unwrap().is_some());
+}
+
+/// A program other than Kit holding `port`, answering every request with 404.
+fn foreign_holder(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    })
+}
+
+#[tokio::test]
+async fn no_link_is_shown_when_another_program_holds_the_port() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let holder = foreign_holder(holder);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.foreign", port)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.foreign")).await;
+    auth.turn_started();
+    // Instead of a link nothing can receive, the user is told what to change.
+    let hint = next_hint(&mut hints).await;
+    assert!(hint.url.is_none(), "{hint:?}");
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains("oauth.redirectPort") && notice.contains(&port.to_string()),
+        "{notice}"
+    );
+    // The CLI refuses too, without showing a link.
+    let error = auth
+        .login(Some("test.foreign"), |_, _| panic!("a link was shown"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("oauth.redirectPort"), "{error}");
+    holder.abort();
+}
+
+#[tokio::test]
+async fn cli_sign_in_takes_over_the_port_when_the_peer_stops() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // Another Kit process listens on the port: it answers Kit's probe.
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = peer.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = peer.accept().await else {
+                return;
+            };
+            let _ = read_request(&mut stream).await;
+            let reply = login::PROBE_REPLY;
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    });
+    let auth = hook_auth(&storage, vec![issuer.backend("test.takeover", port)]);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let browser = tokio::spawn(async move {
+        let url: url::Url = rx.recv().await.unwrap();
+        // The peer stops listening before the link is opened.
+        peer.abort();
+        let _ = peer.await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !login::kit_listens(port).await {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the CLI takes the port over");
+        assert!(approve(&url, port).await);
+    });
+    let signed_in = auth
+        .login(Some("test.takeover"), |_, url| {
+            tx.send(url.clone()).unwrap()
+        })
+        .await
+        .unwrap();
+    assert_eq!(signed_in, ["test.takeover"]);
+    browser.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_configuration_need_is_this_workspaces_only() {
+    let storage = tempfile::tempdir().unwrap();
+    let backend = json!({"id": "test.same-id", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+        "oauth": {"issuer": "https://auth.example"}});
+    let first = hook_auth_in(&storage, vec![backend.clone()], "/first/hooks.json");
+    let second = hook_auth_in(&storage, vec![backend], "/second/hooks.json");
+    first.configuration_needs_login("test.same-id");
+    assert!(login::registry().has_needs(&first.0.backends["test.same-id"].scope));
+    assert!(!login::registry().has_needs(&second.0.backends["test.same-id"].scope));
+}
+
+#[tokio::test]
+async fn status_for_one_backend_checks_only_that_backend() {
+    let (first, second) = (Issuer::start().await, Issuer::start().await);
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            first.backend("test.status-one", free_port().await),
+            second.backend("test.status-other", free_port().await),
+        ],
+    );
+    let lines = auth.status(Some("test.status-one")).await.unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].0, "test.status-one");
+    assert_eq!(
+        second.hits.load(Ordering::SeqCst),
+        0,
+        "another backend's issuer was contacted"
+    );
+    assert!(auth.status(Some("test.typo")).await.is_err());
+    assert_eq!(
+        first.hits.load(Ordering::SeqCst) + second.hits.load(Ordering::SeqCst),
+        first.hits.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_that_cannot_be_prepared_says_why() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.unprepared", free_port().await);
+    // The issuer is on loopback, which this backend does not allow.
+    backend["oauth"]["allowPrivateNetwork"] = json!(false);
+    let auth = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    auth.configuration_needs_login("test.unprepared");
+    auth.turn_started();
+    let hint = next_hint(&mut hints).await;
+    assert_eq!(hint.url, None);
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains("untrusted_destination") && notice.contains("oauth.allowPrivateNetwork"),
+        "{notice}"
     );
 }

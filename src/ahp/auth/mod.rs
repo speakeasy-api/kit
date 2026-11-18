@@ -178,9 +178,6 @@ impl HookAuth {
             for problem in problems {
                 eprintln!("kit: hooks.json: {problem}");
             }
-            if let Some(context) = backend.context().filter(|_| !backend.header_authorization) {
-                login::registry().register_endpoint(&backend.scope, context);
-            }
             backends.insert(backend.id.clone(), backend);
         }
         Self(Arc::new(Inner {
@@ -218,9 +215,10 @@ impl HookAuth {
         options.backend.auth_provider = Some(Arc::new(self.providers()));
         // A backend whose hooks/configuration needs a sign-in gets its link at
         // the next turn start; once signed in, the SDK configures it again.
-        options.on_configuration_skipped(|diagnostic| {
+        let auth = self.clone();
+        options.on_configuration_skipped(move |diagnostic| {
             if diagnostic.recovery == Some(AuthRecovery::Login) {
-                login::registry().delivery_failed(&diagnostic.backend_id, &[]);
+                auth.configuration_needs_login(&diagnostic.backend_id);
             }
         })
     }
@@ -228,6 +226,20 @@ impl HookAuth {
     /// Bearer, OAuth and unbound routes. A route is chosen by the binding, so
     /// a backend that needs sign-in stays registered and its deliveries fail
     /// under its own failure policy.
+    /// `backend`'s hooks/configuration needs a sign-in. The need is this
+    /// workspace's declaration of it, never another workspace's with the
+    /// same id; a more precise target already recorded is kept.
+    pub(crate) fn configuration_needs_login(&self, backend: &str) {
+        let Some(backend) = self.0.backends.get(backend) else {
+            return;
+        };
+        if let Some(context) = backend.context()
+            && !login::registry().has_needs(&backend.scope)
+        {
+            login::registry().needs_login(&backend.scope, &context, &[]);
+        }
+    }
+
     pub(crate) fn providers(&self) -> AuthProviders {
         let provider: Arc<dyn AuthProvider> = Arc::new(Provider(self.clone()));
         AuthProviders::builder()
@@ -416,13 +428,11 @@ impl HookAuth {
             needs = login::registry().needs(&backend.scope);
         }
         for need in needs {
-            match self.prepare(&need.context, &need.required).await {
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    backend = %backend.id,
-                    code = error.auth_code().map_or("failed", AuthErrorCode::as_str),
-                    "hook sign-in could not be prepared"
-                ),
+            if let Err(error) = self.prepare(&need.context, &need.required).await {
+                let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
+                tracing::warn!(backend = %backend.id, code, "hook sign-in could not be prepared");
+                // The user sees why, once, beside where a link would be.
+                login::registry().problem(&backend.scope, &backend.id, guidance(&error, backend));
             }
         }
     }
@@ -463,18 +473,42 @@ impl HookAuth {
                 );
                 self.record_pending(backend, &login).await;
                 if login::registry().offer(login, &pending, port) {
-                    tokio::spawn(login::listen(port));
+                    match login::bind(port).await {
+                        login::Bound::Here(listener) => {
+                            tokio::spawn(login::listen_on(listener, port));
+                        }
+                        login::Bound::Peer => login::registry().stopped(port),
+                        login::Bound::Foreign => {
+                            // No link is shown that nothing can receive; a
+                            // later turn tries the port again.
+                            login::registry().stopped(port);
+                            login::registry().withdraw(&backend.scope);
+                            return Err(fail(AuthErrorCode::UntrustedDestination));
+                        }
+                    }
                 }
+                login::registry().show(&backend.scope);
                 Ok(Some(pending.authorization_url().clone()))
             }
             _ => Err(fail(AuthErrorCode::ProviderFailed)),
         }
     }
 
-    /// One line per backend for `kit auth status hooks`.
-    pub(crate) async fn status(&self) -> Vec<(String, String)> {
+    /// One line per backend for `kit auth status hooks`, or for `only`.
+    /// An unknown `only` is refused before any credential is checked.
+    pub(crate) async fn status(&self, only: Option<&str>) -> Result<Vec<(String, String)>, String> {
+        if let Some(id) = only
+            && !self.0.backends.contains_key(id)
+        {
+            return Err(format!("no hook backend `{id}` is configured"));
+        }
         let mut lines = Vec::new();
-        for backend in self.0.backends.values() {
+        for backend in self
+            .0
+            .backends
+            .values()
+            .filter(|backend| only.is_none_or(|id| id == backend.id))
+        {
             let status = match backend.context() {
                 None => "no authentication (stdio)".to_owned(),
                 Some(_) if backend.header_authorization => {
@@ -500,7 +534,7 @@ impl HookAuth {
             };
             lines.push((backend.id.clone(), status));
         }
-        lines
+        Ok(lines)
     }
 
     /// Signs in to `only`, or to each backend that needs it. `present` is
@@ -565,10 +599,14 @@ impl HookAuth {
             self.record_pending(backend, &candidate).await;
             let port = backend.settings.redirect_port;
             // Listen before showing the link, so an immediate approval lands.
-            let listener = login::bind(port).await;
+            let bound = login::bind(port).await;
+            if let login::Bound::Foreign = bound {
+                return Err(format!("{}: {}", backend.id, login::foreign_port(port)));
+            }
             present(&backend.id, pending.authorization_url());
-            let completed = match listener {
-                Some(listener) => {
+            let serve = |listener: tokio::net::TcpListener| {
+                let candidate = candidate.clone();
+                async move {
                     let done = std::cell::Cell::new(false);
                     login::serve(
                         &listener,
@@ -579,15 +617,22 @@ impl HookAuth {
                     .await;
                     done.get()
                 }
-                // Another Kit process listens on this port; it completes the
-                // login in the shared store, which is polled here.
-                None => loop {
+            };
+            let completed = match bound {
+                login::Bound::Here(listener) => serve(listener).await,
+                // Another Kit process listens on this port and completes the
+                // login in the shared store, which is polled here. If it stops
+                // listening first, this process takes the port over.
+                _ => loop {
                     if std::time::SystemTime::now() >= expires_at {
                         break false;
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
                         break true;
+                    }
+                    if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                        break serve(listener).await;
                     }
                 },
             };
@@ -646,6 +691,27 @@ impl HookAuth {
             .map_err(|error| describe(&error))?;
         login::registry().reset(&scope, backend);
         Ok(removed > 0)
+    }
+}
+
+/// What to tell the user when a backend's sign-in cannot be prepared: the
+/// safe error code and the setting to check, never a provider message.
+fn guidance(error: &HookError, backend: &Backend) -> String {
+    match error.auth_code() {
+        Some(AuthErrorCode::UntrustedDestination) => format!(
+            "untrusted_destination. Check oauth.issuer, oauth.trustAdvertisedIssuer, oauth.allowPrivateNetwork and that port {} is free (oauth.redirectPort) in hooks.json.",
+            backend.settings.redirect_port
+        ),
+        Some(
+            code @ (AuthErrorCode::CredentialUnavailable
+            | AuthErrorCode::InvalidConfiguration
+            | AuthErrorCode::UnsupportedBinding),
+        ) => format!(
+            "{}. Check the backend's authentication and oauth settings in hooks.json.",
+            code.as_str()
+        ),
+        Some(code) => format!("{}. Kit tries again at the next turn.", code.as_str()),
+        None => "failed. Kit tries again at the next turn.".into(),
     }
 }
 
@@ -738,11 +804,6 @@ pub(crate) async fn logout_everywhere(
     Ok(removed)
 }
 
-/// A delivery to `backend` failed for want of a login.
-pub(crate) fn delivery_needs_login(backend: &str, required: &[String]) {
-    login::registry().delivery_failed(backend, required);
-}
-
 /// Routes each operation to its backend's managed OAuth, and records which
 /// backends need a login.
 struct Provider(HookAuth);
@@ -817,15 +878,9 @@ pub mod cli {
         storage: &CredentialStorage,
         backend: Option<&str>,
     ) -> Result<String, String> {
-        let lines = auth(root, storage)?.status().await;
-        if let Some(backend) = backend
-            && !lines.iter().any(|(id, _)| id == backend)
-        {
-            return Err(format!("no hook backend `{backend}` is configured"));
-        }
+        let lines = auth(root, storage)?.status(backend).await?;
         Ok(lines
             .into_iter()
-            .filter(|(id, _)| backend.is_none_or(|backend| backend == id))
             .map(|(backend, status)| format!("{backend}: {status}"))
             .collect::<Vec<_>>()
             .join("\n"))
@@ -885,6 +940,7 @@ pub(crate) mod test_support {
             expires_at_ms: Some(u64::MAX),
             cleared: false,
             signed_in: false,
+            problem: None,
         }
     }
 

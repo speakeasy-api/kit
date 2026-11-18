@@ -52,6 +52,9 @@ pub(super) struct Settings {
     pub allow_private_network: bool,
     /// Trust the issuer the backend advertises when none is configured.
     pub trust_advertised_issuer: bool,
+    /// `issuer` was given but is not an https URL: the backend's OAuth is
+    /// refused until it is fixed, never treated as unpinned.
+    pub invalid_issuer: bool,
     /// An `oauth` object was given: the user expects OAuth here.
     pub configured: bool,
 }
@@ -96,6 +99,7 @@ impl Settings {
             login_lifetime: MAX_LIFETIME,
             allow_private_network: false,
             trust_advertised_issuer: false,
+            invalid_issuer: false,
             configured: backend["oauth"].is_object(),
         };
         let raw = &backend["oauth"];
@@ -109,7 +113,7 @@ impl Settings {
         if let Some(issuer) = given("issuer") {
             match issuer.as_str().filter(|s| s.starts_with("https://")) {
                 Some(issuer) => settings.issuer = Some(issuer.to_owned()),
-                None => ignore("issuer", "is not an https URL"),
+                None => settings.invalid_issuer = true,
             }
         }
         if let Some(flow) = given("flow") {
@@ -199,6 +203,11 @@ impl Settings {
                 }
             }
         }
+        if settings.invalid_issuer {
+            problems.push(format!(
+                "{id}: oauth.issuer is not an https URL; OAuth for this backend is refused until it is fixed"
+            ));
+        }
         (settings, problems)
     }
 }
@@ -247,6 +256,12 @@ mod tests {
             "loginLifetimeMinutes": 30
         }}));
         assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(settings.invalid_issuer && settings.issuer.is_none());
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("refused until it is fixed"))
+        );
         assert!(settings.registration.is_none());
         assert_eq!(settings.redirect_port, default_port("b"));
         assert_eq!(settings.login_lifetime, MAX_LIFETIME);

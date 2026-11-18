@@ -461,11 +461,6 @@ fn merge(merged: &mut Option<Registration>, next: Registration) {
 
 fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {
     for diagnostic in diagnostics {
-        if let (Some(backend), Some(code)) = (&diagnostic.backend_id, diagnostic.auth_code)
-            && code.recovery() == agenthooksprotocol::auth::AuthRecovery::Login
-        {
-            auth::delivery_needs_login(backend, &diagnostic.required_scopes);
-        }
         tracing::warn!(
             event = event.as_str(),
             ?diagnostic,

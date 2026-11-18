@@ -26,6 +26,9 @@ pub(crate) struct AuthHint {
     pub cleared: bool,
     /// Cleared because sign-in finished, rather than because the link expired.
     pub signed_in: bool,
+    /// Why Kit could not prepare a sign-in the backend needs, with what to
+    /// check: sanitized, never a provider message.
+    pub problem: Option<String>,
 }
 
 /// The `_meta` key that marks a sign-in hint, on a notice or Kit's own
@@ -51,6 +54,12 @@ impl AuthHint {
     /// link and once when sign-in finishes. An expired link says nothing;
     /// the next turn shows its replacement.
     pub(crate) fn notice(&self) -> Option<String> {
+        if let Some(problem) = self.problem.as_ref().filter(|_| !self.cleared) {
+            return Some(format!(
+                "Hook backend `{}` needs you to sign in, but Kit could not start it: {problem}",
+                self.backend
+            ));
+        }
         match (&self.url, self.signed_in) {
             (Some(url), _) if !self.cleared => Some(format!(
                 "Hook backend `{}` needs you to sign in. Open {url} to approve Kit.",
@@ -130,8 +139,6 @@ type Sink = dyn Fn(&AuthHint) + Send + Sync;
 #[derive(Default)]
 struct State {
     needs: HashMap<String, Vec<Need>>,
-    /// Each HTTP backend's own endpoint, for failures that name only it.
-    endpoints: HashMap<String, AuthContext>,
     preparing: HashSet<String>,
     pending: HashMap<String, Pending>,
     /// Ports this process is listening on.
@@ -168,6 +175,7 @@ fn cleared(scope: &str, backend: &str, signed_in: bool) -> AuthHint {
         expires_at_ms: None,
         cleared: true,
         signed_in,
+        problem: None,
     }
 }
 
@@ -239,29 +247,6 @@ impl Registry {
         HintSubscription { _sink: sink }
     }
 
-    pub(super) fn register_endpoint(&self, scope: &str, context: AuthContext) {
-        self.lock().endpoints.insert(scope.to_owned(), context);
-    }
-
-    /// A delivery diagnostic names only the backend id: each scope with that
-    /// id needs its endpoint signed in, unless a precise target is known.
-    pub(super) fn delivery_failed(&self, backend: &str, required: &[String]) {
-        let targets: Vec<_> = {
-            let state = self.lock();
-            state
-                .endpoints
-                .iter()
-                .filter(|(scope, context)| {
-                    context.backend_id == backend && !state.needs.contains_key(*scope)
-                })
-                .map(|(scope, context)| (scope.clone(), context.clone()))
-                .collect()
-        };
-        for (scope, context) in targets {
-            self.needs_login(&scope, &context, required);
-        }
-    }
-
     pub(super) fn needs_login(&self, scope: &str, context: &AuthContext, required: &[String]) {
         let mut state = self.lock();
         let needs = state.needs.entry(scope.to_owned()).or_default();
@@ -316,46 +301,80 @@ impl Registry {
             .then(|| Preparing(scope.to_owned()))
     }
 
-    /// Records a stored pending login and shows its link. A login `prepare`
-    /// reused keeps the same link, so repeated turns show the same hint.
-    /// Returns whether this process should start listening on `port`.
+    /// Records a stored pending login. A login `prepare` reused keeps the
+    /// same link, so repeated turns show the same hint. Returns whether this
+    /// process should start listening on `port`; [`Self::show`] then shows
+    /// the link.
     pub(super) fn offer(&self, login: Login, pending: &PendingLogin, port: u16) -> bool {
         let url = pending.authorization_url().to_string();
-        let backend = login.context.backend_id.clone();
-        let scope = login.scope.clone();
-        let (listen, hint) = {
-            let mut state = self.lock();
-            let entry = state
-                .pending
-                .entry(scope.clone())
-                .or_insert_with(|| Pending {
-                    url: url.clone(),
-                    expires_at: pending.expires_at(),
-                    port,
-                    logins: Vec::new(),
-                });
-            entry
+        let mut state = self.lock();
+        let entry = state
+            .pending
+            .entry(login.scope.clone())
+            .or_insert_with(|| Pending {
+                url: url.clone(),
+                expires_at: pending.expires_at(),
+                port,
+                logins: Vec::new(),
+            });
+        entry
+            .logins
+            .retain(|existing| !same_target(&existing.context, &login.context));
+        entry.logins.push(login);
+        if entry.expires_at < pending.expires_at() || entry.url != url {
+            entry.url = url;
+            entry.expires_at = entry.expires_at.max(pending.expires_at());
+        }
+        entry.port = port;
+        // A process that lost the port retries on later turns.
+        state.listening.insert(port)
+    }
+
+    /// Shows the scope's pending link, once a listener (here or in another
+    /// Kit process) can receive its callback.
+    pub(super) fn show(&self, scope: &str) {
+        let hint = {
+            let state = self.lock();
+            let Some(pending) = state.pending.get(scope) else {
+                return;
+            };
+            let Some(backend) = pending
                 .logins
-                .retain(|existing| !same_target(&existing.context, &login.context));
-            entry.logins.push(login);
-            if entry.expires_at < pending.expires_at() || entry.url != url {
-                entry.url = url.clone();
-                entry.expires_at = entry.expires_at.max(pending.expires_at());
-            }
-            entry.port = port;
-            let hint = AuthHint {
-                scope: scope.clone(),
+                .first()
+                .map(|login| login.context.backend_id.clone())
+            else {
+                return;
+            };
+            AuthHint {
+                scope: scope.to_owned(),
                 backend,
-                url: Some(entry.url.clone()),
-                expires_at_ms: Some(unix_ms(entry.expires_at)),
+                url: Some(pending.url.clone()),
+                expires_at_ms: Some(unix_ms(pending.expires_at)),
                 cleared: false,
                 signed_in: false,
-            };
-            // A process that lost the port retries on later turns.
-            (state.listening.insert(port), hint)
+                problem: None,
+            }
         };
         self.publish(hint);
-        listen
+    }
+
+    /// Nothing can receive the scope's callback: its link is withdrawn, so
+    /// none is shown that cannot work.
+    pub(super) fn withdraw(&self, scope: &str) {
+        self.lock().pending.remove(scope);
+    }
+
+    /// Shows why a sign-in the scope needs could not be prepared.
+    pub(super) fn problem(&self, scope: &str, backend: &str, problem: String) {
+        self.publish(AuthHint {
+            scope: scope.to_owned(),
+            backend: backend.to_owned(),
+            url: None,
+            expires_at_ms: None,
+            cleared: false,
+            signed_in: false,
+            problem: Some(problem),
+        });
     }
 
     /// Every pending login whose callback arrives on `port`, and the latest
@@ -429,6 +448,7 @@ impl Registry {
                 expires_at_ms: Some(unix_ms(next.expires_at)),
                 cleared: false,
                 signed_in: false,
+                problem: None,
             },
             None => cleared(&login.scope, &login.context.backend_id, true),
         });
@@ -450,7 +470,7 @@ impl Registry {
         !waiting
     }
 
-    fn stopped(&self, port: u16) {
+    pub(super) fn stopped(&self, port: u16) {
         self.lock().listening.remove(&port);
     }
 
@@ -467,8 +487,12 @@ impl Registry {
 
 /// The stderr line for a session nobody is attached to: once per link.
 fn headless_line(printed: &mut HashSet<String>, hint: &AuthHint) -> Option<String> {
-    let url = hint.url.as_ref().filter(|_| !hint.cleared)?;
-    if !printed.insert(url.clone()) {
+    let key = match (&hint.url, &hint.problem) {
+        (Some(url), _) => url.clone(),
+        (None, Some(problem)) => format!("{}\n{problem}", hint.scope),
+        (None, None) => return None,
+    };
+    if hint.cleared || !printed.insert(key) {
         return None;
     }
     hint.notice().map(|text| format!("kit: {text}"))
@@ -489,7 +513,7 @@ pub(super) fn redirect_uri(port: u16) -> String {
 /// What a Kit sign-in listener answers at [`PROBE`], so a process that
 /// cannot bind a port can tell another Kit from a foreign program.
 const PROBE: &str = "/kit-hook-sign-in";
-const PROBE_REPLY: &str = "kit hook sign-in";
+pub(super) const PROBE_REPLY: &str = "kit hook sign-in";
 
 /// Whether a Kit sign-in listener holds `port`.
 pub(super) async fn kit_listens(port: u16) -> bool {
@@ -527,33 +551,44 @@ async fn kit_listens_retrying(port: u16) -> bool {
     false
 }
 
-/// Binds `port`, or explains why it cannot: another Kit process waiting
-/// on the same port (which can complete the login, since the credentials
-/// are shared) or a foreign program, which the user must move out of the way.
-pub(super) async fn bind(port: u16) -> Option<TcpListener> {
+/// Who receives callbacks on a port.
+pub(super) enum Bound {
+    /// This process: serve the listener.
+    Here(TcpListener),
+    /// Another Kit process, which completes any process's login from the
+    /// shared store.
+    Peer,
+    /// Another program: no sign-in can complete on this port.
+    Foreign,
+}
+
+/// Binds `port`, or finds out who holds it. A foreign holder is reported
+/// with what to change.
+pub(super) async fn bind(port: u16) -> Bound {
     match TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(listener) => Some(listener),
+        Ok(listener) => Bound::Here(listener),
+        Err(_) if kit_listens_retrying(port).await => {
+            tracing::debug!(port, "another Kit process receives hook sign-in callbacks");
+            Bound::Peer
+        }
         Err(error) => {
-            if kit_listens_retrying(port).await {
-                tracing::debug!(port, "another Kit process receives hook sign-in callbacks");
-            } else {
-                tracing::warn!(port, %error, "hook sign-in callback port is in use");
-                eprintln!(
-                    "kit: hook sign-in cannot receive its callback: port {port} is used by another program. Set oauth.redirectPort for the backend in hooks.json."
-                );
-            }
-            None
+            tracing::warn!(port, %error, "hook sign-in callback port is in use");
+            eprintln!("kit: {}", foreign_port(port));
+            Bound::Foreign
         }
     }
 }
 
-/// Receives sign-in callbacks on a fixed loopback port until no pending
-/// login of this process uses it.
-pub(super) async fn listen(port: u16) {
-    let Some(listener) = bind(port).await else {
-        registry().stopped(port);
-        return;
-    };
+/// What to tell the user when another program holds `port`.
+pub(super) fn foreign_port(port: u16) -> String {
+    format!(
+        "hook sign-in cannot receive its callback: port {port} is used by another program. Set oauth.redirectPort for the backend in hooks.json."
+    )
+}
+
+/// Serves this process's pending logins on `listener` until none uses its
+/// port.
+pub(super) async fn listen_on(listener: TcpListener, port: u16) {
     loop {
         serve(
             &listener,
@@ -781,9 +816,14 @@ pub(crate) fn notices(
     move |hint: &AuthHint| {
         let text = {
             let mut shown = shown.lock().unwrap_or_else(|poison| poison.into_inner());
-            match &hint.url {
-                Some(url) if !hint.cleared => {
+            match (&hint.url, &hint.problem) {
+                (Some(url), _) if !hint.cleared => {
                     if !shown.insert(format!("{}\n{url}", hint.backend)) {
+                        return;
+                    }
+                }
+                (None, Some(problem)) if !hint.cleared => {
+                    if !shown.insert(format!("{}\nproblem\n{problem}", hint.backend)) {
                         return;
                     }
                 }
@@ -823,6 +863,7 @@ mod tests {
             expires_at_ms: None,
             cleared: false,
             signed_in: false,
+            problem: None,
         };
         let first = hint("https://auth.example/a");
         assert_eq!(

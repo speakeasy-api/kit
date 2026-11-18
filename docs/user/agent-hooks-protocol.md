@@ -65,7 +65,9 @@ continue. The backend stays registered.
 When the next turn starts, Kit prepares the sign-in in the background and
 shows its link where only you see it:
 
-- The TUI shows `sign in to hook <backend>: <link>` in the status line.
+- The TUI status line shows a reminder, `sign in to hook <backend> needed
+  (link above)`. The full link, clickable where the terminal supports it,
+  appears once in the conversation view above.
 - Other ACP clients receive a notice with the link, and a second notice when
   sign-in finishes.
 - A session without a client writes one line per link to stderr.
@@ -127,8 +129,9 @@ and uses it only if `oauth.issuer` names it or `oauth.trustAdvertisedIssuer`
 is `true`.
 Put further settings in an `oauth` object on the backend, beside its
 `authentication`. Other AHP harness adapters read the same object, and AHP
-receivers ignore it. All settings are optional, and they take precedence over
-the preset:
+receivers ignore it. All settings are optional. Where a setting and the preset
+both name a value, the setting wins, except `scopes`, which add to the
+preset's:
 
 ```json
 {
@@ -140,10 +143,10 @@ the preset:
 
 | Setting | Meaning |
 | --- | --- |
-| `issuer` | The authorization server trusted for this backend. A preset's `issuer` counts too. |
+| `issuer` | The authorization server trusted for this backend. A preset's `issuer` counts too. An `issuer` that is not an `https` URL disables OAuth for the backend until you fix it. |
 | `trustAdvertisedIssuer` | Without `issuer`, trust the authorization server the backend advertises. Default `false`: Kit refuses it. Client credentials always need `issuer`. |
 | `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
-| `scopes` | Scopes to request. Kit never records a broader grant. |
+| `scopes` | Scopes to request in addition to the preset's, which every operation requires. They are also the most Kit accepts: a backend that asks for a scope outside them is refused, not granted it. |
 | `clientId` | A client registered for Kit in advance. It always wins. |
 | `clientSecretRef` | For client credentials: a key in `~/.kit/ahp-secrets.json`. |
 | `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document that you publish. Kit uses it where the issuer supports such documents. `redirectUris` must include this backend's redirect. |
