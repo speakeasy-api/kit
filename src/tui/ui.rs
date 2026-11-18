@@ -2008,6 +2008,41 @@ fn single_transcript_block_rows(
             ))])),
             None,
         ),
+        Block::HookSignIn { backend, url } => {
+            let link = |text: String, style| LinkedSpan {
+                span: Span::styled(text, style),
+                url: Some(url.clone()),
+                image_end: false,
+            };
+            let plain = |text: String, style| LinkedSpan {
+                span: Span::styled(text, style),
+                url: None,
+                image_end: false,
+            };
+            (
+                vec![
+                    (
+                        LinkedLine::new(vec![
+                            plain(
+                                format!("· Hook backend {backend} needs you to sign in: "),
+                                Style::default().fg(theme::warn_color()),
+                            ),
+                            link(
+                                "open the sign-in page".into(),
+                                theme::bold(theme::accent_color()),
+                            ),
+                        ]),
+                        None,
+                    ),
+                    // The whole link, wrapped and hyperlinked, to copy or click.
+                    (
+                        LinkedLine::new(vec![link(format!("  {url}"), theme::faint())]),
+                        None,
+                    ),
+                ],
+                None,
+            )
+        }
         Block::Error(text) => (
             uncopyable(plain_lines(vec![Line::from(vec![
                 Span::styled("✗ ", theme::bold(theme::error_color())),
@@ -5228,28 +5263,40 @@ mod tests {
             .unwrap()
             .as_millis() as u64
             + 600_000;
+        // A realistic authorize URL is far wider than the status line.
+        let url = format!(
+            "https://login.example.com/oauth2/v1/authorize?response_type=code&client_id=kit&state={}&code_challenge={}&code_challenge_method=S256&redirect_uri=http%3A%2F%2F127.0.0.1%3A30123%2Fcallback&scope=hooks%3Ainvoke&resource=https%3A%2F%2Fpolicy.example.com%2Fhooks",
+            "s".repeat(64),
+            "c".repeat(64)
+        );
+        assert!(url.len() > 300);
         let hint = |url: Option<&str>, cleared| crate::tui::app::Update::HookSignIn {
             backend: "com.example".into(),
             url: url.map(str::to_owned),
             expires_at_ms: Some(later),
             cleared,
         };
-        app.apply(hint(Some("https://a.example/s"), false));
-        let screen = render(&mut app, 120, 12);
+        app.apply(hint(Some(&url), false));
+        app.apply(hint(Some(&url), false));
+        let screen = render(&mut app, 80, 24);
         assert!(
-            screen.contains("sign in to hook com.example: https://a.example/s"),
+            screen.contains("sign in to hook com.example needed"),
             "{screen}"
         );
+        // The whole link is on screen, wrapped, once.
+        let flat: String = screen.lines().map(str::trim).collect();
+        assert!(flat.contains(&url), "{screen}");
+        assert_eq!(flat.matches("open the sign-in page").count(), 1, "{screen}");
         app.apply(hint(None, true));
-        assert!(!render(&mut app, 120, 12).contains("sign in to hook"));
-        // An expired link is not shown, even before it is cleared.
+        assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
+        // An expired link is not shown in the status line, even before it is cleared.
         app.apply(crate::tui::app::Update::HookSignIn {
             backend: "com.example".into(),
-            url: Some("https://a.example/s".into()),
+            url: Some(url.clone()),
             expires_at_ms: Some(1),
             cleared: false,
         });
-        assert!(!render(&mut app, 120, 12).contains("sign in to hook"));
+        assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
     }
 
     #[test]

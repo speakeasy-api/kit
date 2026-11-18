@@ -740,6 +740,12 @@ pub enum Block {
         millis: u64,
     },
     Notice(String),
+    /// A hook backend's sign-in link, shown in full once per link. It is
+    /// for the user only and never reaches the model.
+    HookSignIn {
+        backend: String,
+        url: String,
+    },
     Error(String),
 }
 
@@ -1202,12 +1208,14 @@ impl App {
             .hook_sign_ins
             .iter()
             .filter(|(_, (_, expiry))| expiry.is_none_or(|expiry| u128::from(expiry) > now))
+            .map(|(backend, _)| backend)
             .collect();
+        // Short: the full link is in the transcript, where it wraps.
         match live.as_slice() {
             [] => None,
-            [(backend, (url, _))] => Some(format!("sign in to hook {backend}: {url}")),
-            [(backend, (url, _)), rest @ ..] => Some(format!(
-                "sign in to hook {backend}: {url} (+{} more)",
+            [backend] => Some(format!("sign in to hook {backend} needed (link above)")),
+            [backend, rest @ ..] => Some(format!(
+                "sign in to hook {backend} and {} more needed (links above)",
                 rest.len()
             )),
         }
@@ -2380,6 +2388,16 @@ impl App {
                 cleared,
             } => match url {
                 Some(url) if !cleared => {
+                    let new = self
+                        .hook_sign_ins
+                        .get(&backend)
+                        .is_none_or(|(shown, _)| *shown != url);
+                    if new {
+                        self.push_block(Block::HookSignIn {
+                            backend: backend.clone(),
+                            url: url.clone(),
+                        });
+                    }
                     self.hook_sign_ins.insert(backend, (url, expires_at_ms));
                 }
                 _ => {
