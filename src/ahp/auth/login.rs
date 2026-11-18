@@ -470,6 +470,24 @@ impl Registry {
         !waiting
     }
 
+    /// Whether `login` is still waiting for its callback.
+    pub(super) fn is_pending(&self, login: &Login) -> bool {
+        self.lock()
+            .pending
+            .get(&login.scope)
+            .is_some_and(|pending| {
+                pending
+                    .logins
+                    .iter()
+                    .any(|other| other.state == login.state)
+            })
+    }
+
+    /// Claims `port` for a listener of this process; false if one has it.
+    pub(super) fn claim(&self, port: u16) -> bool {
+        self.lock().listening.insert(port)
+    }
+
     pub(super) fn stopped(&self, port: u16) {
         self.lock().listening.remove(&port);
     }
@@ -599,6 +617,37 @@ pub(super) async fn listen_on(listener: TcpListener, port: u16) {
         .await;
         if registry().stop_if_idle(port) {
             return;
+        }
+    }
+}
+
+/// While another Kit process receives `login`'s callback, until the login
+/// ends or expires: it is completed here as soon as the shared store holds
+/// its grant, and this process takes the port over (same link) if the peer
+/// stops listening first.
+pub(super) async fn watch_peer(login: Login, port: u16) {
+    loop {
+        if SystemTime::now() >= login.expires_at || !registry().is_pending(&login) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let context = AuthContext {
+            deadline,
+            ..login.context.clone()
+        };
+        use agenthooksprotocol::adapters::registered::AuthProvider as _;
+        if matches!(login.oauth.credential(context).await, Ok(Some(_))) {
+            registry().completed(&login);
+            return;
+        }
+        if !registry().claim(port) {
+            // A listener of this process serves the port now.
+            return;
+        }
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return listen_on(listener, port).await,
+            Err(_) => registry().stopped(port),
         }
     }
 }

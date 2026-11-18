@@ -484,12 +484,16 @@ impl HookAuth {
                     self.0.client,
                 );
                 self.record_pending(backend, &login).await;
+                let watched = login.clone();
                 if login::registry().offer(login, &pending, port) {
                     match login::bind(port).await {
                         login::Bound::Here(listener) => {
                             tokio::spawn(login::listen_on(listener, port));
                         }
-                        login::Bound::Peer => login::registry().stopped(port),
+                        login::Bound::Peer => {
+                            login::registry().stopped(port);
+                            tokio::spawn(login::watch_peer(watched, port));
+                        }
                         login::Bound::Foreign => {
                             // No link is shown that nothing can receive; a
                             // later turn tries the port again.

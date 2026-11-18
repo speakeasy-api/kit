@@ -1348,3 +1348,88 @@ async fn event_and_upload_targets_with_different_scopes_each_get_their_own_ceili
     let url = auth.prepare(&upload, &[]).await.unwrap().unwrap();
     assert_eq!(query(&url, "scope"), "hooks:upload");
 }
+
+/// Another Kit process listening on `listener`'s port: it answers Kit's
+/// probe and nothing else.
+fn kit_peer(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_request(&mut stream).await;
+            let reply = login::PROBE_REPLY;
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_session_takes_over_its_link_when_the_peer_stops_listening() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let peer = kit_peer(holder);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.peer-stops", port)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.peer-stops")).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    peer.abort();
+    let _ = peer.await;
+    // The session listens for the same link once the port is free.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !login::kit_listens(port).await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the session takes the port over");
+    assert!(approve(&url, port).await);
+    assert!(next_hint(&mut hints).await.signed_in);
+}
+
+#[tokio::test]
+async fn a_session_learns_when_the_peer_completed_its_login() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let peer = kit_peer(holder);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.peer-completes", port)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, "test.peer-completes");
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The peer receives the callback and completes the login in the shared
+    // store; this process is not told.
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert("peer-code".into(), query(&url, "code_challenge"));
+    let callback = url::Url::parse(&format!(
+        "http://127.0.0.1:{port}/callback?code=peer-code&state={}",
+        query(&url, "state")
+    ))
+    .unwrap();
+    auth.manager(&target)
+        .unwrap()
+        .complete(with_deadline(&target), callback, budget())
+        .await
+        .unwrap();
+    // The session's hint clears without another turn.
+    assert!(next_hint(&mut hints).await.signed_in);
+    peer.abort();
+}
