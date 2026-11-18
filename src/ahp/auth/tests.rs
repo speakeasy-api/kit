@@ -183,13 +183,17 @@ fn hook_auth_in(storage: &tempfile::TempDir, backends: Vec<Value>, source: &str)
             )
         })
         .collect();
-    let mut auth = HookAuth::new(
+    super::test_support::hook_auth(
         CredentialStorage::Filesystem(storage.path().to_path_buf()),
         &json!({"protocolVersion": "draft", "hooks": backends}),
         &sources,
-    );
-    Arc::get_mut(&mut auth.0).unwrap().roots = vec![reqwest::Certificate::from_pem(CA).unwrap()];
-    auth
+        trusting_client,
+    )
+}
+
+/// Trusts only the test CA.
+fn trusting_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().tls_certs_only([reqwest::Certificate::from_pem(CA).unwrap()])
 }
 
 /// Plays the browser: approves the login at `url` by calling back.

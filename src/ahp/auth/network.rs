@@ -32,15 +32,18 @@ fn untrusted() -> HookError {
 /// secrets, so nothing here is ever logged.
 pub(super) struct Network {
     allow_private: bool,
-    roots: Vec<reqwest::Certificate>,
+    client: ClientBuilder,
 }
 
+/// Starts each request's HTTP client: TLS roots and other transport
+/// settings. Redirects, proxies, retries and address pinning are added here.
+pub(super) type ClientBuilder = fn() -> reqwest::ClientBuilder;
+
 impl Network {
-    /// `roots` replaces the system's trusted certificates when not empty.
-    pub(super) fn new(allow_private: bool, roots: Vec<reqwest::Certificate>) -> Self {
+    pub(super) fn new(allow_private: bool, client: ClientBuilder) -> Self {
         Self {
             allow_private,
-            roots,
+            client,
         }
     }
 
@@ -76,14 +79,11 @@ impl Network {
     }
 
     fn client(&self, url: &Url, addresses: &[SocketAddr]) -> Result<reqwest::Client, HookError> {
-        let mut builder = reqwest::Client::builder()
+        let mut builder = (self.client)()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
             .connect_timeout(Duration::from_secs(10));
-        if !self.roots.is_empty() {
-            builder = builder.tls_certs_only(self.roots.clone());
-        }
         if let Some(host) = url.host_str()
             && host.trim_matches(['[', ']']).parse::<IpAddr>().is_err()
         {

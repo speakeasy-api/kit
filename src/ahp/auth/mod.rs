@@ -112,8 +112,8 @@ struct Inner {
     managers: Mutex<HashMap<ManagerKey, Arc<ManagedOAuth>>>,
     /// Secret references from `~/.kit/ahp-secrets.json`.
     references: BTreeMap<String, String>,
-    /// Replaces the system's trusted certificates for OAuth when not empty.
-    roots: Vec<reqwest::Certificate>,
+    /// Starts the HTTP client of each OAuth request.
+    client: network::ClientBuilder,
 }
 
 fn fail(code: AuthErrorCode) -> HookError {
@@ -144,6 +144,15 @@ impl HookAuth {
         storage: CredentialStorage,
         registration: &Value,
         sources: &BTreeMap<String, String>,
+    ) -> Self {
+        Self::with_client(storage, registration, sources, reqwest::Client::builder)
+    }
+
+    fn with_client(
+        storage: CredentialStorage,
+        registration: &Value,
+        sources: &BTreeMap<String, String>,
+        client: network::ClientBuilder,
     ) -> Self {
         let mut backends = BTreeMap::new();
         let mut ports: HashMap<u16, String> = HashMap::new();
@@ -176,7 +185,7 @@ impl HookAuth {
             backends,
             managers: Mutex::default(),
             references: secrets::references(),
-            roots: Vec::new(),
+            client,
         }))
     }
 
@@ -297,7 +306,7 @@ impl HookAuth {
                 TokenAuthMethod::ClientSecretBasic,
             );
         }
-        let network = network::Network::new(settings.allow_private_network, self.0.roots.clone());
+        let network = network::Network::new(settings.allow_private_network, self.0.client);
         let manager = Arc::new(ManagedOAuth::new(
             config,
             Arc::new(network),
@@ -711,6 +720,17 @@ pub(crate) mod test_support {
             cleared: false,
             signed_in: false,
         }
+    }
+
+    /// Hook auth whose OAuth requests start from `client`, as a test that
+    /// trusts its own authorization server's certificate needs.
+    pub(crate) fn hook_auth(
+        storage: crate::credentials::CredentialStorage,
+        registration: &serde_json::Value,
+        sources: &std::collections::BTreeMap<String, String>,
+        client: fn() -> reqwest::ClientBuilder,
+    ) -> super::HookAuth {
+        super::HookAuth::with_client(storage, registration, sources, client)
     }
 
     /// Shows `hint` as a turn start would.
