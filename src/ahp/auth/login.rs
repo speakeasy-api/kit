@@ -38,12 +38,12 @@ impl AuthHint {
     pub(crate) fn meta(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::from_iter([(
             HOOK_AUTH_META.to_owned(),
-            serde_json::json!({
-                "backend": self.backend,
-                "url": self.url,
-                "expiresAt": self.expires_at_ms,
-                "cleared": self.cleared,
-            }),
+            serde_json::Value::Object(serde_json::Map::from_iter([
+                ("backend".into(), self.backend.clone().into()),
+                ("url".into(), self.url.clone().into()),
+                ("expiresAt".into(), self.expires_at_ms.into()),
+                ("cleared".into(), self.cleared.into()),
+            ])),
         )])
     }
 
