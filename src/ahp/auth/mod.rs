@@ -374,7 +374,28 @@ impl HookAuth {
                     login::registry().needs_login(scope, context, error.required_scopes());
                 }
             }
+            Err(error) => self.explain_ceiling(context, error),
             _ => {}
+        }
+    }
+
+    /// A backend that requires scopes outside its allowed set is denied, not
+    /// signed in again; the user is told which scopes and where to allow them.
+    fn explain_ceiling(&self, context: &AuthContext, error: &HookError) {
+        if error.auth_code() != Some(AuthErrorCode::AccessDenied)
+            || error.required_scopes().is_empty()
+        {
+            return;
+        }
+        if let Some(backend) = self.0.backends.get(&context.backend_id) {
+            login::registry().problem(
+                &backend.scope,
+                &backend.id,
+                format!(
+                    "access_denied. The backend requires scopes ({}) outside the ones Kit allows for it. Review oauth.scopes in hooks.json.",
+                    error.required_scopes().join(" ")
+                ),
+            );
         }
     }
 
@@ -859,11 +880,14 @@ impl AuthProvider for Provider {
                 Ok(manager) => manager.challenge(context, challenge).await,
                 Err(error) => Err(error),
             };
-            if let Err(error) = &result
-                && needs_login(error)
-                && let Some(scope) = self.0.scope(&observed)
-            {
-                login::registry().needs_login(scope, &observed, error.required_scopes());
+            if let Err(error) = &result {
+                if needs_login(error) {
+                    if let Some(scope) = self.0.scope(&observed) {
+                        login::registry().needs_login(scope, &observed, error.required_scopes());
+                    }
+                } else {
+                    self.0.explain_ceiling(&observed, error);
+                }
             }
             result
         })

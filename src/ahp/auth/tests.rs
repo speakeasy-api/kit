@@ -1512,3 +1512,38 @@ fn a_replayed_link_reaches_a_new_subscriber_before_its_completion() {
         "the completion overtook the replayed link"
     );
 }
+
+#[tokio::test]
+async fn a_scope_outside_the_allowed_set_is_explained_not_signed_in() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let mut backend = issuer.backend("test.ceiling", port);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    let target = context(&auth, "test.ceiling");
+    sign_in(&auth, "test.ceiling", port).await;
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The backend asks for a scope Kit does not allow it.
+    let challenge = agenthooksprotocol::adapters::registered::AuthChallenge {
+        status: 403,
+        headers: BTreeMap::from([(
+            "WWW-Authenticate".to_owned(),
+            r#"Bearer error="insufficient_scope", scope="hooks:admin""#.to_owned(),
+        )]),
+        attempt_id: None,
+    };
+    let error = Provider(auth.clone())
+        .challenge(target, challenge)
+        .await
+        .unwrap_err();
+    assert_eq!(error.auth_code(), Some(AuthErrorCode::AccessDenied));
+    let hint = next_hint(&mut hints).await;
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains("hooks:admin") && notice.contains("oauth.scopes"),
+        "{notice}"
+    );
+    assert!(!login::registry().has_needs(&auth.0.backends["test.ceiling"].scope));
+}
