@@ -3736,11 +3736,11 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
 }
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    // Leave ordinary text to the terminal so its layout and Caps Lock apply.
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         // Let crossterm decode layout-aware shifted characters rather than
         // inserting the base character from an encoded Shift key event.
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
 }
 
 fn enable_tui_modes() {
@@ -7607,10 +7607,10 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_protocol_reports_command_modified_printable_keys() {
+    fn keyboard_protocol_disambiguates_shortcuts_without_encoding_text() {
         let flags = keyboard_enhancement_flags();
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 
     #[test]

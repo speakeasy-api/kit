@@ -44,8 +44,8 @@ fn read_into_composer() {
         "model".into(),
         "a2a".into(),
     );
-    // Shift+A, Shift+1 and Shift+/, all decoded from terminal bytes.
-    for index in 0..3 {
+    let expected = "A!?Bb";
+    for (index, _) in expected.chars().enumerate() {
         assert!(
             event::poll(Duration::from_secs(3)).unwrap(),
             "missing key {index}"
@@ -56,7 +56,12 @@ fn read_into_composer() {
         let action = app.handle_key(key);
         assert!(matches!(action, Action::None));
     }
-    assert_eq!(app.editor.text(), "A!?", "negotiated shifted text was lost");
+    assert_eq!(app.editor.text(), expected);
+    assert!(event::poll(Duration::from_secs(3)).unwrap());
+    let Event::Key(shortcut) = event::read().unwrap() else {
+        panic!("expected Command+V");
+    };
+    assert!(super::clipboard_paste_key(shortcut));
     crossterm::terminal::disable_raw_mode().unwrap();
 }
 
@@ -149,15 +154,19 @@ fn negotiated_shifted_characters_reach_composer() {
             && let Some((flags, _)) = push.split_once('u')
         {
             let flags: u8 = flags.parse().expect("keyboard protocol push flags");
-            // Kitty's wire bit 4 requests alternate (layout-shifted)
-            // codepoints. Model both outcomes rather than asserting the
-            // bit: without it the actual decoder/composer loses case.
-            let keys: &[u8] = if flags & 4 != 0 {
-                b"\x1b[97:65;2u\x1b[49:33;2u\x1b[47:63;2u"
+            // Shift+A/1/slash, then b and Shift+b with Caps Lock on. A
+            // terminal sends composed text unless wire bit 8 forces CSI-u.
+            let keys: &[u8] = if flags & 8 == 0 {
+                b"A!?Bb"
+            } else if flags & 4 != 0 {
+                b"\x1b[97:65;2u\x1b[49:33;2u\x1b[47:63;2u\x1b[98;65u\x1b[98:66;66u"
             } else {
-                b"\x1b[97;2u\x1b[49;2u\x1b[47;2u"
+                b"\x1b[97;2u\x1b[49;2u\x1b[47;2u\x1b[98;65u\x1b[98;66u"
             };
             master.write_all(keys).unwrap();
+            // Disambiguation still encodes non-text shortcuts like Super+V.
+            let shortcut: &[u8] = if flags & 1 != 0 { b"\x1b[118;9u" } else { b"v" };
+            master.write_all(shortcut).unwrap();
             sent_keys = true;
         }
         if let Some(status) = child.0.try_wait().unwrap() {
