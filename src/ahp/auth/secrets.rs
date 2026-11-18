@@ -80,21 +80,49 @@ pub(crate) fn references() -> std::collections::BTreeMap<String, String> {
     let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
         return Default::default();
     };
-    let path = std::path::PathBuf::from(home).join(".kit/ahp-secrets.json");
-    let Ok(bytes) = crate::config_files::read(&path) else {
-        return Default::default();
+    references_in(&std::path::PathBuf::from(home).join(".kit/ahp-secrets.json"))
+}
+
+/// Reads the secrets file at `path` through one handle: its permissions are
+/// checked on the file that supplies the bytes, and a file whose
+/// permissions cannot be checked is refused.
+fn references_in(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    use std::io::Read as _;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Default::default(),
+        Err(error) => {
+            eprintln!("kit: ignoring {}: {error}", path.display());
+            return Default::default();
+        }
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.permissions().mode() & 0o077 != 0)
-        {
+    let metadata = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
             eprintln!(
-                "kit: ignoring {}: it is readable by other users; chmod 600 it",
+                "kit: ignoring {}: not a readable regular file",
                 path.display()
             );
             return Default::default();
         }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let owner = unsafe { libc::geteuid() };
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != owner {
+            eprintln!(
+                "kit: ignoring {}: it must be yours and readable only by you; chmod 600 it",
+                path.display()
+            );
+            return Default::default();
+        }
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        eprintln!("kit: ignoring {}: could not read it", path.display());
+        return Default::default();
     }
     #[derive(serde::Deserialize)]
     struct File {
@@ -111,5 +139,31 @@ pub(crate) fn references() -> std::collections::BTreeMap<String, String> {
             );
             Default::default()
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::references_in;
+
+    #[test]
+    fn the_secrets_file_must_be_private() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ahp-secrets.json");
+        std::fs::write(&path, r#"{"version": 1, "secrets": {"ref": "value"}}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(references_in(&path).is_empty());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(references_in(&path)["ref"], "value");
+        // Not a file: refused rather than read through another lookup.
+        assert!(references_in(directory.path()).is_empty());
+        assert!(references_in(&directory.path().join("missing.json")).is_empty());
     }
 }
