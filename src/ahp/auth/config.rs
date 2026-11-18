@@ -13,7 +13,8 @@
 //!   "registration": true,
 //!   "redirectPort": 50000,
 //!   "loginLifetimeMinutes": 10,
-//!   "allowPrivateNetwork": false
+//!   "allowPrivateNetwork": false,
+//!   "trustAdvertisedIssuer": false
 //! }
 //! ```
 use std::time::Duration;
@@ -49,6 +50,8 @@ pub(super) struct Settings {
     pub login_lifetime: Duration,
     /// Allow the authorization server on loopback or private addresses.
     pub allow_private_network: bool,
+    /// Trust the issuer the backend advertises when none is configured.
+    pub trust_advertised_issuer: bool,
     /// An `oauth` object was given: the user expects OAuth here.
     pub configured: bool,
 }
@@ -92,6 +95,7 @@ impl Settings {
             redirect_port: default_port(id),
             login_lifetime: MAX_LIFETIME,
             allow_private_network: false,
+            trust_advertised_issuer: false,
             configured: backend["oauth"].is_object(),
         };
         let raw = &backend["oauth"];
@@ -181,10 +185,18 @@ impl Settings {
                 None => ignore("loginLifetimeMinutes", "is not more than 0 and at most 10"),
             }
         }
-        if let Some(allow) = given("allowPrivateNetwork") {
-            match allow.as_bool() {
-                Some(allow) => settings.allow_private_network = allow,
-                None => ignore("allowPrivateNetwork", "is not a boolean"),
+        for (name, slot) in [
+            ("allowPrivateNetwork", &mut settings.allow_private_network),
+            (
+                "trustAdvertisedIssuer",
+                &mut settings.trust_advertised_issuer,
+            ),
+        ] {
+            if let Some(value) = given(name) {
+                match value.as_bool() {
+                    Some(value) => *slot = value,
+                    None => ignore(name, "is not a boolean"),
+                }
             }
         }
         (settings, problems)

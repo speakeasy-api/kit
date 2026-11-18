@@ -115,7 +115,9 @@ A registration `authentication` preset fixes the resource, issuer and client:
 ```
 
 Without a preset, Kit learns the authorization server from the backend's
-protected resource metadata after the backend rejects an anonymous request.
+protected resource metadata after the backend rejects an anonymous request,
+and uses it only if `oauth.issuer` names it or `oauth.trustAdvertisedIssuer`
+is `true`.
 Put further settings in an `oauth` object on the backend, beside its
 `authentication`. Other AHP harness adapters read the same object, and AHP
 receivers ignore it. All settings are optional, and they take precedence over
@@ -131,7 +133,8 @@ the preset:
 
 | Setting | Meaning |
 | --- | --- |
-| `issuer` | The authorization server trusted for this backend. Without it, Kit trusts the one the backend advertises, except for confidential clients, which require it. |
+| `issuer` | The authorization server trusted for this backend. A preset's `issuer` counts too. |
+| `trustAdvertisedIssuer` | Without `issuer`, trust the authorization server the backend advertises. Default `false`: Kit refuses it. Client credentials always need `issuer`. |
 | `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
 | `scopes` | Scopes to request. Kit never records a broader grant. |
 | `clientId` | A client registered for Kit in advance. It always wins. |

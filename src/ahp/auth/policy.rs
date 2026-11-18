@@ -45,12 +45,14 @@ impl OAuthPolicy for Policy {
         }
         match self.pinned_issuer(context.target) {
             Some(pinned) if pinned != metadata.issuer => return Err(denied()),
+            Some(_) => {}
             // A secret is never disclosed to an issuer the backend merely
             // advertised: confidential clients need a configured one.
             None if context.client_secret_ref.is_some() || self.confidential(context.target) => {
                 return Err(denied());
             }
-            _ => {}
+            None if !self.settings.trust_advertised_issuer => return Err(denied()),
+            None => {}
         }
         let token = https(&metadata.token_endpoint)?;
         for endpoint in metadata
@@ -77,7 +79,11 @@ impl OAuthPolicy for Policy {
         if https(&resource.resource)?.origin() != destination.origin() {
             return Err(denied());
         }
-        if self.confidential(target) && self.pinned_issuer(target).is_none() {
+        // Without a configured issuer, the advertised one is trusted only on
+        // explicit opt-in, and never for a confidential client.
+        if self.pinned_issuer(target).is_none()
+            && (self.confidential(target) || !self.settings.trust_advertised_issuer)
+        {
             return Err(denied());
         }
         let issuer = match self.pinned_issuer(target) {

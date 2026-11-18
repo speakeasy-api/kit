@@ -555,3 +555,35 @@ fn backends_never_share_an_explicit_redirect_port() {
         assert!((30000..32768).contains(&config::default_port(id)));
     }
 }
+
+#[test]
+fn an_advertised_issuer_is_trusted_only_on_opt_in() {
+    use agenthooksprotocol::auth::managed::{OAuthPolicy as _, ResourceMetadata};
+    let target = login::event_context("test.trust", "https://hooks.example/ahp", None)
+        .target()
+        .unwrap();
+    let resource = ResourceMetadata::new(
+        "https://hooks.example/ahp".into(),
+        vec!["https://auth.example".into()],
+    );
+    let policy = |oauth: Value| policy::Policy {
+        settings: config::Settings::parse(&json!({"id": "test.trust", "oauth": oauth})).0,
+    };
+    assert!(policy(json!({})).select(&target, &resource, &[]).is_err());
+    let trusted = policy(json!({"trustAdvertisedIssuer": true}))
+        .select(&target, &resource, &[])
+        .unwrap();
+    assert_eq!(trusted.issuer, "https://auth.example");
+    // A configured issuer the backend does not advertise is refused.
+    assert!(
+        policy(json!({"issuer": "https://other.example"}))
+            .select(&target, &resource, &[])
+            .is_err()
+    );
+    // Client credentials never trust an advertised issuer.
+    assert!(
+        policy(json!({"trustAdvertisedIssuer": true, "flow": "client_credentials"}))
+            .select(&target, &resource, &[])
+            .is_err()
+    );
+}
