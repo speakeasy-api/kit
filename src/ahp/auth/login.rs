@@ -81,6 +81,11 @@ pub(super) struct Login {
     pub(super) oauth: Arc<ManagedOAuth>,
     pub(super) context: AuthContext,
     pub(super) state: String,
+    url: String,
+    expires_at: SystemTime,
+    /// Where the login is recorded for listeners in other processes.
+    pub(super) storage: crate::credentials::CredentialStorage,
+    pub(super) client: super::network::ClientBuilder,
 }
 
 impl Login {
@@ -89,17 +94,23 @@ impl Login {
         oauth: Arc<ManagedOAuth>,
         context: &AuthContext,
         pending: &PendingLogin,
+        storage: &crate::credentials::CredentialStorage,
+        client: super::network::ClientBuilder,
     ) -> Self {
         Self {
             scope: scope.to_owned(),
             oauth,
             context: context.clone(),
             state: query(pending.authorization_url(), "state").unwrap_or_default(),
+            url: pending.authorization_url().to_string(),
+            expires_at: pending.expires_at(),
+            storage: storage.clone(),
+            client,
         }
     }
 }
 
-fn query(url: &url::Url, name: &str) -> Option<String> {
+pub(super) fn query(url: &url::Url, name: &str) -> Option<String> {
     url.query_pairs()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
@@ -387,14 +398,40 @@ impl Registry {
         live
     }
 
-    /// `login` completed: its scope is signed in.
+    /// `login` completed. The scope's other targets (an upload on another
+    /// resource, say) keep their logins, and the hint moves on to the next.
     fn completed(&self, login: &Login) {
-        {
+        let next = {
             let mut state = self.lock();
-            state.needs.remove(&login.scope);
-            state.pending.remove(&login.scope);
-        }
-        self.publish(cleared(&login.scope, &login.context.backend_id, true));
+            if let Some(needs) = state.needs.get_mut(&login.scope) {
+                needs.retain(|need| !same_target(&need.context, &login.context));
+                if needs.is_empty() {
+                    state.needs.remove(&login.scope);
+                }
+            }
+            let remaining = state.pending.get_mut(&login.scope).and_then(|pending| {
+                pending.logins.retain(|other| other.state != login.state);
+                let next = pending.logins.first()?.clone();
+                pending.url = next.url.clone();
+                pending.expires_at = next.expires_at;
+                Some(next)
+            });
+            if remaining.is_none() {
+                state.pending.remove(&login.scope);
+            }
+            remaining
+        };
+        self.publish(match next {
+            Some(next) => AuthHint {
+                scope: next.scope.clone(),
+                backend: next.context.backend_id.clone(),
+                url: Some(next.url.clone()),
+                expires_at_ms: Some(unix_ms(next.expires_at)),
+                cleared: false,
+                signed_in: false,
+            },
+            None => cleared(&login.scope, &login.context.backend_id, true),
+        });
     }
 
     fn stopped(&self, port: u16) {
@@ -439,7 +476,7 @@ const PROBE: &str = "/kit-hook-sign-in";
 const PROBE_REPLY: &str = "kit hook sign-in";
 
 /// Whether a Kit sign-in listener holds `port`.
-async fn kit_listens(port: u16) -> bool {
+pub(super) async fn kit_listens(port: u16) -> bool {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let probe = async {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -460,6 +497,20 @@ async fn kit_listens(port: u16) -> bool {
         .unwrap_or(false)
 }
 
+/// [`kit_listens`], retried: a listener answers probes even while it
+/// exchanges a code, but a starting one may not accept yet.
+async fn kit_listens_retrying(port: u16) -> bool {
+    for attempt in 0..3 {
+        if kit_listens(port).await {
+            return true;
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    false
+}
+
 /// Binds `port`, or explains why it cannot: another Kit process waiting
 /// on the same port (which can complete the login, since the credentials
 /// are shared) or a foreign program, which the user must move out of the way.
@@ -467,7 +518,7 @@ pub(super) async fn bind(port: u16) -> Option<TcpListener> {
     match TcpListener::bind(("127.0.0.1", port)).await {
         Ok(listener) => Some(listener),
         Err(error) => {
-            if kit_listens(port).await {
+            if kit_listens_retrying(port).await {
                 tracing::debug!(port, "another Kit process receives hook sign-in callbacks");
             } else {
                 tracing::warn!(port, %error, "hook sign-in callback port is in use");
@@ -496,8 +547,11 @@ pub(super) async fn listen(port: u16) {
 }
 
 /// Completes pending logins from callbacks on `listener`, routed by
-/// `state`. `logins` reports the candidates and their latest expiry; serving
-/// stops when it reports none or they expire.
+/// `state`: this process's own logins in `logins`, else one another Kit
+/// process recorded in the shared store. `logins` also reports the latest
+/// expiry; serving stops when it reports none or they expire. Each
+/// exchange runs on its own task, so probes and other callbacks are
+/// answered meanwhile.
 pub(super) async fn serve(
     listener: &TcpListener,
     port: u16,
@@ -505,6 +559,7 @@ pub(super) async fn serve(
     mut completed: impl FnMut(&Login),
 ) {
     use tokio::io::AsyncWriteExt as _;
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Login>();
     loop {
         let Some((candidates, expires_at)) = logins().filter(|(logins, _)| !logins.is_empty())
         else {
@@ -518,10 +573,18 @@ pub(super) async fn serve(
         }
         // Wake periodically: a later prepare may add a login or extend one.
         let wait = remaining.min(Duration::from_secs(5));
-        let Ok(accepted) = tokio::time::timeout(wait, listener.accept()).await else {
-            continue;
+        let finished = std::pin::pin!(done_rx.recv());
+        let accept = std::pin::pin!(tokio::time::timeout(wait, listener.accept()));
+        let accepted = match futures_util::future::select(finished, accept).await {
+            futures_util::future::Either::Left((Some(login), _)) => {
+                completed(&login);
+                continue;
+            }
+            // The loop keeps a sender, so the channel never closes.
+            futures_util::future::Either::Left((None, _)) => continue,
+            futures_util::future::Either::Right((accepted, _)) => accepted,
         };
-        let Ok((mut stream, _)) = accepted else {
+        let Ok(Ok((mut stream, _))) = accepted else {
             continue;
         };
         let target = match tokio::time::timeout(Duration::from_secs(5), request_target(&mut stream))
@@ -556,28 +619,49 @@ pub(super) async fn serve(
             continue;
         };
         let state = query(&callback, "state").unwrap_or_default();
-        let mut done = None;
+        let storage = candidates
+            .first()
+            .map(|login| (login.storage.clone(), login.client));
         // Only the login the callback names; any other is never touched.
-        for login in candidates.into_iter().filter(|login| login.state == state) {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let context = AuthContext {
-                deadline,
-                ..login.context.clone()
-            };
-            if login
-                .oauth
-                .complete(context, callback.clone(), OperationBudget::until(deadline))
-                .await
-                .is_ok()
-            {
-                done = Some(login);
-                break;
+        // Logins offered while this callback was awaited count too.
+        let candidates = logins().map_or(candidates, |(current, _)| current);
+        let matching: Vec<_> = candidates
+            .into_iter()
+            .filter(|login| login.state == state)
+            .collect();
+        let done_tx = done_tx.clone();
+        tokio::spawn(async move {
+            let own = !matching.is_empty();
+            let mut done = None;
+            for login in matching {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let context = AuthContext {
+                    deadline,
+                    ..login.context.clone()
+                };
+                if login
+                    .oauth
+                    .complete(context, callback.clone(), OperationBudget::until(deadline))
+                    .await
+                    .is_ok()
+                {
+                    done = Some(login);
+                    break;
+                }
             }
-        }
-        respond(&mut stream, done.is_some()).await;
-        if let Some(login) = done {
-            completed(&login);
-        }
+            let ok = match (&done, storage) {
+                (Some(_), _) => true,
+                // Another Kit process's login on this shared port.
+                (None, Some((storage, client))) if !own => {
+                    super::complete_stored(&storage, client, &state, callback).await
+                }
+                _ => false,
+            };
+            respond(&mut stream, ok).await;
+            if let Some(login) = done {
+                let _ = done_tx.send(login);
+            }
+        });
     }
 }
 

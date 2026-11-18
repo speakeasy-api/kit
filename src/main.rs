@@ -510,6 +510,7 @@ impl AuthAction {
                 "provider",
                 "backend",
                 "local_only",
+                "all_workspaces",
             ]));
             let command = command
                 .arg(
@@ -526,6 +527,14 @@ impl AuthAction {
                         .action(clap::ArgAction::Set)
                         .help("Hook backend id, for `hooks`"),
                 );
+            let command = command.arg(
+                clap::Arg::new("all_workspaces")
+                    .long("all-workspaces")
+                    .value_name("ALL_WORKSPACES")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("For `hooks`: sign out of the backend in every workspace, including moved ones"),
+            );
             command.arg(
                 clap::Arg::new("local_only")
                     .long("local-only")
@@ -551,6 +560,7 @@ impl AuthAction {
                 provider: required_arg(matches, "provider")?,
                 backend: optional_arg(matches, "backend")?,
                 local_only: required_arg(matches, "local_only")?,
+                all_workspaces: required_arg(matches, "all_workspaces")?,
             }),
             _ => Err(clap::Error::raw(
                 clap::error::ErrorKind::InvalidSubcommand,
@@ -1771,6 +1781,8 @@ enum AuthAction {
         backend: Option<String>,
         /// Remove local credentials without attempting remote revocation.
         local_only: bool,
+        /// For `hooks`: every workspace, including ones whose hooks file moved.
+        all_workspaces: bool,
     },
 }
 
@@ -2089,7 +2101,20 @@ async fn execute_auth(
             provider,
             backend,
             local_only,
+            all_workspaces,
         } => match provider {
+            AuthProvider::Hooks if *all_workspaces => {
+                let backend = backend.as_deref().ok_or_else(|| {
+                    io::Error::other(
+                        "name the hook backend to sign out of: kit auth logout hooks <backend>",
+                    )
+                })?;
+                let removed = kit::hook_auth::logout_all_workspaces(&storage, backend)
+                    .await
+                    .map_err(io::Error::other)?;
+                println!("Signed out of hook backend `{backend}` in {removed} workspace(s).");
+                return Ok(());
+            }
             AuthProvider::Hooks => {
                 let backend = backend.as_deref().ok_or_else(|| {
                     io::Error::other(

@@ -147,16 +147,23 @@ impl CredentialStorage {
         deadline: Instant,
     ) -> Result<CredentialEntryLock, CredentialStoreError> {
         let entry = self.entry(namespace, identity);
+        // One in-process lock per entry of this storage: the same entry key
+        // in another credential directory is another entry.
+        let local_key = match self {
+            Self::Memory => format!("memory\0{}", entry.key),
+            Self::Keychain => format!("keychain\0{}", entry.key),
+            Self::Filesystem(directory) => format!("{}\0{}", directory.display(), entry.key),
+        };
         let local = {
             let mut locks = ENTRY_LOCKS
                 .lock()
                 .map_err(|_| error("credential entry lock registry is poisoned"))?;
             locks.retain(|_, lock| lock.strong_count() != 0);
-            match locks.get(&entry.key).and_then(Weak::upgrade) {
+            match locks.get(&local_key).and_then(Weak::upgrade) {
                 Some(lock) => lock,
                 None => {
                     let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(entry.key.clone(), Arc::downgrade(&lock));
+                    locks.insert(local_key, Arc::downgrade(&lock));
                     lock
                 }
             }

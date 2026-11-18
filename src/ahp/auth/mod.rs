@@ -48,6 +48,8 @@ struct Backend {
     /// The backend id within the hooks file that declares it: the key of
     /// its grant, its stored records and its hints.
     scope: String,
+    /// That hooks file.
+    source: String,
     /// The HTTP transport URL; stdio backends never authenticate.
     url: Option<String>,
     preset: Option<Value>,
@@ -63,6 +65,7 @@ impl Backend {
         let id = value["id"].as_str().unwrap_or_default().to_owned();
         let backend = Self {
             scope: format!("{source}#{id}"),
+            source: source.to_owned(),
             id,
             url: (transport["type"] == "http")
                 .then(|| transport["url"].as_str().map(str::to_owned))
@@ -433,8 +436,15 @@ impl HookAuth {
                     .get(&context.backend_id)
                     .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?;
                 let port = backend.settings.redirect_port;
-                let login =
-                    login::Login::new(&backend.scope, Arc::clone(&manager), &context, &pending);
+                let login = login::Login::new(
+                    &backend.scope,
+                    Arc::clone(&manager),
+                    &context,
+                    &pending,
+                    &self.0.storage,
+                    self.0.client,
+                );
+                self.record_pending(backend, &login).await;
                 if login::registry().offer(login, &pending, port) {
                     tokio::spawn(login::listen(port));
                 }
@@ -526,12 +536,21 @@ impl HookAuth {
                 }
                 Err(error) => return Err(format!("{}: {}", backend.id, describe(&error))),
             };
-            present(&backend.id, pending.authorization_url());
             let expires_at = pending.expires_at();
-            let candidate =
-                login::Login::new(&backend.scope, Arc::clone(&manager), &context, &pending);
+            let candidate = login::Login::new(
+                &backend.scope,
+                Arc::clone(&manager),
+                &context,
+                &pending,
+                &self.0.storage,
+                self.0.client,
+            );
+            self.record_pending(backend, &candidate).await;
             let port = backend.settings.redirect_port;
-            let completed = match login::bind(port).await {
+            // Listen before showing the link, so an immediate approval lands.
+            let listener = login::bind(port).await;
+            present(&backend.id, pending.authorization_url());
+            let completed = match listener {
                 Some(listener) => {
                     let done = std::cell::Cell::new(false);
                     login::serve(
@@ -564,6 +583,41 @@ impl HookAuth {
         Ok(signed_in)
     }
 
+    /// Records `login` by its `state` for a listener in another Kit process
+    /// that shares this backend's callback port.
+    async fn record_pending(&self, backend: &Backend, login: &login::Login) {
+        let record = Value::Object(serde_json::Map::from_iter([
+            ("source".into(), backend.source.clone().into()),
+            ("backend".into(), backend.id.clone().into()),
+            (
+                "destination".into(),
+                login.context.destination.clone().into(),
+            ),
+            (
+                "upload".into(),
+                (login.context.purpose
+                    == agenthooksprotocol::adapters::registered::AuthPurpose::Upload)
+                    .into(),
+            ),
+            (
+                "authentication".into(),
+                login.context.authentication.clone().unwrap_or(Value::Null),
+            ),
+        ]));
+        let store = store::Store::new(self.0.storage.clone(), &backend.scope);
+        if store
+            .remember(store::PENDING, &login.state, budget())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let entry = self.0.storage.entry(store::PENDING, &login.state);
+        if let Ok(bytes) = serde_json::to_vec(&record) {
+            let _ = tokio::task::spawn_blocking(move || entry.save(&bytes)).await;
+        }
+    }
+
     /// Forgets `backend`'s tokens, pending login and registered client, and
     /// nothing of any other backend.
     pub(crate) async fn logout(&self, backend: &str) -> Result<bool, String> {
@@ -587,6 +641,85 @@ fn describe(error: &HookError) -> String {
         Some(code) => format!("failing ({})", code.as_str()),
         None => "failing".into(),
     }
+}
+
+/// Completes a pending login another Kit process recorded under `state`,
+/// as that process would: from its hooks file and the shared store.
+pub(super) async fn complete_stored(
+    storage: &CredentialStorage,
+    client: network::ClientBuilder,
+    state: &str,
+    callback: url::Url,
+) -> bool {
+    let entry = storage.entry(store::PENDING, state);
+    let Ok(Ok(Some(bytes))) = tokio::task::spawn_blocking(move || entry.load()).await else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let (Some(source), Some(id), Some(destination)) = (
+        record["source"].as_str(),
+        record["backend"].as_str(),
+        record["destination"].as_str(),
+    ) else {
+        return false;
+    };
+    let Ok(Some(registration)) = super::read(std::path::Path::new(source)) else {
+        return false;
+    };
+    let Ok(registration) = serde_json::to_value(registration) else {
+        return false;
+    };
+    let sources = BTreeMap::from([(id.to_owned(), source.to_owned())]);
+    let auth = HookAuth::with_client(storage.clone(), &registration, &sources, client);
+    let context = AuthContext {
+        backend_id: id.to_owned(),
+        authentication: Some(record["authentication"].clone()).filter(|value| !value.is_null()),
+        destination: destination.to_owned(),
+        purpose: if record["upload"] == true {
+            agenthooksprotocol::adapters::registered::AuthPurpose::Upload
+        } else {
+            agenthooksprotocol::adapters::registered::AuthPurpose::Event
+        },
+        deadline: Instant::now() + OPERATION,
+    };
+    let Ok(manager) = auth.manager(&context) else {
+        return false;
+    };
+    // The SDK validates state, redirect and issuer before claiming the
+    // stored login, so a mismatched record cannot consume it.
+    let completed = manager.complete(context, callback, budget()).await.is_ok();
+    if completed {
+        let entry = storage.entry(store::PENDING, state);
+        let _ = tokio::task::spawn_blocking(move || entry.delete()).await;
+    }
+    completed
+}
+
+/// Removes `backend`'s state in every workspace, including workspaces whose
+/// hooks file has since moved. Returns how many workspaces had state.
+pub(crate) async fn logout_everywhere(
+    storage: &CredentialStorage,
+    backend: &str,
+) -> Result<usize, String> {
+    let scopes = store::scopes(storage)
+        .await
+        .map_err(|error| describe(&error))?;
+    let suffix = format!("#{backend}");
+    let mut removed = 0;
+    for scope in scopes.iter().filter(|scope| scope.ends_with(&suffix)) {
+        if store::Store::new(storage.clone(), scope)
+            .forget(budget())
+            .await
+            .map_err(|error| describe(&error))?
+            > 0
+        {
+            removed += 1;
+        }
+        login::registry().reset(scope, backend);
+    }
+    Ok(removed)
 }
 
 /// A delivery to `backend` failed for want of a login.
@@ -696,6 +829,15 @@ pub mod cli {
         backend: &str,
     ) -> Result<bool, String> {
         auth(root, storage)?.logout(backend).await
+    }
+
+    /// Signs out of `backend` in every workspace, including ones whose hooks
+    /// file moved. Returns how many workspaces had stored state.
+    pub async fn logout_all_workspaces(
+        storage: &CredentialStorage,
+        backend: &str,
+    ) -> Result<usize, String> {
+        super::logout_everywhere(storage, backend).await
     }
 }
 

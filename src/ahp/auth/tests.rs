@@ -33,6 +33,10 @@ const KEY: &[u8] = include_bytes!("../../../fixtures/workload-auth/server-key.de
 struct Issuer {
     origin: String,
     exchanges: Arc<AtomicUsize>,
+    /// Holds each token response this long.
+    delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Token requests received, answered or not.
+    received: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -89,13 +93,19 @@ impl Issuer {
             listener.local_addr().unwrap().port()
         );
         let exchanges = Arc::new(AtomicUsize::new(0));
+        let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (served_origin, counter) = (origin.clone(), Arc::clone(&exchanges));
+        let served_delay = Arc::clone(&delay_ms);
+        let received = Arc::new(AtomicUsize::new(0));
+        let served_received = Arc::clone(&received);
         let task = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let acceptor = acceptor.clone();
                 let origin = served_origin.clone();
                 let counter = Arc::clone(&counter);
+                let delay = Duration::from_millis(served_delay.load(Ordering::SeqCst));
+                let received = Arc::clone(&served_received);
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(socket).await else {
                         return;
@@ -116,7 +126,11 @@ impl Issuer {
                             "code_challenge_methods_supported": ["S256"],
                             "token_endpoint_auth_methods_supported": ["none"],
                         })
-                    } else if path == "/token" && verified(&request_body) {
+                    } else if path == "/token" && {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        verified(&request_body)
+                    } {
                         let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
                         json!({"access_token": format!("token-{n}"), "token_type": "Bearer",
                             "expires_in": 3600, "refresh_token": format!("refresh-{n}")})
@@ -145,6 +159,8 @@ impl Issuer {
         Self {
             origin,
             exchanges,
+            delay_ms,
+            received,
             task,
         }
     }
@@ -701,4 +717,195 @@ async fn a_callback_the_server_rejects_completes_nothing() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn finishing_one_target_keeps_the_others_link() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.two-targets", port)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The event endpoint, and an upload endpoint on another resource.
+    let event = context(&auth, "test.two-targets");
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/uploads", issuer.origin)}));
+    for target in [&event, &upload] {
+        assert!(credential(&auth, target.clone()).await.is_err());
+    }
+    auth.turn_started();
+    let mut shown = next_hint(&mut hints).await;
+    while let Ok(hint) = tokio::time::timeout(Duration::from_millis(500), hints.recv()).await {
+        shown = hint.unwrap();
+    }
+    let first = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
+    assert!(approve(&first, port).await);
+    // The other target's link is shown next, not cleared.
+    let next = next_hint(&mut hints).await;
+    assert!(!next.cleared, "{next:?}");
+    let second = url::Url::parse(next.url.as_deref().unwrap()).unwrap();
+    assert_ne!(first, second);
+    assert!(approve(&second, port).await);
+    assert!(next_hint(&mut hints).await.signed_in);
+    assert!(credential(&auth, event).await.unwrap().is_some());
+    assert!(credential(&auth, upload).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn logout_all_workspaces_finds_grants_of_a_moved_project() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let old = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.moved", port)],
+        "/old/hooks.json",
+    );
+    sign_in(&old, "test.moved", port).await;
+    // The project moved: its new hooks file has no state, and plain logout
+    // finds nothing.
+    let moved = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.moved", port)],
+        "/new/hooks.json",
+    );
+    assert!(!moved.logout("test.moved").await.unwrap());
+    let backend = CredentialStorage::Filesystem(storage.path().to_path_buf());
+    assert_eq!(
+        super::logout_everywhere(&backend, "test.moved")
+            .await
+            .unwrap(),
+        1
+    );
+    // Nothing is left anywhere.
+    assert_eq!(
+        super::logout_everywhere(&backend, "test.moved")
+            .await
+            .unwrap(),
+        0
+    );
+    let status: BTreeMap<_, _> = old.status().await.into_iter().collect();
+    assert_eq!(status["test.moved"], "needs-login");
+}
+
+#[tokio::test]
+async fn a_shared_port_completes_another_processs_stored_login() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    // This process listens for its own backend on the port.
+    let listening = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.listener", port)],
+        "/a/hooks.json",
+    );
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = listening.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&listening, context(&listening, "test.listener")).await;
+    listening.turn_started();
+    let _ = next_hint(&mut hints).await;
+    // Another process's backend, declared in a real hooks file, prepared a
+    // login on the same port; only the shared store knows it.
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("hooks.json");
+    let backend = issuer.backend("test.elsewhere", port);
+    std::fs::write(
+        &file,
+        json!({"protocolVersion": "draft", "hooks": [backend]}).to_string(),
+    )
+    .unwrap();
+    let other = hook_auth_in(&storage, vec![backend], file.to_str().unwrap());
+    let target = context(&other, "test.elsewhere");
+    let manager = other.manager(&target).unwrap();
+    let Preparation::InteractionRequired(pending) = manager
+        .prepare(with_deadline(&target), budget())
+        .await
+        .unwrap()
+    else {
+        panic!("a login is needed");
+    };
+    let entry = &other.0.backends["test.elsewhere"];
+    let login = login::Login::new(
+        &entry.scope,
+        manager,
+        &target,
+        &pending,
+        &other.0.storage,
+        trusting_client,
+    );
+    other.record_pending(entry, &login).await;
+    assert!(approve(pending.authorization_url(), port).await);
+    assert!(credential(&other, target).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_listener_answers_probes_during_a_slow_exchange() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.slow", port)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.slow")).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    issuer.delay_ms.store(3000, Ordering::SeqCst);
+    let browser = tokio::spawn(async move { approve(&url, port).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    assert!(
+        super::login::kit_listens(port).await,
+        "the listener is Kit's"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(browser.await.unwrap());
+}
+
+#[tokio::test]
+async fn an_exchange_whose_request_was_sent_commits_after_the_caller_leaves() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // No listener: the test completes the login itself.
+    let port = free_port().await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.written", port)]);
+    let target = context(&auth, "test.written");
+    let manager = auth.manager(&target).unwrap();
+    let Preparation::InteractionRequired(pending) = manager
+        .prepare(with_deadline(&target), budget())
+        .await
+        .unwrap()
+    else {
+        panic!("a login is needed");
+    };
+    let url = pending.authorization_url();
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert("written-code".into(), query(url, "code_challenge"));
+    let callback = url::Url::parse(&format!(
+        "http://127.0.0.1:{port}/callback?code=written-code&state={}",
+        query(url, "state")
+    ))
+    .unwrap();
+    issuer.delay_ms.store(1000, Ordering::SeqCst);
+    // The caller gives up once the server has the request but before it
+    // answers. The request was marked written once connected, so the SDK
+    // still commits the response.
+    let exchange = manager.complete(with_deadline(&target), callback, budget());
+    let request_arrived = async {
+        while issuer.received.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        _ = exchange => panic!("the response was held back"),
+        () = request_arrived => {}
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(issuer.exchanges(), 1);
+    assert!(credential(&auth, target).await.unwrap().is_some());
 }

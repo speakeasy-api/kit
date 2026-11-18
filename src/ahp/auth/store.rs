@@ -18,6 +18,11 @@ pub(super) const SECRETS: &str = "ahp-oauth-secret";
 /// Per backend, every record and secret Kit wrote for it, so that logging out
 /// of one backend removes exactly its own state.
 const INDEX: &str = "ahp-oauth-index";
+/// Every scope with an index, so a backend's state can be found after its
+/// hooks file moved (a renamed or re-cloned project).
+const SCOPES: (&str, &str) = ("ahp-oauth-scopes", "all");
+/// Pending logins by `state`, for a listener in another Kit process.
+pub(super) const PENDING: &str = "ahp-oauth-pending";
 
 fn unavailable() -> HookError {
     HookError::authentication(AuthErrorCode::ProviderFailed)
@@ -88,23 +93,48 @@ impl Store {
     ) -> Result<(), HookError> {
         let _lock = self.lock(INDEX, &self.backend, budget).await?;
         let mut index = self.index().await?;
+        let first = index.is_empty();
         if index.insert((namespace.to_owned(), identity.to_owned())) {
+            if first {
+                self.list_scope(true, budget).await?;
+            }
             self.save_index(&index).await?;
         }
         Ok(())
     }
 
-    /// Deletes every record and secret this backend wrote. Records are
+    /// Adds this scope to, or removes it from, the list of all scopes.
+    async fn list_scope(&self, present: bool, budget: OperationBudget) -> Result<(), HookError> {
+        let _lock = self.lock(SCOPES.0, SCOPES.1, budget).await?;
+        let mut scopes = scopes(&self.storage).await?;
+        let changed = if present {
+            scopes.insert(self.backend.clone())
+        } else {
+            scopes.remove(&self.backend)
+        };
+        if changed {
+            let entry = self.storage.entry(SCOPES.0, SCOPES.1);
+            let bytes = serde_json::to_vec(&scopes).map_err(|_| unavailable())?;
+            blocking(move || entry.save(&bytes)).await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every record and secret this backend wrote, returning how
+    /// many existed. Records are
     /// deleted under their own locks, so a concurrent writer finishes first.
     pub(super) async fn forget(&self, budget: OperationBudget) -> Result<usize, HookError> {
         let index = {
             let _lock = self.lock(INDEX, &self.backend, budget).await?;
             self.index().await?
         };
+        let mut deleted = 0;
         for (namespace, identity) in &index {
             let _lock = self.lock(namespace, identity, budget).await?;
             let entry = self.storage.entry(namespace, identity);
-            blocking(move || entry.delete()).await?;
+            if blocking(move || entry.delete()).await? {
+                deleted += 1;
+            }
         }
         let _lock = self.lock(INDEX, &self.backend, budget).await?;
         let mut current = self.index().await?;
@@ -112,15 +142,25 @@ impl Store {
         if current.is_empty() {
             let entry = self.storage.entry(INDEX, &self.backend);
             blocking(move || entry.delete()).await?;
+            self.list_scope(false, budget).await?;
         } else {
             self.save_index(&current).await?;
         }
-        Ok(index.len())
+        Ok(deleted)
     }
 
     pub(super) fn storage(&self) -> &CredentialStorage {
         &self.storage
     }
+}
+
+/// Every scope that has stored records.
+pub(super) async fn scopes(storage: &CredentialStorage) -> Result<BTreeSet<String>, HookError> {
+    let entry = storage.entry(SCOPES.0, SCOPES.1);
+    let bytes = blocking(move || entry.load()).await?;
+    Ok(bytes
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default())
 }
 
 impl CredentialStore for Store {

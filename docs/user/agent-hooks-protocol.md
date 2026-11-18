@@ -75,7 +75,7 @@ the next turn shows a new one. Kit listens on
 `http://127.0.0.1:<port>/callback` while a sign-in is pending, so you can
 open the link at any time before it expires. The port is fixed per backend,
 so every Kit process uses the same redirect. When several Kit processes run,
-one listens and any of them can complete the sign-in, because they share the
+one listens, and it completes any process's sign-in from the shared
 credential store. Hook messages and sign-in links never enter the transcript
 that the model reads.
 
@@ -86,12 +86,19 @@ kit auth status hooks --root /path/to/project
 kit auth login hooks --root /path/to/project            # each backend that needs it
 kit auth login hooks com.example.policy --root /path/to/project
 kit auth logout hooks com.example.policy --root /path/to/project
+kit auth logout hooks com.example.policy --all-workspaces
 ```
 
 `status` prints one line per backend: `authorized`, `needs-login`, `anonymous`,
 `bearer token`, or `failing (<reason>)`. `login` prints each link and waits
 until you approve it. `logout` removes the backend's tokens, pending sign-in
-and registered client, and nothing of any other backend. ACP clients that
+and registered client, and nothing of any other backend.
+
+Sign-ins belong to a backend in the hooks file that declares it, so two
+projects with the same backend id sign in separately. Moving or re-cloning a
+project starts a new sign-in, and its old one is no longer found by `logout`
+with `--root`. `--all-workspaces` removes the backend's sign-ins in every
+workspace, including moved ones. ACP clients that
 support terminal authentication offer one `hooks` method, which runs
 `kit auth login hooks`.
 
