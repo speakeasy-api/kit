@@ -1,7 +1,7 @@
 //! Hook backend authentication through the AHP SDK's managed OAuth.
 //!
 //! Every hooks.json backend has its own OAuth state: its own grant (the grant
-//! partition is the backend id, so its event and upload endpoints share one
+//! partition is the backend's scope, so its event and upload endpoints share one
 //! consent), its own pending login and its own fixed loopback redirect.
 //! Delivery never signs in. A delivery or configuration that needs a login
 //! fails under the subscription's failure policy and is recorded; the next
@@ -45,6 +45,9 @@ const SOFTWARE_ID: &str = "dev.kit.ahp";
 #[derive(Clone)]
 struct Backend {
     id: String,
+    /// The backend id within the hooks file that declares it: the key of
+    /// its grant, its stored records and its hints.
+    scope: String,
     /// The HTTP transport URL; stdio backends never authenticate.
     url: Option<String>,
     preset: Option<Value>,
@@ -54,11 +57,13 @@ struct Backend {
 }
 
 impl Backend {
-    fn parse(value: &Value) -> (Self, Vec<String>) {
+    fn parse(value: &Value, source: &str) -> (Self, Vec<String>) {
         let (settings, problems) = config::Settings::parse(value);
         let transport = &value["transport"];
+        let id = value["id"].as_str().unwrap_or_default().to_owned();
         let backend = Self {
-            id: value["id"].as_str().unwrap_or_default().to_owned(),
+            scope: format!("{source}#{id}"),
+            id,
             url: (transport["type"] == "http")
                 .then(|| transport["url"].as_str().map(str::to_owned))
                 .flatten(),
@@ -133,15 +138,36 @@ fn needs_login(error: &HookError) -> bool {
 
 impl HookAuth {
     /// Reads every backend of the effective registration.
-    pub(crate) fn new(storage: CredentialStorage, registration: &Value) -> Self {
+    /// Reads every backend of the effective registration. `sources` names
+    /// the hooks file that declares each backend id.
+    pub(crate) fn new(
+        storage: CredentialStorage,
+        registration: &Value,
+        sources: &BTreeMap<String, String>,
+    ) -> Self {
         let mut backends = BTreeMap::new();
+        let mut ports: HashMap<u16, String> = HashMap::new();
         for value in registration["hooks"].as_array().into_iter().flatten() {
-            let (backend, problems) = Backend::parse(value);
+            let id = value["id"].as_str().unwrap_or_default();
+            let source = sources.get(id).map_or("", String::as_str);
+            let (mut backend, mut problems) = Backend::parse(value, source);
+            let explicit = value["oauth"]["redirectPort"].is_u64();
+            if explicit && let Some(other) = ports.get(&backend.settings.redirect_port) {
+                // Two backends on one explicit port: refuse the second.
+                problems.push(format!(
+                    "{}: oauth.redirectPort {} is also {other}'s; ignored",
+                    backend.id, backend.settings.redirect_port
+                ));
+                backend.settings.redirect_port = config::default_port(&backend.id);
+            }
+            if explicit || !ports.contains_key(&backend.settings.redirect_port) {
+                ports.insert(backend.settings.redirect_port, backend.id.clone());
+            }
             for problem in problems {
                 eprintln!("kit: hooks.json: {problem}");
             }
             if let Some(context) = backend.context().filter(|_| !backend.header_authorization) {
-                login::registry().register_endpoint(context);
+                login::registry().register_endpoint(&backend.scope, context);
             }
             backends.insert(backend.id.clone(), backend);
         }
@@ -199,7 +225,7 @@ impl HookAuth {
             _ => return Err(fail(AuthErrorCode::UnsupportedBinding)),
         };
         let pkce = flow == OAuthFlow::AuthorizationCodePkce;
-        let key = (backend.id.clone(), pkce, preset_client.clone());
+        let key = (backend.scope.clone(), pkce, preset_client.clone());
         let mut managers = self
             .0
             .managers
@@ -208,7 +234,7 @@ impl HookAuth {
         if let Some(manager) = managers.get(&key) {
             return Ok(Arc::clone(manager));
         }
-        let store = store::Store::new(self.0.storage.clone(), &backend.id);
+        let store = store::Store::new(self.0.storage.clone(), &backend.scope);
         let redirect = login::redirect_uri(settings.redirect_port);
         let client = settings.client_id.clone().or(preset_client);
         let mut config = match &client {
@@ -250,7 +276,7 @@ impl HookAuth {
         let scopes = policy.requested(&target);
         config = config
             .redirect_uri(redirect)
-            .grant_partition(&backend.id)
+            .grant_partition(&backend.scope)
             .login_lifetime(settings.login_lifetime)
             .scopes(scopes.clone(), scopes)
             .client_secret_storage(Arc::new(secrets::Secrets(store.clone())));
@@ -285,24 +311,42 @@ impl HookAuth {
     /// Records what an operation learned about its backend's sign-in.
     fn observe<T>(&self, context: &AuthContext, result: &Result<Option<T>, HookError>) {
         match result {
-            Ok(Some(_)) => login::registry().usable(context),
+            Ok(Some(_)) => {
+                if let Some(scope) = self.scope(context) {
+                    login::registry().usable(scope, context);
+                }
+            }
             Err(error) if needs_login(error) => {
-                login::registry().needs_login(context, error.required_scopes());
+                if let Some(scope) = self.scope(context) {
+                    login::registry().needs_login(scope, context, error.required_scopes());
+                }
             }
             _ => {}
         }
     }
 
     /// The ids of backends whose sign-in hints a session of these hooks shows.
-    pub(crate) fn backend_ids(&self) -> HashSet<String> {
-        self.0.backends.keys().cloned().collect()
+    fn scope(&self, context: &AuthContext) -> Option<&str> {
+        self.0
+            .backends
+            .get(&context.backend_id)
+            .map(|backend| backend.scope.as_str())
+    }
+
+    /// The scopes whose sign-in hints a session of these hooks shows.
+    fn scopes(&self) -> HashSet<String> {
+        self.0
+            .backends
+            .values()
+            .map(|backend| backend.scope.clone())
+            .collect()
     }
 
     pub(crate) fn subscribe(
         &self,
         sink: impl Fn(&AuthHint) + Send + Sync + 'static,
     ) -> HintSubscription {
-        login::registry().subscribe(self.backend_ids(), sink)
+        login::registry().subscribe(self.scopes(), sink)
     }
 
     /// At a turn boundary: for each backend that needs a login, prepare it
@@ -313,11 +357,11 @@ impl HookAuth {
             return;
         }
         for backend in self.0.backends.values() {
-            let known = login::registry().has_needs(&backend.id);
+            let known = login::registry().has_needs(&backend.scope);
             if !known && !backend.expects_oauth() {
                 continue;
             }
-            let Some(claim) = login::registry().begin_preparing(&backend.id) else {
+            let Some(claim) = login::registry().begin_preparing(&backend.scope) else {
                 continue;
             };
             let auth = self.clone();
@@ -330,7 +374,7 @@ impl HookAuth {
     }
 
     async fn prepare_backend(&self, backend: &Backend) {
-        let mut needs = login::registry().needs(&backend.id);
+        let mut needs = login::registry().needs(&backend.scope);
         if needs.is_empty() {
             // Not yet seen failing: a known grant needs nothing; ask the store.
             let Some(context) = backend.context() else {
@@ -340,7 +384,7 @@ impl HookAuth {
             if !matches!(&result, Err(error) if needs_login(error)) {
                 return;
             }
-            needs = login::registry().needs(&backend.id);
+            needs = login::registry().needs(&backend.scope);
         }
         for need in needs {
             match self.prepare(&need.context, &need.required).await {
@@ -368,17 +412,22 @@ impl HookAuth {
             .await?
         {
             Preparation::Ready(_) => {
-                login::registry().usable(&context);
+                if let Some(scope) = self.scope(&context) {
+                    login::registry().usable(scope, &context);
+                }
                 Ok(None)
             }
             Preparation::InteractionRequired(pending) => {
-                if login::registry().offer(Arc::clone(&manager), &context, &pending) {
-                    let port = self
-                        .0
-                        .backends
-                        .get(&context.backend_id)
-                        .map_or(0, |backend| backend.settings.redirect_port);
-                    tokio::spawn(login::listen(context.backend_id.clone(), port));
+                let backend = self
+                    .0
+                    .backends
+                    .get(&context.backend_id)
+                    .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?;
+                let port = backend.settings.redirect_port;
+                let login =
+                    login::Login::new(&backend.scope, Arc::clone(&manager), &context, &pending);
+                if login::registry().offer(login, &pending, port) {
+                    tokio::spawn(login::listen(port));
                 }
                 Ok(Some(pending.authorization_url().clone()))
             }
@@ -470,33 +519,37 @@ impl HookAuth {
             };
             present(&backend.id, pending.authorization_url());
             let expires_at = pending.expires_at();
-            let candidates = vec![(Arc::clone(&manager), context.clone())];
-            let completed =
-                match tokio::net::TcpListener::bind(("127.0.0.1", backend.settings.redirect_port))
-                    .await
-                {
-                    Ok(listener) => {
-                        login::serve(&listener, backend.settings.redirect_port, || {
-                            Some((candidates.clone(), expires_at))
-                        })
-                        .await
+            let candidate =
+                login::Login::new(&backend.scope, Arc::clone(&manager), &context, &pending);
+            let port = backend.settings.redirect_port;
+            let completed = match login::bind(port).await {
+                Some(listener) => {
+                    let done = std::cell::Cell::new(false);
+                    login::serve(
+                        &listener,
+                        port,
+                        || (!done.get()).then(|| (vec![candidate.clone()], expires_at)),
+                        |_| done.set(true),
+                    )
+                    .await;
+                    done.get()
+                }
+                // Another Kit process listens on this port; it completes the
+                // login in the shared store, which is polled here.
+                None => loop {
+                    if std::time::SystemTime::now() >= expires_at {
+                        break false;
                     }
-                    // Another Kit process listens for this backend; it completes
-                    // the login in the shared store, which is polled here.
-                    Err(_) => loop {
-                        if std::time::SystemTime::now() >= expires_at {
-                            break false;
-                        }
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
-                            break true;
-                        }
-                    },
-                };
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
+                        break true;
+                    }
+                },
+            };
             if !completed {
                 return Err(format!("{}: the sign-in link expired", backend.id));
             }
-            login::registry().usable(&context);
+            login::registry().usable(&backend.scope, &context);
             signed_in.push(backend.id.clone());
         }
         Ok(signed_in)
@@ -505,14 +558,14 @@ impl HookAuth {
     /// Forgets `backend`'s tokens, pending login and registered client, and
     /// nothing of any other backend.
     pub(crate) async fn logout(&self, backend: &str) -> Result<bool, String> {
-        if !self.0.backends.contains_key(backend) {
+        let Some(scope) = self.0.backends.get(backend).map(|b| b.scope.clone()) else {
             return Err(format!("no hook backend `{backend}` is configured"));
-        }
-        let removed = store::Store::new(self.0.storage.clone(), backend)
+        };
+        let removed = store::Store::new(self.0.storage.clone(), &scope)
             .forget(budget())
             .await
             .map_err(|error| describe(&error))?;
-        login::registry().reset(backend);
+        login::registry().reset(&scope, backend);
         Ok(removed > 0)
     }
 }
@@ -565,8 +618,9 @@ impl AuthProvider for Provider {
             };
             if let Err(error) = &result
                 && needs_login(error)
+                && let Some(scope) = self.0.scope(&observed)
             {
-                login::registry().needs_login(&observed, error.required_scopes());
+                login::registry().needs_login(scope, &observed, error.required_scopes());
             }
             result
         })
@@ -580,11 +634,15 @@ pub mod cli {
     use crate::credentials::CredentialStorage;
 
     fn auth(root: &Path, storage: &CredentialStorage) -> Result<super::HookAuth, String> {
-        let registration = super::super::effective_registration(root)
+        let (registration, sources) = super::super::effective_registration_sources(root)
             .ok_or_else(|| "no hook backends are configured for this workspace".to_owned())?;
         let registration =
             serde_json::to_value(registration).map_err(|_| "invalid hook configuration")?;
-        Ok(super::HookAuth::new(storage.clone(), &registration))
+        Ok(super::HookAuth::new(
+            storage.clone(),
+            &registration,
+            &sources,
+        ))
     }
 
     /// `backend: status` lines, for `backend` or every backend.
@@ -641,6 +699,20 @@ pub mod cli {
     clippy::disallowed_macros
 )]
 pub(crate) mod test_support {
+    /// A pending sign-in hint for `backend` of `hooks`.
+    pub(crate) fn hint(hooks: &crate::ahp::Hooks, backend: &str, url: &str) -> super::AuthHint {
+        super::AuthHint {
+            scope: hooks.auth.as_ref().unwrap().0.backends[backend]
+                .scope
+                .clone(),
+            backend: backend.into(),
+            url: Some(url.into()),
+            expires_at_ms: Some(u64::MAX),
+            cleared: false,
+            signed_in: false,
+        }
+    }
+
     /// Shows `hint` as a turn start would.
     pub(crate) fn publish(hint: super::AuthHint) {
         super::login::registry().publish(hint);

@@ -93,9 +93,9 @@ impl Hooks {
         root: &Path,
         storage: &crate::credentials::CredentialStorage,
     ) -> Option<Arc<Self>> {
-        let registration = effective_registration(root)?;
+        let (registration, sources) = effective_registration_sources(root)?;
         let auth = match serde_json::to_value(&registration) {
-            Ok(value) => auth::HookAuth::new(storage.clone(), &value),
+            Ok(value) => auth::HookAuth::new(storage.clone(), &value, &sources),
             Err(error) => {
                 eprintln!("kit: agent hooks disabled: {error}");
                 return None;
@@ -408,18 +408,31 @@ fn options() -> Result<HooksOptions, String> {
     Ok(options)
 }
 
-/// The global registration with project backends merged over it.
-pub(crate) fn effective_registration(root: &Path) -> Option<Registration> {
+/// The global registration with project backends merged over it, and the
+/// hooks file that declares each backend.
+pub(crate) fn effective_registration_sources(
+    root: &Path,
+) -> Option<(Registration, std::collections::BTreeMap<String, String>)> {
     let mut merged: Option<Registration> = None;
+    let mut sources = std::collections::BTreeMap::new();
     for directory in crate::runtime::agents_directories(root).iter().rev() {
         let path = directory.join(CONFIG_FILE);
         match read(&path) {
-            Ok(Some(registration)) => merge(&mut merged, registration),
+            Ok(Some(registration)) => {
+                let source = std::fs::canonicalize(&path)
+                    .unwrap_or_else(|_| path.clone())
+                    .to_string_lossy()
+                    .into_owned();
+                for backend in &registration.hooks {
+                    sources.insert(backend.id.to_string(), source.clone());
+                }
+                merge(&mut merged, registration);
+            }
             Ok(None) => {}
             Err(error) => eprintln!("kit: ignoring {}: {error}", path.display()),
         }
     }
-    merged
+    merged.map(|registration| (registration, sources))
 }
 
 fn read(path: &Path) -> Result<Option<Registration>, String> {

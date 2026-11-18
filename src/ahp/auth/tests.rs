@@ -169,9 +169,24 @@ async fn free_port() -> u16 {
 
 /// Hook auth for `backends`, trusting the test authorization server.
 fn hook_auth(storage: &tempfile::TempDir, backends: Vec<Value>) -> HookAuth {
+    hook_auth_in(storage, backends, "/project/.agents/hooks.json")
+}
+
+/// [`hook_auth`] for backends declared by the hooks file `source`.
+fn hook_auth_in(storage: &tempfile::TempDir, backends: Vec<Value>, source: &str) -> HookAuth {
+    let sources = backends
+        .iter()
+        .map(|backend| {
+            (
+                backend["id"].as_str().unwrap().to_owned(),
+                source.to_owned(),
+            )
+        })
+        .collect();
     let mut auth = HookAuth::new(
         CredentialStorage::Filesystem(storage.path().to_path_buf()),
         &json!({"protocolVersion": "draft", "hooks": backends}),
+        &sources,
     );
     Arc::get_mut(&mut auth.0).unwrap().roots = vec![reqwest::Certificate::from_pem(CA).unwrap()];
     auth
@@ -185,6 +200,10 @@ async fn approve(url: &url::Url, port: u16) -> bool {
         .unwrap()
         .1
         .into_owned();
+    call_back(port, &state).await
+}
+
+async fn call_back(port: u16, state: &str) -> bool {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     stream
         .write_all(
@@ -414,6 +433,7 @@ fn notices_show_each_link_once_and_completion_once() {
     let recorded = Arc::clone(&shown);
     let sink = notices(move |_, text| recorded.lock().unwrap().push(text));
     let pending = AuthHint {
+        scope: "test#test.notice".into(),
         backend: "test.notice".into(),
         url: Some("https://auth.example/authorize?state=1".into()),
         expires_at_ms: Some(1),
@@ -437,4 +457,101 @@ fn notices_show_each_link_once_and_completion_once() {
             "Hook backend `test.notice` is signed in.",
         ]
     );
+}
+
+#[tokio::test]
+async fn one_port_serves_two_workspaces_by_state() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    // The same backend id, declared by two workspaces' hooks files.
+    let first = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.shared", port)],
+        "/a/hooks.json",
+    );
+    let second = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.shared", port)],
+        "/b/hooks.json",
+    );
+    let (first_tx, mut first_hints) = mpsc::unbounded_channel();
+    let _first = first.subscribe(move |hint| first_tx.send(hint.clone()).unwrap());
+    let (second_tx, mut second_hints) = mpsc::unbounded_channel();
+    let _second = second.subscribe(move |hint| second_tx.send(hint.clone()).unwrap());
+    for auth in [&first, &second] {
+        let error = credential(auth, context(auth, "test.shared"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.auth_code(), Some(AuthErrorCode::InteractionRequired));
+        auth.turn_started();
+    }
+    let first_url = url::Url::parse(&next_hint(&mut first_hints).await.url.unwrap()).unwrap();
+    let second_url = url::Url::parse(&next_hint(&mut second_hints).await.url.unwrap()).unwrap();
+    assert_ne!(
+        first_url, second_url,
+        "workspaces never share a pending login"
+    );
+    // One listener holds the port; it answers Kit's probe.
+    assert!(super::login::bind(port).await.is_none());
+
+    // A callback with an unknown state completes nothing.
+    assert!(!call_back(port, "forged-state").await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(first_hints.try_recv().is_err() && second_hints.try_recv().is_err());
+    assert_eq!(issuer.exchanges(), 0);
+
+    assert!(approve(&second_url, port).await);
+    assert!(next_hint(&mut second_hints).await.signed_in);
+    assert!(
+        first_hints.try_recv().is_err(),
+        "the other workspace is still pending"
+    );
+    assert!(approve(&first_url, port).await);
+    assert!(next_hint(&mut first_hints).await.signed_in);
+    assert_eq!(issuer.exchanges(), 2);
+    // Logging out of one workspace's backend leaves the other's.
+    assert!(first.logout("test.shared").await.unwrap());
+    let first_status: BTreeMap<_, _> = first.status().await.into_iter().collect();
+    let second_status: BTreeMap<_, _> = second.status().await.into_iter().collect();
+    assert_eq!(first_status["test.shared"], "needs-login");
+    assert_eq!(second_status["test.shared"], "authorized");
+}
+
+#[tokio::test]
+async fn a_port_held_by_another_program_is_not_mistaken_for_kit() {
+    let foreign = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let answer = tokio::spawn(async move {
+        let (mut stream, _) = foreign.accept().await.unwrap();
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            .await;
+    });
+    assert!(super::login::bind(port).await.is_none());
+    answer.await.unwrap();
+}
+
+#[test]
+fn backends_never_share_an_explicit_redirect_port() {
+    let storage = tempfile::tempdir().unwrap();
+    let backend = |id: &str| {
+        json!({"id": id, "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+            "oauth": {"redirectPort": 30001}})
+    };
+    let auth = hook_auth(
+        &storage,
+        vec![backend("test.port-a"), backend("test.port-b")],
+    );
+    let ports: Vec<_> = auth
+        .0
+        .backends
+        .values()
+        .map(|backend| backend.settings.redirect_port)
+        .collect();
+    assert_eq!(ports[0], 30001);
+    assert_ne!(ports[1], 30001);
+    for id in ["a", "b", "com.example.policy"] {
+        assert!((30000..32768).contains(&config::default_port(id)));
+    }
 }

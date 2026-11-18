@@ -3954,13 +3954,11 @@ mod tests {
             activity,
         )
         .with_hook_auth(Some(&hooks), None);
-        let pending = crate::ahp::auth::AuthHint {
-            backend: "test.v2-sign-in".into(),
-            url: Some("https://auth.example/authorize?state=v2".into()),
-            expires_at_ms: Some(u64::MAX),
-            cleared: false,
-            signed_in: false,
-        };
+        let pending = crate::ahp::auth::test_support::hint(
+            &hooks,
+            "test.v2-sign-in",
+            "https://auth.example/authorize?state=v2",
+        );
         // Repeated turns repeat the link; the client sees it once.
         crate::ahp::auth::test_support::publish(pending.clone());
         crate::ahp::auth::test_support::publish(pending.clone());

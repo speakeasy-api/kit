@@ -54,12 +54,13 @@ pub(super) struct Settings {
 }
 
 /// A stable port per backend, so every Kit process derives the same
-/// redirect. Outside the range other AHP adapters derive theirs from, so two
-/// harnesses signing in to the same backend never share a callback port.
+/// redirect. 30000 to 32767 lies below the Linux (32768+) and macOS (49152+)
+/// ephemeral ranges and apart from other AHP adapters' (pi: 20000 to 29999),
+/// so neither an outgoing connection nor another harness takes it.
 pub(super) fn default_port(backend: &str) -> u16 {
     let hash = blake3::hash(backend.as_bytes());
     let bytes = hash.as_bytes();
-    49152 + u16::from_le_bytes([bytes[0], bytes[1]]) % 16000
+    30000 + u16::from_le_bytes([bytes[0], bytes[1]]) % 2768
 }
 
 fn strings(value: &Value) -> Option<Vec<String>> {

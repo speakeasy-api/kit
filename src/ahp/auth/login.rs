@@ -16,6 +16,8 @@ use tokio::net::TcpListener;
 /// What the user is shown about one backend's sign-in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthHint {
+    /// The backend within the hooks file that declares it.
+    pub scope: String,
     pub backend: String,
     /// Where to approve Kit. `None` once cleared.
     pub url: Option<String>,
@@ -71,19 +73,49 @@ fn same_target(a: &AuthContext, b: &AuthContext) -> bool {
     a.purpose == b.purpose && a.destination == b.destination
 }
 
-/// A stored pending login: the provider that created it and its target.
-pub(super) type Login = (Arc<ManagedOAuth>, AuthContext);
+/// A stored pending login: the provider that created it, its target, and
+/// the `state` its callback carries.
+#[derive(Clone)]
+pub(super) struct Login {
+    pub(super) scope: String,
+    pub(super) oauth: Arc<ManagedOAuth>,
+    pub(super) context: AuthContext,
+    pub(super) state: String,
+}
+
+impl Login {
+    pub(super) fn new(
+        scope: &str,
+        oauth: Arc<ManagedOAuth>,
+        context: &AuthContext,
+        pending: &PendingLogin,
+    ) -> Self {
+        Self {
+            scope: scope.to_owned(),
+            oauth,
+            context: context.clone(),
+            state: query(pending.authorization_url(), "state").unwrap_or_default(),
+        }
+    }
+}
+
+fn query(url: &url::Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
 
 struct Pending {
     url: String,
     expires_at: SystemTime,
-    /// Every stored login whose callback this backend's redirect receives.
+    port: u16,
     logins: Vec<Login>,
-    listening: bool,
 }
 
 type Sink = dyn Fn(&AuthHint) + Send + Sync;
 
+/// Keyed by scope: a backend id within the hooks file that declares it, so
+/// two workspaces with the same backend id never share hints or needs.
 #[derive(Default)]
 struct State {
     needs: HashMap<String, Vec<Need>>,
@@ -91,6 +123,8 @@ struct State {
     endpoints: HashMap<String, AuthContext>,
     preparing: HashSet<String>,
     pending: HashMap<String, Pending>,
+    /// Ports this process is listening on.
+    listening: HashSet<u16>,
     hints: HashMap<String, AuthHint>,
     /// Links already printed to stderr for a session nobody is attached to.
     printed: HashSet<String>,
@@ -115,30 +149,43 @@ pub(crate) struct HintSubscription {
     _sink: Arc<Sink>,
 }
 
+fn cleared(scope: &str, backend: &str, signed_in: bool) -> AuthHint {
+    AuthHint {
+        scope: scope.to_owned(),
+        backend: backend.to_owned(),
+        url: None,
+        expires_at_ms: None,
+        cleared: true,
+        signed_in,
+    }
+}
+
 impl Registry {
     fn lock(&self) -> MutexGuard<'_, State> {
         // No callback, await or drop of a sink runs under this guard.
         self.0.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Delivers `hint` outside the lock: to subscribers for its backend, or
+    /// Delivers `hint` outside the lock: to subscribers for its scope, or
     /// as one stderr line per link when nobody is attached.
     pub(super) fn publish(&self, hint: AuthHint) {
         let (sinks, print) = {
             let mut state = self.lock();
-            if state.hints.get(&hint.backend) == Some(&hint) {
+            if state.hints.get(&hint.scope) == Some(&hint)
+                || (hint.cleared && !state.hints.contains_key(&hint.scope))
+            {
                 return;
             }
             if hint.cleared {
-                state.hints.remove(&hint.backend);
+                state.hints.remove(&hint.scope);
             } else {
-                state.hints.insert(hint.backend.clone(), hint.clone());
+                state.hints.insert(hint.scope.clone(), hint.clone());
             }
             state.sinks.retain(|(_, sink)| sink.strong_count() != 0);
             let sinks: Vec<_> = state
                 .sinks
                 .iter()
-                .filter(|(backends, _)| backends.contains(&hint.backend))
+                .filter(|(scopes, _)| scopes.contains(&hint.scope))
                 .filter_map(|(_, sink)| sink.upgrade())
                 .collect();
             let line = if sinks.is_empty() {
@@ -160,17 +207,17 @@ impl Registry {
 
     pub(super) fn subscribe(
         &self,
-        backends: HashSet<String>,
+        scopes: HashSet<String>,
         sink: impl Fn(&AuthHint) + Send + Sync + 'static,
     ) -> HintSubscription {
         let sink: Arc<Sink> = Arc::new(sink);
         let current: Vec<_> = {
             let mut state = self.lock();
-            state.sinks.push((backends.clone(), Arc::downgrade(&sink)));
+            state.sinks.push((scopes.clone(), Arc::downgrade(&sink)));
             state
                 .hints
                 .values()
-                .filter(|hint| backends.contains(&hint.backend))
+                .filter(|hint| scopes.contains(&hint.scope))
                 .cloned()
                 .collect()
         };
@@ -181,30 +228,32 @@ impl Registry {
         HintSubscription { _sink: sink }
     }
 
-    pub(super) fn register_endpoint(&self, context: AuthContext) {
-        self.lock()
-            .endpoints
-            .insert(context.backend_id.clone(), context);
+    pub(super) fn register_endpoint(&self, scope: &str, context: AuthContext) {
+        self.lock().endpoints.insert(scope.to_owned(), context);
     }
 
-    /// A delivery diagnostic names only the backend: its own endpoint needs
-    /// a login unless a more precise target was already recorded.
+    /// A delivery diagnostic names only the backend id: each scope with that
+    /// id needs its endpoint signed in, unless a precise target is known.
     pub(super) fn delivery_failed(&self, backend: &str, required: &[String]) {
-        let context = {
+        let targets: Vec<_> = {
             let state = self.lock();
-            if state.needs.contains_key(backend) {
-                return;
-            }
-            state.endpoints.get(backend).cloned()
+            state
+                .endpoints
+                .iter()
+                .filter(|(scope, context)| {
+                    context.backend_id == backend && !state.needs.contains_key(*scope)
+                })
+                .map(|(scope, context)| (scope.clone(), context.clone()))
+                .collect()
         };
-        if let Some(context) = context {
-            self.needs_login(&context, required);
+        for (scope, context) in targets {
+            self.needs_login(&scope, &context, required);
         }
     }
 
-    pub(super) fn needs_login(&self, context: &AuthContext, required: &[String]) {
+    pub(super) fn needs_login(&self, scope: &str, context: &AuthContext, required: &[String]) {
         let mut state = self.lock();
-        let needs = state.needs.entry(context.backend_id.clone()).or_default();
+        let needs = state.needs.entry(scope.to_owned()).or_default();
         let need = Need {
             context: context.clone(),
             required: required.to_vec(),
@@ -216,154 +265,150 @@ impl Registry {
     }
 
     /// A target that now has a usable credential needs no login. When none
-    /// of the backend's targets does, its hint is cleared.
-    pub(super) fn usable(&self, context: &AuthContext) {
-        let cleared = {
+    /// of the scope's targets does, its hint is cleared.
+    pub(super) fn usable(&self, scope: &str, context: &AuthContext) {
+        {
             let mut state = self.lock();
-            let Some(needs) = state.needs.get_mut(&context.backend_id) else {
+            let Some(needs) = state.needs.get_mut(scope) else {
                 return;
             };
             needs.retain(|need| !same_target(&need.context, context));
             if !needs.is_empty() {
                 return;
             }
-            state.needs.remove(&context.backend_id);
-            if let Some(pending) = state.pending.get_mut(&context.backend_id) {
+            state.needs.remove(scope);
+            if let Some(pending) = state.pending.get_mut(scope) {
                 pending
                     .logins
-                    .retain(|(_, login)| !same_target(login, context));
+                    .retain(|login| !same_target(&login.context, context));
                 if pending.logins.is_empty() {
-                    state.pending.remove(&context.backend_id);
+                    state.pending.remove(scope);
                 }
             }
-            state.hints.contains_key(&context.backend_id)
-        };
-        if cleared {
-            self.publish(AuthHint {
-                backend: context.backend_id.clone(),
-                url: None,
-                expires_at_ms: None,
-                cleared: true,
-                signed_in: true,
-            });
         }
+        self.publish(cleared(scope, &context.backend_id, true));
     }
 
-    pub(super) fn needs(&self, backend: &str) -> Vec<Need> {
-        self.lock().needs.get(backend).cloned().unwrap_or_default()
+    pub(super) fn needs(&self, scope: &str) -> Vec<Need> {
+        self.lock().needs.get(scope).cloned().unwrap_or_default()
     }
 
-    pub(super) fn has_needs(&self, backend: &str) -> bool {
-        self.lock().needs.contains_key(backend)
+    pub(super) fn has_needs(&self, scope: &str) -> bool {
+        self.lock().needs.contains_key(scope)
     }
 
-    /// Claims the right to prepare `backend`'s logins; one task at a time.
-    pub(super) fn begin_preparing(&self, backend: &str) -> Option<Preparing> {
+    /// Claims the right to prepare a scope's logins; one task at a time.
+    pub(super) fn begin_preparing(&self, scope: &str) -> Option<Preparing> {
         self.lock()
             .preparing
-            .insert(backend.to_owned())
-            .then(|| Preparing(backend.to_owned()))
+            .insert(scope.to_owned())
+            .then(|| Preparing(scope.to_owned()))
     }
 
     /// Records a stored pending login and shows its link. A login `prepare`
     /// reused keeps the same link, so repeated turns show the same hint.
-    /// Returns whether this process should start the callback listener.
-    pub(super) fn offer(
-        &self,
-        oauth: Arc<ManagedOAuth>,
-        context: &AuthContext,
-        login: &PendingLogin,
-    ) -> bool {
-        let backend = context.backend_id.clone();
-        let url = login.authorization_url().to_string();
+    /// Returns whether this process should start listening on `port`.
+    pub(super) fn offer(&self, login: Login, pending: &PendingLogin, port: u16) -> bool {
+        let url = pending.authorization_url().to_string();
+        let backend = login.context.backend_id.clone();
+        let scope = login.scope.clone();
         let (listen, hint) = {
             let mut state = self.lock();
-            let pending = state
+            let entry = state
                 .pending
-                .entry(backend.clone())
+                .entry(scope.clone())
                 .or_insert_with(|| Pending {
                     url: url.clone(),
-                    expires_at: login.expires_at(),
+                    expires_at: pending.expires_at(),
+                    port,
                     logins: Vec::new(),
-                    listening: false,
                 });
-            pending
+            entry
                 .logins
-                .retain(|(_, existing)| !same_target(existing, context));
-            pending.logins.push((oauth, context.clone()));
-            if pending.expires_at < login.expires_at() || pending.url != url {
-                pending.url = url.clone();
-                pending.expires_at = pending.expires_at.max(login.expires_at());
+                .retain(|existing| !same_target(&existing.context, &login.context));
+            entry.logins.push(login);
+            if entry.expires_at < pending.expires_at() || entry.url != url {
+                entry.url = url.clone();
+                entry.expires_at = entry.expires_at.max(pending.expires_at());
             }
-            let listen = !pending.listening;
-            pending.listening = true;
+            entry.port = port;
             let hint = AuthHint {
-                backend: backend.clone(),
-                url: Some(pending.url.clone()),
-                expires_at_ms: Some(unix_ms(pending.expires_at)),
+                scope: scope.clone(),
+                backend,
+                url: Some(entry.url.clone()),
+                expires_at_ms: Some(unix_ms(entry.expires_at)),
                 cleared: false,
                 signed_in: false,
             };
-            (listen, hint)
+            // A process that lost the port retries on later turns.
+            (state.listening.insert(port), hint)
         };
         self.publish(hint);
         listen
     }
 
-    fn logins(&self, backend: &str) -> Option<(Vec<Login>, SystemTime)> {
-        self.lock()
-            .pending
-            .get(backend)
-            .map(|pending| (pending.logins.clone(), pending.expires_at))
-    }
-
-    /// The listener stopped: sign-in finished, the link expired, or the port
-    /// belongs to another process, which will receive the callback instead.
-    fn stopped(&self, backend: &str, signed_in: bool) {
-        let clear = {
+    /// Every pending login whose callback arrives on `port`, and the latest
+    /// expiry among them. Expired logins are dropped and their hints cleared.
+    fn logins(&self, port: u16) -> Option<(Vec<Login>, SystemTime)> {
+        let now = SystemTime::now();
+        let (expired, live) = {
             let mut state = self.lock();
-            let expired = state
+            let expired: Vec<_> = state
                 .pending
-                .get(backend)
-                .is_none_or(|pending| pending.expires_at <= SystemTime::now());
-            if signed_in {
-                state.needs.remove(backend);
+                .iter()
+                .filter(|(_, pending)| pending.port == port && pending.expires_at <= now)
+                .map(|(scope, pending)| {
+                    let backend = pending
+                        .logins
+                        .first()
+                        .map(|login| login.context.backend_id.clone())
+                        .unwrap_or_default();
+                    (scope.clone(), backend)
+                })
+                .collect();
+            for (scope, _) in &expired {
+                state.pending.remove(scope);
             }
-            if signed_in || expired {
-                state.pending.remove(backend);
-                true
-            } else {
-                if let Some(pending) = state.pending.get_mut(backend) {
-                    pending.listening = false;
-                }
-                false
-            }
+            let live: Vec<_> = state
+                .pending
+                .values()
+                .filter(|pending| pending.port == port)
+                .collect();
+            let logins = live
+                .iter()
+                .flat_map(|pending| pending.logins.iter().cloned())
+                .collect::<Vec<_>>();
+            let expiry = live.iter().map(|pending| pending.expires_at).max();
+            (expired, expiry.map(|expiry| (logins, expiry)))
         };
-        if clear {
-            self.publish(AuthHint {
-                backend: backend.to_owned(),
-                url: None,
-                expires_at_ms: None,
-                cleared: true,
-                signed_in,
-            });
+        for (scope, backend) in expired {
+            self.publish(cleared(&scope, &backend, false));
         }
+        live
     }
 
-    /// Forgets everything about `backend`, as after logging out.
-    pub(super) fn reset(&self, backend: &str) {
+    /// `login` completed: its scope is signed in.
+    fn completed(&self, login: &Login) {
         {
             let mut state = self.lock();
-            state.needs.remove(backend);
-            state.pending.remove(backend);
+            state.needs.remove(&login.scope);
+            state.pending.remove(&login.scope);
         }
-        self.publish(AuthHint {
-            backend: backend.to_owned(),
-            url: None,
-            expires_at_ms: None,
-            cleared: true,
-            signed_in: false,
-        });
+        self.publish(cleared(&login.scope, &login.context.backend_id, true));
+    }
+
+    fn stopped(&self, port: u16) {
+        self.lock().listening.remove(&port);
+    }
+
+    /// Forgets everything about a scope, as after logging out.
+    pub(super) fn reset(&self, scope: &str, backend: &str) {
+        {
+            let mut state = self.lock();
+            state.needs.remove(scope);
+            state.pending.remove(scope);
+        }
+        self.publish(cleared(scope, backend, false));
     }
 }
 
@@ -388,93 +433,154 @@ pub(super) fn redirect_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}/callback")
 }
 
-/// Receives `backend`'s sign-in callbacks on its fixed loopback port until
-/// one completes a pending login or every link expires.
-pub(super) async fn listen(backend: String, port: u16) {
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            // Usually another Kit process waiting for the same backend; any
-            // process sharing the credentials can complete the login.
-            tracing::debug!(%backend, %error, "hook sign-in callback port unavailable");
-            registry().stopped(&backend, false);
-            return;
-        }
+/// What a Kit sign-in listener answers at [`PROBE`], so a process that
+/// cannot bind a port can tell another Kit from a foreign program.
+const PROBE: &str = "/kit-hook-sign-in";
+const PROBE_REPLY: &str = "kit hook sign-in";
+
+/// Whether a Kit sign-in listener holds `port`.
+async fn kit_listens(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        stream
+            .write_all(format!("GET {PROBE} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+            .await
+            .ok()?;
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.ok()?;
+        Some(String::from_utf8_lossy(&reply).contains(PROBE_REPLY))
     };
-    let signed_in = serve(&listener, port, || registry().logins(&backend)).await;
-    registry().stopped(&backend, signed_in);
+    tokio::time::timeout(Duration::from_secs(2), probe)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
-/// Completes a pending login from callbacks on `listener`. `logins` reports
-/// the current candidates and their common expiry; `None` stops serving.
+/// Binds `port`, or explains why it cannot: another Kit process waiting
+/// on the same port (which can complete the login, since the credentials
+/// are shared) or a foreign program, which the user must move out of the way.
+pub(super) async fn bind(port: u16) -> Option<TcpListener> {
+    match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            if kit_listens(port).await {
+                tracing::debug!(port, "another Kit process receives hook sign-in callbacks");
+            } else {
+                tracing::warn!(port, %error, "hook sign-in callback port is in use");
+                eprintln!(
+                    "kit: hook sign-in cannot receive its callback: port {port} is used by another program. Set oauth.redirectPort for the backend in hooks.json."
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Receives sign-in callbacks on a fixed loopback port until no pending
+/// login of this process uses it.
+pub(super) async fn listen(port: u16) {
+    if let Some(listener) = bind(port).await {
+        serve(
+            &listener,
+            port,
+            || registry().logins(port),
+            |login| registry().completed(login),
+        )
+        .await;
+    }
+    registry().stopped(port);
+}
+
+/// Completes pending logins from callbacks on `listener`, routed by
+/// `state`. `logins` reports the candidates and their latest expiry; serving
+/// stops when it reports none or they expire.
 pub(super) async fn serve(
     listener: &TcpListener,
     port: u16,
     logins: impl Fn() -> Option<(Vec<Login>, SystemTime)>,
-) -> bool {
+    mut completed: impl FnMut(&Login),
+) {
+    use tokio::io::AsyncWriteExt as _;
     loop {
-        let Some((candidates, expires_at)) = logins() else {
-            return false;
+        let Some((candidates, expires_at)) = logins().filter(|(logins, _)| !logins.is_empty())
+        else {
+            return;
         };
         let remaining = expires_at
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
         if remaining.is_zero() {
-            return false;
+            return;
         }
-        // Wake periodically: a later prepare may extend the expiry.
-        let wait = remaining.min(Duration::from_secs(30));
+        // Wake periodically: a later prepare may add a login or extend one.
+        let wait = remaining.min(Duration::from_secs(5));
         let Ok(accepted) = tokio::time::timeout(wait, listener.accept()).await else {
             continue;
         };
         let Ok((mut stream, _)) = accepted else {
             continue;
         };
-        let target =
-            match tokio::time::timeout(Duration::from_secs(5), request_target(&mut stream)).await {
-                Ok(Ok(target))
-                    if target.starts_with("/callback?")
-                        && ((has_query_param(&target, "code")
-                            && has_query_param(&target, "state"))
-                            || has_query_param(&target, "error")) =>
-                {
-                    target
-                }
-                _ => {
-                    respond(&mut stream, false).await;
-                    continue;
-                }
-            };
+        let target = match tokio::time::timeout(Duration::from_secs(5), request_target(&mut stream))
+            .await
+        {
+            Ok(Ok(target)) if target == PROBE => {
+                let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PROBE_REPLY}",
+                                PROBE_REPLY.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                continue;
+            }
+            Ok(Ok(target))
+                if target.starts_with("/callback?")
+                    && has_query_param(&target, "state")
+                    && (has_query_param(&target, "code") || has_query_param(&target, "error")) =>
+            {
+                target
+            }
+            _ => {
+                respond(&mut stream, false).await;
+                continue;
+            }
+        };
         let Ok(callback) = url::Url::parse(&format!("http://127.0.0.1:{port}{target}")) else {
             respond(&mut stream, false).await;
             continue;
         };
-        let mut completed = false;
-        for (oauth, context) in candidates {
+        let state = query(&callback, "state").unwrap_or_default();
+        let mut done = None;
+        // Only the login the callback names; any other is never touched.
+        for login in candidates.into_iter().filter(|login| login.state == state) {
             let deadline = Instant::now() + Duration::from_secs(30);
             let context = AuthContext {
                 deadline,
-                ..context
+                ..login.context.clone()
             };
-            // A callback for another login fails validation without
-            // consuming that login, so each candidate may be tried.
-            if oauth
+            if login
+                .oauth
                 .complete(context, callback.clone(), OperationBudget::until(deadline))
                 .await
                 .is_ok()
             {
-                completed = true;
+                done = Some(login);
                 break;
             }
         }
-        respond(&mut stream, completed).await;
-        if completed {
-            return true;
+        respond(&mut stream, done.is_some()).await;
+        if let Some(login) = done {
+            completed(&login);
         }
     }
 }
 
-/// The context `prepare` and status use for a backend's own endpoint.
 pub(super) fn event_context(
     backend: &str,
     destination: &str,
@@ -605,6 +711,7 @@ mod tests {
     fn headless_sessions_print_one_line_per_link() {
         let mut printed = HashSet::new();
         let hint = |url: &str| AuthHint {
+            scope: "test#test.headless".into(),
             backend: "test.headless".into(),
             url: Some(url.into()),
             expires_at_ms: None,
