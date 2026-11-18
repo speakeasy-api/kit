@@ -40,6 +40,11 @@ impl InteractiveConfig {
         if self.dynamic_registration && self.client_metadata_url.is_some() {
             return Err("`dynamicRegistration` and `clientMetadataUrl` cannot be combined".into());
         }
+        // A pre-registered client is never registered, so the flag would
+        // do nothing.
+        if self.dynamic_registration && self.client_id.is_some() {
+            return Err("`dynamicRegistration` and `clientId` cannot be combined".into());
+        }
         Ok(())
     }
 
@@ -256,6 +261,12 @@ async fn migrate_credentials(
     config: &InteractiveConfig,
     credential_storage: &CredentialStorage,
 ) -> Result<(), String> {
+    // Credentials saved before scopes were part of the key are shared by
+    // both modes' older key; they belong to the default mode. Opting out
+    // only uses credentials saved under its own key.
+    if config.dynamic_registration {
+        return Ok(());
+    }
     super::credentials::migrate_legacy(
         credential_storage,
         &legacy_credential_identity(resource_url, config),
@@ -973,6 +984,61 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.contains("cannot be combined"), "{error}");
+    }
+
+    #[test]
+    fn dynamic_registration_cannot_name_a_client() {
+        let config =
+            |value: serde_json::Value| -> Config { serde_json::from_value(value).unwrap() };
+        assert!(
+            config(serde_json::json!({"type":"oauth", "clientId": "registered"}))
+                .interactive()
+                .is_ok()
+        );
+        assert!(
+            config(serde_json::json!({
+                "type": "oauth",
+                "clientId": "registered",
+                "dynamicRegistration": true
+            }))
+            .interactive()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_credentials_migrate_only_to_the_default_mode() {
+        let resource = format!("https://legacy-{}.example/mcp", std::process::id());
+        let config =
+            |value: serde_json::Value| -> Config { serde_json::from_value(value).unwrap() };
+        let default = config(serde_json::json!({"type":"oauth"}));
+        let opt_out = config(serde_json::json!({"type":"oauth", "dynamicRegistration": true}));
+        let (default, opt_out) = (
+            default.interactive().unwrap(),
+            opt_out.interactive().unwrap(),
+        );
+        let storage = CredentialStorage::Memory;
+        let at = |config: &super::InteractiveConfig| {
+            storage.entry(
+                "mcp-oauth",
+                &credential_identity(&resource, config).unwrap(),
+            )
+        };
+        storage
+            .entry(
+                "mcp-oauth",
+                &super::legacy_credential_identity(&resource, default),
+            )
+            .save(b"legacy")
+            .unwrap();
+        super::migrate_credentials(&resource, opt_out, &storage)
+            .await
+            .unwrap();
+        assert!(at(opt_out).load().unwrap().is_none());
+        super::migrate_credentials(&resource, default, &storage)
+            .await
+            .unwrap();
+        assert_eq!(at(default).load().unwrap().unwrap().as_slice(), b"legacy");
     }
 
     #[test]
