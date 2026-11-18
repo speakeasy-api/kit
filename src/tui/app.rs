@@ -748,6 +748,8 @@ pub enum Block {
     HookSignIn {
         backend: String,
         url: String,
+        /// Completed, expired or replaced: shown without its link.
+        retired: bool,
     },
     Error(String),
 }
@@ -894,7 +896,7 @@ pub struct App {
     /// change this view, and a session's links return when it does.
     hook_sign_ins: std::collections::BTreeMap<(String, String), (String, Option<u64>)>,
     /// Sign-in problems already shown, by session and backend.
-    hook_problems: std::collections::BTreeSet<(String, String, String)>,
+    hook_problems: std::collections::BTreeMap<(String, String), String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1204,7 +1206,31 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
     }
 }
 
+fn hook_problem_text(backend: &str, problem: &str) -> String {
+    format!("Hook backend {backend} needs you to sign in, but Kit could not start it: {problem}")
+}
+
 impl App {
+    /// Shows `backend`'s sign-in links in the current view without their
+    /// link: completed, expired or replaced.
+    fn retire_hook_sign_ins(&mut self, backend: &str) {
+        let retiring: Vec<_> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                matches!(block, Block::HookSignIn { backend: shown, retired: false, .. } if shown == backend)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in retiring {
+            if let Some(Block::HookSignIn { retired, .. }) = self.blocks.get_mut(index) {
+                *retired = true;
+            }
+            self.mark_block_dirty(index);
+        }
+    }
+
     /// The status-line hint for hook backends waiting for sign-in, while
     /// their links last. Only the user sees it; the model never does.
     pub(super) fn hook_sign_in_status(&self) -> Option<String> {
@@ -2402,32 +2428,42 @@ impl App {
             } => {
                 let current = self.session_id.as_deref() == Some(session_id.as_str());
                 let key = (session_id, backend);
-                match (url, problem) {
-                    (Some(url), _) if !cleared => {
+                let url = url.filter(|_| !cleared);
+                let problem = problem.filter(|_| !cleared);
+                match url {
+                    Some(url) => {
                         let new = self
                             .hook_sign_ins
                             .get(&key)
                             .is_none_or(|(shown, _)| *shown != url);
                         if new && current {
+                            self.retire_hook_sign_ins(&key.1);
                             self.push_block(Block::HookSignIn {
                                 backend: key.1.clone(),
                                 url: url.clone(),
+                                retired: false,
                             });
                         }
-                        self.hook_sign_ins.insert(key, (url, expires_at_ms));
+                        self.hook_sign_ins.insert(key.clone(), (url, expires_at_ms));
                     }
-                    (None, Some(problem)) if !cleared => {
+                    None => {
+                        if current {
+                            self.retire_hook_sign_ins(&key.1);
+                        }
                         self.hook_sign_ins.remove(&key);
-                        let text = format!(
-                            "Hook backend {} needs you to sign in, but Kit could not start it: {problem}",
-                            key.1
-                        );
-                        if current && self.hook_problems.insert((key.0, key.1, problem)) {
-                            self.push_block(Block::Notice(text));
+                    }
+                }
+                match problem {
+                    Some(problem) => {
+                        if self.hook_problems.get(&key) != Some(&problem) {
+                            if current {
+                                self.push_block(Block::Notice(hook_problem_text(&key.1, &problem)));
+                            }
+                            self.hook_problems.insert(key, problem);
                         }
                     }
-                    _ => {
-                        self.hook_sign_ins.remove(&key);
+                    None => {
+                        self.hook_problems.remove(&key);
                     }
                 }
             }
@@ -3407,7 +3443,21 @@ impl App {
             .map(|((_, backend), (url, _))| (backend.clone(), url.clone()))
             .collect();
         for (backend, url) in links {
-            self.push_block(Block::HookSignIn { backend, url });
+            self.push_block(Block::HookSignIn {
+                backend,
+                url,
+                retired: false,
+            });
+        }
+        // And its unresolved sign-in problems.
+        let problems: Vec<_> = self
+            .hook_problems
+            .iter()
+            .filter(|((owner, _), _)| self.session_id.as_deref() == Some(owner.as_str()))
+            .map(|((_, backend), problem)| hook_problem_text(backend, problem))
+            .collect();
+        for text in problems {
+            self.push_block(Block::Notice(text));
         }
     }
 
