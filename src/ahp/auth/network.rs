@@ -78,8 +78,16 @@ impl Network {
         Ok(addresses)
     }
 
-    fn client(&self, url: &Url, addresses: &[SocketAddr]) -> Result<reqwest::Client, HookError> {
+    fn client(
+        &self,
+        url: &Url,
+        addresses: &[SocketAddr],
+        written: Option<RequestWritten>,
+    ) -> Result<reqwest::Client, HookError> {
+        // One client per request, so its connection belongs to this request.
         let mut builder = (self.client)()
+            .connector_layer(MarkOnConnect(written))
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
@@ -101,33 +109,97 @@ fn https(url: &Url) -> bool {
         && url.fragment().is_none()
 }
 
-/// Loopback, private, link-local, shared and other non-public addresses.
+/// Whether `ip` is anything but a globally routable unicast address.
+/// IPv6 forms that carry an IPv4 address are judged by that address
+/// (IPv4-mapped, IPv4-compatible) or refused outright (NAT64 and 6to4,
+/// whose destination a gateway chooses).
 fn private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            let [a, b, ..] = ip.octets();
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || a == 0
+            let [a, b, c, _] = ip.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
                 || (a == 100 && (64..128).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..32).contains(&b))
+                || (a == 192 && b == 0 && (c == 0 || c == 2))
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
                 || (a == 198 && (18..20).contains(&b))
-                || a >= 240
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
         }
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return private(IpAddr::V4(mapped));
+            let segments = ip.segments();
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return private(IpAddr::V4(v4));
             }
-            let first = ip.segments()[0];
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || first == 0x2001 && ip.segments()[1] == 0x0db8
+            // IPv4-compatible ::a.b.c.d (deprecated, but still routed by some stacks).
+            if segments[..6].iter().all(|segment| *segment == 0) && !ip.is_loopback() {
+                let [.., a, b, c, d] = ip.octets();
+                return ip.is_unspecified() || private(IpAddr::V4([a, b, c, d].into()));
+            }
+            // Only 2000::/3 is global unicast; within it, refuse the
+            // translated, documentation and IETF special-purpose blocks.
+            (segments[0] & 0xe000) != 0x2000
+                || segments[0] == 0x2002
+                || (segments[0] == 0x2001 && segments[1] < 0x0200)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b)
         }
+    }
+}
+
+/// Marks a token or registration request written once its connection is
+/// established (TCP and TLS), the closest reqwest lets Kit observe.
+#[derive(Clone)]
+struct MarkOnConnect(Option<RequestWritten>);
+
+impl<S> tower::Layer<S> for MarkOnConnect {
+    type Service = MarkOnConnectService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        MarkOnConnectService {
+            inner,
+            written: self.0.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MarkOnConnectService<S> {
+    inner: S,
+    written: Option<RequestWritten>,
+}
+
+impl<S, R> tower::Service<R> for MarkOnConnectService<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        let connecting = self.inner.call(request);
+        let written = self.written.clone();
+        Box::pin(async move {
+            let connection = connecting.await?;
+            if let Some(written) = written {
+                written.mark();
+            }
+            Ok(connection)
+        })
     }
 }
 
@@ -150,8 +222,8 @@ impl agenthooksprotocol::auth::managed::OAuthNetwork for Network {
         Box::pin(async move {
             let url = Url::parse(&request.uri().to_string()).map_err(|_| untrusted())?;
             let addresses = self.addresses(&url, budget).await?;
-            let client = self.client(&url, &addresses)?;
             let written = request.extensions().get::<RequestWritten>().cloned();
+            let client = self.client(&url, &addresses, written)?;
             let remaining = budget.deadline().saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(failed());
@@ -164,13 +236,9 @@ impl agenthooksprotocol::auth::managed::OAuthNetwork for Network {
                 .body(body)
                 .build()
                 .map_err(|_| failed())?;
-            // reqwest cannot report when the request bytes are written. As the
-            // SDK documents for such clients, mark when the send is first
-            // polled. Marking early only lets the SDK finish an exchange the
-            // caller abandoned; it never loses a rotated refresh token.
-            if let Some(written) = &written {
-                written.mark();
-            }
+            // reqwest cannot report when the request bytes are written; the
+            // connector marks the request once connected, as the SDK
+            // documents for such clients. Before that, cancellation aborts.
             let response = client.execute(outgoing).await.map_err(|error| {
                 if error.is_connect() {
                     // DNS, TCP and TLS failures: the endpoint never saw it.
@@ -212,24 +280,75 @@ impl agenthooksprotocol::auth::managed::OAuthNetwork for Network {
     clippy::disallowed_macros
 )]
 mod tests {
-    use super::private;
+    use super::*;
 
     #[test]
     fn non_public_addresses_are_private() {
         for ip in [
             "127.0.0.1",
             "10.1.2.3",
+            "172.16.0.1",
             "192.168.0.1",
             "169.254.1.1",
             "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "198.18.0.1",
+            "::",
             "::1",
             "fd00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::808:808",
+            "2002:7f00:1::1",
+            "2001:db8::1",
+            "2001::1",
         ] {
             assert!(private(ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["93.184.216.34", "2606:4700::1111"] {
+        for ip in [
+            "93.184.216.34",
+            "8.8.8.8",
+            "::ffff:8.8.8.8",
+            "2606:4700::1111",
+        ] {
             assert!(!private(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[tokio::test]
+    async fn ip_literal_endpoints_are_checked_like_resolved_ones() {
+        use agenthooksprotocol::auth::managed::{EndpointUse, OAuthNetwork as _};
+        let network = Network::new(false, reqwest::Client::builder);
+        let budget = OperationBudget::until(Instant::now() + Duration::from_secs(5));
+        for url in [
+            "https://127.0.0.1/token",
+            "https://[::1]/token",
+            "https://[::ffff:127.0.0.1]/token",
+            "https://[::ffff:7f00:1]/token",
+            "https://[64:ff9b::7f00:1]/token",
+            "https://localhost/token",
+        ] {
+            let result = network
+                .check(url.parse().unwrap(), EndpointUse::Token, budget)
+                .await;
+            assert!(result.is_err(), "{url}");
+        }
+        // Allowed on request, as for a local authorization server.
+        let local = Network::new(true, reqwest::Client::builder);
+        assert!(
+            local
+                .check(
+                    "https://[::ffff:127.0.0.1]/token".parse().unwrap(),
+                    EndpointUse::Token,
+                    budget
+                )
+                .await
+                .is_ok()
+        );
     }
 }

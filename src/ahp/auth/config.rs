@@ -9,9 +9,9 @@
 //!   "scopes": ["hooks"],
 //!   "clientId": "kit",
 //!   "clientSecretRef": "example-secret",
-//!   "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1:50000/callback"] },
+//!   "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1:30123/callback"] },
 //!   "registration": true,
-//!   "redirectPort": 50000,
+//!   "redirectPort": 30123,
 //!   "loginLifetimeMinutes": 10,
 //!   "allowPrivateNetwork": false,
 //!   "trustAdvertisedIssuer": false
