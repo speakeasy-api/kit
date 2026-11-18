@@ -118,6 +118,12 @@ impl PromptHook {
         };
         // Capture before dispatch so a late outcome cannot reach a resumed session.
         let producer = self.hooks.injections.producer(&ctx.session_id.to_string());
+        // A backend that needs sign-in gets its link now, in the background.
+        if event_type == EventType::TurnStart
+            && let Some(auth) = &self.hooks.auth
+        {
+            auth.turn_started();
+        }
         // A new turn starts clean of any context an earlier turn left undelivered.
         if event_type == EventType::TurnStart
             && let Some(producer) = &producer
@@ -282,6 +288,10 @@ impl PromptHook {
                     .join("\n")),
                 _ => return Ok(true),
             },
+            // Only an intercepting hook may refuse a prompt, and its failure
+            // policy has already been applied by the SDK. A failure to deliver
+            // to observers is reported, never turned into a refusal.
+            None if !self.hooks.sdk.intercepts(event_type) => return Ok(true),
             None => Err("agent hook dispatch failed".into()),
         };
         let Some(index) = index else {

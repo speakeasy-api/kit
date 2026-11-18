@@ -1,4 +1,5 @@
 //! Agent Hooks Protocol integration at Kit's native lifecycle seams.
+pub(crate) mod auth;
 mod injection;
 pub(crate) mod messages;
 mod model;
@@ -67,6 +68,7 @@ pub struct Hooks {
     messages: messages::Routes,
     turn_events: turn::TurnQueues,
     root: Option<std::path::PathBuf>,
+    auth: Option<auth::HookAuth>,
 }
 
 impl Hooks {
@@ -86,20 +88,27 @@ impl Hooks {
 
     /// Loads `~/.agents/hooks.json`, then `<root>/.agents/hooks.json`. Project
     /// hooks replace global hooks with the same id. Invalid files are skipped.
-    pub(crate) fn load(root: &Path) -> Option<Arc<Self>> {
-        let mut merged: Option<Registration> = None;
-        for directory in crate::runtime::agents_directories(root).iter().rev() {
-            let path = directory.join(CONFIG_FILE);
-            match read(&path) {
-                Ok(Some(registration)) => merge(&mut merged, registration),
-                Ok(None) => {}
-                Err(error) => eprintln!("kit: ignoring {}: {error}", path.display()),
+    /// Backends that need sign-in stay registered; see [`auth`].
+    pub(crate) fn load(
+        root: &Path,
+        storage: &crate::credentials::CredentialStorage,
+    ) -> Option<Arc<Self>> {
+        let registration = effective_registration(root)?;
+        let auth = match serde_json::to_value(&registration) {
+            Ok(value) => auth::HookAuth::new(storage.clone(), &value),
+            Err(error) => {
+                eprintln!("kit: agent hooks disabled: {error}");
+                return None;
             }
-        }
-        let registration = merged?;
-        match options().and_then(|options| Self::new(registration, options)) {
+        };
+        match options().and_then(|mut options| {
+            options.backend.credentials = auth.references();
+            options.backend.auth_provider = Some(Arc::new(auth.providers()));
+            Self::new(registration, options)
+        }) {
             Ok(mut hooks) => {
                 hooks.root = Some(root.to_path_buf());
+                hooks.auth = Some(auth);
                 Some(Arc::new(hooks))
             }
             Err(error) => {
@@ -107,6 +116,20 @@ impl Hooks {
                 None
             }
         }
+    }
+
+    /// Some backend may need a sign-in: an HTTP backend not authenticated
+    /// by a header or a bearer binding.
+    pub(crate) fn may_sign_in(&self) -> bool {
+        self.auth.as_ref().is_some_and(auth::HookAuth::may_sign_in)
+    }
+
+    /// Shows hook sign-in hints for this workspace's backends to `sink`.
+    pub(crate) fn subscribe_auth_hints(
+        &self,
+        sink: impl Fn(&auth::AuthHint) + Send + Sync + 'static,
+    ) -> Option<auth::HintSubscription> {
+        self.auth.as_ref().map(|auth| auth.subscribe(sink))
     }
 
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
@@ -118,6 +141,7 @@ impl Hooks {
             messages: messages::Routes::default(),
             turn_events: turn::TurnQueues::default(),
             root: None,
+            auth: None,
         })
     }
 
@@ -381,11 +405,21 @@ fn options() -> Result<HooksOptions, String> {
         capabilities,
     );
     options.backend.inherit_environment = true;
-    // A user-configured hook is trusted to receive event bodies and choose its
-    // upload destinations, credential bindings, and header forwarding policy.
-    // Discovery does not expand Kit's host event/effect grants.
-    options.authorize_configuration = Some(Arc::new(|_, _| Ok(true)));
     Ok(options)
+}
+
+/// The global registration with project backends merged over it.
+pub(crate) fn effective_registration(root: &Path) -> Option<Registration> {
+    let mut merged: Option<Registration> = None;
+    for directory in crate::runtime::agents_directories(root).iter().rev() {
+        let path = directory.join(CONFIG_FILE);
+        match read(&path) {
+            Ok(Some(registration)) => merge(&mut merged, registration),
+            Ok(None) => {}
+            Err(error) => eprintln!("kit: ignoring {}: {error}", path.display()),
+        }
+    }
+    merged
 }
 
 fn read(path: &Path) -> Result<Option<Registration>, String> {
@@ -418,6 +452,11 @@ fn merge(merged: &mut Option<Registration>, next: Registration) {
 
 fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {
     for diagnostic in diagnostics {
+        if let (Some(backend), Some(code)) = (&diagnostic.backend_id, diagnostic.auth_code)
+            && code.recovery() == agenthooksprotocol::auth::AuthRecovery::Login
+        {
+            auth::delivery_needs_login(backend, &diagnostic.required_scopes);
+        }
         tracing::warn!(
             event = event.as_str(),
             ?diagnostic,

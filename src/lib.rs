@@ -16,6 +16,7 @@
 
 mod acp_child;
 mod ahp;
+pub use ahp::auth::cli as hook_auth;
 mod artifacts;
 pub mod compaction;
 mod compose_output;

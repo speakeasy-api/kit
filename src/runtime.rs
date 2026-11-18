@@ -1182,7 +1182,7 @@ impl Runtime {
     pub fn with_hooks(runtime: Arc<Self>) -> Result<Arc<Self>, String> {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure agent hooks after runtime was shared".to_string())?;
-        runtime.hooks = crate::ahp::Hooks::load(&runtime.root);
+        runtime.hooks = crate::ahp::Hooks::load(&runtime.root, &runtime.credential_storage);
         runtime.hooks_enabled = true;
         Ok(Arc::new(runtime))
     }
@@ -1232,6 +1232,13 @@ impl Runtime {
 
     pub(crate) fn hooks(&self) -> Option<&crate::ahp::Hooks> {
         self.hooks.as_deref()
+    }
+
+    /// Hook sign-in applies to HTTP hook backends that may use OAuth, and
+    /// stores grants, so it needs durable credential storage.
+    pub(crate) fn supports_hook_authentication(&self) -> bool {
+        self.credential_storage.is_persistent()
+            && self.hooks().is_some_and(crate::ahp::Hooks::may_sign_in)
     }
 
     pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
@@ -1650,7 +1657,7 @@ impl Runtime {
             skill_package_roots: self.skill_package_roots.clone(),
             skill_directories: self.skill_directories.clone(),
             hooks: if self.hooks_enabled {
-                crate::ahp::Hooks::load(&root)
+                crate::ahp::Hooks::load(&root, &self.credential_storage)
             } else {
                 None
             },
