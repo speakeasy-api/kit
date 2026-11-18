@@ -101,11 +101,7 @@ impl Hooks {
                 return None;
             }
         };
-        match options().and_then(|mut options| {
-            options.backend.credentials = auth.references();
-            options.backend.auth_provider = Some(Arc::new(auth.providers()));
-            Self::new(registration, options)
-        }) {
+        match options().and_then(|options| Self::new(registration, auth.install(options))) {
             Ok(mut hooks) => {
                 hooks.root = Some(root.to_path_buf());
                 hooks.auth = Some(auth);

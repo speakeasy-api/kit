@@ -173,8 +173,10 @@ over all of the above: Kit sends that header and nothing else.
 ### Backends that supply their own subscriptions
 
 A backend that supplies its subscriptions through `hooks/configuration`
-contributes none while it needs a sign-in. After you sign in, its
-subscriptions apply from the next session.
+contributes none while it needs a sign-in. Its link appears at the next turn
+start, like any other. As soon as you sign in, Kit asks the backend for its
+configuration again and delivers events to it from then on, in the same
+session.
 
 ## Use server-provided subscriptions
 

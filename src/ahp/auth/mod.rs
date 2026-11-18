@@ -208,6 +208,23 @@ impl HookAuth {
         self.0.references.clone()
     }
 
+    /// Kit's hook authentication in `options`: bearer references, the
+    /// providers, and configuration skips as a source of needed logins.
+    pub(crate) fn install(
+        &self,
+        mut options: agenthooksprotocol::hooks::HooksOptions,
+    ) -> agenthooksprotocol::hooks::HooksOptions {
+        options.backend.credentials = self.references();
+        options.backend.auth_provider = Some(Arc::new(self.providers()));
+        // A backend whose hooks/configuration needs a sign-in gets its link at
+        // the next turn start; once signed in, the SDK configures it again.
+        options.on_configuration_skipped(|diagnostic| {
+            if diagnostic.recovery == Some(AuthRecovery::Login) {
+                login::registry().delivery_failed(&diagnostic.backend_id, &[]);
+            }
+        })
+    }
+
     /// Bearer, OAuth and unbound routes. A route is chosen by the binding, so
     /// a backend that needs sign-in stays registered and its deliveries fail
     /// under its own failure policy.
@@ -731,6 +748,14 @@ pub(crate) fn delivery_needs_login(backend: &str, required: &[String]) {
 struct Provider(HookAuth);
 
 impl AuthProvider for Provider {
+    /// Forwarded, so a completed sign-in lets the SDK retry the backend's
+    /// configuration within the session.
+    fn preparations(&self, context: &AuthContext) -> u64 {
+        self.0
+            .manager(context)
+            .map_or(0, |manager| manager.preparations(context))
+    }
+
     fn credential(
         &self,
         context: AuthContext,

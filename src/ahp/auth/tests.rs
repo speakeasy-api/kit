@@ -1016,3 +1016,101 @@ async fn a_listener_keeps_serving_a_login_offered_as_it_stops() {
     registry.completed(second);
     assert!(registry.stop_if_idle(port));
 }
+
+/// A hook server behind OAuth whose subscriptions come from
+/// hooks/configuration. It answers only once Kit holds a token for it.
+struct ProtectedServer {
+    oauth: Arc<ManagedOAuth>,
+    endpoint: AuthContext,
+    events: Mutex<Vec<Value>>,
+}
+
+impl agenthooksprotocol::adapters::registered::ManagedBackend for ProtectedServer {
+    fn call(&self, request: Value, _: Duration) -> LocalFuture<'_, Result<Value, HookError>> {
+        Box::pin(async move {
+            // The resource refuses a request without a usable token.
+            if !matches!(
+                self.oauth.credential(with_deadline(&self.endpoint)).await,
+                Ok(Some(_))
+            ) {
+                return Err(HookError::authentication(
+                    AuthErrorCode::InteractionRequired,
+                ));
+            }
+            if request["method"] == "hooks/configuration" {
+                return Ok(json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "protocolVersion": "draft",
+                    "configuration": {"subscriptions": [
+                        crate::ahp::test_support::observe(&["context.compact.before"])
+                    ]},
+                }}));
+            }
+            self.events
+                .lock()
+                .unwrap()
+                .push(request["params"]["event"].clone());
+            Ok(Value::Null)
+        })
+    }
+
+    fn shutdown(&self) -> LocalFuture<'_, Result<(), HookError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let mut backend = issuer.backend("test.configured", port);
+    backend.as_object_mut().unwrap().remove("subscriptions");
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let endpoint = context(&auth, "test.configured");
+    let server = Arc::new(ProtectedServer {
+        oauth: auth.manager(&endpoint).unwrap(),
+        endpoint: endpoint.clone(),
+        events: Mutex::default(),
+    });
+    let registration =
+        serde_json::from_value(json!({"protocolVersion": "draft", "hooks": [backend]})).unwrap();
+    let options = crate::ahp::options()
+        .unwrap()
+        .with_backend("test.configured", Arc::clone(&server) as _);
+    let hooks = crate::ahp::Hooks::new(registration, auth.install(options)).unwrap();
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+
+    // Configuration needs a sign-in: the backend is skipped, and the
+    // configuration diagnostic records the need.
+    hooks.sdk.initialize().await.unwrap();
+    let scope = auth.0.backends["test.configured"].scope.clone();
+    assert!(login::registry().has_needs(&scope));
+
+    // The next turn shows the link; signing in completes it.
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    assert!(approve(&url, port).await);
+    assert!(next_hint(&mut hints).await.signed_in);
+
+    // The same Hooks configure the backend now and deliver to it.
+    hooks.sdk.initialize().await.unwrap();
+    let items = [agentkit_core::Item::text(
+        agentkit_core::ItemKind::User,
+        "old",
+    )];
+    hooks
+        .compact_before("configured", &items, true, "summarize", None)
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server.events.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the event reaches the backend configured after sign-in");
+    assert_eq!(
+        server.events.lock().unwrap()[0]["type"],
+        "context.compact.before"
+    );
+}
