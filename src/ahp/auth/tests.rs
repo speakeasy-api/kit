@@ -1065,7 +1065,12 @@ async fn reconfiguring_without_a_credential_never_offers_a_link() {
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let scope = auth.0.backends[id].scope.clone();
     // The credential is gone by the time the configuration is prepared.
-    auth.prepare_quietly(&context(&auth, id)).await.unwrap();
+    assert!(
+        !auth
+            .prepare_quietly(&context(&auth, id), &[])
+            .await
+            .unwrap()
+    );
     assert!(login::test_support::pending(&scope).is_empty());
     assert!(hints.try_recv().is_err());
     assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 0);
@@ -1187,6 +1192,117 @@ async fn a_live_link_for_less_than_the_need_is_replaced_next_turn() {
     assert!(approve(&second).await);
     let cleared = next_hint(&mut hints).await;
     assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+/// A challenge from the hook endpoint of `auth`'s backend `id`.
+async fn challenge(auth: &HookAuth, id: &str, status: u16, header: &str) -> HookError {
+    Provider(auth.clone())
+        .challenge(
+            context(auth, id),
+            AuthChallenge {
+                status,
+                headers: BTreeMap::from([("www-authenticate".to_owned(), header.to_owned())]),
+                attempt_id: None,
+            },
+        )
+        .await
+        .unwrap_err()
+}
+
+#[tokio::test]
+async fn only_a_403_records_a_step_up() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.challenges";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 401 that names scopes asks to sign in: a plain need.
+    let error = challenge(&auth, id, 401, r#"Bearer scope="hooks:admin""#).await;
+    assert!(needs_login(&error), "{error:?}");
+    assert!(login::registry().needs(&scope)[0].required.is_empty());
+    // A 403 insufficient_scope asks for more: a step-up need.
+    let error = challenge(
+        &auth,
+        id,
+        403,
+        r#"Bearer error="insufficient_scope", scope="hooks:admin""#,
+    )
+    .await;
+    assert!(needs_login(&error), "{error:?}");
+    assert_eq!(login::registry().needs(&scope)[0].required, ["hooks:admin"]);
+}
+
+#[tokio::test]
+async fn a_step_up_granted_elsewhere_clears_its_link_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.step-up-elsewhere";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let other = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(
+        &scope,
+        &target,
+        &["hooks:invoke".into(), "hooks:admin".into()],
+    );
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    assert!(shown.url.is_some());
+    // Another process signs in, and its grant includes `hooks:admin`.
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the link is withdrawn");
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_sign_in_granted_too_few_scopes_says_so() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.too-few";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, id)).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The issuer grants `hooks:admin` but not the binding's `hooks:invoke`.
+    let code = issue_code_granting(&url, "hooks:admin");
+    assert!(!call_back_with(port(&url), &query(&url, "state"), &code).await);
+    let problem = loop {
+        let hint = next_hint(&mut hints).await;
+        if let Some(problem) = hint.problem {
+            break problem;
+        }
+    };
+    assert!(
+        problem.contains("did not grant") && problem.contains("hooks:invoke"),
+        "{problem}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_turns_retry_a_configuration_once_per_credential() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.concurrent-reconfigure";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    auth.configuration_needs_login(id);
+    let backend = auth.0.backends[id].clone();
+    tokio::join!(
+        auth.reconfigure(&backend, None),
+        auth.reconfigure(&backend, None)
+    );
+    assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 1);
 }
 
 /// What happens, besides a delivery, once a credential with only the

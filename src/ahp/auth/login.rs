@@ -12,6 +12,7 @@ use std::{
 
 use agenthooksprotocol::{
     adapters::registered::{AuthContext, AuthPurpose},
+    auth::AuthErrorCode,
     auth::managed::{ManagedOAuth, OperationBudget, PendingLogin},
 };
 use tokio::{net::TcpListener, sync::Notify};
@@ -177,7 +178,13 @@ pub(super) fn query(url: &url::Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-type Sink = dyn Fn(&AuthHint) + Send + Sync;
+/// A subscriber: each hint arrives with its sequence number, so one that
+/// was overtaken on the way is dropped (see [`ordered`]).
+type Sink = dyn Fn(u64, &AuthHint) + Send + Sync;
+
+/// What a subscriber has been shown last for each scope: the sequence
+/// number of its latest hint.
+type Shown = Mutex<HashMap<String, u64>>;
 
 /// Keyed by scope: a backend id within the hooks file that declares it, so
 /// two workspaces with the same backend id never share hints or needs.
@@ -187,7 +194,10 @@ struct State {
     preparing: HashSet<String>,
     /// This process's pending logins, one per target; the first is shown.
     pending: HashMap<String, Vec<Login>>,
-    hints: HashMap<String, AuthHint>,
+    /// The current hint per scope, with its sequence number.
+    hints: HashMap<String, (u64, AuthHint)>,
+    /// Numbers hints in the order the registry's state produced them.
+    sequence: u64,
     /// Links already printed to stderr for a session nobody is attached to.
     printed: HashSet<String>,
     sinks: Vec<(HashSet<String>, Weak<Sink>)>,
@@ -229,43 +239,13 @@ impl Registry {
         self.0.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Delivers `hint` outside the lock: to subscribers for its scope, or
-    /// as one stderr line per link when nobody is attached.
+    /// Delivers `hint`: to subscribers for its scope, or as one stderr
+    /// line per link when nobody is attached. Kit stages each hint with the
+    /// state change that produced it instead; tests publish directly.
+    #[cfg(test)]
     pub(super) fn publish(&self, hint: AuthHint) {
-        let (sinks, print) = {
-            let mut state = self.lock();
-            if state.hints.get(&hint.scope) == Some(&hint)
-                || (hint.cleared && !state.hints.contains_key(&hint.scope))
-            {
-                return;
-            }
-            if hint.cleared {
-                state.hints.remove(&hint.scope);
-            } else {
-                state.hints.insert(hint.scope.clone(), hint.clone());
-            }
-            state.sinks.retain(|(_, sink)| sink.strong_count() != 0);
-            let sinks: Vec<_> = state
-                .sinks
-                .iter()
-                .filter(|(scopes, _)| scopes.contains(&hint.scope))
-                .filter_map(|(_, sink)| sink.upgrade())
-                .collect();
-            let line = if sinks.is_empty() {
-                headless_line(&mut state.printed, &hint)
-            } else {
-                None
-            };
-            (sinks, line)
-        };
-        if let Some(line) = print {
-            // The link is shown, never logged.
-            tracing::info!(backend = %hint.backend, "hook backend needs sign-in");
-            eprintln!("{line}");
-        }
-        for sink in sinks {
-            sink(&hint);
-        }
+        let delivery = stage(&mut self.lock(), hint);
+        deliver(delivery);
     }
 
     pub(super) fn subscribe(
@@ -273,35 +253,26 @@ impl Registry {
         scopes: HashSet<String>,
         sink: impl Fn(&AuthHint) + Send + Sync + 'static,
     ) -> HintSubscription {
-        // One subscriber's deliveries are serialized: live updates wait
-        // until the snapshot below is replayed, so a completion can never
-        // arrive before the link it clears. Sinks still run outside the
-        // registry lock.
-        let inner: Arc<Sink> = Arc::new(sink);
-        let gate = Arc::new(Mutex::new(()));
-        let sink: Arc<Sink> = Arc::new({
-            let (inner, gate) = (Arc::clone(&inner), Arc::clone(&gate));
-            move |hint: &AuthHint| {
-                let _turn = gate.lock().unwrap_or_else(|poison| poison.into_inner());
-                inner(hint);
-            }
-        });
-        let (current, turn) = {
+        let inner: Arc<dyn Fn(&AuthHint) + Send + Sync> = Arc::new(sink);
+        let (sink, shown) = ordered(Arc::clone(&inner));
+        let (current, mut turn) = {
             let mut state = self.lock();
             state.sinks.push((scopes.clone(), Arc::downgrade(&sink)));
             let current: Vec<_> = state
                 .hints
                 .values()
-                .filter(|hint| scopes.contains(&hint.scope))
+                .filter(|(_, hint)| scopes.contains(&hint.scope))
                 .cloned()
                 .collect();
             // Taken before the registry lock is released (registry, then
-            // gate; never the reverse).
-            let turn = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+            // subscriber; never the reverse): live updates wait until the
+            // snapshot is replayed, and any it already includes are dropped.
+            let turn = shown.lock().unwrap_or_else(|poison| poison.into_inner());
             (current, turn)
         };
         // A session attached after a link was shown still sees it.
-        for hint in &current {
+        for (sequence, hint) in &current {
+            turn.insert(hint.scope.clone(), *sequence);
             inner(hint);
         }
         drop(turn);
@@ -392,33 +363,38 @@ impl Registry {
 
     /// Shows the scope's pending link.
     pub(super) fn show(&self, scope: &str) {
-        let hint = self
-            .lock()
-            .pending
-            .get(scope)
-            .and_then(|logins| logins.first())
-            .map(Login::hint);
-        if let Some(hint) = hint {
-            self.publish(hint);
-        }
+        let delivery = {
+            let mut state = self.lock();
+            let hint = state
+                .pending
+                .get(scope)
+                .and_then(|logins| logins.first())
+                .map(Login::hint);
+            hint.and_then(|hint| stage(&mut state, hint))
+        };
+        deliver(delivery);
     }
 
     /// Shows why a sign-in the scope needs could not be prepared.
     /// A link already shown for the scope stays: the problem is added to it.
     pub(super) fn problem(&self, scope: &str, backend: &str, problem: String) {
-        let link = self
-            .lock()
-            .pending
-            .get(scope)
-            .and_then(|logins| logins.first())
-            .map(Login::hint);
-        self.publish(AuthHint {
-            problem: Some(problem),
-            ..link.unwrap_or_else(|| AuthHint {
-                cleared: false,
-                ..cleared(scope, backend, false)
-            })
-        });
+        let delivery = {
+            let mut state = self.lock();
+            let link = state
+                .pending
+                .get(scope)
+                .and_then(|logins| logins.first())
+                .map(Login::hint);
+            let hint = AuthHint {
+                problem: Some(problem),
+                ..link.unwrap_or_else(|| AuthHint {
+                    cleared: false,
+                    ..cleared(scope, backend, false)
+                })
+            };
+            stage(&mut state, hint)
+        };
+        deliver(delivery);
     }
 
     /// `login` completed: its listener is gone, so it is withdrawn, and it
@@ -458,7 +434,7 @@ impl Registry {
     /// If anything changed, the hint shows the scope's next link, or clears:
     /// as signed in once no target of the scope needs a login.
     fn settle(&self, scope: &str, context: &AuthContext, how: Settle<'_>, finished: Option<&str>) {
-        let (stopped, hint) = {
+        let (stopped, delivery) = {
             let mut state = self.lock();
             let mut changed = false;
             let mut stopped = Vec::new();
@@ -509,26 +485,113 @@ impl Registry {
             }
             let signed_in = matches!(how, Settle::Granted(_)) && !state.needs.contains_key(scope);
             let hint = next.unwrap_or_else(|| cleared(scope, &context.backend_id, signed_in));
-            (stopped, hint)
+            (stopped, stage(&mut state, hint))
         };
         for stop in stopped {
             stop.notify_one();
         }
-        self.publish(hint);
+        deliver(delivery);
     }
 
     /// Forgets everything about a scope, as after logging out.
     pub(super) fn reset(&self, scope: &str, backend: &str) {
-        let stopped = {
+        let (stopped, delivery) = {
             let mut state = self.lock();
             state.needs.remove(scope);
-            state.pending.remove(scope).unwrap_or_default()
+            let stopped = state.pending.remove(scope).unwrap_or_default();
+            (stopped, stage(&mut state, cleared(scope, backend, false)))
         };
         for login in stopped {
             login.stop.notify_one();
         }
-        self.publish(cleared(scope, backend, false));
+        deliver(delivery);
     }
+}
+
+/// One hint's delivery: staged under the registry lock, together with the
+/// state change that produced it, and run outside it.
+struct Delivery {
+    sequence: u64,
+    hint: AuthHint,
+    sinks: Vec<Arc<Sink>>,
+    line: Option<String>,
+}
+
+/// Makes `hint` the scope's current hint and numbers it, unless nothing
+/// changes. Called under the registry lock by whatever produced the hint,
+/// so the current hint and the numbering follow the state's own order.
+fn stage(state: &mut State, hint: AuthHint) -> Option<Delivery> {
+    let current = state.hints.get(&hint.scope).map(|(_, current)| current);
+    if current == Some(&hint) || (hint.cleared && current.is_none()) {
+        return None;
+    }
+    state.sequence += 1;
+    let sequence = state.sequence;
+    if hint.cleared {
+        state.hints.remove(&hint.scope);
+    } else {
+        state
+            .hints
+            .insert(hint.scope.clone(), (sequence, hint.clone()));
+    }
+    state.sinks.retain(|(_, sink)| sink.strong_count() != 0);
+    let sinks: Vec<_> = state
+        .sinks
+        .iter()
+        .filter(|(scopes, _)| scopes.contains(&hint.scope))
+        .filter_map(|(_, sink)| sink.upgrade())
+        .collect();
+    let line = if sinks.is_empty() {
+        headless_line(&mut state.printed, &hint)
+    } else {
+        None
+    };
+    Some(Delivery {
+        sequence,
+        hint,
+        sinks,
+        line,
+    })
+}
+
+/// Runs a staged delivery, outside the registry lock.
+fn deliver(delivery: Option<Delivery>) {
+    let Some(Delivery {
+        sequence,
+        hint,
+        sinks,
+        line,
+    }) = delivery
+    else {
+        return;
+    };
+    if let Some(line) = line {
+        // The link is shown, never logged.
+        tracing::info!(backend = %hint.backend, "hook backend needs sign-in");
+        eprintln!("{line}");
+    }
+    for sink in sinks {
+        sink(sequence, &hint);
+    }
+}
+
+/// A subscriber's sink: its deliveries are serialized, and a hint older
+/// than the last one it was shown for the scope (overtaken between the
+/// registry lock and delivery) is dropped.
+fn ordered(inner: Arc<dyn Fn(&AuthHint) + Send + Sync>) -> (Arc<Sink>, Arc<Shown>) {
+    let shown: Arc<Shown> = Arc::default();
+    let sink: Arc<Sink> = Arc::new({
+        let shown = Arc::clone(&shown);
+        move |sequence: u64, hint: &AuthHint| {
+            let mut shown = shown.lock().unwrap_or_else(|poison| poison.into_inner());
+            if shown.get(&hint.scope).is_some_and(|&last| last >= sequence) {
+                return;
+            }
+            shown.insert(hint.scope.clone(), sequence);
+            inner(hint);
+        }
+    });
+    (sink, shown)
 }
 
 /// The stderr line for a session nobody is attached to: once per link.
@@ -577,6 +640,9 @@ pub(super) enum Outcome {
     Completed,
     /// The link expired, or the user denied consent.
     Ended,
+    /// The issuer granted fewer than the target's own scopes: the login
+    /// ended, and signing in again the same way would fail the same way.
+    NotGranted,
     /// The login is no longer wanted, as when another process signed in.
     Stopped,
 }
@@ -643,19 +709,22 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             deadline,
             ..login.context.clone()
         };
+        // The user denied consent: the callback carries an error, not a code.
+        let denied = query(&callback, "error").is_some();
         let completed = login
             .oauth
             .complete(context, callback, OperationBudget::until(deadline))
-            .await
-            .is_ok();
-        respond(&mut stream, completed).await;
+            .await;
+        respond(&mut stream, completed.is_ok()).await;
         // A callback with the login's state ends it either way: the SDK
         // claims the login before it exchanges the code, so after a denial
         // or a failed exchange its link no longer works.
-        return if completed {
-            Outcome::Completed
-        } else {
-            Outcome::Ended
+        return match completed {
+            Ok(_) => Outcome::Completed,
+            Err(error) if !denied && error.auth_code() == Some(AuthErrorCode::AccessDenied) => {
+                Outcome::NotGranted
+            }
+            Err(_) => Outcome::Ended,
         };
     }
 }
@@ -807,6 +876,30 @@ pub(super) mod test_support {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hint_overtaken_on_the_way_is_dropped() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (sink, _) = ordered(Arc::new({
+            let seen = Arc::clone(&seen);
+            move |hint: &AuthHint| seen.lock().unwrap().push(hint.cleared)
+        }));
+        let link = AuthHint {
+            scope: "test#test.order".into(),
+            backend: "test.order".into(),
+            url: Some("https://auth.example/a".into()),
+            expires_at_ms: None,
+            cleared: false,
+            signed_in: false,
+            problem: None,
+        };
+        let done = cleared("test#test.order", "test.order", true);
+        // The later state (signed in) arrives first; the older link that
+        // was staged before it must not replace it.
+        sink(2, &done);
+        sink(1, &link);
+        assert_eq!(*seen.lock().unwrap(), [true]);
+    }
 
     #[test]
     fn headless_sessions_print_one_line_per_link() {

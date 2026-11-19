@@ -553,9 +553,17 @@ impl HookAuth {
                 }
                 continue;
             }
-            // A live link that would meet the need stays until it expires;
-            // one that would not (the need grew) is replaced.
+            // A live link that would meet the need stays until it expires,
+            // unless a grant with the step-up scopes arrived meanwhile (from
+            // another Kit process, say); one that would not meet the need
+            // (the need grew) is replaced.
             if login::registry().has_live_login(&backend.scope, &need.context, &need.required) {
+                if !need.required.is_empty()
+                    && let Err(error) = self.prepare_quietly(&need.context, &need.required).await
+                {
+                    let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
+                    tracing::warn!(backend = %backend.id, code, "hook step-up could not be checked");
+                }
                 continue;
             }
             self.prepare_or_explain(backend, &need.context, &need.required)
@@ -589,29 +597,52 @@ impl HookAuth {
                 _ => return,
             },
         };
-        let prepared_before = self
-            .0
-            .last_ready
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&backend.id)
-            .is_some_and(|attempt| *attempt == credential.attempt_id);
-        if prepared_before {
-            return;
+        // Reserved before any await, so two turns never retry the
+        // configuration twice for one credential; released if no
+        // preparation is counted.
+        let previous = {
+            let mut last = self
+                .0
+                .last_ready
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if last.get(&backend.id) == Some(&credential.attempt_id) {
+                return;
+            }
+            last.insert(backend.id.clone(), credential.attempt_id.clone())
+        };
+        let counted = self.prepare_quietly(&context, &[]).await;
+        if !matches!(counted, Ok(true)) {
+            let mut last = self
+                .0
+                .last_ready
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if last.get(&backend.id) == Some(&credential.attempt_id) {
+                match previous {
+                    Some(previous) => last.insert(backend.id.clone(), previous),
+                    None => last.remove(&backend.id),
+                };
+            }
         }
-        if let Err(error) = self.prepare_quietly(&context).await {
+        if let Err(error) = counted {
             let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
             tracing::warn!(backend = %backend.id, code, "hook configuration could not be prepared again");
         }
     }
 
-    /// Prepares `context`'s target without ever offering a login: should
-    /// the credential have gone meanwhile, the login the SDK created is
-    /// cancelled, and the recorded need shows a link at the next turn.
-    async fn prepare_quietly(&self, context: &AuthContext) -> Result<(), HookError> {
+    /// Prepares `context`'s target with `required` scopes without ever
+    /// offering a login: should no grant have them, the login the SDK
+    /// created is cancelled, and the recorded need keeps (or gets, at the
+    /// next turn) its link. `Ok(true)` when the SDK counted a preparation.
+    async fn prepare_quietly(
+        &self,
+        context: &AuthContext,
+        required: &[String],
+    ) -> Result<bool, HookError> {
         let manager = self.manager(context)?;
         let context = with_deadline(context);
-        let mut options = PrepareOptions::new();
+        let mut options = PrepareOptions::new().required(required.to_vec());
         // A PKCE preparation needs a redirect even when it finds a grant;
         // the listener is never served.
         let _listener = if self.pkce(&context)? {
@@ -627,20 +658,18 @@ impl HookAuth {
             .prepare_with(context.clone(), options, budget())
             .await?
         {
-            // Only the base scopes were prepared: a step-up need and its
-            // link stay.
+            // A need for no more than `required` is met; a step-up need
+            // asking for more, and its link, stay.
             Preparation::Ready(credential) => {
-                if let Some(scope) = self.scope(&context) {
-                    login::registry().usable(scope, &context);
-                }
-                self.counted(&context, Some(&credential));
+                self.granted(&context, &credential, required);
+                Ok(true)
             }
             Preparation::InteractionRequired(pending) => {
                 let _ = manager.cancel_login(pending, budget()).await;
+                Ok(false)
             }
-            _ => {}
+            _ => Ok(false),
         }
-        Ok(())
     }
 
     async fn prepare_or_explain(
@@ -703,6 +732,15 @@ impl HookAuth {
                             auth.counted(&login.context, None);
                         }
                         login::Outcome::Ended => login::registry().ended(&login),
+                        // Said once, beside where the next link appears.
+                        login::Outcome::NotGranted => {
+                            login::registry().ended(&login);
+                            login::registry().problem(
+                                &login.scope,
+                                &login.context.backend_id,
+                                not_granted(&login.context),
+                            );
+                        }
                         login::Outcome::Stopped => {}
                     }
                 });
@@ -860,8 +898,10 @@ impl HookAuth {
         present(&backend.id, pending.authorization_url());
         let candidate =
             login::Login::new(&backend.scope, Arc::clone(&manager), &context, &[], pending);
-        if login::serve(&listener, &candidate).await != login::Outcome::Completed {
-            return Err("the sign-in link expired or was not approved".into());
+        match login::serve(&listener, &candidate).await {
+            login::Outcome::Completed => {}
+            login::Outcome::NotGranted => return Err(not_granted(&context)),
+            _ => return Err("the sign-in link expired or was not approved".into()),
         }
         login::registry().usable(&backend.scope, &context);
         self.counted(&context, None);
@@ -899,6 +939,17 @@ fn guidance(error: &HookError) -> String {
         Some(code) => format!("{}. Kit tries again at the next turn.", code.as_str()),
         None => "failed. Kit tries again at the next turn.".into(),
     }
+}
+
+/// The issuer granted a sign-in fewer than the target's own scopes.
+fn not_granted(context: &AuthContext) -> String {
+    let scopes = context
+        .target()
+        .map(|target| target.scopes().join(" "))
+        .unwrap_or_default();
+    format!(
+        "access_denied. The authorization server did not grant the scopes Kit needs ({scopes}). Check which scopes it allows Kit."
+    )
 }
 
 fn describe(error: &HookError) -> String {
@@ -971,6 +1022,9 @@ impl AuthProvider for Provider {
     ) -> LocalFuture<'_, Result<(), HookError>> {
         Box::pin(async move {
             let observed = context.clone();
+            // Only a 403 (insufficient_scope) asks for more scopes. A 401
+            // asks to sign in, whatever scopes the SDK attaches to it.
+            let step_up = challenge.status == 403;
             let result = match self.0.manager(&context) {
                 Ok(manager) => manager.challenge(context, challenge).await,
                 Err(error) => Err(error),
@@ -978,7 +1032,12 @@ impl AuthProvider for Provider {
             if let Err(error) = &result {
                 if needs_login(error) {
                     if let Some(scope) = self.0.scope(&observed) {
-                        login::registry().needs_login(scope, &observed, error.required_scopes());
+                        let required = if step_up {
+                            error.required_scopes()
+                        } else {
+                            &[]
+                        };
+                        login::registry().needs_login(scope, &observed, required);
                     }
                 } else {
                     self.0.explain_ceiling(&observed, error);
