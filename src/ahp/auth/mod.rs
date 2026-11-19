@@ -270,12 +270,12 @@ impl HookAuth {
         self.skipped().contains(&backend.id)
     }
 
-    /// `context`'s target is signed in with its need's scopes, through this
-    /// instance's providers: the SDK counted it, so a skipped configuration
-    /// of the backend is retried and needs no further preparation.
-    fn granted(&self, context: &AuthContext, credential: &BearerCredential) {
+    /// `context`'s target was prepared with `required` scopes through this
+    /// instance's providers: a need for no more is met, and the SDK counted
+    /// it, so a skipped configuration of the backend is retried.
+    fn granted(&self, context: &AuthContext, credential: &BearerCredential, required: &[String]) {
         if let Some(scope) = self.scope(context) {
-            login::registry().prepared(scope, context);
+            login::registry().prepared(scope, context, required);
         }
         self.counted(context, Some(credential));
     }
@@ -631,7 +631,14 @@ impl HookAuth {
             .prepare_with(context.clone(), options, budget())
             .await?
         {
-            Preparation::Ready(credential) => self.granted(&context, &credential),
+            // Only the base scopes were prepared: a step-up need and its
+            // link stay.
+            Preparation::Ready(credential) => {
+                if let Some(scope) = self.scope(&context) {
+                    login::registry().usable(scope, &context);
+                }
+                self.counted(&context, Some(&credential));
+            }
             Preparation::InteractionRequired(pending) => {
                 let _ = manager.cancel_login(pending, budget()).await;
             }
@@ -679,7 +686,7 @@ impl HookAuth {
             .await?
         {
             Preparation::Ready(credential) => {
-                self.granted(&context, &credential);
+                self.granted(&context, &credential, required);
                 Ok(None)
             }
             Preparation::InteractionRequired(pending) => {
@@ -689,7 +696,7 @@ impl HookAuth {
                     .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?
                     .to_owned();
                 let url = pending.authorization_url().clone();
-                let login = login::Login::new(&scope, manager, &context, pending);
+                let login = login::Login::new(&scope, manager, &context, required, pending);
                 login::registry().offer(login.clone());
                 // Listening already: the link works as soon as it is shown.
                 let auth = self.clone();
@@ -855,7 +862,8 @@ impl HookAuth {
             return Err(describe(&fail(AuthErrorCode::ProviderFailed)));
         };
         present(&backend.id, pending.authorization_url());
-        let candidate = login::Login::new(&backend.scope, Arc::clone(&manager), &context, pending);
+        let candidate =
+            login::Login::new(&backend.scope, Arc::clone(&manager), &context, &[], pending);
         if login::serve(&listener, &candidate).await != login::Outcome::Completed {
             return Err("the sign-in link expired or was not approved".into());
         }

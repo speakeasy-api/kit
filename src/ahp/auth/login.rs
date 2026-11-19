@@ -103,6 +103,9 @@ pub(super) struct Login {
     pub(super) context: AuthContext,
     pub(super) pending: PendingLogin,
     pub(super) state: String,
+    /// The scopes it was prepared with beyond the target's own: a step-up
+    /// login's. Completing it meets a need for no more than these.
+    pub(super) required: Vec<String>,
     pub(super) url: String,
     pub(super) expires_at: SystemTime,
     /// Stops the login's listener once it is no longer wanted.
@@ -114,6 +117,7 @@ impl Login {
         scope: &str,
         oauth: Arc<ManagedOAuth>,
         context: &AuthContext,
+        required: &[String],
         pending: PendingLogin,
     ) -> Self {
         Self {
@@ -121,6 +125,7 @@ impl Login {
             oauth,
             context: context.clone(),
             state: query(pending.authorization_url(), "state").unwrap_or_default(),
+            required: required.to_vec(),
             url: pending.authorization_url().to_string(),
             expires_at: pending.expires_at(),
             pending,
@@ -301,10 +306,12 @@ impl Registry {
         self.settle(scope, context, Settle::Usable);
     }
 
-    /// `context`'s target was prepared with its need's scopes: its need is
-    /// met, step-up or not.
-    pub(super) fn prepared(&self, scope: &str, context: &AuthContext) {
-        self.settle(scope, context, Settle::Granted);
+    /// `context`'s target was prepared with `required` scopes beyond its
+    /// own. Its need is met when it asks for no more than those; a step-up
+    /// need that asks for more (recorded meanwhile, say) stays, as after
+    /// [`Self::usable`].
+    pub(super) fn prepared(&self, scope: &str, context: &AuthContext, required: &[String]) {
+        self.settle(scope, context, Settle::Granted(required));
     }
 
     pub(super) fn needs(&self, scope: &str) -> Vec<Need> {
@@ -388,7 +395,11 @@ impl Registry {
     /// `login` completed. The scope's other targets (an upload on another
     /// resource, say) keep their logins, and the hint moves on to the next.
     pub(super) fn completed(&self, login: &Login) {
-        self.settle(&login.scope, &login.context, Settle::Granted);
+        self.settle(
+            &login.scope,
+            &login.context,
+            Settle::Granted(&login.required),
+        );
     }
 
     /// `login` ended without a grant (its link expired or consent was
@@ -420,14 +431,9 @@ impl Registry {
                 Settle::Usable => {
                     let known =
                         state.needs.contains_key(scope) || state.pending.contains_key(scope);
-                    let step_up = state.needs.get(scope).is_some_and(|needs| {
-                        needs.iter().any(|need| {
-                            same_target(&need.context, context) && !need.required.is_empty()
-                        })
-                    });
-                    !known || step_up
+                    !known || unmet(&state, scope, context, &[])
                 }
-                Settle::Granted => false,
+                Settle::Granted(granted) => unmet(&state, scope, context, granted),
             };
             if skip {
                 return;
@@ -505,13 +511,24 @@ fn headless_line(printed: &mut HashSet<String>, hint: &AuthHint) -> Option<Strin
     hint.notice().map(|text| format!("kit: {text}"))
 }
 
+/// Whether `context`'s target needs scopes beyond `granted`: a step-up
+/// need that a credential with only those does not meet.
+fn unmet(state: &State, scope: &str, context: &AuthContext, granted: &[String]) -> bool {
+    state.needs.get(scope).is_some_and(|needs| {
+        needs.iter().any(|need| {
+            same_target(&need.context, context)
+                && !need.required.iter().all(|scope| granted.contains(scope))
+        })
+    })
+}
+
 /// Why a target's pending login ends.
 #[derive(Clone, Copy)]
 enum Settle<'a> {
     /// An operation found a usable credential: not enough for a step-up.
     Usable,
-    /// Signed in, or prepared, with the need's scopes.
-    Granted,
+    /// Signed in, or prepared, with these scopes beyond the target's own.
+    Granted(&'a [String]),
     /// The login with this `state` ended without a grant.
     Ended(&'a str),
 }

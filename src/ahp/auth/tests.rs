@@ -1043,11 +1043,24 @@ async fn reconfiguring_without_a_credential_never_offers_a_link() {
     assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 0);
 }
 
-#[tokio::test]
-async fn a_step_up_link_stays_while_the_base_credential_works() {
+/// What happens, besides a delivery, once a credential with only the base
+/// scopes exists while a step-up link is shown.
+#[derive(Clone, Copy)]
+enum BaseCredential {
+    /// The next turn finds it.
+    NextTurn,
+    /// The backend's configuration was skipped: the next turn prepares it
+    /// again, with the base scopes.
+    SkippedConfiguration,
+    /// A preparation for the base scopes that started before the 403
+    /// finishes after it.
+    BasePreparation,
+}
+
+/// A step-up link stays live through `then`, and still completes.
+async fn a_step_up_link_stays(id: &str, then: BaseCredential) {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let id = "test.step-up";
     let mut backend = issuer.backend(id);
     backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
     let auth = hook_auth(&storage, vec![backend.clone()]);
@@ -1068,18 +1081,46 @@ async fn a_step_up_link_stays_while_the_base_credential_works() {
             .collect()
     };
     assert_eq!(states(), [query(&url, "state")]);
-    // A credential with the base scopes exists (signed in elsewhere); a
-    // delivery and the next turn find it, and the step-up link stays.
+    // A credential with the base scopes exists (signed in elsewhere), and
+    // a delivery finds it.
     let (base, complete) = elsewhere(&other, id).await;
     complete(issue_code(&base)).await;
     assert!(credential(&auth, target.clone()).await.unwrap().is_some());
-    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    match then {
+        BaseCredential::NextTurn => auth.prepare_backend(&auth.0.backends[id].clone()).await,
+        BaseCredential::SkippedConfiguration => {
+            auth.configuration_needs_login(id);
+            auth.prepare_backend(&auth.0.backends[id].clone()).await;
+            // The configuration is still retried with the base credential.
+            assert_eq!(Provider(auth.clone()).preparations(&target), 1);
+        }
+        BaseCredential::BasePreparation => {
+            assert_eq!(auth.prepare(&target, &[]).await.unwrap(), None);
+        }
+    }
     assert_eq!(states(), [query(&url, "state")]);
+    assert!(login::registry().has_needs(&scope));
     assert!(hints.try_recv().is_err());
     // The earlier link still completes the step-up.
     assert!(approve(&url).await);
     let cleared = next_hint(&mut hints).await;
     assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_step_up_link_stays_while_the_base_credential_works() {
+    a_step_up_link_stays("test.step-up", BaseCredential::NextTurn).await;
+}
+
+#[tokio::test]
+async fn reconfiguring_with_the_base_credential_keeps_the_step_up_link() {
+    a_step_up_link_stays("test.step-up-skipped", BaseCredential::SkippedConfiguration).await;
+}
+
+#[tokio::test]
+async fn a_late_base_preparation_keeps_the_step_up_link() {
+    a_step_up_link_stays("test.step-up-race", BaseCredential::BasePreparation).await;
 }
 
 #[tokio::test]
