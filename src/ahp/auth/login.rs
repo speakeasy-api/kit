@@ -87,7 +87,32 @@ impl AuthHint {
 #[derive(Clone)]
 pub(super) struct Need {
     pub(super) context: AuthContext,
+    /// Its step-up scopes (see [`step_up`]); empty for a plain sign-in.
     pub(super) required: Vec<String>,
+}
+
+/// The scopes `required` asks for beyond `context`'s target's own. A plain
+/// sign-in always obtains the target's own scopes (the SDK reports them as
+/// required on every `interaction_required`), so only these make a step-up.
+/// Every need and login keeps only these, and every comparison uses them.
+pub(super) fn step_up(context: &AuthContext, required: &[String]) -> Vec<String> {
+    let own = context
+        .target()
+        .map(|target| target.scopes().to_vec())
+        .unwrap_or_default();
+    let mut extra: Vec<String> = required
+        .iter()
+        .filter(|scope| !own.contains(scope))
+        .cloned()
+        .collect();
+    extra.sort();
+    extra.dedup();
+    extra
+}
+
+/// Whether `granted` step-up scopes include every one in `required`.
+fn covers(granted: &[String], required: &[String]) -> bool {
+    required.iter().all(|scope| granted.contains(scope))
 }
 
 fn same_target(a: &AuthContext, b: &AuthContext) -> bool {
@@ -103,8 +128,8 @@ pub(super) struct Login {
     pub(super) context: AuthContext,
     pub(super) pending: PendingLogin,
     pub(super) state: String,
-    /// The scopes it was prepared with beyond the target's own: a step-up
-    /// login's. Completing it meets a need for no more than these.
+    /// Its step-up scopes (see [`step_up`]): completing it meets a need
+    /// for no more than these.
     pub(super) required: Vec<String>,
     pub(super) url: String,
     pub(super) expires_at: SystemTime,
@@ -125,7 +150,7 @@ impl Login {
             oauth,
             context: context.clone(),
             state: query(pending.authorization_url(), "state").unwrap_or_default(),
-            required: required.to_vec(),
+            required: step_up(context, required),
             url: pending.authorization_url().to_string(),
             expires_at: pending.expires_at(),
             pending,
@@ -288,7 +313,7 @@ impl Registry {
         let needs = state.needs.entry(scope.to_owned()).or_default();
         let need = Need {
             context: context.clone(),
-            required: required.to_vec(),
+            required: step_up(context, required),
         };
         match needs.iter_mut().find(|n| same_target(&n.context, context)) {
             Some(existing) => *existing = need,
@@ -296,22 +321,18 @@ impl Registry {
         }
     }
 
-    /// A target that now has a usable credential, signed in here or by
-    /// another Kit process, needs no login: its pending login stops, and
-    /// the hint moves on to another target's link or clears once none of
-    /// the scope's targets needs one. A step-up need (one that requires
-    /// more scopes) is not met by a usable credential: it and its link stay
-    /// until a login or preparation with those scopes succeeds.
+    /// A target that now has a usable credential with its own scopes,
+    /// signed in here or by another Kit process: a plain need is met (see
+    /// [`Self::settle`]); a step-up need is not.
     pub(super) fn usable(&self, scope: &str, context: &AuthContext) {
-        self.settle(scope, context, Settle::Usable);
+        self.settle(scope, context, Settle::Granted(&[]), None);
     }
 
-    /// `context`'s target was prepared with `required` scopes beyond its
-    /// own. Its need is met when it asks for no more than those; a step-up
-    /// need that asks for more (recorded meanwhile, say) stays, as after
-    /// [`Self::usable`].
+    /// `context`'s target was prepared with `required` scopes: a need for
+    /// no more is met.
     pub(super) fn prepared(&self, scope: &str, context: &AuthContext, required: &[String]) {
-        self.settle(scope, context, Settle::Granted(required));
+        let granted = step_up(context, required);
+        self.settle(scope, context, Settle::Granted(&granted), None);
     }
 
     pub(super) fn needs(&self, scope: &str) -> Vec<Need> {
@@ -331,13 +352,21 @@ impl Registry {
     }
 
     /// Whether this process has a login for `context`'s target whose link
-    /// still works. Later turns keep showing it rather than prepare another.
-    pub(super) fn has_live_login(&self, scope: &str, context: &AuthContext) -> bool {
+    /// still works and that would meet a need for `required` step-up
+    /// scopes. Later turns keep showing it rather than prepare another.
+    pub(super) fn has_live_login(
+        &self,
+        scope: &str,
+        context: &AuthContext,
+        required: &[String],
+    ) -> bool {
         let now = SystemTime::now();
         self.lock().pending.get(scope).is_some_and(|logins| {
-            logins
-                .iter()
-                .any(|login| same_target(&login.context, context) && login.expires_at > now)
+            logins.iter().any(|login| {
+                same_target(&login.context, context)
+                    && login.expires_at > now
+                    && covers(&login.required, required)
+            })
         })
     }
 
@@ -392,13 +421,15 @@ impl Registry {
         });
     }
 
-    /// `login` completed. The scope's other targets (an upload on another
-    /// resource, say) keep their logins, and the hint moves on to the next.
+    /// `login` completed: its listener is gone, so it is withdrawn, and it
+    /// meets its target's need if its scopes cover it. The scope's other
+    /// targets (an upload on another resource, say) keep their logins.
     pub(super) fn completed(&self, login: &Login) {
         self.settle(
             &login.scope,
             &login.context,
             Settle::Granted(&login.required),
+            Some(&login.state),
         );
     }
 
@@ -406,82 +437,84 @@ impl Registry {
     /// denied): it is withdrawn, and the next turn prepares a new one. A
     /// newer login for the same target, which replaced it, stays.
     pub(super) fn ended(&self, login: &Login) {
-        self.settle(&login.scope, &login.context, Settle::Ended(&login.state));
+        self.settle(
+            &login.scope,
+            &login.context,
+            Settle::Ended,
+            Some(&login.state),
+        );
     }
 
-    /// Ends the pending login for `context`'s target, or for
-    /// [`Settle::Ended`] only the login with that `state` (nothing, if it is
-    /// no longer pending). Signed in, the target needs no login either. The
-    /// hint shows the scope's next link, or clears once no target needs one.
-    /// Every check is made under the lock that removes, so a login that
-    /// replaced another meanwhile, or a step-up need, is never withdrawn.
-    fn settle(&self, scope: &str, context: &AuthContext, how: Settle<'_>) {
-        let signed_in = !matches!(how, Settle::Ended(_));
+    /// The one place sign-in state changes after an operation, all under
+    /// one lock:
+    ///
+    /// - `finished`, the `state` of a login whose listener is gone, is
+    ///   withdrawn (a login without a state matches none).
+    /// - [`Settle::Granted`] meets the target's need when its step-up scopes
+    ///   cover the need's; then the target's remaining logins stop too. A
+    ///   need that asks for more (a step-up, perhaps recorded meanwhile)
+    ///   stays, with its logins.
+    ///
+    /// If anything changed, the hint shows the scope's next link, or clears:
+    /// as signed in once no target of the scope needs a login.
+    fn settle(&self, scope: &str, context: &AuthContext, how: Settle<'_>, finished: Option<&str>) {
         let (stopped, hint) = {
             let mut state = self.lock();
-            let skip = match how {
-                // A login without a state matches no callback, and no other.
-                Settle::Ended(only) => {
-                    only.is_empty()
-                        || !state
-                            .pending
-                            .get(scope)
-                            .is_some_and(|logins| logins.iter().any(|login| login.state == only))
+            let mut changed = false;
+            let mut stopped = Vec::new();
+            if let Some(finished) = finished.filter(|state| !state.is_empty())
+                && let Some(logins) = state.pending.get_mut(scope)
+            {
+                let before = logins.len();
+                logins.retain(|login| login.state != finished);
+                changed |= logins.len() != before;
+            }
+            if let Settle::Granted(granted) = how {
+                let met = state.needs.get(scope).is_none_or(|needs| {
+                    needs.iter().all(|need| {
+                        !same_target(&need.context, context) || covers(granted, &need.required)
+                    })
+                });
+                if met {
+                    if let Some(needs) = state.needs.get_mut(scope) {
+                        let before = needs.len();
+                        needs.retain(|need| !same_target(&need.context, context));
+                        changed |= needs.len() != before;
+                        if needs.is_empty() {
+                            state.needs.remove(scope);
+                        }
+                    }
+                    if let Some(logins) = state.pending.get_mut(scope) {
+                        logins.retain(|login| {
+                            let ended = same_target(&login.context, context);
+                            if ended {
+                                stopped.push(Arc::clone(&login.stop));
+                            }
+                            !ended
+                        });
+                        changed |= !stopped.is_empty();
+                    }
                 }
-                Settle::Usable => {
-                    let known =
-                        state.needs.contains_key(scope) || state.pending.contains_key(scope);
-                    !known || unmet(&state, scope, context, &[])
-                }
-                Settle::Granted(granted) => unmet(&state, scope, context, granted),
-            };
-            if skip {
+            }
+            if !changed {
                 return;
             }
-            let only = match how {
-                Settle::Ended(only) => Some(only),
-                _ => None,
-            };
-            let mut needed = state.needs.contains_key(scope);
-            if signed_in && let Some(needs) = state.needs.get_mut(scope) {
-                needs.retain(|need| !same_target(&need.context, context));
-                needed = !needs.is_empty();
-                if !needed {
-                    state.needs.remove(scope);
-                }
-            }
-            let mut stopped = Vec::new();
-            let next = state.pending.get_mut(scope).and_then(|logins| {
-                logins.retain(|login| {
-                    let ended = only.map_or_else(
-                        || same_target(&login.context, context),
-                        |only| login.state == only,
-                    );
-                    if ended {
-                        stopped.push(Arc::clone(&login.stop));
-                    }
-                    !ended
-                });
-                logins.first().map(Login::hint)
-            });
+            let next = state
+                .pending
+                .get(scope)
+                .and_then(|logins| logins.first())
+                .map(Login::hint);
             if next.is_none() {
                 state.pending.remove(scope);
             }
-            let hint = match next {
-                Some(next) => Some(next),
-                // Another target still needs a sign-in: its link comes at
-                // the next turn start.
-                None if signed_in && needed => None,
-                None => Some(cleared(scope, &context.backend_id, signed_in)),
-            };
+            let signed_in = matches!(how, Settle::Granted(_)) && !state.needs.contains_key(scope);
+            let hint = next.unwrap_or_else(|| cleared(scope, &context.backend_id, signed_in));
             (stopped, hint)
         };
         for stop in stopped {
             stop.notify_one();
         }
-        if let Some(hint) = hint {
-            self.publish(hint);
-        }
+        self.publish(hint);
     }
 
     /// Forgets everything about a scope, as after logging out.
@@ -511,26 +544,14 @@ fn headless_line(printed: &mut HashSet<String>, hint: &AuthHint) -> Option<Strin
     hint.notice().map(|text| format!("kit: {text}"))
 }
 
-/// Whether `context`'s target needs scopes beyond `granted`: a step-up
-/// need that a credential with only those does not meet.
-fn unmet(state: &State, scope: &str, context: &AuthContext, granted: &[String]) -> bool {
-    state.needs.get(scope).is_some_and(|needs| {
-        needs.iter().any(|need| {
-            same_target(&need.context, context)
-                && !need.required.iter().all(|scope| granted.contains(scope))
-        })
-    })
-}
-
-/// Why a target's pending login ends.
+/// What an operation learned about a target's sign-in.
 #[derive(Clone, Copy)]
 enum Settle<'a> {
-    /// An operation found a usable credential: not enough for a step-up.
-    Usable,
-    /// Signed in, or prepared, with these scopes beyond the target's own.
+    /// It holds a credential with these step-up scopes (none: only the
+    /// target's own).
     Granted(&'a [String]),
-    /// The login with this `state` ended without a grant.
-    Ended(&'a str),
+    /// A login ended without a grant.
+    Ended,
 }
 
 pub(super) struct Preparing(String);

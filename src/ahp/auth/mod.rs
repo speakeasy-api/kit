@@ -538,29 +538,25 @@ impl HookAuth {
         }
         let mut reconfigured = false;
         for need in needs {
-            let live = login::registry().has_live_login(&backend.scope, &need.context);
-            // A step-up link stays until it expires: a credential with the
-            // base scopes does not meet it.
-            if live && !need.required.is_empty() {
-                continue;
-            }
-            if need.required.is_empty() {
-                // Signed in meanwhile, perhaps from another Kit process: the
-                // shown link is withdrawn and no new one is offered.
-                match Provider(self.clone())
+            // A need keeps only its step-up scopes: without any, a credential
+            // with the target's own scopes meets it. Signed in meanwhile,
+            // perhaps from another Kit process: the shown link is withdrawn
+            // and no new one is offered.
+            if need.required.is_empty()
+                && let Ok(Some(credential)) = Provider(self.clone())
                     .credential(with_deadline(&need.context))
                     .await
-                {
-                    Ok(Some(credential)) => {
-                        if need.context.purpose == AuthPurpose::Event {
-                            self.reconfigure(backend, Some(credential)).await;
-                            reconfigured = true;
-                        }
-                        continue;
-                    }
-                    _ if live => continue,
-                    _ => {}
+            {
+                if need.context.purpose == AuthPurpose::Event {
+                    self.reconfigure(backend, Some(credential)).await;
+                    reconfigured = true;
                 }
+                continue;
+            }
+            // A live link that would meet the need stays until it expires;
+            // one that would not (the need grew) is replaced.
+            if login::registry().has_live_login(&backend.scope, &need.context, &need.required) {
+                continue;
             }
             self.prepare_or_explain(backend, &need.context, &need.required)
                 .await;

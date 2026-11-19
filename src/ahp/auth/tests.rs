@@ -138,8 +138,12 @@ impl Issuer {
                         verified(&request_body)
                     } {
                         let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        json!({"access_token": format!("token-{n}"), "token_type": "Bearer",
-                            "expires_in": 3600, "refresh_token": format!("refresh-{n}")})
+                        let mut body = json!({"access_token": format!("token-{n}"), "token_type": "Bearer",
+                            "expires_in": 3600, "refresh_token": format!("refresh-{n}")});
+                        if let Some(scope) = narrowed(&request_body) {
+                            body["scope"] = scope.into();
+                        }
+                        body
                     } else if path == "/token" {
                         json!({"error": "invalid_grant"})
                     } else {
@@ -220,6 +224,30 @@ fn trusting_client() -> reqwest::ClientBuilder {
 /// Codes the fake authorization server issued, with their PKCE challenge.
 static AUTHORIZATIONS: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
     std::sync::LazyLock::new(Mutex::default);
+
+/// Codes whose grant has fewer scopes than were asked for, with the scope
+/// the token response reports.
+static NARROWED: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// The scope a code exchange's token response reports, if the user
+/// granted fewer scopes than Kit asked for.
+fn narrowed(body: &str) -> Option<String> {
+    let form: BTreeMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    NARROWED.lock().unwrap().remove(form.get("code")?)
+}
+
+/// Issues a code for the login at `url` that grants only `scope`.
+fn issue_code_granting(url: &url::Url, scope: &str) -> String {
+    let code = issue_code(url);
+    NARROWED
+        .lock()
+        .unwrap()
+        .insert(code.clone(), scope.to_owned());
+    code
+}
 
 /// Whether a token request redeems an issued code with its PKCE verifier,
 /// or presents a refresh token. A code is redeemed once.
@@ -1043,24 +1071,29 @@ async fn reconfiguring_without_a_credential_never_offers_a_link() {
     assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 0);
 }
 
-/// What happens, besides a delivery, once a credential with only the base
-/// scopes exists while a step-up link is shown.
-#[derive(Clone, Copy)]
-enum BaseCredential {
-    /// The next turn finds it.
-    NextTurn,
-    /// The backend's configuration was skipped: the next turn prepares it
-    /// again, with the base scopes.
-    SkippedConfiguration,
-    /// A preparation for the base scopes that started before the 403
-    /// finishes after it.
-    BasePreparation,
+/// A backend whose binding declares `hooks:invoke`, and that Kit may also
+/// ask for `hooks:admin`: a scope outside the binding's, so a need for it
+/// is a step-up.
+fn step_up_backend(issuer: &Issuer, id: &str) -> Value {
+    let mut backend = issuer.backend(id);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    backend["oauth"]["scopes"] = json!(["hooks:admin"]);
+    backend
 }
 
-/// A step-up link stays live through `then`, and still completes.
-async fn a_step_up_link_stays(id: &str, then: BaseCredential) {
+/// The states of this process's pending logins for `scope`.
+fn states(scope: &str) -> Vec<String> {
+    login::test_support::pending(scope)
+        .into_iter()
+        .map(|login| login.state)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_plain_need_of_a_scoped_binding_clears_once_signed_in_elsewhere() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
+    let id = "test.scoped-plain";
     let mut backend = issuer.backend(id);
     backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
     let auth = hook_auth(&storage, vec![backend.clone()]);
@@ -1069,36 +1102,145 @@ async fn a_step_up_link_stays(id: &str, then: BaseCredential) {
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let target = context(&auth, id);
     let scope = auth.0.backends[id].scope.clone();
-    // A 403 asked for more scopes: the step-up link is shown.
-    login::registry().needs_login(&scope, &target, &["hooks:invoke".into()]);
+    // The SDK reports the binding's own scopes as required on a plain
+    // "not signed in"; that is not a step-up.
+    let error = credential(&auth, target.clone()).await.unwrap_err();
+    assert_eq!(error.required_scopes(), ["hooks:invoke"]);
+    assert!(login::registry().needs(&scope)[0].required.is_empty());
+    auth.turn_started();
+    assert!(next_hint(&mut hints).await.url.is_some());
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    // The next turn finds the grant: the link is withdrawn, signed in.
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the hint clears");
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_login_completed_for_less_than_the_need_is_replaced_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.need-grows";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let first = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // While that plain link is live, an operation needs `hooks:admin` too.
+    login::registry().needs_login(
+        &scope,
+        &target,
+        &["hooks:invoke".into(), "hooks:admin".into()],
+    );
+    // The user approves the first link, granting only the binding's scope.
+    let code = issue_code_granting(&first, "hooks:invoke");
+    assert!(call_back_with(port(&first), &query(&first, "state"), &code).await);
+    // Its listener is gone, so it is withdrawn; the need stays, and so the
+    // hint clears without saying signed in.
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+    assert!(login::registry().has_needs(&scope));
+    // The next turn offers a link for the step-up.
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let next = hints.try_recv().expect("a new link");
+    let second = url::Url::parse(next.url.as_deref().unwrap()).unwrap();
+    assert_ne!(query(&second, "state"), query(&first, "state"));
+    assert!(
+        query(&second, "scope")
+            .split(' ')
+            .any(|s| s == "hooks:admin")
+    );
+    assert_eq!(states(&scope), [query(&second, "state")]);
+}
+
+#[tokio::test]
+async fn a_live_link_for_less_than_the_need_is_replaced_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.need-grows-live";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let first = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    login::registry().needs_login(
+        &scope,
+        &target,
+        &["hooks:invoke".into(), "hooks:admin".into()],
+    );
+    // The plain link would not meet the step-up: the next turn replaces it.
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let next = hints.try_recv().expect("a new link");
+    let second = url::Url::parse(next.url.as_deref().unwrap()).unwrap();
+    assert_ne!(query(&second, "state"), query(&first, "state"));
+    assert_eq!(states(&scope), [query(&second, "state")]);
+    assert!(approve(&second).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+/// What happens, besides a delivery, once a credential with only the
+/// binding's scope exists while a step-up link is shown.
+#[derive(Clone, Copy)]
+enum BaseCredential {
+    /// The next turn finds it.
+    NextTurn,
+    /// The backend's configuration was skipped: the next turn prepares it
+    /// again, with the binding's scope.
+    SkippedConfiguration,
+    /// A preparation for the binding's scope that started before the 403
+    /// finishes after it.
+    BasePreparation,
+}
+
+/// A step-up link stays live through `then`, and still completes.
+async fn a_step_up_link_stays(id: &str, then: BaseCredential) {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let other = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 403 asked for `hooks:admin`: the step-up link is shown.
+    login::registry().needs_login(
+        &scope,
+        &target,
+        &["hooks:invoke".into(), "hooks:admin".into()],
+    );
     auth.turn_started();
     let shown = next_hint(&mut hints).await;
     let url = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
-    let states = || -> Vec<String> {
-        login::test_support::pending(&scope)
-            .into_iter()
-            .map(|login| login.state)
-            .collect()
-    };
-    assert_eq!(states(), [query(&url, "state")]);
-    // A credential with the base scopes exists (signed in elsewhere), and
-    // a delivery finds it.
+    assert_eq!(states(&scope), [query(&url, "state")]);
+    // A credential with only the binding's scope exists (signed in
+    // elsewhere), and a delivery finds it.
     let (base, complete) = elsewhere(&other, id).await;
-    complete(issue_code(&base)).await;
+    complete(issue_code_granting(&base, "hooks:invoke")).await;
     assert!(credential(&auth, target.clone()).await.unwrap().is_some());
     match then {
         BaseCredential::NextTurn => auth.prepare_backend(&auth.0.backends[id].clone()).await,
         BaseCredential::SkippedConfiguration => {
             auth.configuration_needs_login(id);
             auth.prepare_backend(&auth.0.backends[id].clone()).await;
-            // The configuration is still retried with the base credential.
+            // The configuration is still retried with that credential.
             assert_eq!(Provider(auth.clone()).preparations(&target), 1);
         }
         BaseCredential::BasePreparation => {
             assert_eq!(auth.prepare(&target, &[]).await.unwrap(), None);
         }
     }
-    assert_eq!(states(), [query(&url, "state")]);
+    assert_eq!(states(&scope), [query(&url, "state")]);
     assert!(login::registry().has_needs(&scope));
     assert!(hints.try_recv().is_err());
     // The earlier link still completes the step-up.
