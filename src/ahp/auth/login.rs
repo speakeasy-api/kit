@@ -301,7 +301,7 @@ impl Registry {
             state.needs.contains_key(scope) || state.pending.contains_key(scope)
         };
         if known {
-            self.settle(scope, context, true);
+            self.settle(scope, context, true, None);
         }
     }
 
@@ -386,28 +386,33 @@ impl Registry {
     /// `login` completed. The scope's other targets (an upload on another
     /// resource, say) keep their logins, and the hint moves on to the next.
     pub(super) fn completed(&self, login: &Login) {
-        self.settle(&login.scope, &login.context, true);
+        self.settle(&login.scope, &login.context, true, None);
     }
 
     /// `login` ended without a grant (its link expired or consent was
-    /// denied): it is withdrawn, and the next turn prepares a new one.
+    /// denied): it is withdrawn, and the next turn prepares a new one. A
+    /// newer login for the same target, which replaced it, stays.
     pub(super) fn ended(&self, login: &Login) {
-        let current = self
-            .lock()
-            .pending
-            .get(&login.scope)
-            .is_some_and(|logins| logins.iter().any(|other| other.state == login.state));
-        if current {
-            self.settle(&login.scope, &login.context, false);
-        }
+        self.settle(&login.scope, &login.context, false, Some(&login.state));
     }
 
-    /// Ends the pending login for `context`'s target. Signed in, the target
-    /// needs no login either. The hint shows the scope's next link, or
-    /// clears once no target needs one.
-    fn settle(&self, scope: &str, context: &AuthContext, signed_in: bool) {
+    /// Ends the pending login for `context`'s target, or only the login with
+    /// `state` when one is given (nothing, if it is no longer pending).
+    /// Signed in, the target needs no login either. The hint shows the
+    /// scope's next link, or clears once no target needs one.
+    fn settle(&self, scope: &str, context: &AuthContext, signed_in: bool, only: Option<&str>) {
         let (stopped, hint) = {
             let mut state = self.lock();
+            // Checked under the same lock that removes it, so a login that
+            // replaced this one meanwhile is never withdrawn.
+            if let Some(only) = only
+                && !state
+                    .pending
+                    .get(scope)
+                    .is_some_and(|logins| logins.iter().any(|login| login.state == only))
+            {
+                return;
+            }
             let mut needed = state.needs.contains_key(scope);
             if signed_in && let Some(needs) = state.needs.get_mut(scope) {
                 needs.retain(|need| !same_target(&need.context, context));
@@ -419,7 +424,10 @@ impl Registry {
             let mut stopped = Vec::new();
             let next = state.pending.get_mut(scope).and_then(|logins| {
                 logins.retain(|login| {
-                    let ended = same_target(&login.context, context);
+                    let ended = only.map_or_else(
+                        || same_target(&login.context, context),
+                        |only| login.state == only,
+                    );
                     if ended {
                         stopped.push(Arc::clone(&login.stop));
                     }
@@ -530,6 +538,9 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             Either::Right((Ok(accepted), _)) => accepted,
         };
         let Ok((mut stream, _)) = accepted else {
+            // A persistent accept error (too many open files, say) must not
+            // spin; the expiry and stop checks above still end the login.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         let target = match tokio::time::timeout(Duration::from_secs(5), request_target(&mut stream))

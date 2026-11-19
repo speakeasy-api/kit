@@ -168,8 +168,8 @@ Client ID Metadata Document, then dynamic registration. If none applies,
 
 OAuth requests go only to HTTPS endpoints. They follow no redirects, and they
 connect only to the public addresses they resolved, unless
-`allowPrivateNetwork` is set. A client secret is sent only to its issuer's own
-origin.
+`allowPrivateNetwork` is set. A client secret named by `clientSecretRef` is
+sent only to a token endpoint on its configured issuer's own origin.
 
 `~/.kit/ahp-secrets.json` holds secrets that hooks.json names by reference
 (`clientSecretRef`, `initialAccessTokenRef` and a bearer `tokenRef`), as
@@ -184,7 +184,8 @@ over all of the above: Kit sends that header and nothing else.
 
 A backend that supplies its subscriptions through `hooks/configuration`
 contributes none while it needs a sign-in. Its link appears at the next turn
-start, like any other. As soon as you sign in, Kit asks the backend for its
+start, like any other. Once you sign in, through that link or elsewhere (such
+as `kit auth login hooks` in another terminal), Kit asks the backend for its
 configuration again and delivers events to it from then on, in the same
 session.
 

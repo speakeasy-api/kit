@@ -897,6 +897,107 @@ async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session(
     );
 }
 
+/// A session whose backend `id` supplies its subscriptions through
+/// hooks/configuration, which needs a sign-in: initialized, so the
+/// configuration was skipped.
+async fn skipped_configuration(
+    issuer: &Issuer,
+    storage: &tempfile::TempDir,
+    id: &str,
+) -> (HookAuth, Arc<crate::ahp::Hooks>, Arc<ProtectedServer>) {
+    let mut backend = issuer.backend(id);
+    backend.as_object_mut().unwrap().remove("subscriptions");
+    let auth = hook_auth(storage, vec![backend.clone()]);
+    let endpoint = context(&auth, id);
+    let server = Arc::new(ProtectedServer {
+        oauth: auth.manager(&endpoint).unwrap(),
+        endpoint,
+        events: Mutex::default(),
+    });
+    let registration =
+        serde_json::from_value(json!({"protocolVersion": "draft", "hooks": [backend]})).unwrap();
+    let options = crate::ahp::options()
+        .unwrap()
+        .with_backend(id, Arc::clone(&server) as _);
+    let hooks = Arc::new(crate::ahp::Hooks::new(registration, auth.install(options)).unwrap());
+    hooks.sdk.initialize().await.unwrap();
+    assert!(auth.was_skipped(&auth.0.backends[id]));
+    (auth, hooks, server)
+}
+
+/// After a turn start, the session configures the backend it skipped and
+/// delivers an event to it.
+async fn delivered_after_turn(
+    auth: &HookAuth,
+    hooks: &crate::ahp::Hooks,
+    server: &ProtectedServer,
+    id: &str,
+) {
+    auth.turn_started();
+    let endpoint = context(auth, id);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while Provider(auth.clone()).preparations(&endpoint) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the turn start prepares the signed-in backend");
+    hooks.sdk.initialize().await.unwrap();
+    let items = [agentkit_core::Item::text(
+        agentkit_core::ItemKind::User,
+        "old",
+    )];
+    hooks
+        .compact_before("configured", &items, true, "summarize", None)
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.events.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the event reaches the backend configured after sign-in");
+    assert!(!auth.was_skipped(&auth.0.backends[id]));
+}
+
+#[tokio::test]
+async fn a_sign_in_elsewhere_configures_a_skipped_backend_at_the_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.configured-elsewhere";
+    let (auth, hooks, server) = skipped_configuration(&issuer, &storage, id).await;
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The session shows its link; the user signs in from another process
+    // (`kit auth login hooks` in another terminal, say) instead.
+    auth.turn_started();
+    assert!(next_hint(&mut hints).await.url.is_some());
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    delivered_after_turn(&auth, &hooks, &server, id).await;
+}
+
+#[tokio::test]
+async fn a_sign_in_by_another_session_configures_a_skipped_backend() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.configured-by-session";
+    let (auth, hooks, server) = skipped_configuration(&issuer, &storage, id).await;
+    // Another session of this process signs in: the need it shares with
+    // this one is cleared, but this session's configuration is still skipped.
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    sign_in(&other, id).await;
+    assert!(
+        credential(&other, context(&other, id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!login::registry().has_needs(&auth.0.backends[id].scope));
+    delivered_after_turn(&auth, &hooks, &server, id).await;
+}
+
 #[tokio::test]
 async fn scope_settings_add_to_the_presets_scopes() {
     let issuer = Issuer::start().await;
@@ -1383,6 +1484,64 @@ async fn denying_consent_ends_the_login() {
     assert!(error.contains("not approved"), "{error}");
     browser.await.unwrap();
     assert_eq!(issuer.exchanges(), 0);
+}
+
+#[tokio::test]
+async fn an_ended_login_never_withdraws_its_replacement() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.replaced")]);
+    let target = context(&auth, "test.replaced");
+    let scope = auth.0.backends["test.replaced"].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    let first = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    let old = login::test_support::pending(&scope).remove(0);
+    // A newer login for the same target replaces the first.
+    let second = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    assert_ne!(query(&first, "state"), query(&second, "state"));
+    // The first login's listener ending late withdraws only itself.
+    login::registry().ended(&old);
+    let states: Vec<_> = login::test_support::pending(&scope)
+        .into_iter()
+        .map(|login| login.state)
+        .collect();
+    assert_eq!(states, [query(&second, "state")]);
+    assert!(approve(&second).await);
+}
+
+#[tokio::test]
+async fn signing_in_to_every_backend_tries_them_all_and_reports_each_failure() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // Sorted first, and its client secret reference resolves to nothing.
+    let broken = json!({"id": "test.a-broken", "transport": {"type": "http", "url": format!("{}/ahp", issuer.origin)},
+        "oauth": {"issuer": issuer.origin, "flow": "client_credentials", "clientId": "kit",
+            "clientSecretRef": "test.missing", "allowPrivateNetwork": true}});
+    let auth = hook_auth(&storage, vec![broken, issuer.backend("test.b-working")]);
+    let (tx, mut links) = mpsc::unbounded_channel();
+    let browser = tokio::spawn(async move {
+        let url: url::Url = links.recv().await.unwrap();
+        assert!(approve(&url).await);
+    });
+    let error = auth
+        .login(None, |_, url| tx.send(url.clone()).unwrap())
+        .await
+        .unwrap_err();
+    browser.await.unwrap();
+    assert!(
+        error.contains("test.a-broken: failing (credential_unavailable)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Signed in to hook backends: test.b-working"),
+        "{error}"
+    );
+    assert!(
+        credential(&auth, context(&auth, "test.b-working"))
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

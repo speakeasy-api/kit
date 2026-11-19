@@ -118,6 +118,11 @@ struct Inner {
     references: BTreeMap<String, String>,
     /// Starts the HTTP client of each OAuth request.
     client: network::ClientBuilder,
+    /// Backends whose hooks/configuration these hooks skipped for want of a
+    /// sign-in. Once a grant exists, from any process or session, a turn
+    /// start prepares their event endpoint through this instance's own
+    /// providers: that preparation is what lets the SDK configure them again.
+    skipped: Mutex<HashSet<String>>,
 }
 
 /// The flow of a target and its preset's client: the binding's, or for an
@@ -189,6 +194,7 @@ impl HookAuth {
             managers: Mutex::default(),
             references: secrets::references(),
             client,
+            skipped: Mutex::default(),
         }))
     }
 
@@ -234,12 +240,27 @@ impl HookAuth {
             return;
         };
         // A backend authenticated by its Authorization header never signs in.
-        if let Some(context) = backend.context()
-            && !backend.header_authorization
-            && !login::registry().has_needs(&backend.scope)
-        {
+        let Some(context) = backend.context() else {
+            return;
+        };
+        if backend.header_authorization {
+            return;
+        }
+        self.skipped().insert(backend.id.clone());
+        if !login::registry().has_needs(&backend.scope) {
             login::registry().needs_login(&backend.scope, &context, &[]);
         }
+    }
+
+    fn skipped(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.0
+            .skipped
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn was_skipped(&self, backend: &Backend) -> bool {
+        self.skipped().contains(&backend.id)
     }
 
     /// Bearer, OAuth and unbound routes. A route is chosen by the binding, so
@@ -437,10 +458,19 @@ impl HookAuth {
         }
         for backend in self.0.backends.values() {
             let known = login::registry().has_needs(&backend.scope);
-            if !known && !backend.expects_oauth() {
+            let skipped = self.was_skipped(backend);
+            if !known && !skipped && !backend.expects_oauth() {
                 continue;
             }
             let Some(claim) = login::registry().begin_preparing(&backend.scope) else {
+                // Another session is preparing this backend's logins. A
+                // configuration this one skipped still needs its own
+                // preparation once signed in; that never shows a link.
+                if skipped {
+                    let auth = self.clone();
+                    let backend = backend.clone();
+                    tokio::spawn(async move { auth.reconfigure(&backend).await });
+                }
                 continue;
             };
             let auth = self.clone();
@@ -455,13 +485,21 @@ impl HookAuth {
     async fn prepare_backend(&self, backend: &Backend) {
         let mut needs = login::registry().needs(&backend.scope);
         if needs.is_empty() {
-            // Not yet seen failing: a known grant needs nothing; ask the store.
+            // Not yet seen failing, or signed in already (perhaps by another
+            // session of this process): a known grant needs no login.
             let Some(context) = backend.context() else {
                 return;
             };
-            let result = Provider(self.clone()).credential(context).await;
-            if !matches!(&result, Err(error) if needs_login(error)) {
-                return;
+            let result = Provider(self.clone())
+                .credential(with_deadline(&context))
+                .await;
+            match &result {
+                Err(error) if needs_login(error) => {}
+                Ok(Some(_)) => {
+                    self.reconfigure(backend).await;
+                    return;
+                }
+                _ => return,
             }
             needs = login::registry().needs(&backend.scope);
         }
@@ -469,17 +507,51 @@ impl HookAuth {
             if login::registry().has_live_login(&backend.scope, &need.context) {
                 // The link shown stays until it expires, unless the grant
                 // arrived meanwhile (signed in from another Kit process).
-                let _ = Provider(self.clone())
+                let signed_in = Provider(self.clone())
                     .credential(with_deadline(&need.context))
                     .await;
-                continue;
+                if !matches!(signed_in, Ok(Some(_))) {
+                    continue;
+                }
             }
-            if let Err(error) = self.prepare(&need.context, &need.required).await {
-                let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
-                tracing::warn!(backend = %backend.id, code, "hook sign-in could not be prepared");
-                // The user sees why, once, beside where a link would be.
-                login::registry().problem(&backend.scope, &backend.id, guidance(&error));
-            }
+            // With a grant this only prepares, which lets the SDK retry a
+            // configuration that needed it; without one it shows a link.
+            self.prepare_or_explain(backend, &need.context, &need.required)
+                .await;
+        }
+        // An upload's need may have hidden the configuration's.
+        self.reconfigure(backend).await;
+    }
+
+    /// A configuration these hooks skipped is prepared once a grant exists,
+    /// wherever it was signed in. Without a grant this does nothing: the
+    /// recorded need shows the link.
+    async fn reconfigure(&self, backend: &Backend) {
+        if !self.was_skipped(backend) {
+            return;
+        }
+        let Some(context) = backend.context() else {
+            return;
+        };
+        if let Ok(Some(_)) = Provider(self.clone())
+            .credential(with_deadline(&context))
+            .await
+        {
+            self.prepare_or_explain(backend, &context, &[]).await;
+        }
+    }
+
+    async fn prepare_or_explain(
+        &self,
+        backend: &Backend,
+        context: &AuthContext,
+        required: &[String],
+    ) {
+        if let Err(error) = self.prepare(context, required).await {
+            let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
+            tracing::warn!(backend = %backend.id, code, "hook sign-in could not be prepared");
+            // The user sees why, once, beside where a link would be.
+            login::registry().problem(&backend.scope, &backend.id, guidance(&error));
         }
     }
 
@@ -510,6 +582,11 @@ impl HookAuth {
             Preparation::Ready(_) => {
                 if let Some(scope) = self.scope(&context) {
                     login::registry().usable(scope, &context);
+                }
+                // The SDK counted this preparation; a skipped configuration
+                // of the backend is retried.
+                if context.purpose == agenthooksprotocol::adapters::registered::AuthPurpose::Event {
+                    self.skipped().remove(&context.backend_id);
                 }
                 Ok(None)
             }
@@ -582,6 +659,8 @@ impl HookAuth {
 
     /// Signs in to `only`, or to each backend that needs it. `present` is
     /// shown each link; a backend with a usable grant is never re-prompted.
+    /// Without `only`, a backend that fails does not stop the others: every
+    /// failure is reported at the end, after the rest were tried.
     pub(crate) async fn login(
         &self,
         only: Option<&str>,
@@ -593,71 +672,98 @@ impl HookAuth {
             return Err(format!("no hook backend `{id}` is configured"));
         }
         let mut signed_in = Vec::new();
+        let mut failures = Vec::new();
         for backend in self.0.backends.values() {
             if only.is_some_and(|id| id != backend.id) || backend.header_authorization {
                 continue;
             }
-            let Some(context) = backend.context() else {
-                continue;
-            };
-            let manager = match self.manager(&context) {
-                Ok(manager) => manager,
-                Err(_) if only.is_none() => continue,
-                Err(error) => return Err(format!("{}: {}", backend.id, describe(&error))),
-            };
-            if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
-                continue;
+            match self
+                .login_backend(backend, only.is_some(), &mut present)
+                .await
+            {
+                Ok(true) => signed_in.push(backend.id.clone()),
+                Ok(false) => {}
+                Err(error) => failures.push(format!("{}: {error}", backend.id)),
             }
-            // Listen before showing the link, so an immediate approval lands.
-            // Client credentials have no callback and never listen.
-            let mut options = PrepareOptions::new();
-            let listener = if self.pkce(&context).unwrap_or(false) {
-                let (listener, redirect) = login::bind().await.map_err(|error| {
-                    format!("{}: could not listen for sign-in: {error}", backend.id)
-                })?;
-                options = options.redirect_uri(redirect);
-                Some(listener)
-            } else {
-                None
-            };
-            let prepared = manager
-                .prepare_with(with_deadline(&context), options, budget())
-                .await;
-            let pending = match prepared {
-                Ok(Preparation::Ready(_)) => continue,
-                Ok(Preparation::InteractionRequired(pending)) => pending,
-                Ok(_) => continue,
-                // Without a preset or settings, a backend that publishes no
-                // protected resource metadata does not use OAuth.
-                Err(error)
-                    if only.is_none()
-                        && !backend.expects_oauth()
-                        && error.auth_code() == Some(AuthErrorCode::DiscoveryFailed) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(format!("{}: {}", backend.id, describe(&error))),
-            };
-            let Some(listener) = listener else {
-                return Err(format!(
-                    "{}: {}",
-                    backend.id,
-                    describe(&fail(AuthErrorCode::ProviderFailed))
-                ));
-            };
-            present(&backend.id, pending.authorization_url());
-            let candidate =
-                login::Login::new(&backend.scope, Arc::clone(&manager), &context, pending);
-            if login::serve(&listener, &candidate).await != login::Outcome::Completed {
-                return Err(format!(
-                    "{}: the sign-in link expired or was not approved",
-                    backend.id
-                ));
-            }
-            login::registry().usable(&backend.scope, &context);
-            signed_in.push(backend.id.clone());
         }
-        Ok(signed_in)
+        if failures.is_empty() {
+            Ok(signed_in)
+        } else if signed_in.is_empty() {
+            Err(failures.join("\n"))
+        } else {
+            Err(format!(
+                "{}\nSigned in to hook backends: {}",
+                failures.join("\n"),
+                signed_in.join(", ")
+            ))
+        }
+    }
+
+    /// Signs in to one backend. `Ok(true)` when it is signed in now,
+    /// `Ok(false)` when it needed nothing. A backend that is not named and
+    /// does not use OAuth is skipped rather than failed.
+    async fn login_backend(
+        &self,
+        backend: &Backend,
+        named: bool,
+        present: &mut impl FnMut(&str, &url::Url),
+    ) -> Result<bool, String> {
+        let Some(context) = backend.context() else {
+            return Ok(false);
+        };
+        let manager = match self.manager(&context) {
+            Ok(manager) => manager,
+            // Not named and not expecting OAuth: a bearer preset, say.
+            Err(_) if !named && !backend.expects_oauth() => return Ok(false),
+            Err(error) => return Err(describe(&error)),
+        };
+        if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
+            return Ok(false);
+        }
+        // Listen before showing the link, so an immediate approval lands.
+        // Client credentials have no callback and never listen.
+        let mut options = PrepareOptions::new();
+        let listener = if self.pkce(&context).unwrap_or(false) {
+            let (listener, redirect) = login::bind()
+                .await
+                .map_err(|error| format!("could not listen for sign-in: {error}"))?;
+            options = options.redirect_uri(redirect);
+            Some(listener)
+        } else {
+            None
+        };
+        let prepared = manager
+            .prepare_with(with_deadline(&context), options, budget())
+            .await;
+        let pending = match prepared {
+            // Client credentials: the token was just obtained.
+            Ok(Preparation::Ready(_)) => {
+                login::registry().usable(&backend.scope, &context);
+                return Ok(true);
+            }
+            Ok(Preparation::InteractionRequired(pending)) => pending,
+            Ok(_) => return Ok(false),
+            // Without a preset or settings, a backend that publishes no
+            // protected resource metadata does not use OAuth.
+            Err(error)
+                if !named
+                    && !backend.expects_oauth()
+                    && error.auth_code() == Some(AuthErrorCode::DiscoveryFailed) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(describe(&error)),
+        };
+        let Some(listener) = listener else {
+            return Err(describe(&fail(AuthErrorCode::ProviderFailed)));
+        };
+        present(&backend.id, pending.authorization_url());
+        let candidate = login::Login::new(&backend.scope, Arc::clone(&manager), &context, pending);
+        if login::serve(&listener, &candidate).await != login::Outcome::Completed {
+            return Err("the sign-in link expired or was not approved".into());
+        }
+        login::registry().usable(&backend.scope, &context);
+        Ok(true)
     }
 
     /// Forgets `backend`'s tokens, pending login and registered client, and

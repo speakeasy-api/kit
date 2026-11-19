@@ -988,8 +988,12 @@ impl ChildOutput {
     }
 
     fn record(&mut self, update: SessionUpdate) {
-        if let Ok(value) = serde_json::to_value(&update)
-            && user_only(&value)
+        // Sign-in hints are notices; no other update needs inspecting.
+        if let SessionUpdate::Notice(notice) = &update
+            && notice
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(crate::ahp::auth::HOOK_AUTH_META))
         {
             return;
         }
