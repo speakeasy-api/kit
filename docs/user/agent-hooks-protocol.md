@@ -73,13 +73,15 @@ shows its link where only you see it:
 - A session without a client writes one line per link to stderr.
 
 Every turn shows the same link until it expires (at most 10 minutes); then
-the next turn shows a new one. Kit listens on
-`http://127.0.0.1:<port>/callback` while a sign-in is pending, so you can
-open the link at any time before it expires. The port is fixed per backend,
-so every Kit process uses the same redirect. When several Kit processes run,
-one listens, and it completes any process's sign-in from the shared
-credential store. Hook messages and sign-in links never enter the transcript
-that the model reads.
+the next turn shows a new one. As with MCP sign-in, each link has its own
+callback, `http://127.0.0.1:<port>/callback` on a port the system chooses,
+and the Kit process that showed the link listens there until the link
+expires, so you can open it at any time before then. When several Kit
+processes run, each shows its own link, and signing in through any of them
+signs in all of them: the sign-in is stored in the shared credential store,
+and the other processes clear their links when they next use the backend
+or start a turn. If you sign in twice, the newest sign-in wins. Hook
+messages and sign-in links never enter the transcript that the model reads.
 
 ### Sign in from the command line
 
@@ -155,9 +157,8 @@ receivers ignore it. All settings are optional. Alongside a preset:
 | `scopes` | Scopes to request in addition to the preset's, which every operation requires. They are also the most Kit accepts: a backend that asks for a scope outside them is refused, not granted it. |
 | `clientId` | A client registered for Kit in advance. It always wins. |
 | `clientSecretRef` | For client credentials: a key in `~/.kit/ahp-secrets.json`. |
-| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document that you publish. Kit uses it where the issuer supports such documents. `redirectUris` must include this backend's redirect. |
+| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document that you publish. Kit uses it where the issuer supports such documents. Its `redirectUris` must include `http://127.0.0.1/callback`; the authorization server must accept any port on it (RFC 8252). |
 | `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
-| `redirectPort` | The callback port (1024 to 65535). Default: a port derived from the backend id. |
 | `loginLifetimeMinutes` | How long a sign-in link lasts, up to 10 (the default). |
 | `allowPrivateNetwork` | Allow the authorization server on loopback or private addresses. Default `false`. |
 

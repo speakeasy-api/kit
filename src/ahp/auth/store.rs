@@ -11,7 +11,7 @@ use agenthooksprotocol::{
 
 use crate::credentials::{CredentialEntryLock, CredentialStorage};
 
-/// SDK binding, grant, pending-login and registration records.
+/// SDK binding, grant and registration records.
 pub(super) const RECORDS: &str = "ahp-oauth";
 /// Client secrets issued by dynamic registration.
 pub(super) const SECRETS: &str = "ahp-oauth-secret";
@@ -21,8 +21,6 @@ const INDEX: &str = "ahp-oauth-index";
 /// Every scope with an index, so a backend's state can be found after its
 /// hooks file moved (a renamed or re-cloned project).
 const SCOPES: (&str, &str) = ("ahp-oauth-scopes", "all");
-/// Pending logins by `state`, for a listener in another Kit process.
-pub(super) const PENDING: &str = "ahp-oauth-pending";
 
 fn unavailable() -> HookError {
     HookError::authentication(AuthErrorCode::ProviderFailed)
@@ -116,53 +114,6 @@ impl Store {
             let entry = self.storage.entry(SCOPES.0, SCOPES.1);
             let bytes = serde_json::to_vec(&scopes).map_err(|_| unavailable())?;
             blocking(move || entry.save(&bytes)).await?;
-        }
-        Ok(())
-    }
-
-    /// Stores a pending-login record, then indexes it. In that order, a
-    /// concurrent [`Self::prune_pending`] never finds an indexed login
-    /// without its record and drops it.
-    pub(super) async fn record_pending(
-        &self,
-        state: &str,
-        record: Vec<u8>,
-        budget: OperationBudget,
-    ) -> Result<(), HookError> {
-        let entry = self.storage.entry(PENDING, state);
-        blocking(move || entry.save(&record)).await?;
-        self.remember(PENDING, state, budget).await
-    }
-
-    /// Drops this backend's pending-login records that expired by `now_ms`
-    /// (Unix milliseconds), and their index entries, so neither grows with
-    /// each new link.
-    pub(super) async fn prune_pending(
-        &self,
-        now_ms: u64,
-        budget: OperationBudget,
-    ) -> Result<(), HookError> {
-        let _lock = self.lock(INDEX, &self.backend, budget).await?;
-        let mut index = self.index().await?;
-        let mut pruned = false;
-        for (namespace, identity) in index.clone() {
-            if namespace != PENDING {
-                continue;
-            }
-            let entry = self.storage.entry(PENDING, &identity);
-            let bytes = blocking(move || entry.load()).await?;
-            let expires_at = bytes
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|record| record["expiresAt"].as_u64());
-            if expires_at.is_none_or(|expires_at| expires_at <= now_ms) {
-                let entry = self.storage.entry(PENDING, &identity);
-                blocking(move || entry.delete()).await?;
-                index.remove(&(namespace, identity));
-                pruned = true;
-            }
-        }
-        if pruned {
-            self.save_index(&index).await?;
         }
         Ok(())
     }
@@ -357,71 +308,6 @@ mod tests {
         assert_eq!(first.forget(budget()).await.unwrap(), 1);
         let mut guard = second.acquire(key("cas"), budget()).await.unwrap();
         assert!(guard.load().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn a_pending_login_is_stored_before_it_is_indexed() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
-        let store = Store::new(storage.clone(), "test#record-order");
-        // Hold the index, as a concurrent prune would.
-        let index = store
-            .lock(INDEX, "test#record-order", budget())
-            .await
-            .unwrap();
-        let recording = tokio::spawn({
-            let store = store.clone();
-            async move {
-                let record = serde_json::json!({"expiresAt": u64::MAX}).to_string();
-                store
-                    .record_pending("live", record.into_bytes(), budget())
-                    .await
-            }
-        });
-        // While indexing waits, the record already exists, so a prune that
-        // holds the index cannot see the key without its record.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while storage.entry(PENDING, "live").load().unwrap().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the record is stored before indexing");
-        drop(index);
-        recording.await.unwrap().unwrap();
-        store.prune_pending(1, budget()).await.unwrap();
-        assert!(storage.entry(PENDING, "live").load().unwrap().is_some());
-        assert!(
-            store
-                .index()
-                .await
-                .unwrap()
-                .contains(&(PENDING.to_owned(), "live".to_owned()))
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_pending_logins_are_pruned_from_storage_and_index() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
-        let store = Store::new(storage.clone(), "test#prune");
-        for (state, expires_at) in [("old", 1_000_u64), ("live", u64::MAX)] {
-            store.remember(PENDING, state, budget()).await.unwrap();
-            storage
-                .entry(PENDING, state)
-                .save(
-                    serde_json::json!({"expiresAt": expires_at})
-                        .to_string()
-                        .as_bytes(),
-                )
-                .unwrap();
-        }
-        store.prune_pending(2_000, budget()).await.unwrap();
-        assert!(storage.entry(PENDING, "old").load().unwrap().is_none());
-        assert!(storage.entry(PENDING, "live").load().unwrap().is_some());
-        let index = store.index().await.unwrap();
-        assert!(!index.contains(&(PENDING.to_owned(), "old".to_owned())));
-        assert!(index.contains(&(PENDING.to_owned(), "live".to_owned())));
     }
 
     #[tokio::test]

@@ -2,7 +2,10 @@
 //!
 //! Every hooks.json backend has its own OAuth state: its own grant (the grant
 //! partition is the backend's scope, so its event and upload endpoints share one
-//! consent), its own pending login and its own fixed loopback redirect.
+//! consent) and its own pending logins. As in Kit's MCP sign-in, each login
+//! listens on its own loopback port and is completed by the process that
+//! prepared it; grants are shared with other Kit processes through the
+//! credential store, and the newest completed sign-in wins.
 //! Delivery never signs in. A delivery or configuration that needs a login
 //! fails under the subscription's failure policy and is recorded; the next
 //! turn prepares the login in the background and shows its link to the user.
@@ -25,7 +28,7 @@ use agenthooksprotocol::{
         AuthBinding, AuthErrorCode, AuthProviders, AuthRecovery, BearerAuth, OAuthFlow,
         managed::{
             ClientSecret, ManagedOAuth, OAuthClientConfig, OperationBudget, Preparation,
-            RegistrationPolicy, TokenAuthMethod,
+            PrepareOptions, RegistrationPolicy, TokenAuthMethod,
         },
     },
     client::{HookError, LocalFuture},
@@ -48,8 +51,6 @@ struct Backend {
     /// The backend id within the hooks file that declares it: the key of
     /// its grant, its stored records and its hints.
     scope: String,
-    /// That hooks file.
-    source: String,
     /// The HTTP transport URL; stdio backends never authenticate.
     url: Option<String>,
     preset: Option<Value>,
@@ -65,7 +66,6 @@ impl Backend {
         let id = value["id"].as_str().unwrap_or_default().to_owned();
         let backend = Self {
             scope: format!("{source}#{id}"),
-            source: source.to_owned(),
             id,
             url: (transport["type"] == "http")
                 .then(|| transport["url"].as_str().map(str::to_owned))
@@ -141,7 +141,6 @@ fn needs_login(error: &HookError) -> bool {
 }
 
 impl HookAuth {
-    /// Reads every backend of the effective registration.
     /// Reads every backend of the effective registration. `sources` names
     /// the hooks file that declares each backend id.
     pub(crate) fn new(
@@ -159,23 +158,10 @@ impl HookAuth {
         client: network::ClientBuilder,
     ) -> Self {
         let mut backends = BTreeMap::new();
-        let mut ports: HashMap<u16, String> = HashMap::new();
         for value in registration["hooks"].as_array().into_iter().flatten() {
             let id = value["id"].as_str().unwrap_or_default();
             let source = sources.get(id).map_or("", String::as_str);
-            let (mut backend, mut problems) = Backend::parse(value, source);
-            let explicit = value["oauth"]["redirectPort"].is_u64();
-            if explicit && let Some(other) = ports.get(&backend.settings.redirect_port) {
-                // Two backends on one explicit port: refuse the second.
-                problems.push(format!(
-                    "{}: oauth.redirectPort {} is also {other}'s; ignored",
-                    backend.id, backend.settings.redirect_port
-                ));
-                backend.settings.redirect_port = config::default_port(&backend.id);
-            }
-            if explicit || !ports.contains_key(&backend.settings.redirect_port) {
-                ports.insert(backend.settings.redirect_port, backend.id.clone());
-            }
+            let (backend, problems) = Backend::parse(value, source);
             for problem in problems {
                 eprintln!("kit: hooks.json: {problem}");
             }
@@ -292,7 +278,6 @@ impl HookAuth {
             return Ok(Arc::clone(manager));
         }
         let store = store::Store::new(self.0.storage.clone(), &backend.scope);
-        let redirect = login::redirect_uri(settings.redirect_port);
         let client = settings.client_id.clone().or(preset_client);
         let mut config = match &client {
             Some(client) => OAuthClientConfig::new(NAMESPACE, client, flow),
@@ -327,8 +312,8 @@ impl HookAuth {
                 config
             }
         };
+        // Each login passes its own loopback redirect when it is prepared.
         config = config
-            .redirect_uri(redirect)
             .grant_partition(&backend.scope)
             .login_lifetime(settings.login_lifetime)
             .scopes(scopes.clone(), scopes)
@@ -461,17 +446,25 @@ impl HookAuth {
             needs = login::registry().needs(&backend.scope);
         }
         for need in needs {
+            if login::registry().has_live_login(&backend.scope, &need.context) {
+                // The link shown stays until it expires, unless the grant
+                // arrived meanwhile (signed in from another Kit process).
+                let _ = Provider(self.clone())
+                    .credential(with_deadline(&need.context))
+                    .await;
+                continue;
+            }
             if let Err(error) = self.prepare(&need.context, &need.required).await {
                 let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
                 tracing::warn!(backend = %backend.id, code, "hook sign-in could not be prepared");
                 // The user sees why, once, beside where a link would be.
-                login::registry().problem(&backend.scope, &backend.id, guidance(&error, backend));
+                login::registry().problem(&backend.scope, &backend.id, guidance(&error));
             }
         }
     }
 
-    /// Prepares one target: a usable grant clears its need; otherwise the
-    /// (possibly reused) pending login is shown and its callback awaited.
+    /// Prepares one target: a usable grant clears its need; otherwise a new
+    /// login is shown, and its own listener awaits the callback.
     async fn prepare(
         &self,
         context: &AuthContext,
@@ -479,8 +472,14 @@ impl HookAuth {
     ) -> Result<Option<url::Url>, HookError> {
         let manager = self.manager(context)?;
         let context = with_deadline(context);
+        let (listener, redirect) = login::bind()
+            .await
+            .map_err(|_| fail(AuthErrorCode::ProviderFailed))?;
+        let options = PrepareOptions::new()
+            .required(required.to_vec())
+            .redirect_uri(redirect);
         match manager
-            .prepare_with_required(context.clone(), required, budget())
+            .prepare_with(context.clone(), options, budget())
             .await?
         {
             Preparation::Ready(_) => {
@@ -490,42 +489,23 @@ impl HookAuth {
                 Ok(None)
             }
             Preparation::InteractionRequired(pending) => {
-                let backend = self
-                    .0
-                    .backends
-                    .get(&context.backend_id)
-                    .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?;
-                let port = backend.settings.redirect_port;
-                let login = login::Login::new(
-                    &backend.scope,
-                    Arc::clone(&manager),
-                    &context,
-                    &pending,
-                    &self.0.storage,
-                    self.0.client,
-                );
-                self.record_pending(backend, &login).await;
-                let watched = login.clone();
-                if login::registry().offer(login, &pending, port) {
-                    match login::bind(port).await {
-                        login::Bound::Here(listener) => {
-                            tokio::spawn(login::listen_on(listener, port));
-                        }
-                        login::Bound::Peer => {
-                            login::registry().stopped(port);
-                            tokio::spawn(login::watch_peer(watched, port));
-                        }
-                        login::Bound::Foreign => {
-                            // No link is shown that nothing can receive; a
-                            // later turn tries the port again.
-                            login::registry().stopped(port);
-                            login::registry().withdraw(&backend.scope);
-                            return Err(fail(AuthErrorCode::UntrustedDestination));
-                        }
+                let scope = self
+                    .scope(&context)
+                    .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?
+                    .to_owned();
+                let url = pending.authorization_url().clone();
+                let login = login::Login::new(&scope, manager, &context, pending);
+                login::registry().offer(login.clone());
+                // Listening already: the link works as soon as it is shown.
+                tokio::spawn(async move {
+                    match login::serve(&listener, &login).await {
+                        login::Outcome::Completed => login::registry().completed(&login),
+                        login::Outcome::Ended => login::registry().ended(&login),
+                        login::Outcome::Stopped => {}
                     }
-                }
-                login::registry().show(&backend.scope);
-                Ok(Some(pending.authorization_url().clone()))
+                });
+                login::registry().show(&scope);
+                Ok(Some(url))
             }
             _ => Err(fail(AuthErrorCode::ProviderFailed)),
         }
@@ -602,10 +582,14 @@ impl HookAuth {
             if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
                 continue;
             }
+            // Listen before showing the link, so an immediate approval lands.
+            let (listener, redirect) = login::bind().await.map_err(|error| {
+                format!("{}: could not listen for sign-in: {error}", backend.id)
+            })?;
             let prepared = manager
                 .prepare_with(
                     with_deadline(&context),
-                    agenthooksprotocol::auth::managed::PrepareOptions::new(),
+                    PrepareOptions::new().redirect_uri(redirect),
                     budget(),
                 )
                 .await;
@@ -624,96 +608,19 @@ impl HookAuth {
                 }
                 Err(error) => return Err(format!("{}: {}", backend.id, describe(&error))),
             };
-            let expires_at = pending.expires_at();
-            let candidate = login::Login::new(
-                &backend.scope,
-                Arc::clone(&manager),
-                &context,
-                &pending,
-                &self.0.storage,
-                self.0.client,
-            );
-            self.record_pending(backend, &candidate).await;
-            let port = backend.settings.redirect_port;
-            // Listen before showing the link, so an immediate approval lands.
-            let bound = login::bind(port).await;
-            if let login::Bound::Foreign = bound {
-                return Err(format!("{}: {}", backend.id, login::foreign_port(port)));
-            }
             present(&backend.id, pending.authorization_url());
-            let serve = |listener: tokio::net::TcpListener| {
-                let candidate = candidate.clone();
-                async move {
-                    let done = std::cell::Cell::new(false);
-                    login::serve(
-                        &listener,
-                        port,
-                        || (!done.get()).then(|| (vec![candidate.clone()], expires_at)),
-                        |_| done.set(true),
-                    )
-                    .await;
-                    done.get()
-                }
-            };
-            let completed = match bound {
-                login::Bound::Here(listener) => serve(listener).await,
-                // Another Kit process listens on this port and completes the
-                // login in the shared store, which is polled here. If it stops
-                // listening first, this process takes the port over.
-                _ => loop {
-                    if std::time::SystemTime::now() >= expires_at {
-                        break false;
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if let Ok(Some(_)) = manager.credential(with_deadline(&context)).await {
-                        break true;
-                    }
-                    if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                        break serve(listener).await;
-                    }
-                },
-            };
-            if !completed {
-                return Err(format!("{}: the sign-in link expired", backend.id));
+            let candidate =
+                login::Login::new(&backend.scope, Arc::clone(&manager), &context, pending);
+            if login::serve(&listener, &candidate).await != login::Outcome::Completed {
+                return Err(format!(
+                    "{}: the sign-in link expired or was not approved",
+                    backend.id
+                ));
             }
             login::registry().usable(&backend.scope, &context);
             signed_in.push(backend.id.clone());
         }
         Ok(signed_in)
-    }
-
-    /// Records `login` by its `state` for a listener in another Kit process
-    /// that shares this backend's callback port.
-    async fn record_pending(&self, backend: &Backend, login: &login::Login) {
-        let record = Value::Object(serde_json::Map::from_iter([
-            ("source".into(), backend.source.clone().into()),
-            ("backend".into(), backend.id.clone().into()),
-            (
-                "destination".into(),
-                login.context.destination.clone().into(),
-            ),
-            (
-                "upload".into(),
-                (login.context.purpose
-                    == agenthooksprotocol::adapters::registered::AuthPurpose::Upload)
-                    .into(),
-            ),
-            (
-                "authentication".into(),
-                login.context.authentication.clone().unwrap_or(Value::Null),
-            ),
-            ("expiresAt".into(), login::unix_ms(login.expires_at).into()),
-        ]));
-        let store = store::Store::new(self.0.storage.clone(), &backend.scope);
-        let now = login::unix_ms(std::time::SystemTime::now());
-        if let Err(error) = store.prune_pending(now, budget()).await {
-            tracing::debug!(code = ?error.auth_code(), "could not prune expired hook sign-ins");
-        }
-        if let Ok(bytes) = serde_json::to_vec(&record)
-            && let Err(error) = store.record_pending(&login.state, bytes, budget()).await
-        {
-            tracing::debug!(code = ?error.auth_code(), "could not record a hook sign-in");
-        }
     }
 
     /// Forgets `backend`'s tokens, pending login and registered client, and
@@ -733,12 +640,9 @@ impl HookAuth {
 
 /// What to tell the user when a backend's sign-in cannot be prepared: the
 /// safe error code and the setting to check, never a provider message.
-fn guidance(error: &HookError, backend: &Backend) -> String {
+fn guidance(error: &HookError) -> String {
     match error.auth_code() {
-        Some(AuthErrorCode::UntrustedDestination) => format!(
-            "untrusted_destination. Check oauth.issuer, oauth.trustAdvertisedIssuer, oauth.allowPrivateNetwork and that port {} is free (oauth.redirectPort) in hooks.json.",
-            backend.settings.redirect_port
-        ),
+        Some(AuthErrorCode::UntrustedDestination) => "untrusted_destination. Check oauth.issuer, oauth.trustAdvertisedIssuer and oauth.allowPrivateNetwork in hooks.json.".into(),
         Some(
             code @ (AuthErrorCode::CredentialUnavailable
             | AuthErrorCode::InvalidConfiguration
@@ -760,60 +664,6 @@ fn describe(error: &HookError) -> String {
         Some(code) => format!("failing ({})", code.as_str()),
         None => "failing".into(),
     }
-}
-
-/// Completes a pending login another Kit process recorded under `state`,
-/// as that process would: from its hooks file and the shared store.
-pub(super) async fn complete_stored(
-    storage: &CredentialStorage,
-    client: network::ClientBuilder,
-    state: &str,
-    callback: url::Url,
-) -> bool {
-    let entry = storage.entry(store::PENDING, state);
-    let Ok(Ok(Some(bytes))) = tokio::task::spawn_blocking(move || entry.load()).await else {
-        return false;
-    };
-    let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
-        return false;
-    };
-    let (Some(source), Some(id), Some(destination)) = (
-        record["source"].as_str(),
-        record["backend"].as_str(),
-        record["destination"].as_str(),
-    ) else {
-        return false;
-    };
-    let Ok(Some(registration)) = super::read(std::path::Path::new(source)) else {
-        return false;
-    };
-    let Ok(registration) = serde_json::to_value(registration) else {
-        return false;
-    };
-    let sources = BTreeMap::from([(id.to_owned(), source.to_owned())]);
-    let auth = HookAuth::with_client(storage.clone(), &registration, &sources, client);
-    let context = AuthContext {
-        backend_id: id.to_owned(),
-        authentication: Some(record["authentication"].clone()).filter(|value| !value.is_null()),
-        destination: destination.to_owned(),
-        purpose: if record["upload"] == true {
-            agenthooksprotocol::adapters::registered::AuthPurpose::Upload
-        } else {
-            agenthooksprotocol::adapters::registered::AuthPurpose::Event
-        },
-        deadline: Instant::now() + OPERATION,
-    };
-    let Ok(manager) = auth.manager(&context) else {
-        return false;
-    };
-    // The SDK validates state, redirect and issuer before claiming the
-    // stored login, so a mismatched record cannot consume it.
-    let completed = manager.complete(context, callback, budget()).await.is_ok();
-    if completed {
-        let entry = storage.entry(store::PENDING, state);
-        let _ = tokio::task::spawn_blocking(move || entry.delete()).await;
-    }
-    completed
 }
 
 /// Removes `backend`'s state in every workspace, including workspaces whose

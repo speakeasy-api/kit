@@ -9,9 +9,8 @@
 //!   "scopes": ["hooks"],
 //!   "clientId": "kit",
 //!   "clientSecretRef": "example-secret",
-//!   "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1:30123/callback"] },
+//!   "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1/callback"] },
 //!   "registration": true,
-//!   "redirectPort": 30123,
 //!   "loginLifetimeMinutes": 10,
 //!   "allowPrivateNetwork": false,
 //!   "trustAdvertisedIssuer": false
@@ -45,8 +44,6 @@ pub(super) struct Settings {
     /// A published Client ID Metadata Document and its `redirect_uris`.
     pub client_metadata_document: Option<(String, Vec<String>)>,
     pub registration: Option<Registration>,
-    /// The fixed loopback port of this backend's sign-in callback.
-    pub redirect_port: u16,
     pub login_lifetime: Duration,
     /// Allow the authorization server on loopback or private addresses.
     pub allow_private_network: bool,
@@ -57,16 +54,6 @@ pub(super) struct Settings {
     pub invalid_issuer: bool,
     /// An `oauth` object was given: the user expects OAuth here.
     pub configured: bool,
-}
-
-/// A stable port per backend, so every Kit process derives the same
-/// redirect. 30000 to 32767 lies below the Linux (32768+) and macOS (49152+)
-/// ephemeral ranges and apart from other AHP adapters' (pi: 20000 to 29999),
-/// so neither an outgoing connection nor another harness takes it.
-pub(super) fn default_port(backend: &str) -> u16 {
-    let hash = blake3::hash(backend.as_bytes());
-    let bytes = hash.as_bytes();
-    30000 + u16::from_le_bytes([bytes[0], bytes[1]]) % 2768
 }
 
 fn strings(value: &Value) -> Option<Vec<String>> {
@@ -95,7 +82,6 @@ impl Settings {
             client_secret_ref: None,
             client_metadata_document: None,
             registration: None,
-            redirect_port: default_port(id),
             login_lifetime: MAX_LIFETIME,
             allow_private_network: false,
             trust_advertised_issuer: false,
@@ -171,16 +157,6 @@ impl Settings {
             settings.registration = None;
             ignore("registration", "needs oauth.issuer");
         }
-        if let Some(port) = given("redirectPort") {
-            match port
-                .as_u64()
-                .and_then(|port| u16::try_from(port).ok())
-                .filter(|port| *port >= 1024)
-            {
-                Some(port) => settings.redirect_port = port,
-                None => ignore("redirectPort", "is not a port from 1024 to 65535"),
-            }
-        }
         if let Some(minutes) = given("loginLifetimeMinutes") {
             match minutes.as_f64().filter(|m| *m > 0.0 && *m <= 10.0) {
                 Some(minutes) => {
@@ -229,14 +205,13 @@ mod tests {
             "issuer": "https://auth.example", "flow": "client_credentials", "scopes": ["hooks"],
             "clientId": "kit", "clientSecretRef": "secret",
             "clientMetadataDocument": {"url": "https://kit.example/client.json",
-                "redirectUris": ["http://127.0.0.1:50000/callback"]},
+                "redirectUris": ["http://127.0.0.1/callback"]},
             "registration": {"clientName": "Kit", "initialAccessTokenRef": "iat"},
-            "redirectPort": 50000, "loginLifetimeMinutes": 5, "allowPrivateNetwork": true
+            "loginLifetimeMinutes": 5, "allowPrivateNetwork": true
         }}));
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(settings.issuer.as_deref(), Some("https://auth.example"));
         assert_eq!(settings.flow, Some(OAuthFlow::ClientCredentials));
-        assert_eq!(settings.redirect_port, 50000);
         assert_eq!(settings.login_lifetime, Duration::from_secs(300));
         assert!(settings.allow_private_network && settings.configured);
         assert_eq!(
@@ -252,10 +227,10 @@ mod tests {
     #[test]
     fn invalid_settings_are_named_and_ignored() {
         let (settings, problems) = Settings::parse(&json!({"id": "b", "oauth": {
-            "issuer": "http://auth.example", "registration": true, "redirectPort": 80,
+            "issuer": "http://auth.example", "registration": true,
             "loginLifetimeMinutes": 30
         }}));
-        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(settings.invalid_issuer && settings.issuer.is_none());
         assert!(
             problems
@@ -263,7 +238,6 @@ mod tests {
                 .any(|problem| problem.contains("refused until it is fixed"))
         );
         assert!(settings.registration.is_none());
-        assert_eq!(settings.redirect_port, default_port("b"));
         assert_eq!(settings.login_lifetime, MAX_LIFETIME);
         let (unconfigured, problems) = Settings::parse(&json!({"id": "b"}));
         assert!(problems.is_empty() && !unconfigured.configured);

@@ -177,24 +177,15 @@ impl Issuer {
     }
 
     /// A PKCE backend whose preset names this issuer.
-    fn backend(&self, id: &str, port: u16) -> Value {
+    fn backend(&self, id: &str) -> Value {
         json!({
             "id": id,
             "transport": {"type": "http", "url": format!("{}/ahp", self.origin)},
             "authentication": {"type": "oauth", "flow": "authorization_code_pkce",
                 "issuer": self.origin, "clientId": "kit", "resource": format!("{}/ahp", self.origin)},
-            "oauth": {"redirectPort": port, "allowPrivateNetwork": true},
+            "oauth": {"allowPrivateNetwork": true},
         })
     }
-}
-
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// Hook auth for `backends`, trusting the test authorization server.
@@ -263,25 +254,35 @@ fn query(url: &url::Url, name: &str) -> String {
         .into_owned()
 }
 
-/// Plays the browser: the user approves the login at `url`, the server
-/// issues a code bound to its PKCE challenge, and the browser calls back.
-async fn approve(url: &url::Url, port: u16) -> bool {
+/// The loopback port of the login at `url`: its redirect's.
+fn port(url: &url::Url) -> u16 {
+    let redirect = url::Url::parse(&query(url, "redirect_uri")).unwrap();
+    assert_eq!(redirect.host_str(), Some("127.0.0.1"));
+    redirect.port().unwrap()
+}
+
+/// Issues a code bound to the PKCE challenge of the login at `url`.
+fn issue_code(url: &url::Url) -> String {
     assert_eq!(query(url, "code_challenge_method"), "S256");
     let code = format!("code-{}", next_code());
     AUTHORIZATIONS
         .lock()
         .unwrap()
         .insert(code.clone(), query(url, "code_challenge"));
-    call_back_with(port, &query(url, "state"), &code).await
+    code
+}
+
+/// Plays the browser: the user approves the login at `url`, the server
+/// issues a code bound to its PKCE challenge, and the browser calls back
+/// to the login's redirect.
+async fn approve(url: &url::Url) -> bool {
+    let code = issue_code(url);
+    call_back_with(port(url), &query(url, "state"), &code).await
 }
 
 fn next_code() -> usize {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     NEXT.fetch_add(1, Ordering::SeqCst)
-}
-
-async fn call_back(port: u16, state: &str) -> bool {
-    call_back_with(port, state, "never-issued").await
 }
 
 async fn call_back_with(port: u16, state: &str, code: &str) -> bool {
@@ -310,17 +311,17 @@ async fn credential(auth: &HookAuth, context: AuthContext) -> Result<Option<Stri
 }
 
 /// Signs `id` in through `kit auth login hooks <id>`.
-async fn sign_in(auth: &HookAuth, id: &str, port: u16) {
+async fn sign_in(auth: &HookAuth, id: &str) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let browser = tokio::spawn(async move {
         let url: url::Url = rx.recv().await.unwrap();
-        assert!(approve(&url, port).await);
+        assert!(approve(&url).await);
     });
     let signed_in = auth
         .login(Some(id), |_, url| {
             // Kit listens before it shows the link, so it can be opened at once.
             assert!(
-                std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+                std::net::TcpStream::connect(("127.0.0.1", port(url))).is_ok(),
                 "the link was shown before Kit listened for its callback"
             );
             tx.send(url.clone()).unwrap();
@@ -331,24 +332,8 @@ async fn sign_in(auth: &HookAuth, id: &str, port: u16) {
     browser.await.unwrap();
 }
 
-/// The pending logins on `port`, once there are `count` of them.
-async fn wait_for_logins(port: u16, count: usize) -> Vec<login::Login> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some((logins, _)) = login::registry().logins(port)
-                && logins.len() >= count
-            {
-                return logins;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("pending logins")
-}
-
 async fn next_hint(hints: &mut mpsc::UnboundedReceiver<AuthHint>) -> AuthHint {
-    tokio::time::timeout(Duration::from_secs(10), hints.recv())
+    tokio::time::timeout(Duration::from_secs(30), hints.recv())
         .await
         .expect("a sign-in hint")
         .unwrap()
@@ -358,13 +343,12 @@ async fn next_hint(hints: &mut mpsc::UnboundedReceiver<AuthHint>) -> AuthHint {
 async fn a_backend_with_a_grant_is_never_prompted_again() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.granted", port)]);
-    sign_in(&auth, "test.granted", port).await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.granted")]);
+    sign_in(&auth, "test.granted").await;
     assert_eq!(issuer.exchanges(), 1);
 
     // A new process sharing the storage finds the grant.
-    let again = hook_auth(&storage, vec![issuer.backend("test.granted", port)]);
+    let again = hook_auth(&storage, vec![issuer.backend("test.granted")]);
     let signed_in = again
         .login(None, |backend, _| panic!("{backend} was prompted again"))
         .await
@@ -390,8 +374,7 @@ async fn a_backend_with_a_grant_is_never_prompted_again() {
 async fn turns_repeat_one_link_until_sign_in_clears_it() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.hinted", port)]);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.hinted")]);
     let (tx, mut hints) = mpsc::unbounded_channel();
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
 
@@ -406,20 +389,16 @@ async fn turns_repeat_one_link_until_sign_in_clears_it() {
     assert_eq!(first.backend, "test.hinted");
     assert!(!first.cleared);
     let url = url::Url::parse(first.url.as_deref().unwrap()).unwrap();
-    // The next turn reuses the stored pending login: the same link, so no
-    // new hint, and nothing is exchanged.
+    // The next turn keeps this process's pending login: the same link, so
+    // no new hint, and nothing is exchanged.
     tokio::time::sleep(Duration::from_millis(200)).await;
     auth.turn_started();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(hints.try_recv().is_err());
-    let reused = auth
-        .prepare(&context(&auth, "test.hinted"), &[])
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(reused, url);
+    let scope = auth.0.backends["test.hinted"].scope.clone();
+    assert_eq!(login::test_support::pending(&scope).len(), 1);
 
-    assert!(approve(&url, port).await);
+    assert!(approve(&url).await);
     let cleared = next_hint(&mut hints).await;
     assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
     assert_eq!(
@@ -439,9 +418,8 @@ async fn turns_repeat_one_link_until_sign_in_clears_it() {
 async fn event_and_upload_endpoints_share_one_consent() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.upload", port)]);
-    sign_in(&auth, "test.upload", port).await;
+    let auth = hook_auth(&storage, vec![issuer.backend("test.upload")]);
+    sign_in(&auth, "test.upload").await;
     let mut upload = context(&auth, "test.upload");
     upload.purpose = AuthPurpose::Upload;
     upload.destination = format!("{}/ahp/uploads", issuer.origin);
@@ -456,11 +434,10 @@ async fn event_and_upload_endpoints_share_one_consent() {
 async fn logout_from_another_process_always_finds_the_grant() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let backends = || vec![issuer.backend("test.relogin", port)];
+    let backends = || vec![issuer.backend("test.relogin")];
     let live = hook_auth(&storage, backends());
     for round in 0..2 {
-        sign_in(&live, "test.relogin", port).await;
+        sign_in(&live, "test.relogin").await;
         // A separate process, sharing the storage, logs out.
         let other = hook_auth(&storage, backends());
         assert!(other.logout("test.relogin").await.unwrap(), "round {round}");
@@ -473,19 +450,18 @@ async fn logout_from_another_process_always_finds_the_grant() {
 async fn logout_and_status_are_per_backend() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let (first, second) = (free_port().await, free_port().await);
     let auth = hook_auth(
         &storage,
         vec![
-            issuer.backend("test.first", first),
-            issuer.backend("test.second", second),
+            issuer.backend("test.first"),
+            issuer.backend("test.second"),
             json!({"id": "test.stdio", "transport": {"type": "stdio", "command": "true", "lifecycle": "persistent"}}),
             json!({"id": "test.bearer", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
                 "authentication": {"type": "bearer", "tokenEnv": "TEST_HOOK_TOKEN"}}),
         ],
     );
-    sign_in(&auth, "test.first", first).await;
-    sign_in(&auth, "test.second", second).await;
+    sign_in(&auth, "test.first").await;
+    sign_in(&auth, "test.second").await;
     assert!(auth.logout("test.first").await.unwrap());
     assert!(!auth.logout("test.first").await.unwrap());
     let status: BTreeMap<_, _> = auth.status(None).await.unwrap().into_iter().collect();
@@ -591,109 +567,6 @@ fn notices_show_each_link_once_and_completion_once() {
     );
 }
 
-#[tokio::test]
-async fn one_port_serves_two_workspaces_by_state() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    // The same backend id, declared by two workspaces' hooks files.
-    let first = hook_auth_in(
-        &storage,
-        vec![issuer.backend("test.shared", port)],
-        "/a/hooks.json",
-    );
-    let second = hook_auth_in(
-        &storage,
-        vec![issuer.backend("test.shared", port)],
-        "/b/hooks.json",
-    );
-    let (first_tx, mut first_hints) = mpsc::unbounded_channel();
-    let _first = first.subscribe(move |hint| first_tx.send(hint.clone()).unwrap());
-    let (second_tx, mut second_hints) = mpsc::unbounded_channel();
-    let _second = second.subscribe(move |hint| second_tx.send(hint.clone()).unwrap());
-    for auth in [&first, &second] {
-        let error = credential(auth, context(auth, "test.shared"))
-            .await
-            .unwrap_err();
-        assert_eq!(error.auth_code(), Some(AuthErrorCode::InteractionRequired));
-        auth.turn_started();
-    }
-    let first_url = url::Url::parse(&next_hint(&mut first_hints).await.url.unwrap()).unwrap();
-    let second_url = url::Url::parse(&next_hint(&mut second_hints).await.url.unwrap()).unwrap();
-    assert_ne!(
-        first_url, second_url,
-        "workspaces never share a pending login"
-    );
-    // One listener holds the port; it answers Kit's probe.
-    assert!(matches!(
-        super::login::bind(port).await,
-        super::login::Bound::Peer
-    ));
-
-    // A callback with an unknown state completes nothing.
-    assert!(!call_back(port, "forged-state").await);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(first_hints.try_recv().is_err() && second_hints.try_recv().is_err());
-    assert_eq!(issuer.exchanges(), 0);
-
-    assert!(approve(&second_url, port).await);
-    assert!(next_hint(&mut second_hints).await.signed_in);
-    assert!(
-        first_hints.try_recv().is_err(),
-        "the other workspace is still pending"
-    );
-    assert!(approve(&first_url, port).await);
-    assert!(next_hint(&mut first_hints).await.signed_in);
-    assert_eq!(issuer.exchanges(), 2);
-    // Logging out of one workspace's backend leaves the other's.
-    assert!(first.logout("test.shared").await.unwrap());
-    let first_status: BTreeMap<_, _> = first.status(None).await.unwrap().into_iter().collect();
-    let second_status: BTreeMap<_, _> = second.status(None).await.unwrap().into_iter().collect();
-    assert_eq!(first_status["test.shared"], "needs-login");
-    assert_eq!(second_status["test.shared"], "authorized");
-}
-
-#[tokio::test]
-async fn a_port_held_by_another_program_is_not_mistaken_for_kit() {
-    let foreign = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = foreign.local_addr().unwrap().port();
-    let answer = tokio::spawn(async move {
-        let (mut stream, _) = foreign.accept().await.unwrap();
-        let _ = stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-            .await;
-    });
-    assert!(matches!(
-        super::login::bind(port).await,
-        super::login::Bound::Foreign
-    ));
-    answer.await.unwrap();
-}
-
-#[test]
-fn backends_never_share_an_explicit_redirect_port() {
-    let storage = tempfile::tempdir().unwrap();
-    let backend = |id: &str| {
-        json!({"id": id, "transport": {"type": "http", "url": "https://hooks.example/ahp"},
-            "oauth": {"redirectPort": 30001}})
-    };
-    let auth = hook_auth(
-        &storage,
-        vec![backend("test.port-a"), backend("test.port-b")],
-    );
-    let ports: Vec<_> = auth
-        .0
-        .backends
-        .values()
-        .map(|backend| backend.settings.redirect_port)
-        .collect();
-    assert_eq!(ports[0], 30001);
-    assert_ne!(ports[1], 30001);
-    for id in ["a", "b", "com.example.policy"] {
-        assert!((30000..32768).contains(&config::default_port(id)));
-    }
-}
-
 #[test]
 fn an_advertised_issuer_is_trusted_only_on_opt_in() {
     use agenthooksprotocol::auth::managed::{OAuthPolicy as _, ResourceMetadata};
@@ -736,8 +609,7 @@ fn an_advertised_issuer_is_trusted_only_on_opt_in() {
 async fn a_callback_the_server_rejects_completes_nothing() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.rejected", port)]);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.rejected")]);
     let (tx, mut hints) = mpsc::unbounded_channel();
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let _ = credential(&auth, context(&auth, "test.rejected")).await;
@@ -748,7 +620,7 @@ async fn a_callback_the_server_rejects_completes_nothing() {
         .lock()
         .unwrap()
         .insert("stolen-code".into(), "another-challenge".into());
-    assert!(!call_back_with(port, &query(&url, "state"), "stolen-code").await);
+    assert!(!call_back_with(port(&url), &query(&url, "state"), "stolen-code").await);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         hints.try_recv().is_err(),
@@ -766,8 +638,7 @@ async fn a_callback_the_server_rejects_completes_nothing() {
 async fn finishing_one_target_keeps_the_others_link() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.two-targets", port)]);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.two-targets")]);
     let (tx, mut hints) = mpsc::unbounded_channel();
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     // The event endpoint, and an upload endpoint on another resource.
@@ -781,11 +652,27 @@ async fn finishing_one_target_keeps_the_others_link() {
         assert!(credential(&auth, target.clone()).await.is_err());
     }
     auth.turn_started();
-    // Wait until both targets' logins are pending.
-    let logins = wait_for_logins(port, 2).await;
+    // Wait until both targets' logins are pending, each with its own
+    // listener.
+    let scope = auth.0.backends["test.two-targets"].scope.clone();
+    let logins = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let logins = login::test_support::pending(&scope);
+            if logins.len() >= 2 {
+                return logins;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending logins");
     let (first, second) = (&logins[0], &logins[1]);
     assert_ne!(first.url, second.url);
-    assert!(approve(&url::Url::parse(&first.url).unwrap(), port).await);
+    assert_ne!(
+        port(&url::Url::parse(&first.url).unwrap()),
+        port(&url::Url::parse(&second.url).unwrap())
+    );
+    assert!(approve(&url::Url::parse(&first.url).unwrap()).await);
     // The other target's link is shown next, not cleared.
     let next = loop {
         let hint = next_hint(&mut hints).await;
@@ -795,7 +682,7 @@ async fn finishing_one_target_keeps_the_others_link() {
     };
     assert!(!next.cleared, "{next:?}");
     assert_eq!(next.url.as_deref(), Some(second.url.as_str()));
-    assert!(approve(&url::Url::parse(&second.url).unwrap(), port).await);
+    assert!(approve(&url::Url::parse(&second.url).unwrap()).await);
     assert!(next_hint(&mut hints).await.signed_in);
     assert!(credential(&auth, event).await.unwrap().is_some());
     assert!(credential(&auth, upload).await.unwrap().is_some());
@@ -805,18 +692,17 @@ async fn finishing_one_target_keeps_the_others_link() {
 async fn logout_all_workspaces_finds_grants_of_a_moved_project() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
     let old = hook_auth_in(
         &storage,
-        vec![issuer.backend("test.moved", port)],
+        vec![issuer.backend("test.moved")],
         "/old/hooks.json",
     );
-    sign_in(&old, "test.moved", port).await;
+    sign_in(&old, "test.moved").await;
     // The project moved: its new hooks file has no state, and plain logout
     // finds nothing.
     let moved = hook_auth_in(
         &storage,
-        vec![issuer.backend("test.moved", port)],
+        vec![issuer.backend("test.moved")],
         "/new/hooks.json",
     );
     assert!(!moved.logout("test.moved").await.unwrap());
@@ -839,89 +725,20 @@ async fn logout_all_workspaces_finds_grants_of_a_moved_project() {
 }
 
 #[tokio::test]
-async fn a_shared_port_completes_another_processs_stored_login() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    // This process listens for its own backend on the port.
-    let listening = hook_auth_in(
-        &storage,
-        vec![issuer.backend("test.listener", port)],
-        "/a/hooks.json",
-    );
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = listening.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let _ = credential(&listening, context(&listening, "test.listener")).await;
-    listening.turn_started();
-    let _ = next_hint(&mut hints).await;
-    // Another process's backend, declared in a real hooks file, prepared a
-    // login on the same port; only the shared store knows it.
-    let workspace = tempfile::tempdir().unwrap();
-    let file = workspace.path().join("hooks.json");
-    let backend = issuer.backend("test.elsewhere", port);
-    std::fs::write(
-        &file,
-        json!({"protocolVersion": "draft", "hooks": [backend]}).to_string(),
-    )
-    .unwrap();
-    let other = hook_auth_in(&storage, vec![backend], file.to_str().unwrap());
-    let target = context(&other, "test.elsewhere");
-    let manager = other.manager(&target).unwrap();
-    let Preparation::InteractionRequired(pending) = manager
-        .prepare(with_deadline(&target), budget())
-        .await
-        .unwrap()
-    else {
-        panic!("a login is needed");
-    };
-    let entry = &other.0.backends["test.elsewhere"];
-    let login = login::Login::new(
-        &entry.scope,
-        manager,
-        &target,
-        &pending,
-        &other.0.storage,
-        trusting_client,
-    );
-    other.record_pending(entry, &login).await;
-    assert!(approve(pending.authorization_url(), port).await);
-    assert!(credential(&other, target).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn a_listener_answers_probes_during_a_slow_exchange() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.slow", port)]);
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let _ = credential(&auth, context(&auth, "test.slow")).await;
-    auth.turn_started();
-    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
-    issuer.delay_ms.store(3000, Ordering::SeqCst);
-    let browser = tokio::spawn(async move { approve(&url, port).await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let started = Instant::now();
-    assert!(
-        super::login::kit_listens(port).await,
-        "the listener is Kit's"
-    );
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(browser.await.unwrap());
-}
-
-#[tokio::test]
 async fn an_exchange_whose_request_was_sent_commits_after_the_caller_leaves() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
     // No listener: the test completes the login itself.
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.written", port)]);
+    let auth = hook_auth(&storage, vec![issuer.backend("test.written")]);
     let target = context(&auth, "test.written");
     let manager = auth.manager(&target).unwrap();
+    let redirect = "http://127.0.0.1:9/callback";
     let Preparation::InteractionRequired(pending) = manager
-        .prepare(with_deadline(&target), budget())
+        .prepare_with(
+            with_deadline(&target),
+            PrepareOptions::new().redirect_uri(redirect),
+            budget(),
+        )
         .await
         .unwrap()
     else {
@@ -933,7 +750,7 @@ async fn an_exchange_whose_request_was_sent_commits_after_the_caller_leaves() {
         .unwrap()
         .insert("written-code".into(), query(url, "code_challenge"));
     let callback = url::Url::parse(&format!(
-        "http://127.0.0.1:{port}/callback?code=written-code&state={}",
+        "{redirect}?code=written-code&state={}",
         query(url, "state")
     ))
     .unwrap();
@@ -954,87 +771,6 @@ async fn an_exchange_whose_request_was_sent_commits_after_the_caller_leaves() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(issuer.exchanges(), 1);
     assert!(credential(&auth, target).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn a_listener_completes_a_login_offered_after_it_started_waiting() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.late", port)]);
-    let event = context(&auth, "test.late");
-    let mut upload = event.clone();
-    upload.purpose = AuthPurpose::Upload;
-    upload.destination = format!("{}/late-uploads", issuer.origin);
-    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
-        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/late-uploads", issuer.origin)}));
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    // The listener starts for the event login and waits for a callback.
-    let early = auth.prepare(&event, &[]).await.unwrap().unwrap();
-    wait_for_logins(port, 1).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // A login offered while it waits is completed by it, as its own: the
-    // hint moves back to the event's link.
-    let late = auth.prepare(&upload, &[]).await.unwrap().unwrap();
-    while next_hint(&mut hints).await.url.as_deref() != Some(late.as_str()) {}
-    assert!(approve(&late, port).await);
-    assert_eq!(
-        next_hint(&mut hints).await.url.as_deref(),
-        Some(early.as_str())
-    );
-    assert!(credential(&auth, upload).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn a_listener_keeps_serving_a_login_offered_as_it_stops() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(&storage, vec![issuer.backend("test.stopping", port)]);
-    let event = context(&auth, "test.stopping");
-    let mut upload = event.clone();
-    upload.purpose = AuthPurpose::Upload;
-    upload.destination = format!("{}/stopping-uploads", issuer.origin);
-    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
-        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/stopping-uploads", issuer.origin)}));
-    let scope = auth.0.backends["test.stopping"].scope.clone();
-    let mut logins = Vec::new();
-    for target in [&event, &upload] {
-        let manager = auth.manager(target).unwrap();
-        let Preparation::InteractionRequired(pending) = manager
-            .prepare(with_deadline(target), budget())
-            .await
-            .unwrap()
-        else {
-            panic!("a login is needed");
-        };
-        let login = login::Login::new(
-            &scope,
-            manager,
-            target,
-            &pending,
-            &auth.0.storage,
-            trusting_client,
-        );
-        logins.push((login, pending));
-    }
-    let registry = login::registry();
-    // The first login starts a listener (this test plays it).
-    let (first, first_pending) = &logins[0];
-    assert!(registry.offer(first.clone(), first_pending, port));
-    // It completes, so the listener's serve loop finds nothing and returns;
-    // before it stops, the second login is offered, which sees a listener.
-    registry.completed(first);
-    let (second, second_pending) = &logins[1];
-    assert!(!registry.offer(second.clone(), second_pending, port));
-    // So the listener must not stop: the second login has no other.
-    assert!(
-        !registry.stop_if_idle(port),
-        "a pending login was left without a listener"
-    );
-    registry.completed(second);
-    assert!(registry.stop_if_idle(port));
 }
 
 /// A hook server behind OAuth whose subscriptions come from
@@ -1082,8 +818,7 @@ impl agenthooksprotocol::adapters::registered::ManagedBackend for ProtectedServe
 async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let mut backend = issuer.backend("test.configured", port);
+    let mut backend = issuer.backend("test.configured");
     backend.as_object_mut().unwrap().remove("subscriptions");
     let auth = hook_auth(&storage, vec![backend.clone()]);
     let endpoint = context(&auth, "test.configured");
@@ -1110,7 +845,7 @@ async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session(
     // The next turn shows the link; signing in completes it.
     auth.turn_started();
     let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
-    assert!(approve(&url, port).await);
+    assert!(approve(&url).await);
     assert!(next_hint(&mut hints).await.signed_in);
 
     // The same Hooks configure the backend now and deliver to it.
@@ -1122,7 +857,7 @@ async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session(
     hooks
         .compact_before("configured", &items, true, "summarize", None)
         .await;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while server.events.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1139,8 +874,7 @@ async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session(
 async fn scope_settings_add_to_the_presets_scopes() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let mut backend = issuer.backend("test.scopes", port);
+    let mut backend = issuer.backend("test.scopes");
     backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
     backend["oauth"]["scopes"] = json!(["hooks:upload"]);
     let auth = hook_auth(&storage, vec![backend]);
@@ -1150,104 +884,8 @@ async fn scope_settings_add_to_the_presets_scopes() {
     requested.sort();
     assert_eq!(requested, ["hooks:invoke", "hooks:upload"]);
     // And the grant satisfies the preset's requirement.
-    assert!(approve(&url, port).await);
+    assert!(approve(&url).await);
     assert!(credential(&auth, target).await.unwrap().is_some());
-}
-
-/// A program other than Kit holding `port`, answering every request with 404.
-fn foreign_holder(listener: TcpListener) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-        }
-    })
-}
-
-#[tokio::test]
-async fn no_link_is_shown_when_another_program_holds_the_port() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = holder.local_addr().unwrap().port();
-    let holder = foreign_holder(holder);
-    let auth = hook_auth(&storage, vec![issuer.backend("test.foreign", port)]);
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let _ = credential(&auth, context(&auth, "test.foreign")).await;
-    auth.turn_started();
-    // Instead of a link nothing can receive, the user is told what to change.
-    let hint = next_hint(&mut hints).await;
-    assert!(hint.url.is_none(), "{hint:?}");
-    let notice = hint.notice().unwrap();
-    assert!(
-        notice.contains("oauth.redirectPort") && notice.contains(&port.to_string()),
-        "{notice}"
-    );
-    // The CLI refuses too, without showing a link.
-    let error = auth
-        .login(Some("test.foreign"), |_, _| panic!("a link was shown"))
-        .await
-        .unwrap_err();
-    assert!(error.contains("oauth.redirectPort"), "{error}");
-    holder.abort();
-}
-
-#[tokio::test]
-async fn cli_sign_in_takes_over_the_port_when_the_peer_stops() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    // Another Kit process listens on the port: it answers Kit's probe.
-    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = peer.local_addr().unwrap().port();
-    let peer = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = peer.accept().await else {
-                return;
-            };
-            let _ = read_request(&mut stream).await;
-            let reply = login::PROBE_REPLY;
-            let _ = stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply}",
-                        reply.len()
-                    )
-                    .as_bytes(),
-                )
-                .await;
-        }
-    });
-    let auth = hook_auth(&storage, vec![issuer.backend("test.takeover", port)]);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let browser = tokio::spawn(async move {
-        let url: url::Url = rx.recv().await.unwrap();
-        // The peer stops listening before the link is opened.
-        peer.abort();
-        let _ = peer.await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !login::kit_listens(port).await {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the CLI takes the port over");
-        assert!(approve(&url, port).await);
-    });
-    let signed_in = auth
-        .login(Some("test.takeover"), |_, url| {
-            tx.send(url.clone()).unwrap()
-        })
-        .await
-        .unwrap();
-    assert_eq!(signed_in, ["test.takeover"]);
-    browser.await.unwrap();
 }
 
 #[tokio::test]
@@ -1284,8 +922,8 @@ async fn status_for_one_backend_checks_only_that_backend() {
     let auth = hook_auth(
         &storage,
         vec![
-            first.backend("test.status-one", free_port().await),
-            second.backend("test.status-other", free_port().await),
+            first.backend("test.status-one"),
+            second.backend("test.status-other"),
         ],
     );
     let lines = auth.status(Some("test.status-one")).await.unwrap();
@@ -1309,7 +947,7 @@ async fn status_for_one_backend_checks_only_that_backend() {
 async fn a_sign_in_that_cannot_be_prepared_says_why() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let mut backend = issuer.backend("test.unprepared", free_port().await);
+    let mut backend = issuer.backend("test.unprepared");
     // The issuer is on loopback, which this backend does not allow.
     backend["oauth"]["allowPrivateNetwork"] = json!(false);
     let auth = hook_auth(&storage, vec![backend]);
@@ -1330,8 +968,7 @@ async fn a_sign_in_that_cannot_be_prepared_says_why() {
 async fn event_and_upload_targets_with_different_scopes_each_get_their_own_ceiling() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let mut backend = issuer.backend("test.scoped-targets", port);
+    let mut backend = issuer.backend("test.scoped-targets");
     backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
     let auth = hook_auth(&storage, vec![backend]);
     let event = context(&auth, "test.scoped-targets");
@@ -1349,100 +986,11 @@ async fn event_and_upload_targets_with_different_scopes_each_get_their_own_ceili
     assert_eq!(query(&url, "scope"), "hooks:upload");
 }
 
-/// Another Kit process listening on `listener`'s port: it answers Kit's
-/// probe and nothing else.
-fn kit_peer(listener: TcpListener) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let _ = read_request(&mut stream).await;
-            let reply = login::PROBE_REPLY;
-            let _ = stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply}",
-                        reply.len()
-                    )
-                    .as_bytes(),
-                )
-                .await;
-        }
-    })
-}
-
-#[tokio::test]
-async fn a_session_takes_over_its_link_when_the_peer_stops_listening() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = holder.local_addr().unwrap().port();
-    let peer = kit_peer(holder);
-    let auth = hook_auth(&storage, vec![issuer.backend("test.peer-stops", port)]);
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let _ = credential(&auth, context(&auth, "test.peer-stops")).await;
-    auth.turn_started();
-    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
-    peer.abort();
-    let _ = peer.await;
-    // The session listens for the same link once the port is free.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !login::kit_listens(port).await {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the session takes the port over");
-    assert!(approve(&url, port).await);
-    assert!(next_hint(&mut hints).await.signed_in);
-}
-
-#[tokio::test]
-async fn a_session_learns_when_the_peer_completed_its_login() {
-    let issuer = Issuer::start().await;
-    let storage = tempfile::tempdir().unwrap();
-    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = holder.local_addr().unwrap().port();
-    let peer = kit_peer(holder);
-    let auth = hook_auth(&storage, vec![issuer.backend("test.peer-completes", port)]);
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let target = context(&auth, "test.peer-completes");
-    let _ = credential(&auth, target.clone()).await;
-    auth.turn_started();
-    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
-    // The peer receives the callback and completes the login in the shared
-    // store; this process is not told.
-    AUTHORIZATIONS
-        .lock()
-        .unwrap()
-        .insert("peer-code".into(), query(&url, "code_challenge"));
-    let callback = url::Url::parse(&format!(
-        "http://127.0.0.1:{port}/callback?code=peer-code&state={}",
-        query(&url, "state")
-    ))
-    .unwrap();
-    auth.manager(&target)
-        .unwrap()
-        .complete(with_deadline(&target), callback, budget())
-        .await
-        .unwrap();
-    // The session's hint clears without another turn.
-    assert!(next_hint(&mut hints).await.signed_in);
-    peer.abort();
-}
-
 #[tokio::test]
 async fn a_problem_with_one_target_keeps_the_others_link() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let auth = hook_auth(
-        &storage,
-        vec![issuer.backend("test.link-and-problem", port)],
-    );
+    let auth = hook_auth(&storage, vec![issuer.backend("test.link-and-problem")]);
     let (tx, mut hints) = mpsc::unbounded_channel();
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let event = context(&auth, "test.link-and-problem");
@@ -1517,12 +1065,11 @@ fn a_replayed_link_reaches_a_new_subscriber_before_its_completion() {
 async fn a_scope_outside_the_allowed_set_is_explained_not_signed_in() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let port = free_port().await;
-    let mut backend = issuer.backend("test.ceiling", port);
+    let mut backend = issuer.backend("test.ceiling");
     backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
     let auth = hook_auth(&storage, vec![backend]);
     let target = context(&auth, "test.ceiling");
-    sign_in(&auth, "test.ceiling", port).await;
+    sign_in(&auth, "test.ceiling").await;
     let (tx, mut hints) = mpsc::unbounded_channel();
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     // The backend asks for a scope Kit does not allow it.
@@ -1549,46 +1096,264 @@ async fn a_scope_outside_the_allowed_set_is_explained_not_signed_in() {
 }
 
 #[tokio::test]
-async fn one_watcher_follows_a_login_behind_a_peer_and_withdraws_it_at_expiry() {
+async fn two_workspaces_with_one_backend_id_sign_in_separately() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = holder.local_addr().unwrap().port();
-    let peer = kit_peer(holder);
-    let mut backend = issuer.backend("test.peer-expires", port);
-    // A link that lasts under two seconds.
-    backend["oauth"]["loginLifetimeMinutes"] = json!(0.03);
-    let auth = hook_auth(&storage, vec![backend]);
-    let (tx, mut hints) = mpsc::unbounded_channel();
-    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let target = context(&auth, "test.peer-expires");
-    let _ = credential(&auth, target.clone()).await;
-    auth.turn_started();
-    let shown = next_hint(&mut hints).await;
-    assert!(shown.url.is_some());
-    // Another turn's watcher for the same login stops at once.
-    let scope = auth.0.backends["test.peer-expires"].scope.clone();
+    // The same backend id, declared by two workspaces' hooks files.
+    let first = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.shared")],
+        "/a/hooks.json",
+    );
+    let second = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.shared")],
+        "/b/hooks.json",
+    );
+    let (first_tx, mut first_hints) = mpsc::unbounded_channel();
+    let _first = first.subscribe(move |hint| first_tx.send(hint.clone()).unwrap());
+    let (second_tx, mut second_hints) = mpsc::unbounded_channel();
+    let _second = second.subscribe(move |hint| second_tx.send(hint.clone()).unwrap());
+    for auth in [&first, &second] {
+        let error = credential(auth, context(auth, "test.shared"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.auth_code(), Some(AuthErrorCode::InteractionRequired));
+        auth.turn_started();
+    }
+    let first_url = url::Url::parse(&next_hint(&mut first_hints).await.url.unwrap()).unwrap();
+    let second_url = url::Url::parse(&next_hint(&mut second_hints).await.url.unwrap()).unwrap();
+    assert_ne!(port(&first_url), port(&second_url));
+
+    // A callback with an unknown state completes nothing.
+    assert!(!call_back_with(port(&first_url), "forged-state", "never-issued").await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(first_hints.try_recv().is_err() && second_hints.try_recv().is_err());
+    assert_eq!(issuer.exchanges(), 0);
+
+    assert!(approve(&second_url).await);
+    assert!(next_hint(&mut second_hints).await.signed_in);
+    assert!(
+        first_hints.try_recv().is_err(),
+        "the other workspace is still pending"
+    );
+    assert!(approve(&first_url).await);
+    assert!(next_hint(&mut first_hints).await.signed_in);
+    assert_eq!(issuer.exchanges(), 2);
+    // Logging out of one workspace's backend leaves the other's.
+    assert!(first.logout("test.shared").await.unwrap());
+    let first_status: BTreeMap<_, _> = first.status(None).await.unwrap().into_iter().collect();
+    let second_status: BTreeMap<_, _> = second.status(None).await.unwrap().into_iter().collect();
+    assert_eq!(first_status["test.shared"], "needs-login");
+    assert_eq!(second_status["test.shared"], "authorized");
+}
+
+/// A sign-in to `id` by another Kit process sharing the credential store:
+/// its own provider prepares the login, and completing it with a code
+/// touches nothing of this process's sign-in state.
+async fn elsewhere(
+    auth: &HookAuth,
+    id: &str,
+) -> (
+    url::Url,
+    impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
+    let target = context(auth, id);
     let manager = auth.manager(&target).unwrap();
+    let redirect = "http://127.0.0.1:9/callback";
     let Preparation::InteractionRequired(pending) = manager
-        .prepare(with_deadline(&target), budget())
+        .prepare_with(
+            with_deadline(&target),
+            PrepareOptions::new().redirect_uri(redirect),
+            budget(),
+        )
         .await
         .unwrap()
     else {
         panic!("a login is needed");
     };
-    let again = login::Login::new(
-        &scope,
-        manager,
-        &target,
-        &pending,
-        &auth.0.storage,
-        trusting_client,
+    let url = pending.authorization_url().clone();
+    let state = query(&url, "state");
+    let complete = move |code: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+        Box::pin(async move {
+            let callback =
+                url::Url::parse(&format!("{redirect}?code={code}&state={state}")).unwrap();
+            manager
+                .complete(with_deadline(&target), callback, budget())
+                .await
+                .unwrap();
+        })
+    };
+    (url, complete)
+}
+
+/// Starts `kit auth login hooks <id>` for `auth`, as another Kit process
+/// would, and returns its link once it is shown.
+fn cli_login(
+    auth: &HookAuth,
+    id: &'static str,
+) -> (
+    tokio::task::JoinHandle<Result<Vec<String>, String>>,
+    mpsc::UnboundedReceiver<url::Url>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let auth = auth.clone();
+    let task = tokio::spawn(async move {
+        auth.login(Some(id), move |_, url| tx.send(url.clone()).unwrap())
+            .await
+    });
+    (task, rx)
+}
+
+#[tokio::test]
+async fn processes_sign_in_to_one_backend_concurrently_and_share_the_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // Two Kit processes for one workspace, sharing the credential store.
+    let session = hook_auth(&storage, vec![issuer.backend("test.concurrent")]);
+    let cli = hook_auth(&storage, vec![issuer.backend("test.concurrent")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = session.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&session, "test.concurrent");
+    assert!(credential(&session, target.clone()).await.is_err());
+    session.turn_started();
+    let session_url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The other process signs in at the same time, with its own login.
+    let (other_url, complete) = elsewhere(&cli, "test.concurrent").await;
+    assert_ne!(query(&session_url, "state"), query(&other_url, "state"));
+
+    // Only the process that prepared a login completes it: the other
+    // process's callback, delivered to this one, is refused.
+    let code = issue_code(&other_url);
+    assert!(!call_back_with(port(&session_url), &query(&other_url, "state"), &code).await);
+    assert_eq!(issuer.exchanges(), 0);
+    complete(code).await;
+    assert_eq!(issuer.exchanges(), 1);
+
+    // The grant is shared: the session's next delivery uses it, and its
+    // own hint clears without the user opening its link.
+    assert_eq!(
+        credential(&session, target).await.unwrap().as_deref(),
+        Some("token-1")
     );
-    tokio::time::timeout(Duration::from_millis(500), login::watch_peer(again, port))
-        .await
-        .expect("a second watcher for the same login stops at once");
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    // Its listener is gone, so its link no longer completes anything.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while TcpStream::connect(("127.0.0.1", port(&session_url)))
+            .await
+            .is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the session stops listening once signed in elsewhere");
+    assert_eq!(issuer.exchanges(), 1);
+}
+
+#[tokio::test]
+async fn a_turn_start_sees_a_grant_from_another_process() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let session = hook_auth(&storage, vec![issuer.backend("test.elsewhere")]);
+    let other = hook_auth(&storage, vec![issuer.backend("test.elsewhere")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = session.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    assert!(
+        credential(&session, context(&session, "test.elsewhere"))
+            .await
+            .is_err()
+    );
+    session.turn_started();
+    assert!(next_hint(&mut hints).await.url.is_some());
+    let (url, complete) = elsewhere(&other, "test.elsewhere").await;
+    complete(issue_code(&url)).await;
+    // The next turn start finds the grant instead of showing the link again.
+    session.turn_started();
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+#[tokio::test]
+async fn the_newest_completed_sign_in_wins() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let first = hook_auth(&storage, vec![issuer.backend("test.newest")]);
+    let second = hook_auth(&storage, vec![issuer.backend("test.newest")]);
+    let (first_login, mut first_links) = cli_login(&first, "test.newest");
+    let (second_login, mut second_links) = cli_login(&second, "test.newest");
+    let first_url = first_links.recv().await.unwrap();
+    let second_url = second_links.recv().await.unwrap();
+    assert!(approve(&first_url).await);
+    first_login.await.unwrap().unwrap();
+    assert!(approve(&second_url).await);
+    second_login.await.unwrap().unwrap();
+    for auth in [&first, &second] {
+        assert_eq!(
+            credential(auth, context(auth, "test.newest"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("token-2")
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_expired_link_is_withdrawn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.expires");
+    // A link that lasts under two seconds.
+    backend["oauth"]["loginLifetimeMinutes"] = json!(0.03);
+    let auth = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.expires")).await;
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    let url = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
     // At expiry the link is withdrawn, not left clickable.
     let cleared = next_hint(&mut hints).await;
     assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
-    peer.abort();
+    assert!(
+        TcpStream::connect(("127.0.0.1", port(&url))).await.is_err(),
+        "the listener outlived its link"
+    );
+    // The next turn prepares a new link.
+    auth.turn_started();
+    let again = next_hint(&mut hints).await;
+    assert!(again.url.is_some() && again.url != shown.url, "{again:?}");
+}
+
+#[tokio::test]
+async fn denying_consent_ends_the_login() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.denied")]);
+    let (tx, mut links) = mpsc::unbounded_channel();
+    let browser = tokio::spawn(async move {
+        let url: url::Url = links.recv().await.unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port(&url))).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /callback?error=access_denied&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                    query(&url, "state")
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+    });
+    let error = auth
+        .login(Some("test.denied"), |_, url| tx.send(url.clone()).unwrap())
+        .await
+        .unwrap_err();
+    assert!(error.contains("not approved"), "{error}");
+    browser.await.unwrap();
+    assert_eq!(issuer.exchanges(), 0);
 }
