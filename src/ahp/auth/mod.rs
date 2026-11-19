@@ -23,7 +23,9 @@ use std::{
 };
 
 use agenthooksprotocol::{
-    adapters::registered::{AuthChallenge, AuthContext, AuthProvider, BearerCredential},
+    adapters::registered::{
+        AuthChallenge, AuthContext, AuthProvider, AuthPurpose, BearerCredential,
+    },
     auth::{
         AuthBinding, AuthErrorCode, AuthProviders, AuthRecovery, BearerAuth, OAuthFlow,
         managed::{
@@ -123,6 +125,10 @@ struct Inner {
     /// start prepares their event endpoint through this instance's own
     /// providers: that preparation is what lets the SDK configure them again.
     skipped: Mutex<HashSet<String>>,
+    /// Per backend, the credential (its SDK attempt id) of the last
+    /// preparation that let the SDK retry its configuration. A backend that
+    /// rejects that credential is not prepared again until another arrives.
+    last_ready: Mutex<HashMap<String, String>>,
 }
 
 /// The flow of a target and its preset's client: the binding's, or for an
@@ -195,6 +201,7 @@ impl HookAuth {
             references: secrets::references(),
             client,
             skipped: Mutex::default(),
+            last_ready: Mutex::default(),
         }))
     }
 
@@ -261,6 +268,32 @@ impl HookAuth {
 
     fn was_skipped(&self, backend: &Backend) -> bool {
         self.skipped().contains(&backend.id)
+    }
+
+    /// `context`'s target is signed in with its need's scopes, through this
+    /// instance's providers: the SDK counted it, so a skipped configuration
+    /// of the backend is retried and needs no further preparation.
+    fn granted(&self, context: &AuthContext, credential: &BearerCredential) {
+        if let Some(scope) = self.scope(context) {
+            login::registry().prepared(scope, context);
+        }
+        self.counted(context, Some(credential));
+    }
+
+    /// The SDK counted a preparation or completed login of `context`'s
+    /// target. For the event endpoint, a skipped configuration is retried.
+    fn counted(&self, context: &AuthContext, credential: Option<&BearerCredential>) {
+        if context.purpose != AuthPurpose::Event {
+            return;
+        }
+        self.skipped().remove(&context.backend_id);
+        if let Some(credential) = credential.filter(|c| !c.attempt_id.is_empty()) {
+            self.0
+                .last_ready
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(context.backend_id.clone(), credential.attempt_id.clone());
+        }
     }
 
     /// Bearer, OAuth and unbound routes. A route is chosen by the binding, so
@@ -469,7 +502,7 @@ impl HookAuth {
                 if skipped {
                     let auth = self.clone();
                     let backend = backend.clone();
-                    tokio::spawn(async move { auth.reconfigure(&backend).await });
+                    tokio::spawn(async move { auth.reconfigure(&backend, None).await });
                 }
                 continue;
             };
@@ -490,55 +523,121 @@ impl HookAuth {
             let Some(context) = backend.context() else {
                 return;
             };
-            let result = Provider(self.clone())
+            match Provider(self.clone())
                 .credential(with_deadline(&context))
-                .await;
-            match &result {
-                Err(error) if needs_login(error) => {}
-                Ok(Some(_)) => {
-                    self.reconfigure(backend).await;
+                .await
+            {
+                Err(error) if needs_login(&error) => {}
+                Ok(Some(credential)) => {
+                    self.reconfigure(backend, Some(credential)).await;
                     return;
                 }
                 _ => return,
             }
             needs = login::registry().needs(&backend.scope);
         }
+        let mut reconfigured = false;
         for need in needs {
-            if login::registry().has_live_login(&backend.scope, &need.context) {
-                // The link shown stays until it expires, unless the grant
-                // arrived meanwhile (signed in from another Kit process).
-                let signed_in = Provider(self.clone())
+            let live = login::registry().has_live_login(&backend.scope, &need.context);
+            // A step-up link stays until it expires: a credential with the
+            // base scopes does not meet it.
+            if live && !need.required.is_empty() {
+                continue;
+            }
+            if need.required.is_empty() {
+                // Signed in meanwhile, perhaps from another Kit process: the
+                // shown link is withdrawn and no new one is offered.
+                match Provider(self.clone())
                     .credential(with_deadline(&need.context))
-                    .await;
-                if !matches!(signed_in, Ok(Some(_))) {
-                    continue;
+                    .await
+                {
+                    Ok(Some(credential)) => {
+                        if need.context.purpose == AuthPurpose::Event {
+                            self.reconfigure(backend, Some(credential)).await;
+                            reconfigured = true;
+                        }
+                        continue;
+                    }
+                    _ if live => continue,
+                    _ => {}
                 }
             }
-            // With a grant this only prepares, which lets the SDK retry a
-            // configuration that needed it; without one it shows a link.
             self.prepare_or_explain(backend, &need.context, &need.required)
                 .await;
         }
         // An upload's need may have hidden the configuration's.
-        self.reconfigure(backend).await;
+        if !reconfigured {
+            self.reconfigure(backend, None).await;
+        }
     }
 
-    /// A configuration these hooks skipped is prepared once a grant exists,
-    /// wherever it was signed in. Without a grant this does nothing: the
-    /// recorded need shows the link.
-    async fn reconfigure(&self, backend: &Backend) {
+    /// A configuration these hooks skipped is prepared again once a
+    /// credential exists, wherever it was signed in, and once per
+    /// credential: a backend that rejects it waits for another. `known` is
+    /// the event endpoint's credential, when the caller has it. Never shows
+    /// a link or a problem: without a credential the recorded need does.
+    async fn reconfigure(&self, backend: &Backend, known: Option<BearerCredential>) {
         if !self.was_skipped(backend) {
             return;
         }
         let Some(context) = backend.context() else {
             return;
         };
-        if let Ok(Some(_)) = Provider(self.clone())
-            .credential(with_deadline(&context))
-            .await
-        {
-            self.prepare_or_explain(backend, &context, &[]).await;
+        let credential = match known {
+            Some(credential) => credential,
+            None => match Provider(self.clone())
+                .credential(with_deadline(&context))
+                .await
+            {
+                Ok(Some(credential)) => credential,
+                _ => return,
+            },
+        };
+        let prepared_before = self
+            .0
+            .last_ready
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&backend.id)
+            .is_some_and(|attempt| *attempt == credential.attempt_id);
+        if prepared_before {
+            return;
         }
+        if let Err(error) = self.prepare_quietly(&context).await {
+            let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
+            tracing::warn!(backend = %backend.id, code, "hook configuration could not be prepared again");
+        }
+    }
+
+    /// Prepares `context`'s target without ever offering a login: should
+    /// the credential have gone meanwhile, the login the SDK created is
+    /// cancelled, and the recorded need shows a link at the next turn.
+    async fn prepare_quietly(&self, context: &AuthContext) -> Result<(), HookError> {
+        let manager = self.manager(context)?;
+        let context = with_deadline(context);
+        let mut options = PrepareOptions::new();
+        // A PKCE preparation needs a redirect even when it finds a grant;
+        // the listener is never served.
+        let _listener = if self.pkce(&context)? {
+            let (listener, redirect) = login::bind()
+                .await
+                .map_err(|_| fail(AuthErrorCode::ProviderFailed))?;
+            options = options.redirect_uri(redirect);
+            Some(listener)
+        } else {
+            None
+        };
+        match manager
+            .prepare_with(context.clone(), options, budget())
+            .await?
+        {
+            Preparation::Ready(credential) => self.granted(&context, &credential),
+            Preparation::InteractionRequired(pending) => {
+                let _ = manager.cancel_login(pending, budget()).await;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn prepare_or_explain(
@@ -579,15 +678,8 @@ impl HookAuth {
             .prepare_with(context.clone(), options, budget())
             .await?
         {
-            Preparation::Ready(_) => {
-                if let Some(scope) = self.scope(&context) {
-                    login::registry().usable(scope, &context);
-                }
-                // The SDK counted this preparation; a skipped configuration
-                // of the backend is retried.
-                if context.purpose == agenthooksprotocol::adapters::registered::AuthPurpose::Event {
-                    self.skipped().remove(&context.backend_id);
-                }
+            Preparation::Ready(credential) => {
+                self.granted(&context, &credential);
                 Ok(None)
             }
             Preparation::InteractionRequired(pending) => {
@@ -600,9 +692,13 @@ impl HookAuth {
                 let login = login::Login::new(&scope, manager, &context, pending);
                 login::registry().offer(login.clone());
                 // Listening already: the link works as soon as it is shown.
+                let auth = self.clone();
                 tokio::spawn(async move {
                     match login::serve(&listener, &login).await {
-                        login::Outcome::Completed => login::registry().completed(&login),
+                        login::Outcome::Completed => {
+                            login::registry().completed(&login);
+                            auth.counted(&login.context, None);
+                        }
                         login::Outcome::Ended => login::registry().ended(&login),
                         login::Outcome::Stopped => {}
                     }
@@ -737,8 +833,9 @@ impl HookAuth {
             .await;
         let pending = match prepared {
             // Client credentials: the token was just obtained.
-            Ok(Preparation::Ready(_)) => {
+            Ok(Preparation::Ready(credential)) => {
                 login::registry().usable(&backend.scope, &context);
+                self.counted(&context, Some(&credential));
                 return Ok(true);
             }
             Ok(Preparation::InteractionRequired(pending)) => pending,
@@ -763,6 +860,7 @@ impl HookAuth {
             return Err("the sign-in link expired or was not approved".into());
         }
         login::registry().usable(&backend.scope, &context);
+        self.counted(&context, None);
         Ok(true)
     }
 

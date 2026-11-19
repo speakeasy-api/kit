@@ -294,15 +294,17 @@ impl Registry {
     /// A target that now has a usable credential, signed in here or by
     /// another Kit process, needs no login: its pending login stops, and
     /// the hint moves on to another target's link or clears once none of
-    /// the scope's targets needs one.
+    /// the scope's targets needs one. A step-up need (one that requires
+    /// more scopes) is not met by a usable credential: it and its link stay
+    /// until a login or preparation with those scopes succeeds.
     pub(super) fn usable(&self, scope: &str, context: &AuthContext) {
-        let known = {
-            let state = self.lock();
-            state.needs.contains_key(scope) || state.pending.contains_key(scope)
-        };
-        if known {
-            self.settle(scope, context, true, None);
-        }
+        self.settle(scope, context, Settle::Usable);
+    }
+
+    /// `context`'s target was prepared with its need's scopes: its need is
+    /// met, step-up or not.
+    pub(super) fn prepared(&self, scope: &str, context: &AuthContext) {
+        self.settle(scope, context, Settle::Granted);
     }
 
     pub(super) fn needs(&self, scope: &str) -> Vec<Need> {
@@ -386,33 +388,54 @@ impl Registry {
     /// `login` completed. The scope's other targets (an upload on another
     /// resource, say) keep their logins, and the hint moves on to the next.
     pub(super) fn completed(&self, login: &Login) {
-        self.settle(&login.scope, &login.context, true, None);
+        self.settle(&login.scope, &login.context, Settle::Granted);
     }
 
     /// `login` ended without a grant (its link expired or consent was
     /// denied): it is withdrawn, and the next turn prepares a new one. A
     /// newer login for the same target, which replaced it, stays.
     pub(super) fn ended(&self, login: &Login) {
-        self.settle(&login.scope, &login.context, false, Some(&login.state));
+        self.settle(&login.scope, &login.context, Settle::Ended(&login.state));
     }
 
-    /// Ends the pending login for `context`'s target, or only the login with
-    /// `state` when one is given (nothing, if it is no longer pending).
-    /// Signed in, the target needs no login either. The hint shows the
-    /// scope's next link, or clears once no target needs one.
-    fn settle(&self, scope: &str, context: &AuthContext, signed_in: bool, only: Option<&str>) {
+    /// Ends the pending login for `context`'s target, or for
+    /// [`Settle::Ended`] only the login with that `state` (nothing, if it is
+    /// no longer pending). Signed in, the target needs no login either. The
+    /// hint shows the scope's next link, or clears once no target needs one.
+    /// Every check is made under the lock that removes, so a login that
+    /// replaced another meanwhile, or a step-up need, is never withdrawn.
+    fn settle(&self, scope: &str, context: &AuthContext, how: Settle<'_>) {
+        let signed_in = !matches!(how, Settle::Ended(_));
         let (stopped, hint) = {
             let mut state = self.lock();
-            // Checked under the same lock that removes it, so a login that
-            // replaced this one meanwhile is never withdrawn.
-            if let Some(only) = only
-                && !state
-                    .pending
-                    .get(scope)
-                    .is_some_and(|logins| logins.iter().any(|login| login.state == only))
-            {
+            let skip = match how {
+                // A login without a state matches no callback, and no other.
+                Settle::Ended(only) => {
+                    only.is_empty()
+                        || !state
+                            .pending
+                            .get(scope)
+                            .is_some_and(|logins| logins.iter().any(|login| login.state == only))
+                }
+                Settle::Usable => {
+                    let known =
+                        state.needs.contains_key(scope) || state.pending.contains_key(scope);
+                    let step_up = state.needs.get(scope).is_some_and(|needs| {
+                        needs.iter().any(|need| {
+                            same_target(&need.context, context) && !need.required.is_empty()
+                        })
+                    });
+                    !known || step_up
+                }
+                Settle::Granted => false,
+            };
+            if skip {
                 return;
             }
+            let only = match how {
+                Settle::Ended(only) => Some(only),
+                _ => None,
+            };
             let mut needed = state.needs.contains_key(scope);
             if signed_in && let Some(needs) = state.needs.get_mut(scope) {
                 needs.retain(|need| !same_target(&need.context, context));
@@ -480,6 +503,17 @@ fn headless_line(printed: &mut HashSet<String>, hint: &AuthHint) -> Option<Strin
         return None;
     }
     hint.notice().map(|text| format!("kit: {text}"))
+}
+
+/// Why a target's pending login ends.
+#[derive(Clone, Copy)]
+enum Settle<'a> {
+    /// An operation found a usable credential: not enough for a step-up.
+    Usable,
+    /// Signed in, or prepared, with the need's scopes.
+    Granted,
+    /// The login with this `state` ended without a grant.
+    Ended(&'a str),
 }
 
 pub(super) struct Preparing(String);

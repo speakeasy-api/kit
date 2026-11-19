@@ -999,6 +999,90 @@ async fn a_sign_in_by_another_session_configures_a_skipped_backend() {
 }
 
 #[tokio::test]
+async fn a_skipped_configuration_is_prepared_once_per_credential() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.rejects-token";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    let backend = auth.0.backends[id].clone();
+    let prepared = || Provider(auth.clone()).preparations(&context(&auth, id));
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+
+    auth.configuration_needs_login(id);
+    auth.prepare_backend(&backend).await;
+    assert_eq!(prepared(), 1);
+    // The backend rejects that token and its configuration is skipped
+    // again: Kit does not prepare it again for the same credential.
+    auth.configuration_needs_login(id);
+    auth.prepare_backend(&backend).await;
+    assert_eq!(prepared(), 1);
+    assert!(auth.was_skipped(&backend));
+    // A new sign-in brings a new credential, which is tried once.
+    assert!(other.logout(id).await.unwrap());
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    auth.prepare_backend(&backend).await;
+    assert_eq!(prepared(), 2);
+}
+
+#[tokio::test]
+async fn reconfiguring_without_a_credential_never_offers_a_link() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.quiet";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    // The credential is gone by the time the configuration is prepared.
+    auth.prepare_quietly(&context(&auth, id)).await.unwrap();
+    assert!(login::test_support::pending(&scope).is_empty());
+    assert!(hints.try_recv().is_err());
+    assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 0);
+}
+
+#[tokio::test]
+async fn a_step_up_link_stays_while_the_base_credential_works() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.step-up";
+    let mut backend = issuer.backend(id);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let other = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 403 asked for more scopes: the step-up link is shown.
+    login::registry().needs_login(&scope, &target, &["hooks:invoke".into()]);
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    let url = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
+    let states = || -> Vec<String> {
+        login::test_support::pending(&scope)
+            .into_iter()
+            .map(|login| login.state)
+            .collect()
+    };
+    assert_eq!(states(), [query(&url, "state")]);
+    // A credential with the base scopes exists (signed in elsewhere); a
+    // delivery and the next turn find it, and the step-up link stays.
+    let (base, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&base)).await;
+    assert!(credential(&auth, target.clone()).await.unwrap().is_some());
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    assert_eq!(states(), [query(&url, "state")]);
+    assert!(hints.try_recv().is_err());
+    // The earlier link still completes the step-up.
+    assert!(approve(&url).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+#[tokio::test]
 async fn scope_settings_add_to_the_presets_scopes() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
