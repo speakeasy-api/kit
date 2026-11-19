@@ -391,12 +391,17 @@ async fn turns_repeat_one_link_until_sign_in_clears_it() {
     let url = url::Url::parse(first.url.as_deref().unwrap()).unwrap();
     // The next turn keeps this process's pending login: the same link, so
     // no new hint, and nothing is exchanged.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    auth.turn_started();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let backend = auth.0.backends["test.hinted"].clone();
+    let states = || -> Vec<String> {
+        login::test_support::pending(&backend.scope)
+            .into_iter()
+            .map(|login| login.state)
+            .collect()
+    };
+    assert_eq!(states(), [query(&url, "state")]);
+    auth.prepare_backend(&backend).await;
+    assert_eq!(states(), [query(&url, "state")]);
     assert!(hints.try_recv().is_err());
-    let scope = auth.0.backends["test.hinted"].scope.clone();
-    assert_eq!(login::test_support::pending(&scope).len(), 1);
 
     assert!(approve(&url).await);
     let cleared = next_hint(&mut hints).await;
@@ -464,6 +469,21 @@ async fn logout_and_status_are_per_backend() {
     sign_in(&auth, "test.second").await;
     assert!(auth.logout("test.first").await.unwrap());
     assert!(!auth.logout("test.first").await.unwrap());
+    // Logging out also stops a pending link's listener.
+    let url = auth
+        .prepare(&context(&auth, "test.first"), &[])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(TcpStream::connect(("127.0.0.1", port(&url))).await.is_ok());
+    auth.logout("test.first").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while TcpStream::connect(("127.0.0.1", port(&url))).await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("logout stops the link's listener");
     let status: BTreeMap<_, _> = auth.status(None).await.unwrap().into_iter().collect();
     assert_eq!(status["test.first"], "needs-login");
     assert_eq!(status["test.second"], "authorized");
@@ -621,10 +641,11 @@ async fn a_callback_the_server_rejects_completes_nothing() {
         .unwrap()
         .insert("stolen-code".into(), "another-challenge".into());
     assert!(!call_back_with(port(&url), &query(&url, "state"), "stolen-code").await);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The SDK ended the login, so its dead link is withdrawn, not signed in.
+    let cleared = next_hint(&mut hints).await;
     assert!(
-        hints.try_recv().is_err(),
-        "a rejected exchange is not a sign-in"
+        cleared.cleared && !cleared.signed_in,
+        "a rejected exchange is not a sign-in: {cleared:?}"
     );
     assert_eq!(issuer.exchanges(), 0);
     assert!(
@@ -632,6 +653,12 @@ async fn a_callback_the_server_rejects_completes_nothing() {
             .await
             .is_err()
     );
+    // The next turn shows a fresh link.
+    auth.turn_started();
+    let fresh = next_hint(&mut hints).await;
+    let fresh = url::Url::parse(fresh.url.as_deref().unwrap()).unwrap();
+    assert_ne!(query(&fresh, "state"), query(&url, "state"));
+    assert!(approve(&fresh).await);
 }
 
 #[tokio::test]
@@ -1356,4 +1383,24 @@ async fn denying_consent_ends_the_login() {
     assert!(error.contains("not approved"), "{error}");
     browser.await.unwrap();
     assert_eq!(issuer.exchanges(), 0);
+}
+
+#[test]
+fn only_pkce_targets_listen_for_a_callback() {
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            json!({"id": "test.pkce", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "oauth": {"issuer": "https://auth.example"}}),
+            json!({"id": "test.machine", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "oauth": {"issuer": "https://auth.example", "flow": "client_credentials"}}),
+            json!({"id": "test.preset-machine", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "authentication": {"type": "oauth", "flow": "client_credentials",
+                    "issuer": "https://auth.example", "clientId": "kit", "resource": "https://hooks.example/ahp"}}),
+        ],
+    );
+    assert!(auth.pkce(&context(&auth, "test.pkce")).unwrap());
+    assert!(!auth.pkce(&context(&auth, "test.machine")).unwrap());
+    assert!(!auth.pkce(&context(&auth, "test.preset-machine")).unwrap());
 }

@@ -179,6 +179,11 @@ impl Settings {
                 }
             }
         }
+        if raw.get("redirectPort").is_some_and(|port| !port.is_null()) {
+            problems.push(format!(
+                "{id}: oauth.redirectPort is no longer used; Kit listens on a port the system chooses; the authorization server must accept any loopback port (RFC 8252 \u{a7}7.3)"
+            ));
+        }
         if settings.invalid_issuer {
             problems.push(format!(
                 "{id}: oauth.issuer is not an https URL; OAuth for this backend is refused until it is fixed"
@@ -227,10 +232,15 @@ mod tests {
     #[test]
     fn invalid_settings_are_named_and_ignored() {
         let (settings, problems) = Settings::parse(&json!({"id": "b", "oauth": {
-            "issuer": "http://auth.example", "registration": true,
+            "issuer": "http://auth.example", "registration": true, "redirectPort": 30123,
             "loginLifetimeMinutes": 30
         }}));
-        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("oauth.redirectPort is no longer used"))
+        );
         assert!(settings.invalid_issuer && settings.issuer.is_none());
         assert!(
             problems

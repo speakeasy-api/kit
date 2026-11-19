@@ -503,7 +503,8 @@ pub(super) enum Outcome {
 
 /// Receives `login`'s callback on its own `listener` and completes the
 /// login, until it completes, ends or is stopped. Other requests, and
-/// callbacks for any other `state`, are refused and change nothing.
+/// callbacks for any other `state`, are refused and change nothing; the
+/// first callback with its `state` completes or ends it.
 pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
     let Ok(address) = listener.local_addr() else {
         return Outcome::Ended;
@@ -554,7 +555,6 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             respond(&mut stream, false).await;
             continue;
         }
-        let denied = has_query_param(&target, "error");
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = AuthContext {
             deadline,
@@ -566,12 +566,14 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             .await
             .is_ok();
         respond(&mut stream, completed).await;
-        if completed {
-            return Outcome::Completed;
-        }
-        if denied {
-            return Outcome::Ended;
-        }
+        // A callback with the login's state ends it either way: the SDK
+        // claims the login before it exchanges the code, so after a denial
+        // or a failed exchange its link no longer works.
+        return if completed {
+            Outcome::Completed
+        } else {
+            Outcome::Ended
+        };
     }
 }
 

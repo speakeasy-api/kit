@@ -120,6 +120,22 @@ struct Inner {
     client: network::ClientBuilder,
 }
 
+/// The flow of a target and its preset's client: the binding's, or for an
+/// unbound target the backend's `oauth.flow`.
+fn flow(
+    target: &agenthooksprotocol::auth::AuthTarget,
+    settings: &config::Settings,
+) -> Result<(OAuthFlow, Option<String>), HookError> {
+    match target.binding() {
+        AuthBinding::OAuth { flow, .. } => Ok((*flow, target.client_id().map(str::to_owned))),
+        AuthBinding::Unbound => Ok((
+            settings.flow.unwrap_or(OAuthFlow::AuthorizationCodePkce),
+            None,
+        )),
+        _ => Err(fail(AuthErrorCode::UnsupportedBinding)),
+    }
+}
+
 fn fail(code: AuthErrorCode) -> HookError {
     HookError::authentication(code)
 }
@@ -238,6 +254,17 @@ impl HookAuth {
             .build()
     }
 
+    /// Whether `context`'s target signs in with PKCE, and so has a callback.
+    fn pkce(&self, context: &AuthContext) -> Result<bool, HookError> {
+        let target = context.target()?;
+        let backend = self
+            .0
+            .backends
+            .get(target.backend_id())
+            .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?;
+        Ok(flow(&target, &backend.settings)?.0 == OAuthFlow::AuthorizationCodePkce)
+    }
+
     fn manager(&self, context: &AuthContext) -> Result<Arc<ManagedOAuth>, HookError> {
         let target = context.target()?;
         let backend = self
@@ -246,14 +273,7 @@ impl HookAuth {
             .get(target.backend_id())
             .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?;
         let settings = &backend.settings;
-        let (flow, preset_client) = match target.binding() {
-            AuthBinding::OAuth { flow, .. } => (*flow, target.client_id().map(str::to_owned)),
-            AuthBinding::Unbound => (
-                settings.flow.unwrap_or(OAuthFlow::AuthorizationCodePkce),
-                None,
-            ),
-            _ => return Err(fail(AuthErrorCode::UnsupportedBinding)),
-        };
+        let (flow, preset_client) = flow(&target, settings)?;
         let pkce = flow == OAuthFlow::AuthorizationCodePkce;
         let policy = policy::Policy {
             settings: settings.clone(),
@@ -472,12 +492,17 @@ impl HookAuth {
     ) -> Result<Option<url::Url>, HookError> {
         let manager = self.manager(context)?;
         let context = with_deadline(context);
-        let (listener, redirect) = login::bind()
-            .await
-            .map_err(|_| fail(AuthErrorCode::ProviderFailed))?;
-        let options = PrepareOptions::new()
-            .required(required.to_vec())
-            .redirect_uri(redirect);
+        let mut options = PrepareOptions::new().required(required.to_vec());
+        // Only a PKCE login has a callback; client credentials never listen.
+        let listener = if self.pkce(&context)? {
+            let (listener, redirect) = login::bind()
+                .await
+                .map_err(|_| fail(AuthErrorCode::ProviderFailed))?;
+            options = options.redirect_uri(redirect);
+            Some(listener)
+        } else {
+            None
+        };
         match manager
             .prepare_with(context.clone(), options, budget())
             .await?
@@ -489,6 +514,7 @@ impl HookAuth {
                 Ok(None)
             }
             Preparation::InteractionRequired(pending) => {
+                let listener = listener.ok_or_else(|| fail(AuthErrorCode::ProviderFailed))?;
                 let scope = self
                     .scope(&context)
                     .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?
@@ -583,15 +609,19 @@ impl HookAuth {
                 continue;
             }
             // Listen before showing the link, so an immediate approval lands.
-            let (listener, redirect) = login::bind().await.map_err(|error| {
-                format!("{}: could not listen for sign-in: {error}", backend.id)
-            })?;
+            // Client credentials have no callback and never listen.
+            let mut options = PrepareOptions::new();
+            let listener = if self.pkce(&context).unwrap_or(false) {
+                let (listener, redirect) = login::bind().await.map_err(|error| {
+                    format!("{}: could not listen for sign-in: {error}", backend.id)
+                })?;
+                options = options.redirect_uri(redirect);
+                Some(listener)
+            } else {
+                None
+            };
             let prepared = manager
-                .prepare_with(
-                    with_deadline(&context),
-                    PrepareOptions::new().redirect_uri(redirect),
-                    budget(),
-                )
+                .prepare_with(with_deadline(&context), options, budget())
                 .await;
             let pending = match prepared {
                 Ok(Preparation::Ready(_)) => continue,
@@ -607,6 +637,13 @@ impl HookAuth {
                     continue;
                 }
                 Err(error) => return Err(format!("{}: {}", backend.id, describe(&error))),
+            };
+            let Some(listener) = listener else {
+                return Err(format!(
+                    "{}: {}",
+                    backend.id,
+                    describe(&fail(AuthErrorCode::ProviderFailed))
+                ));
             };
             present(&backend.id, pending.authorization_url());
             let candidate =

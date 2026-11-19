@@ -155,7 +155,7 @@ receivers ignore it. All settings are optional. Alongside a preset:
 | `trustAdvertisedIssuer` | Without `issuer`, trust the authorization server the backend advertises. Default `false`: Kit refuses it. Client credentials always need `issuer`. |
 | `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
 | `scopes` | Scopes to request in addition to the preset's, which every operation requires. They are also the most Kit accepts: a backend that asks for a scope outside them is refused, not granted it. |
-| `clientId` | A client registered for Kit in advance. It always wins. |
+| `clientId` | A client registered for Kit in advance. It always wins. Kit listens on a port the system chooses, so its registration must accept any loopback port on `http://127.0.0.1/callback` (RFC 8252 §7.3). `oauth.redirectPort` is no longer used; Kit warns when it is set. |
 | `clientSecretRef` | For client credentials: a key in `~/.kit/ahp-secrets.json`. |
 | `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document that you publish. Kit uses it where the issuer supports such documents. Its `redirectUris` must include `http://127.0.0.1/callback`; the authorization server must accept any port on it (RFC 8252). |
 | `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
