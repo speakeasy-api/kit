@@ -188,14 +188,19 @@ pub(super) fn notification(
         }),
     ))
 }
+pub(super) fn prompt_outcome_unknown(error: &agent_client_protocol::Error) -> bool {
+    agent_client_protocol::is_connection_terminated(error)
+        || agent_client_protocol::is_incoming_transport_closed(error)
+        || error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(|value| value.as_str())
+            == Some("outcome_unknown")
+}
+
 pub(super) fn submission_error(error: &agent_client_protocol::Error) -> String {
-    if error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("reason"))
-        .and_then(|value| value.as_str())
-        == Some("outcome_unknown")
-    {
+    if prompt_outcome_unknown(error) {
         "Message acceptance is unknown; it was not retried. Review the recovered transcript before submitting again.".into()
     } else {
         format!("message was not accepted: {}", super::error_detail(error))
@@ -265,7 +270,7 @@ mod tests {
     }
     #[test]
     fn submission_error_preserves_internal_error_detail() {
-        let error = agent_client_protocol::util::internal_error("session is unavailable");
+        let error = agent_client_protocol::Error::internal_error().data("session is unavailable");
         assert_eq!(
             submission_error(&error),
             "message was not accepted: session is unavailable"
@@ -281,7 +286,7 @@ mod tests {
     }
     #[test]
     fn outcome_unknown_does_not_claim_rejection_or_authorize_retry() {
-        let mut error = agent_client_protocol::util::internal_error("lost request");
+        let mut error = agent_client_protocol::Error::internal_error().data("lost request");
         error.data =
             Some(serde_json::json!({"reason":"outcome_unknown", "method":"session/prompt"}));
         let message = submission_error(&error);

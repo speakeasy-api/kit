@@ -3,8 +3,8 @@
 //! The initialize message includes both generations' identity/capability keys:
 //! the selected protocol then determines response parsing and all session RPCs.
 use agent_client_protocol::{
-    ConnectionTo, Error, JsonRpcRequest, UntypedMessage,
-    schema::{ProtocolVersion, v2},
+    ConnectionTo, Error, JsonRpcRequest, RawJsonRpcId, UntypedMessage, schema::ProtocolVersion,
+    v2::schema as v2,
 };
 use agentkit_acp as v1;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -104,7 +104,7 @@ pub(super) type Initialized = (Version, v1::AgentCapabilities, Vec<v1::AuthMetho
 pub(super) fn requires_v1(error: &Error) -> bool {
     const REJECTION: &str =
         "unsupported ACP protocol version 2; this endpoint only supports ACP protocol version 1";
-    error.code == agent_client_protocol::ErrorCode::InvalidRequest
+    error.code == agent_client_protocol::ErrorCode::INVALID_REQUEST
         && (error.data.as_ref().and_then(Value::as_str) == Some(REJECTION)
             || error.message == REJECTION)
 }
@@ -147,12 +147,12 @@ fn negotiated(response: Value) -> Result<Initialized, Error> {
         ProtocolVersion::V2 => {
             let initialized: v2::InitializeResponse = serde_json::from_value(response)?;
             let mut capabilities = v1::AgentCapabilities::default();
-            let supports_steer;
+            let mut supports_steer = false;
             if let Some(session) = initialized.capabilities.session {
-                supports_steer = session
-                    .inject
-                    .is_some_and(|inject| inject.modes.contains(&v2::SessionInjectMode::Steer));
                 if let Some(prompt) = session.prompt {
+                    supports_steer = prompt
+                        .delivery
+                        .is_some_and(|delivery| delivery.steer.is_some());
                     capabilities.prompt_capabilities.image = prompt.image.is_some();
                     capabilities.prompt_capabilities.audio = prompt.audio.is_some();
                     capabilities.prompt_capabilities.embedded_context =
@@ -284,20 +284,27 @@ where
     }
 }
 
-/// Injection is acknowledged independently of the foreground prompt's settlement.
+/// Prompt insertion is acknowledged independently of foreground settlement.
 pub(super) fn steer(
     connection: &ConnectionTo<Agent>,
     session_id: v1::SessionId,
     content: Vec<v1::ContentBlock>,
 ) -> Result<impl Future<Output = Result<Value, Error>> + Send + 'static, Error> {
-    let request = v2::InjectSessionRequest::new(
-        session_id.to_string(),
-        v2::SessionInjectMode::Steer,
-        serde_json::from_value(serde_json::to_value(content)?)?,
-    );
-    // send_request enqueues synchronously; callers can guard generation admission.
-    let sent = connection.send_request(request);
-    Ok(async move { Ok(serde_json::to_value(sent.block_task().await?)?) })
+    let request = v2::PromptRequest::new(session_id.to_string(), cast(content)?)
+        .delivery(v2::PromptDelivery::Steer);
+    // Publish while the generation is still guarded. The receipt wait is only
+    // local: timing out must not send a request cancellation to the child.
+    let (reply, receipt) = tokio::sync::oneshot::channel();
+    connection
+        .prepare_request(request)
+        .on_receiving_result(async move |result| {
+            let _ = reply.send(result);
+            Ok(())
+        })?;
+    Ok(async move {
+        let inserted = receipt.await.map_err(Error::into_internal_error)??;
+        Ok(serde_json::to_value(inserted)?)
+    })
 }
 
 pub(super) fn fork(
@@ -306,7 +313,7 @@ pub(super) fn fork(
     request: v1::ForkSessionRequest,
 ) -> Result<
     (
-        v1::RequestId,
+        RawJsonRpcId,
         impl Future<Output = Result<v1::ForkSessionResponse, Error>> + Send + 'static,
     ),
     Error,
@@ -418,11 +425,10 @@ mod tests {
     fn steering_requires_v2_and_an_advertised_steer_mode() {
         for (session, expected) in [
             (json!({}), false),
-            (json!({"inject": {"modes": ["queue"]}}), false),
-            (
-                json!({"inject": {"modes": ["steer"], "steerInStream": ["finish"]}}),
-                true,
-            ),
+            (json!({"inject": {"modes": ["steer"]}}), false),
+            (json!({"prompt": {"delivery": {"queue": {}}}}), false),
+            (json!({"prompt": {"delivery": {"steer": null}}}), false),
+            (json!({"prompt": {"delivery": {"steer": {}}}}), true),
         ] {
             let (_, _, _, supported) = negotiated(json!({"protocolVersion": 2,
                 "info": {"name": "child", "version": "1"}, "capabilities": {"session": session}
@@ -431,7 +437,7 @@ mod tests {
             assert_eq!(supported, expected);
         }
         let (_, _, _, supported) = negotiated(json!({"protocolVersion": 1,
-            "agentCapabilities": {"sessionCapabilities": {"inject": {"modes": ["steer"]}}}
+            "agentCapabilities": {"sessionCapabilities": {"prompt": {"delivery": {"steer": {}}}}}
         }))
         .unwrap();
         assert!(!supported);

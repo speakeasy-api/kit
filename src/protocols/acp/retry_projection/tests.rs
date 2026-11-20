@@ -92,7 +92,7 @@ fn retry_projection_poison_isolates_only_progress() {
 fn retry_projection_notice_wire_is_identical_in_v1_and_v2() {
     let update = Projection::default().observe(&scheduled(1, 0)).unwrap();
     let value = serde_json::to_value(update).unwrap();
-    let v2: agent_client_protocol::schema::v2::SessionUpdate =
+    let v2: agent_client_protocol::v2::schema::SessionUpdate =
         serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(v2).unwrap(), value);
     assert_eq!(

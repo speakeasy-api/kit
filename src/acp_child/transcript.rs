@@ -212,18 +212,18 @@ impl Transcript {
         generation: u64,
         content: &[super::ContentBlock],
     ) {
-        use agent_client_protocol::schema::v1::{SessionMessage, SessionUpdate};
+        use agent_client_protocol::v1::schema::{SessionMessage, SessionUpdate};
         let mut message = SessionMessage::new(format!(
             "kit-delegation-{generation}-{}",
             crate::session::new_id()
         ))
-        .recipient_session_id(agent_client_protocol::schema::v1::SessionId::from(
+        .recipient_session_id(agent_client_protocol::v1::schema::SessionId::from(
             owner.to_owned(),
         ))
         .content(content.to_vec());
         if let Some(parent) = self.stream.as_ref().and_then(|stream| stream.parent(owner)) {
             message = message
-                .sender_session_id(agent_client_protocol::schema::v1::SessionId::from(parent));
+                .sender_session_id(agent_client_protocol::v1::schema::SessionId::from(parent));
         }
         if let Ok(update) = serde_json::to_value(SessionUpdate::SessionMessage(message)) {
             self.directed(owner, update.clone());

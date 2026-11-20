@@ -73,7 +73,6 @@ final class ACPClient {
     private var supportsAdditionalDirectories = false
     private var promptCapabilities: ACPPromptCapabilities?
     private(set) var supportsSteering = false
-    private(set) var supportsPendingSteerEdit = false
 
     init(launchOverride: LaunchOverride? = nil, requestTimeout: TimeInterval = 30, promptTimeout: TimeInterval = 6 * 60 * 60) {
         self.launchOverride = launchOverride
@@ -93,66 +92,36 @@ final class ACPClient {
         ACPClient(launchOverride: launchOverride, requestTimeout: requestTimeout, promptTimeout: promptTimeout)
     }
 
-    func prompt(text: String, attachments: [Attachment], onSent: (() -> Void)? = nil, completion: @escaping (Result<Dictionary, Error>) -> Void) {
-        queue.async {
-            guard let sessionID = self.sessionID else {
-                self.complete(completion, with: .failure(ACPClientError.protocolError("ACP session is not ready")))
-                return
-            }
-            do {
-                let blocks = try self.promptBlocks(text: text, attachments: attachments)
-                self.requestLocked(method: "session/prompt", params: ["sessionId": sessionID, "prompt": blocks], timeout: self.promptTimeout, onSent: onSent, completion: completion)
-            } catch { self.complete(completion, with: .failure(error)) }
-        }
-    }
-
-    func inject(
-        text: String, attachments: [Attachment],
-        completion: @escaping (Result<ACPInjectSessionResponse, Error>) -> Void
+    func prompt(
+        text: String, attachments: [Attachment], delivery: ACPPromptDelivery? = nil,
+        onSent: ((Int) -> Void)? = nil, completion: @escaping (Result<ACPPromptResponse, Error>) -> Void
     ) {
         queue.async {
+            let handleResponse: (Result<Dictionary, Error>) -> Void = { result in
+                completion(result.flatMap { payload in
+                    do { return .success(try Self.decode(ACPPromptResponse.self, from: payload)) }
+                    catch { return .failure(ACPClientError.protocolError("Malformed session/prompt response: " + error.localizedDescription)) }
+                })
+            }
             guard let sessionID = self.sessionID else {
-                DispatchQueue.main.async { completion(.failure(ACPClientError.protocolError("ACP session is not ready"))) }
+                self.complete(handleResponse, with: .failure(ACPClientError.protocolError("ACP session is not ready")))
                 return
             }
             do {
-                let blocks = try self.promptBlocks(text: text, attachments: attachments)
-                let content = try blocks.map { block in
-                    try JSONDecoder().decode(JSONValue.self, from: JSONSerialization.data(withJSONObject: block))
-                }
-                let request = ACPInjectSessionRequest(sessionId: sessionID, mode: "steer", content: content)
-                self.requestLocked(method: "session/inject", params: try Self.dictionary(request)) { result in
-                    switch result {
-                    case .failure(let error): completion(.failure(error))
-                    case .success(let payload):
-                        do { completion(.success(try Self.decode(ACPInjectSessionResponse.self, from: payload))) }
-                        catch { completion(.failure(ACPClientError.protocolError("Malformed session/inject response: " + error.localizedDescription))) }
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
-            }
+                let request = ACPPromptRequest(
+                    sessionId: sessionID, prompt: try self.promptBlocks(text: text, attachments: attachments), delivery: delivery
+                )
+                self.requestLocked(method: "session/prompt", params: try Self.dictionary(request),
+                                   timeout: self.promptTimeout, onSent: onSent, completion: handleResponse)
+            } catch { self.complete(handleResponse, with: .failure(error)) }
         }
     }
 
-    func replacePendingSteer(id: String, text: String, completion: @escaping (Result<Dictionary, Error>) -> Void) {
-        mutatePendingSteer(method: "session/replace_inject", id: id, text: text, completion: completion)
-    }
-
-    func revokePendingSteer(id: String, completion: @escaping (Result<Dictionary, Error>) -> Void) {
-        mutatePendingSteer(method: "session/revoke_inject", id: id, text: nil, completion: completion)
-    }
-
-    private func mutatePendingSteer(method: String, id: String, text: String?, completion: @escaping (Result<Dictionary, Error>) -> Void) {
+    func withdrawPrompt(requestID: Int) {
         queue.async {
-            guard let sessionID = self.sessionID, self.supportsSteering,
-                  text == nil || self.supportsPendingSteerEdit else {
-                self.complete(completion, with: .failure(ACPClientError.protocolError("Pending message mutation is unavailable")))
-                return
-            }
-            var params: Dictionary = ["sessionId": sessionID, "messageId": id]
-            if let text { params["content"] = [["type": "text", "text": text]] }
-            self.requestLocked(method: method, params: params, completion: completion)
+            guard self.pending[requestID]?.method == "session/prompt" else { return }
+            // Leave the request pending until the agent confirms cancellation or insertion.
+            self.notifyLocked(method: "$/cancel_request", params: ["requestId": requestID])
         }
     }
 
@@ -388,15 +357,7 @@ final class ACPClient {
                         }
                         self.supportsAdditionalDirectories = response.capabilities?.session?.additionalDirectories != nil
                         self.promptCapabilities = response.capabilities?.session?.prompt
-                        let injection = response.capabilities?.session?.inject
-                        // Match the TUI: finish-mode steering queues input for the next safe boundary.
-                        self.supportsSteering = injection?.modes.contains("steer") == true
-                            && injection?.steerInStream?.contains("finish") == true
-                        let capabilities = payload["capabilities"] as? Dictionary
-                        let session = capabilities?["session"] as? Dictionary
-                        let inject = session?["inject"] as? Dictionary
-                        let pending = inject?["pending"] as? Dictionary
-                        self.supportsPendingSteerEdit = self.supportsSteering && pending?["replace"] as? Bool == true
+                        self.supportsSteering = self.promptCapabilities?.delivery?.steer != nil
                         completion(result)
                     } catch {
                         completion(.failure(ACPClientError.protocolError("Malformed ACP v2 initialize response: " + error.localizedDescription)))
@@ -599,7 +560,7 @@ final class ACPClient {
         }
     }
 
-    private func requestLocked(method: String, params: Dictionary, timeout: TimeInterval? = nil, onSent: (() -> Void)? = nil, completion: @escaping (Result<Dictionary, Error>) -> Void) {
+    private func requestLocked(method: String, params: Dictionary, timeout: TimeInterval? = nil, onSent: ((Int) -> Void)? = nil, completion: @escaping (Result<Dictionary, Error>) -> Void) {
         guard isProcessRunning, !exited else { complete(completion, with: .failure(ACPClientError.process("Kit process is not running"))); return }
         let id = nextID; nextID += 1
         let work = DispatchWorkItem { [weak self] in
@@ -613,7 +574,7 @@ final class ACPClient {
             complete(completion, with: .failure(error))
             return
         }
-        if let onSent { DispatchQueue.main.async(execute: onSent) }
+        if let onSent { DispatchQueue.main.async { onSent(id) } }
         queue.asyncAfter(deadline: .now() + (timeout ?? requestTimeout), execute: work)
     }
 
@@ -731,11 +692,10 @@ final class ACPClient {
         DispatchQueue.main.async { completion(result) }
     }
 
-    private func promptBlocks(text: String, attachments: [Attachment]) throws -> [Dictionary] {
+    private func promptBlocks(text: String, attachments: [Attachment]) throws -> [JSONValue] {
         guard attachments.count <= 8 else { throw ACPClientError.attachment("At most 8 attachments can be pending") }
         var total: Int64 = 0
-        var blocks: [Dictionary] = []
-        let modelText = text
+        var blocks: [JSONValue] = [.object(["type": .string("text"), "text": .string(text)])]
         for attachment in attachments {
             let supported = switch attachment.kind {
             case .image: promptCapabilities?.image != nil
@@ -748,11 +708,13 @@ final class ACPClient {
             guard data.count <= 10 * 1024 * 1024 else { throw ACPClientError.attachment("\(attachment.url.lastPathComponent) exceeds the 10 MiB limit") }
             total += Int64(data.count)
             guard total <= 20 * 1024 * 1024 else { throw ACPClientError.attachment("Attachments exceed the 20 MiB total limit") }
-            var block: Dictionary = ["type": attachment.kind.rawValue, "data": data.base64EncodedString(), "mimeType": attachment.mimeType]
-            if attachment.kind == .image { block["uri"] = attachment.url.absoluteString }
-            blocks.append(block)
+            var block: [String: JSONValue] = [
+                "type": .string(attachment.kind.rawValue), "data": .string(data.base64EncodedString()),
+                "mimeType": .string(attachment.mimeType),
+            ]
+            if attachment.kind == .image { block["uri"] = .string(attachment.url.absoluteString) }
+            blocks.append(.object(block))
         }
-        blocks.insert(["type": "text", "text": modelText], at: 0)
         return blocks
     }
 

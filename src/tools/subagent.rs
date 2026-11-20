@@ -166,7 +166,9 @@ fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
 fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
     match error {
         ChildError::TerminalCancelled | ChildError::TerminalFailed(_) => true,
-        ChildError::Cancelled | ChildError::Failed(_) => child.is_closed(),
+        ChildError::Cancelled | ChildError::Failed(_) | ChildError::DeliveryUnknown(_) => {
+            child.is_closed()
+        }
     }
 }
 
@@ -896,7 +898,7 @@ impl Subagents {
                 }
                 continue;
             }
-            // An injected message has no turn of its own to carry an output contract.
+            // An in-turn steer cannot establish its own output contract.
             if status == SubagentStatus::Working
                 && !forking
                 && contract.is_none()
@@ -909,6 +911,7 @@ impl Subagents {
                     Ok(_) => {
                         return self.turn_value(id, &state, generation, &cancellation).await;
                     }
+                    Err(error @ ChildError::DeliveryUnknown(_)) => return Err(error),
                     Err(error) if child_error_is_terminal(&error, &child) => return Err(error),
                     Err(_) => {}
                 }
@@ -2741,9 +2744,9 @@ fn result(
 ) -> Result<ToolResult, ToolError> {
     let value = value.map_err(|error| match error {
         ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
-        ChildError::Failed(error) | ChildError::TerminalFailed(error) => {
-            ToolError::ExecutionFailed(error)
-        }
+        ChildError::Failed(error)
+        | ChildError::DeliveryUnknown(error)
+        | ChildError::TerminalFailed(error) => ToolError::ExecutionFailed(error),
     })?;
     let serialized = serde_json::to_value(&value).map_err(|error| {
         ToolError::ExecutionFailed(format!("failed to serialize subagent value: {error}"))
@@ -3142,7 +3145,9 @@ mod steer_tests {
                 if log
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .any(|request| request["method"] == "session/inject")
+                    .any(|request| {
+                        request["method"] == "session/prompt" && request["delivery"] == "steer"
+                    })
                 {
                     break;
                 }
@@ -3226,7 +3231,7 @@ mod steer_tests {
             assert!(
                 history
                     .iter()
-                    .any(|update| update["messageId"] == "injected-1"
+                    .any(|update| update["messageId"] == "steered-1"
                         && update["content"][0]["text"] == "original turn")
             );
             crate::protocols::acp::test_support::assert_transcript_route(

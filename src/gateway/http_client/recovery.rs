@@ -1,6 +1,6 @@
 //! Single-owner reconnect state. Only initialize and same-session resume retry.
 use super::*;
-use agent_client_protocol::schema::v2::UpdateSessionNotification;
+use agent_client_protocol::v2::schema::UpdateSessionNotification;
 use std::time::{Duration, Instant};
 
 const PREFIX: &str = "kit.gateway.internal/";
@@ -362,6 +362,12 @@ pub(super) async fn run(
                 }
                 Event::Line(Some((admitted, line))) => {
                     let value: Value = serde_json::from_str(&line?)?;
+                    if value.is_array() {
+                        // The upstream SDK treats a batch as malformed. Reject
+                        // it locally before registering any pending IDs.
+                        reject(&mut output, &value, "not_sent", &session)?;
+                        continue;
+                    }
                     if phase != "live"
                         || resumed.is_some()
                         || gate.is_some_and(|gate| admitted <= gate)
@@ -383,15 +389,7 @@ pub(super) async fn run(
                         .iter()
                         .filter(|v| v.get("id").is_some() && v.get("method").is_some())
                         .count();
-                    let duplicate_batch = entries(&value).iter().enumerate().any(|(index, v)| {
-                        v.get("id").is_some()
-                            && v.get("method").is_some()
-                            && entries(&value)[..index]
-                                .iter()
-                                .any(|p| p["id"] == v["id"] && p.get("method").is_some())
-                    });
-                    if duplicate_batch
-                        || pending.len() + requests > MAX_PENDING
+                    if pending.len() + requests > MAX_PENDING
                         || entries(&value).iter().any(|v| {
                             v.get("method").is_some()
                                 && v.get("id").is_some()

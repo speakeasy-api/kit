@@ -700,6 +700,8 @@ struct Pending {
     attachment: String,
     original: Value,
     method: String,
+    explicit_delivery: bool,
+    withdrawal_pending: bool,
     // The caller's policy, independent of full internal child cache seeding.
     replay: bool,
 }
@@ -802,16 +804,33 @@ impl Actor {
         });
         let mut lines = framing::Lines::new(stdout);
         loop {
+            let withdrawal = self.next_withdrawal();
             let event = {
+                let withdrawal_permit = std::pin::pin!(async {
+                    if withdrawal.is_some() {
+                        writes.reserve().await
+                    } else {
+                        std::future::pending().await
+                    }
+                });
                 let command = std::pin::pin!(commands.recv());
                 let line = std::pin::pin!(lines.next_line());
                 let exited = std::pin::pin!(child.wait());
                 let written = std::pin::pin!(writer.join_next());
                 let io = std::pin::pin!(select(line, select(exited, written)));
-                match select(command, io).await {
-                    Either::Left((command, _)) => Either::Left(command),
-                    Either::Right((Either::Left((line, _)), _)) => Either::Right(Some(line)),
-                    Either::Right((Either::Right(_), _)) => Either::Right(None),
+                match select(withdrawal_permit, std::pin::pin!(select(command, io))).await {
+                    Either::Left((permit, _)) => {
+                        let (Some(id), Ok(permit)) = (withdrawal, permit) else {
+                            break;
+                        };
+                        self.send_withdrawal(id, permit);
+                        continue;
+                    }
+                    Either::Right((Either::Left((command, _)), _)) => Either::Left(command),
+                    Either::Right((Either::Right((Either::Left((line, _)), _)), _)) => {
+                        Either::Right(Some(line))
+                    }
+                    Either::Right((Either::Right((Either::Right(_), _)), _)) => Either::Right(None),
                 }
             };
             match event {
@@ -927,7 +946,10 @@ impl Actor {
         if let Some(attachment) = &mut self.attachment
             && !attachment.push(message)
         {
-            self.attachment = None;
+            let retired = self.attachment.take().map(|attachment| attachment.id);
+            if let Some(id) = retired {
+                self.mark_withdrawals(&id);
+            }
         }
     }
     fn remember(&mut self, message: Value) {
@@ -1130,6 +1152,48 @@ impl Actor {
         }
         Ok(messages)
     }
+    fn mark_withdrawals(&mut self, attachment: &str) {
+        // The backlog is one bit per bounded pending request. Settlement
+        // removes the bit with the request, so we never cancel an already
+        // answered ID or hold an extra unbounded queue when child stdin stalls.
+        for pending in self.pending.values_mut() {
+            if pending.attachment == attachment && pending.explicit_delivery {
+                pending.withdrawal_pending = true;
+            }
+        }
+    }
+
+    fn next_withdrawal(&self) -> Option<u64> {
+        self.pending
+            .iter()
+            .filter_map(|(&id, p)| p.withdrawal_pending.then_some(id))
+            .min()
+    }
+
+    fn send_withdrawal(&mut self, id: u64, permit: mpsc::Permit<'_, ChildWrite>) {
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.withdrawal_pending = false;
+            let message = object([
+                ("jsonrpc", "2.0".into()),
+                ("method", "$/cancel_request".into()),
+                ("params", object([("requestId", id.into())])),
+            ]);
+            permit.send(ChildWrite {
+                message,
+                _charge: None,
+            });
+        }
+    }
+
+    fn flush_withdrawals(&mut self, writes: &mpsc::Sender<ChildWrite>) {
+        while let Some(id) = self.next_withdrawal() {
+            let Ok(permit) = writes.try_reserve() else {
+                break;
+            };
+            self.send_withdrawal(id, permit);
+        }
+    }
+
     fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
         if (self.closed || self.pending.values().any(|p| p.method == "session/close"))
             && !matches!(request, Request::Poll { .. } | Request::Detach { .. })
@@ -1268,6 +1332,10 @@ impl Actor {
                 };
             // No fallible work after the ownership commit. The previous controller
             // survives every replay/snapshot preparation failure.
+            if let Some(previous) = self.attachment.take() {
+                self.mark_withdrawals(&previous.id);
+                self.flush_withdrawals(writes);
+            }
             self.committed_owner = Some(CommittedOwner {
                 id: id.clone(),
                 recovery_id,
@@ -1299,8 +1367,10 @@ impl Actor {
             })?;
         attachment.touched = Instant::now();
         match request {
-            Request::Detach { .. } => {
+            Request::Detach { attachment, .. } => {
                 self.attachment = None;
+                self.mark_withdrawals(&attachment);
+                self.flush_withdrawals(writes);
                 Ok(object([]))
             }
             Request::Poll { cursor, .. } => {
@@ -1361,10 +1431,35 @@ impl Actor {
                 if method == "kit/background/cancel" && message["params"]["session_id"] != self.id {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
-                // Request-task cancellation is not an execution interrupt. In
-                // particular, SDK teardown must not cancel detached work; use
-                // explicit session/cancel (which is session-scoped) instead.
+                // Only withdraw a prompt from the same attachment. A request
+                // cancellation never interrupts work for an inserted prompt.
                 if method == "$/cancel_request" {
+                    if original.is_some() {
+                        return Err(Failure::bad("request cancellation must be a notification"));
+                    }
+                    let Some(id) = message["params"].get("requestId").filter(|id| {
+                        id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
+                    }) else {
+                        return Err(Failure::bad("valid cancellation requestId required"));
+                    };
+                    let Some((&child_id, _)) = self.pending.iter().find(|(_, pending)| {
+                        pending.attachment == attachment
+                            && pending.original == *id
+                            && pending.method == "session/prompt"
+                    }) else {
+                        return Ok(object([]));
+                    };
+                    message["params"]["requestId"] = child_id.into();
+                    writes
+                        .try_send(ChildWrite {
+                            message,
+                            _charge: charge,
+                        })
+                        .map_err(|_| {
+                            Failure::unavailable(
+                                "child input queue unavailable; cancellation not accepted",
+                            )
+                        })?;
                     return Ok(object([]));
                 }
                 if !matches!(
@@ -1373,9 +1468,6 @@ impl Actor {
                         | "session/new"
                         | "session/resume"
                         | "session/prompt"
-                        | "session/inject"
-                        | "session/revoke_inject"
-                        | "session/replace_inject"
                         | "session/cancel"
                         | "session/close"
                         | "kit/background/cancel"
@@ -1497,10 +1589,17 @@ impl Actor {
                         .checked_add(1)
                         .ok_or_else(|| Failure::unavailable("request id exhausted"))?;
                     message["id"] = Value::from(self.serial);
+                    let explicit_delivery = method == "session/prompt"
+                        && matches!(
+                            message["params"]["delivery"].as_str(),
+                            Some("steer" | "queue")
+                        );
                     Some(Pending {
                         attachment,
                         original,
                         method,
+                        explicit_delivery,
+                        withdrawal_pending: false,
                         replay,
                     })
                 } else {

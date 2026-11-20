@@ -19,10 +19,10 @@ MODEL_FIELDS = {
         "version": ("string", True),
     },
     "ClientCapabilities": {
-        "auth": ("anyOf($ref:AuthCapabilities,null)", False),
+        "auth": ("anyOf($ref:ClientAuthCapabilities,null)", False),
         "elicitation": ("anyOf($ref:ElicitationCapabilities,null)", False),
     },
-    "AuthCapabilities": {
+    "ClientAuthCapabilities": {
         "terminal": ("anyOf($ref:TerminalAuthCapabilities,null)", False),
     },
     "ElicitationCapabilities": {
@@ -33,25 +33,23 @@ MODEL_FIELDS = {
         "image": ("anyOf($ref:PromptImageCapabilities,null)", False),
         "audio": ("anyOf($ref:PromptAudioCapabilities,null)", False),
         "embeddedContext": ("anyOf($ref:PromptEmbeddedContextCapabilities,null)", False),
+        "delivery": ("anyOf($ref:PromptDeliveryCapabilities,null)", False),
     },
-    "SessionInjectCapabilities": {
-        "modes": ("array[$ref:SessionInjectMode]", True),
-        "steerInStream": ("array|null", False),
+    "PromptDeliveryCapabilities": {
+        "steer": ("anyOf($ref:PromptDeliveryModeCapabilities,null)", False),
+        "queue": ("anyOf($ref:PromptDeliveryModeCapabilities,null)", False),
     },
     "SessionCapabilities": {
         "prompt": ("anyOf($ref:PromptCapabilities,null)", False),
         "mcp": ("anyOf($ref:McpCapabilities,null)", False),
         "delete": ("anyOf($ref:SessionDeleteCapabilities,null)", False),
         "additionalDirectories": ("anyOf($ref:SessionAdditionalDirectoriesCapabilities,null)", False),
-        "inject": ("anyOf($ref:SessionInjectCapabilities,null)", False),
         "fork": ("anyOf($ref:SessionForkCapabilities,null)", False),
     },
     "AgentCapabilities": {
         "session": ("anyOf($ref:SessionCapabilities,null)", False),
         "auth": ("anyOf($ref:AgentAuthCapabilities,null)", False),
         "providers": ("anyOf($ref:ProvidersCapabilities,null)", False),
-        "nes": ("anyOf($ref:NesCapabilities,null)", False),
-        "positionEncoding": ("anyOf($ref:PositionEncodingKind,null)", False),
     },
     "InitializeRequest": {
         "protocolVersion": ("allOf($ref:ProtocolVersion)", True),
@@ -100,16 +98,9 @@ MODEL_FIELDS = {
     "PromptRequest": {
         "sessionId": ("allOf($ref:SessionId)", True),
         "prompt": ("array[$ref:ContentBlock]", True),
+        "delivery": ("anyOf($ref:PromptDelivery,null)", False),
     },
     "PromptResponse": {"messageId": ("allOf($ref:MessageId)", True)},
-    "InjectSessionRequest": {
-        "sessionId": ("allOf($ref:SessionId)", True),
-        "mode": ("allOf($ref:SessionInjectMode)", True),
-        "content": ("array[$ref:ContentBlock]", True),
-    },
-    "InjectSessionResponse": {
-        "messageId": ("allOf($ref:MessageId)", True),
-    },
     "SetSessionConfigOptionRequest": {
         "sessionId": ("allOf($ref:SessionId)", True),
         "configId": ("allOf($ref:SessionConfigId)", True),
@@ -138,10 +129,18 @@ MODEL_FIELDS = {
 # Source fields intentionally not represented by the dependency-free subset.
 # Keeping these explicit makes an upstream field addition fail until reviewed.
 OMITTED_FIELDS = {
-    "ClientCapabilities": {"nes", "positionEncodings"},
+    "ClientCapabilities": {"session"},
+    "SessionCapabilities": {"archive", "options", "status", "systemPrompt", "title"},
+    "NewSessionRequest": {"configOptions", "systemPrompt"},
+    "NewSessionResponse": {"availableCommands"},
+    "ResumeSessionRequest": {"configOptions", "systemPrompt"},
+    "ResumeSessionResponse": {"availableCommands"},
+    "ListSessionsRequest": {"archived"},
+    "SessionInfo": {"archived"},
     "InitializeResponse": {"authMethods"},
     "TextContent": {"annotations"},
-    "SessionInjectCapabilities": {"pending"},
+    "PromptCapabilities": {"skill"},
+    "PromptRequest": {"idempotencyKey"},
 }
 
 METHODS = {
@@ -150,7 +149,6 @@ METHODS = {
     "ResumeSessionRequest": "session/resume", "ResumeSessionResponse": "session/resume",
     "ListSessionsRequest": "session/list", "ListSessionsResponse": "session/list",
     "PromptRequest": "session/prompt", "PromptResponse": "session/prompt",
-    "InjectSessionRequest": "session/inject", "InjectSessionResponse": "session/inject",
     "SetSessionConfigOptionRequest": "session/set_config_option",
     "SetSessionConfigOptionResponse": "session/set_config_option",
     "CloseSessionRequest": "session/close",
@@ -178,7 +176,7 @@ DISCRIMINATORS = {
         {"type": "string:const='boolean'", "value": "boolean"}, (),
     ),
     ("RequestPermissionOutcome", "outcome", "cancelled"): (
-        {"outcome"}, {"outcome": "string:const='cancelled'"}, (),
+        {"outcome"}, {"outcome": "string:const='cancelled'"}, ("$ref:CancelledPermissionOutcome",),
     ),
     ("RequestPermissionOutcome", "outcome", "selected"): (
         {"outcome"}, {"outcome": "string:const='selected'"},
@@ -190,12 +188,14 @@ DISCRIMINATORS = {
 # contracts; validating only their top-level object kind misses new payload data.
 DISCRIMINATOR_BASE_FIELDS = {
     "ReplayFromStart": {},
+    "CancelledPermissionOutcome": {},
     "SelectedPermissionOutcome": {
         "optionId": ("allOf($ref:PermissionOptionId)", True),
     },
 }
 
 OBJECT_FIELDS = {**MODEL_FIELDS, **DISCRIMINATOR_BASE_FIELDS}
+STRING_ENUMS = {"PromptDelivery": {"string:const='steer'", "string:const='queue'"}}
 
 EMPTY_OBJECT_DEFS = {
     "TerminalAuthCapabilities", "ElicitationFormCapabilities",
@@ -211,7 +211,8 @@ REFERENCE_KINDS = {
     "AbsolutePath": "string",
     "AgentAuthCapabilities": "object",
     "AgentCapabilities": "object",
-    "AuthCapabilities": "object",
+    "ClientAuthCapabilities": "object",
+    "CancelledPermissionOutcome": "object",
     "ClientCapabilities": "object",
     "ContentBlock": "object",
     "ElicitationCapabilities": "object",
@@ -221,10 +222,8 @@ REFERENCE_KINDS = {
     "McpCapabilities": "object",
     "MessageId": "string",
     "McpServer": "object",
-    "NesCapabilities": "object",
     "PermissionOption": "object",
     "PermissionOptionId": "string",
-    "PositionEncodingKind": "string",
     "PromptAudioCapabilities": "object",
     "PromptCapabilities": "object",
     "PromptEmbeddedContextCapabilities": "object",
@@ -233,7 +232,7 @@ REFERENCE_KINDS = {
     "ProvidersCapabilities": "object",
     "ReplayFrom": "object",
     "ReplayFromStart": "object",
-    "RequestId": "integer|null|string",
+    "RequestId": "integer|string",
     "RequestPermissionOutcome": "object",
     "RequestPermissionSubject": "object",
     "SelectedPermissionOutcome": "object",
@@ -246,9 +245,9 @@ REFERENCE_KINDS = {
     "SessionForkCapabilities": "object",
     "SessionId": "string",
     "SessionInfo": "object",
-    "SessionInjectMode": "string",
-    "SessionInjectSteerInStream": "string",
-    "SessionInjectCapabilities": "object",
+    "PromptDelivery": "string",
+    "PromptDeliveryModeCapabilities": "object",
+    "PromptDeliveryCapabilities": "object",
     "SessionListCursor": "string",
     "SessionUpdate": "object",
     "TerminalAuthCapabilities": "object",
@@ -284,11 +283,12 @@ struct ACPPromptCapabilities: Codable, Equatable {
     var image: ACPEmptyObject?
     var audio: ACPEmptyObject?
     var embeddedContext: ACPEmptyObject?
+    var delivery: ACPPromptDeliveryCapabilities?
 }
 
-struct ACPSessionInjectCapabilities: Codable, Equatable {
-    var modes: [String]
-    var steerInStream: [String]?
+struct ACPPromptDeliveryCapabilities: Codable, Equatable {
+    var steer: ACPEmptyObject?
+    var queue: ACPEmptyObject?
 }
 
 struct ACPSessionCapabilities: Codable, Equatable {
@@ -296,7 +296,6 @@ struct ACPSessionCapabilities: Codable, Equatable {
     var mcp: JSONValue?
     var delete: JSONValue?
     var additionalDirectories: ACPEmptyObject?
-    var inject: ACPSessionInjectCapabilities?
     var fork: JSONValue?
 }
 
@@ -304,8 +303,6 @@ struct ACPAgentCapabilities: Codable, Equatable {
     var session: ACPSessionCapabilities?
     var auth: JSONValue?
     var providers: JSONValue?
-    var nes: JSONValue?
-    var positionEncoding: String?
 }
 
 struct ACPInitializeRequest: Codable, Equatable {
@@ -370,22 +367,17 @@ struct ACPTextContent: Codable, Equatable {
     var text: String
 }
 
+enum ACPPromptDelivery: String, Codable, Equatable {
+    case steer, queue
+}
+
 struct ACPPromptRequest: Codable, Equatable {
     var sessionId: String
     var prompt: [JSONValue]
+    var delivery: ACPPromptDelivery?
 }
 
 struct ACPPromptResponse: Codable, Equatable {
-    var messageId: String
-}
-
-struct ACPInjectSessionRequest: Codable, Equatable {
-    var sessionId: String
-    var mode: String
-    var content: [JSONValue]
-}
-
-struct ACPInjectSessionResponse: Codable, Equatable {
     var messageId: String
 }
 
@@ -587,6 +579,11 @@ def validate_schema(schema: dict) -> None:
             errors.append(f"{name} discriminator {literal!r} properties changed")
         if actual_all_of != expected_all_of:
             errors.append(f"{name} discriminator {literal!r} allOf changed")
+
+    for name, expected in STRING_ENUMS.items():
+        variants = definitions.get(name, {}).get("oneOf", [])
+        if len(variants) != len(expected) or {_type_signature(variant) for variant in variants} != expected:
+            errors.append(f"{name} string variants changed")
 
     uncontracted_refs = referenced - set(REFERENCE_KINDS)
     stale_refs = set(REFERENCE_KINDS) - referenced

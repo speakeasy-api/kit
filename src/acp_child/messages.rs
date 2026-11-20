@@ -1,7 +1,7 @@
 //! Text projection of v2 message-ID-keyed append and replacement updates.
 use std::collections::HashMap;
 
-use agent_client_protocol::schema::{MaybeUndefined, v2};
+use agent_client_protocol::{schema::MaybeUndefined, v2::schema as v2};
 use serde_json::Value;
 
 /// Each ID has one stable first-seen position and its current text. Notification

@@ -50,11 +50,11 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 
 | Key or input | Action |
 | --- | --- |
-| `Enter` | Send a non-empty prompt when idle; steer and finish the current response while active if the agent advertises that capability |
+| `Enter` | Send a non-empty prompt when idle; steer or queue while active, according to agent capabilities |
 | `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
-| `Esc` | Cancel a pending-message edit and restore the previous draft; leave the queue selector; otherwise interrupt a running turn or dismiss an idle notice |
+| `Esc` | Leave the pending-message selector; otherwise interrupt a running turn or dismiss an idle notice |
 | `F2` | Focus the pending-message queue (or return to the composer) |
-| `Up` / `Down`, `Enter`, `Backspace` / `Delete` in the queue | Select a pending message, edit it if supported, or remove it |
+| `Up` / `Down`, `Backspace` / `Delete` in the pending list | Select a pending message or request withdrawal |
 | `Command+B` | Move the newest running foreground top-level compose call to the background |
 | `Ctrl+C` | Interrupt a running turn; clear a non-empty idle prompt; quit when idle with an empty prompt |
 | `Ctrl+D` | Quit when the prompt is empty |
@@ -79,21 +79,13 @@ Drag over the transcript to select text within Kit. A press on the scrollbar scr
 
 Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
 
-When the session is idle, `Enter` starts a normal prompt. While the agent is active, `Enter` uses ACP v2 `steer` injection with `finish` stream behavior only when the agent advertised both capabilities. An accepted injected user message first appears in the pending queue above the composer. It moves to the transcript when the agent delivers it as part of the current turn. If steering is unavailable, the editor keeps the message and shows `this agent does not support active steering`. Local commands and agent-advertised session commands are available only while idle.
+When the session is idle, `Enter` starts a normal prompt. While the agent is active, `Enter` sends a steer if the agent supports it, or queues the prompt for the next turn if the agent supports only queueing. Kit shows the message above the composer until the agent inserts it. If neither mode is available, Kit keeps the draft in the editor. Local commands and agent-advertised session commands are available only while idle.
 
-### Edit or remove a pending message
+### Withdraw a pending message
 
-Press `F2` to focus the queue, then `Up` or `Down` to select a message. The queue opens only when at least one message is pending; otherwise Kit shows `no pending messages` and leaves you in the composer. The selected row stays visible even when the queue is long. Press `Enter` to edit its text in the composer, or `Backspace` / `Delete` to request removal (the normal Mac Delete key works). `Esc` or `F2` returns from the selector without changing your draft. When the last message is delivered or removed, or the turn finishes, the selector closes automatically and keyboard focus returns to the composer. An in-progress text edit remains available to copy or cancel rather than being discarded.
+Press `F2` to focus the pending list, then `Up` or `Down` to select a message. Press `Backspace` or `Delete` to request withdrawal. `Esc` or `F2` returns to the composer without changing the draft.
 
-After automatic closure, typing, pasting, or moving the composer cursor works normally. Until that fresh composer interaction (or `Esc` to acknowledge focus), Enter and deletion keys are ignored with a visible hint, so a key intended for the disappearing queue cannot send or delete your parked draft. An empty-queue F2 attempt does not enable this safeguard.
-
-While editing, plain `Enter` saves the replacement with the **same message ID and queue position**. `Esc` cancels the edit. Either a successful save or cancellation restores the previous composer draft, cursor, and attachments. Queue edits do not run slash commands. Editing is available only when the agent advertises ACP `session.inject.pending.replace`; removing a pending injection does not require this optional capability.
-
-Save and removal requests run without blocking the UI; updates and `Ctrl+C` cancellation remain available, including when delivery empties the selected queue. Only one change per message can be in flight. You can continue typing or press `Esc` while a save is in progress; `Esc` restores your draft but does not undo a request already sent. A save response never closes a reopened edit or discards text typed after that save began.
-
-If a request fails, Kit retains the replacement text and the parked original draft. You can retry, or press `Esc` to restore the original. If the message has already been delivered or no longer exists, it cannot be changed or removed: the stale queue entry disappears and any in-progress edit stays available to copy before you press `Esc`. A late response never adds that entry back to the queue. Starting or resuming another session clears the queue, selection, and edit state.
-
-Active steering continues to support media attachments. Pending-message **edits are text-only**: messages accepted with image, audio, or other non-text content cannot be edited in the queue, but can still be removed. Kit determines editability from the content actually sent, not stale attachments left in the composer. Media paths pasted during a queue edit are ordinary text, not new attachments. Attachments in the parked original draft remain unchanged when you save or cancel.
+Withdrawal only works before insertion. If insertion wins the race, the message appears in the transcript and cannot be taken back. To change a pending message, withdraw it and send the corrected version as a new prompt; it does not retain its original position. Stopping the current turn does not withdraw pending steers or queued prompts.
 
 ### Assistant image previews
 
@@ -107,7 +99,7 @@ The Markdown text or structured image label remains visible while loading and if
 
 Drag one or more supported local media files into the terminal while editing a prompt. Terminals deliver a drop as pasted, shell-escaped paths rather than as a dedicated file-drop event. Kit treats the paste as attachments only when every parsed token resolves to a supported regular file. Mixed text and paths, unsupported files, invalid shell quoting, missing files, and ambiguous input remain ordinary pasted text. There is no `/attach` command.
 
-Press `Ctrl+V` to read the native clipboard explicitly. If it contains an image, Kit saves a temporary PNG and attaches it; otherwise Kit pastes clipboard text. Kit also recognizes `Ctrl+Shift+V` and `Shift+Insert` when the terminal forwards those keys. On macOS, `Command+V` works when the terminal forwards the Command key through the Kitty keyboard protocol. VS Code's integrated terminal can instead send an empty bracketed paste for an image-only clipboard; in the main composer, Kit responds by checking only for a native clipboard image, never falling back to clipboard text. If no image is available, the empty paste remains a no-op. A terminal that sends neither a key event nor a paste event cannot trigger native image paste; use `Ctrl+V` or paste a saved image's file path instead. Non-empty bracketed text paste remains terminal-delivered and never causes a separate clipboard read. Native clipboard access is supported on macOS, Windows, and X11; native Wayland sessions need XWayland clipboard interoperability. Clipboard images cannot be added while editing a pending queue message, and paste shortcuts respect modal and queue-focus ownership.
+Press `Ctrl+V` to read the native clipboard explicitly. If it contains an image, Kit saves a temporary PNG and attaches it; otherwise Kit pastes clipboard text. Kit also recognizes `Ctrl+Shift+V` and `Shift+Insert` when the terminal forwards those keys. On macOS, `Command+V` works when the terminal forwards the Command key through the Kitty keyboard protocol. VS Code's integrated terminal can instead send an empty bracketed paste for an image-only clipboard; in the main composer, Kit responds by checking only for a native clipboard image, never falling back to clipboard text. If no image is available, the empty paste remains a no-op. A terminal that sends neither a key event nor a paste event cannot trigger native image paste; use `Ctrl+V` or paste a saved image's file path instead. Non-empty bracketed text paste remains terminal-delivered and never causes a separate clipboard read. Native clipboard access is supported on macOS, Windows, and X11; native Wayland sessions need XWayland clipboard interoperability. Paste shortcuts respect modal and pending-list focus.
 
 Supported files are PNG, JPEG, GIF, WebP, WAV, and MP3. Up to 8 attachments can be pending, each file can be at most 10 MiB, and their combined size can be at most 20 MiB. Clipboard pixel data is limited to 64 MiB before PNG encoding. Kit checks the actual file sizes again when the prompt is submitted.
 

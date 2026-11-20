@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use agent_client_protocol::schema::v2::{ToolCallStatus, ToolKind};
+use agent_client_protocol::v2::schema::{ToolCallStatus, ToolKind};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Position, Rect},
@@ -123,8 +123,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         && !app.agents_keyboard_focus
         && app.session_presentation == super::app::SessionPresentation::Welcome
         && app.blocks.is_empty()
-        && app.pending_steers.is_empty()
-        && !app.editing_steer()
+        && app.pending_prompts.is_empty()
         && !app.queue_focused
         && !app.show_logs;
 
@@ -2893,7 +2892,7 @@ const MAX_DOCK_ROWS: usize = 4;
 fn dock_entry_count(app: &App, narrow: bool) -> usize {
     app.background_calls().len()
         + usize::from(dock_agents_row(app, narrow))
-        + app.pending_steers.len()
+        + app.pending_prompts.len()
 }
 
 /// Rows for everything alive outside the current turn, plus a hairline.
@@ -2976,7 +2975,7 @@ fn draw_dock(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
             false,
         ));
     }
-    entries.extend(pending_steer_lines(app, width));
+    entries.extend(pending_prompt_lines(app, width));
 
     let mut lines = vec![Line::from(Span::styled("╌".repeat(width), theme::faint()))];
     let cap = visible.saturating_sub(1);
@@ -3012,36 +3011,48 @@ fn draw_dock(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn pending_steer_lines(app: &App, width: usize) -> Vec<(Line<'static>, bool)> {
+fn pending_prompt_lines(app: &App, width: usize) -> Vec<(Line<'static>, bool)> {
     let selected = app
-        .pending_steers
+        .pending_prompts
         .iter()
-        .position(|pending| app.selected_steer.as_deref() == Some(pending.id.as_str()));
-    app.pending_steers
+        .position(|pending| app.selected_prompt.as_ref() == Some(&pending.id));
+    app.pending_prompts
         .iter()
         .enumerate()
         .map(|(index, pending)| {
             let text = pending
+                .prompt
                 .text
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
             let is_selected = selected == Some(index);
+            let delivery = match pending.delivery {
+                Some(super::wire::PromptDelivery::Steer) => "steer",
+                Some(super::wire::PromptDelivery::Queue) => "queue",
+                _ => "prompt",
+            };
+            let state = match pending.status {
+                super::app::PendingPromptStatus::Waiting => "pending",
+                super::app::PendingPromptStatus::Cancelling => "cancelling",
+                super::app::PendingPromptStatus::Draft => "unsent draft",
+                super::app::PendingPromptStatus::OutcomeUnknown => "outcome unknown",
+            };
             let left = vec![
                 Span::styled(
                     if is_selected { " ▶ " } else { " ⇥ " },
                     theme::bold(theme::user_color()),
                 ),
-                Span::styled(format!("steer {}  ", index + 1), theme::dim()),
+                Span::styled(format!("{delivery} {}  ", index + 1), theme::dim()),
                 Span::styled(text, theme::bold(theme::text_color())),
             ];
             let right = vec![Span::styled(
                 if is_selected {
-                    format!("pending [{}/{}] ", index + 1, app.pending_steers.len())
+                    format!("{state} [{}/{}] ", index + 1, app.pending_prompts.len())
                 } else if app.queue_focused {
-                    "pending ".to_owned()
+                    format!("{state} ")
                 } else {
-                    "pending · f2 ".to_owned()
+                    format!("{state} · f2 ")
                 },
                 theme::faint(),
             )];
@@ -3106,18 +3117,17 @@ fn draw_command_popup(frame: &mut Frame<'_>, app: &App, anchor: Rect) {
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
-    let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
+    let border = if app.phase == Phase::Working && (app.can_steer || app.can_queue)
+        || app.phase == Phase::Idle
+    {
         Style::default().fg(theme::accent_color())
     } else {
         theme::faint()
     };
-    let title = if app.editing_steer() {
-        Line::from(Span::styled(
-            " editing pending · Enter save · Esc cancel ",
-            theme::dim(),
-        ))
-    } else if app.phase == Phase::Working && app.can_steer {
+    let title = if app.phase == Phase::Working && app.can_steer {
         Line::from(Span::styled(" steer ", theme::accent()))
+    } else if app.phase == Phase::Working && app.can_queue {
+        Line::from(Span::styled(" queue ", theme::accent()))
     } else if app.phase == Phase::Idle {
         Line::from(Span::styled(" message ", theme::faint()))
     } else {
@@ -3185,6 +3195,8 @@ fn draw_prompt_editor(
         vec![Line::from(Span::styled(
             if app.phase == Phase::Working && app.can_steer {
                 "steer kit…"
+            } else if app.phase == Phase::Working && app.can_queue {
+                "queue a prompt…"
             } else {
                 "message kit…"
             },
@@ -3333,17 +3345,20 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     let hints = if !app.elicitations.is_empty() {
         ""
-    } else if app.editing_steer() {
-        "⏎ save edit   esc restore draft "
-    } else if app.queue_focused && !app.pending_steers.is_empty() {
-        if app.can_replace_steer
-            && app.pending_steers.iter().any(|pending| {
-                app.selected_steer.as_deref() == Some(pending.id.as_str()) && pending.editable
-            })
-        {
-            "↑/↓ select   ⏎ edit   ⌫/del remove   esc back "
-        } else {
-            "↑/↓ select   ⌫/del remove   esc back · edit unavailable "
+    } else if app.queue_focused && !app.pending_prompts.is_empty() {
+        let selection = app
+            .pending_prompts
+            .iter()
+            .find(|pending| app.selected_prompt.as_ref() == Some(&pending.id));
+        match selection.map(|pending| pending.status) {
+            Some(
+                super::app::PendingPromptStatus::Draft
+                | super::app::PendingPromptStatus::OutcomeUnknown,
+            ) => "↑/↓ select   ⏎ recall draft   ⌫/del discard   esc back ",
+            Some(super::app::PendingPromptStatus::Waiting) => {
+                "↑/↓ select   ⌫/del cancel request   esc back "
+            }
+            _ => "↑/↓ select   esc back ",
         }
     } else if app.queue_handoff {
         "queue closed · type / ←→ / esc to continue "
@@ -3354,8 +3369,10 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let mut keys = Vec::new();
         if app.can_steer {
             keys.push("⏎ steer");
+        } else if app.can_queue {
+            keys.push("⏎ queue");
         }
-        if !app.pending_steers.is_empty() {
+        if !app.pending_prompts.is_empty() {
             keys.push("F2 queue");
         }
         keys.push("esc interrupt");
@@ -3364,7 +3381,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         keys.extend(["⌘b background", "^t reasoning", "^r agents"]);
         &format!("{} ", keys.join("   "))
-    } else if !app.pending_steers.is_empty() {
+    } else if !app.pending_prompts.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
     } else if app.phase == Phase::Idle
         && app
@@ -3436,7 +3453,7 @@ fn compact(value: u64) -> String {
     clippy::disallowed_macros
 )]
 mod tests {
-    use agent_client_protocol::schema::v2::{
+    use agent_client_protocol::v2::schema::{
         IdleStateUpdate, RunningStateUpdate, StateUpdate, StopReason,
     };
     use std::{
@@ -3447,7 +3464,7 @@ mod tests {
         time::Duration,
     };
 
-    use agent_client_protocol::schema::v2::ToolKind;
+    use agent_client_protocol::v2::schema::ToolKind;
     use base64::Engine as _;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
@@ -4802,7 +4819,7 @@ mod tests {
                 used: 1,
                 size: 2,
                 cost: agent_client_protocol::schema::MaybeUndefined::Value(
-                    agent_client_protocol::schema::v2::Cost::new(amount, currency),
+                    agent_client_protocol::v2::schema::Cost::new(amount, currency),
                 ),
             }));
         }
@@ -4954,7 +4971,7 @@ mod tests {
 
         app.set_catalog_providers(Some(vec!["alpha".into(), "beta".into()]));
         app.auth_methods = vec![
-            agent_client_protocol::schema::v2::AuthMethodTerminal::new("gamma", "Gamma").meta(
+            agent_client_protocol::v2::schema::AuthMethodTerminal::new("gamma", "Gamma").meta(
                 serde_json::Map::from_iter([(
                     crate::protocols::acp::AUTH_PROVIDER_META.into(),
                     serde_json::Value::from("gamma"),
@@ -5432,7 +5449,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_steers_render_above_input_until_delivery() {
+    fn pending_prompts_render_above_input_until_delivery() {
         let mut app = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
             "openai-subscription".into(),
@@ -5443,16 +5460,22 @@ mod tests {
         app.apply(Update::State(StateUpdate::Running(
             RunningStateUpdate::new(),
         )));
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "first".into(),
-            text: "first pending".into(),
-        });
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "second".into(),
-            text: "second pending".into(),
-        });
+        app.start_prompt(
+            "first".to_owned().into(),
+            crate::tui::app::SubmittedPrompt {
+                text: "first pending".into(),
+                attachments: vec![],
+            },
+            Some(crate::tui::wire::PromptDelivery::Steer),
+        );
+        app.start_prompt(
+            "second".to_owned().into(),
+            crate::tui::app::SubmittedPrompt {
+                text: "second pending".into(),
+                attachments: vec![],
+            },
+            Some(crate::tui::wire::PromptDelivery::Steer),
+        );
 
         let frame = render(&mut app, 80, 18);
         let first = frame.find("first pending").expect("first steer");
@@ -5472,9 +5495,13 @@ mod tests {
             images: Vec::new(),
             append: false,
         });
+        app.apply(Update::PromptSettled {
+            id: "first".to_owned().into(),
+            result: Ok("first".into()),
+        });
         let frame = render(&mut app, 80, 18);
         assert_eq!(frame.matches("⇥ steer").count(), 1, "{frame}");
-        assert_eq!(app.pending_steers.len(), 1);
+        assert_eq!(app.pending_prompts.len(), 1);
         assert!(
             matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "first pending")
         );
@@ -5489,36 +5516,32 @@ mod tests {
             "model".into(),
             "a2a".into(),
         );
-        app.can_replace_steer = true;
         for index in 0..8 {
-            app.apply(Update::SteerAccepted {
-                editable: true,
-                id: index.to_string(),
-                text: format!("queued text {index}"),
-            });
+            app.start_prompt(
+                index.to_string().into(),
+                crate::tui::app::SubmittedPrompt {
+                    text: format!("queued text {index}"),
+                    attachments: vec![],
+                },
+                Some(crate::tui::wire::PromptDelivery::Steer),
+            );
         }
         assert!(render(&mut app, 100, 18).contains("F2 queue"));
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         let first = render(&mut app, 100, 18);
         assert!(first.contains("▶ steer 1  queued text 0"), "{first}");
-        assert!(first.contains("⏎ edit"), "{first}");
-        assert!(first.contains("del remove"), "{first}");
+        assert!(!first.contains("⏎ edit"), "{first}");
+        assert!(first.contains("del cancel request"), "{first}");
         for _ in 0..7 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let last = render(&mut app, 100, 18);
         assert!(last.contains("▶ steer 8  queued text 7"), "{last}");
         assert!(last.contains("[8/8]"), "{last}");
-        app.pending_steers[7].editable = false;
-        assert!(render(&mut app, 100, 18).contains("edit unavailable"));
-        app.pending_steers[7].editable = true;
-        app.can_replace_steer = false;
-        assert!(render(&mut app, 100, 18).contains("edit unavailable"));
-        app.can_replace_steer = true;
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let editing = render(&mut app, 100, 18);
-        assert!(editing.contains("editing pending"), "{editing}");
-        assert!(editing.contains("esc restore draft"), "{editing}");
+        app.prompt_cancel_sent(&"7".to_owned().into());
+        let cancelling = render(&mut app, 100, 18);
+        assert!(cancelling.contains("cancelling [8/8]"), "{cancelling}");
+        assert!(!cancelling.contains("del cancel request"), "{cancelling}");
     }
 
     #[test]
@@ -5531,17 +5554,18 @@ mod tests {
             "a2a".into(),
         );
         app.paste("draft");
-        app.apply(Update::SteerAccepted {
-            id: "pending".into(),
-            text: "queued".into(),
-            editable: true,
-        });
+        app.start_prompt(
+            "pending".to_owned().into(),
+            crate::tui::app::SubmittedPrompt {
+                text: "queued".into(),
+                attachments: vec![],
+            },
+            Some(crate::tui::wire::PromptDelivery::Steer),
+        );
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        app.apply(Update::UserMessage {
-            id: "pending".into(),
-            text: "queued".into(),
-            images: Vec::new(),
-            append: false,
+        app.apply(Update::PromptSettled {
+            id: "pending".to_owned().into(),
+            result: Ok("message".into()),
         });
         assert!(!app.queue_focused);
         let frame = render(&mut app, 100, 18);
@@ -5746,7 +5770,7 @@ mod tests {
             id: "late-title".into(),
             title: None,
             kind: None,
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Completed),
             script: Some("return 1".into()),
             output: Some(vec!["1".into()]),
             images: None,
@@ -5782,7 +5806,7 @@ mod tests {
             append_output: false,
             intent: None,
             id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Completed),
             script: None,
             output: Some(vec!["compose result".into()]),
             backgrounded: false,
@@ -5825,7 +5849,7 @@ mod tests {
             append_output: false,
             intent: None,
             id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Completed),
             script: None,
             output: Some(vec!["compose result".into()]),
             backgrounded: false,
@@ -5864,7 +5888,7 @@ mod tests {
             append_output: false,
             intent: None,
             id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Completed),
             script: None,
             output: Some(vec!["compose result".into()]),
             backgrounded: false,
@@ -5907,13 +5931,15 @@ mod tests {
                 backgrounded: true,
             });
         }
-        app.can_replace_steer = true;
         for index in 0..3 {
-            app.apply(Update::SteerAccepted {
-                editable: true,
-                id: format!("steer-{index}"),
-                text: format!("queued {index}"),
-            });
+            app.start_prompt(
+                format!("steer-{index}").into(),
+                crate::tui::app::SubmittedPrompt {
+                    text: format!("queued {index}"),
+                    attachments: vec![],
+                },
+                Some(crate::tui::wire::PromptDelivery::Steer),
+            );
         }
         let dock = |frame: &str| {
             frame
@@ -6009,7 +6035,7 @@ mod tests {
             id: "call-1".into(),
             title: None,
             kind: None,
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Completed),
             script: None,
             output: None,
             images: None,
@@ -6039,7 +6065,7 @@ mod tests {
             append_output: false,
             intent: None,
             id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Failed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Failed),
             script: None,
             output: Some(vec!["exit code 1".into()]),
             backgrounded: false,
@@ -6250,7 +6276,7 @@ mod tests {
             append_output: false,
             intent: None,
             id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::v2::schema::ToolCallStatus::Completed),
             script: None,
             output: Some(
                 (0..40)
@@ -6552,7 +6578,7 @@ mod tests {
 
     #[test]
     fn session_cost_is_shown_in_header_only_when_reported() {
-        use agent_client_protocol::schema::v2::Cost;
+        use agent_client_protocol::v2::schema::Cost;
         let mut app = sample();
         assert!(
             !render(&mut app, 160, 24)
@@ -6591,7 +6617,7 @@ mod tests {
     #[test]
     fn agent_rows_show_reported_cost() {
         let mut row = test_agent("Scout", SubagentStatus::Working, None, None, "Explore");
-        row.cost = Some(agent_client_protocol::schema::v2::Cost::new(0.125, "USD"));
+        row.cost = Some(agent_client_protocol::v2::schema::Cost::new(0.125, "USD"));
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
         assert!(line_text(&lines[2]).contains("$0.1250"));
     }
@@ -7162,7 +7188,7 @@ mod tests {
         use crate::tui::{
             BackgroundCompletion, QueuedUpdate, spawn_background_workers, user_message_of,
         };
-        use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+        use agent_client_protocol::v2::schema::{ContentBlock, ImageContent, TextContent};
 
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(2, 1)
@@ -7361,7 +7387,7 @@ mod tests {
     mod canonical_group_tests {
         use super::super::*;
         use crate::tui::{app::Update, translate_for_session};
-        use agent_client_protocol::schema::v2::{
+        use agent_client_protocol::v2::schema::{
             self as wire, SessionUpdate, UpdateSessionNotification,
         };
         use serde_json::json;

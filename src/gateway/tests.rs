@@ -84,10 +84,13 @@ for line in sys.stdin:
   pending=req
   emit({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'resident','update':{'sessionUpdate':'state_update','state':'running'}}})
   emit({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'resident','update':{'sessionUpdate':'agent_message','content':[],'id':'started'}}})
- elif method=='session/inject' or method=='session/cancel':
+ elif method=='$/cancel_request' and pending and req['params']['requestId']==pending['id']:
+  emit({'jsonrpc':'2.0','id':pending['id'],'error':{'code':-32800,'message':'Request cancelled'}}); pending=None
+ elif method=='session/cancel' or method=='kit/session/status':
   emit({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'resident','update':{'sessionUpdate':'state_update','state':'idle'}}})
   emit({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'resident','update':{'sessionUpdate':'agent_message','content':[],'id':method}}})
   if pending: result(pending,{'stopReason':'cancelled' if method=='session/cancel' else 'end_turn'}); pending=None
+  if 'id' in req: result(req,{})
  elif 'id' in req: result(req,{})
 "#;
         self.child_source("resident", source, &[]).await;
@@ -173,6 +176,43 @@ for line in sys.stdin:
             .await;
     }
 }
+#[tokio::test]
+async fn prompt_withdrawal_maps_the_controller_request_id_to_the_child() {
+    let harness = Harness::new().await;
+    harness.child().await;
+    let attachment = harness.attach().await;
+    harness.handshake(&attachment).await;
+    harness
+        .send(
+            &attachment,
+            json!({"jsonrpc":"2.0","id":"held-prompt","method":"session/prompt","params":{"sessionId":"resident","delivery":"steer","prompt":[{"type":"text","text":"withdraw me"}]}}),
+        )
+        .await;
+    harness
+        .events(&attachment, |events| {
+            events
+                .iter()
+                .any(|e| e["params"]["update"]["id"] == "started")
+        })
+        .await;
+    harness
+        .send(
+            &attachment,
+            json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"held-prompt"}}),
+        )
+        .await;
+    let events = harness
+        .events(&attachment, |events| {
+            events.iter().any(|e| e["id"] == "held-prompt")
+        })
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["id"] == "held-prompt" && event["error"]["code"] == -32800 })
+    );
+}
+
 #[tokio::test]
 async fn completed_actor_reclamation_keeps_live_replacement() {
     let harness = Harness::new().await;
@@ -320,14 +360,14 @@ async fn disconnect_replay_single_controller_and_stale_response_isolation() {
     harness
         .send(
             &second,
-            json!({"jsonrpc":"2.0","method":"session/inject","params":{}}),
+            json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}),
         )
         .await;
     let events = harness
         .events(&second, |events| {
             events
                 .iter()
-                .any(|e| e["params"]["update"]["id"] == "session/inject")
+                .any(|e| e["params"]["update"]["id"] == "session/cancel")
         })
         .await;
     assert!(
@@ -583,7 +623,7 @@ async fn dropped_acceptance_future_does_not_cancel_resident_request() {
     harness
         .send(
             &attachment,
-            json!({"jsonrpc":"2.0","method":"session/inject","params":{"sessionId":"resident"}}),
+            json!({"jsonrpc":"2.0","method":"kit/session/status","params":{"sessionId":"resident"}}),
         )
         .await;
     let events = harness
@@ -622,6 +662,8 @@ fn transcript_replay_overflow_returns_error_not_truncated_success() {
             attachment: attachment.clone(),
             original: json!(42),
             method: "session/resume".into(),
+            explicit_delivery: false,
+            withdrawal_pending: false,
             replay: true,
         },
     );
@@ -670,6 +712,8 @@ fn no_replay_restore_and_claim_survive_incomplete_internal_cache() {
             attachment: attachment.clone(),
             original: json!(42),
             method: "session/resume".into(),
+            explicit_delivery: false,
+            withdrawal_pending: false,
             replay: false,
         },
     );
@@ -1020,7 +1064,7 @@ for line in sys.stdin:
             })
             .await;
         // The accepted prompt remains under resident ownership after DELETE.
-        harness.send(&attachment, json!({"jsonrpc":"2.0","method":"session/inject","params":{"sessionId":"resident"}})).await;
+        harness.send(&attachment, json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}})).await;
         harness
             .events(&attachment, |events| {
                 events
@@ -1084,7 +1128,7 @@ fn resident_snapshot_follows_replay_and_precedes_success() {
     );
     // Validate snapshots using the actual ACP v2 SDK, not an invented shape.
     for event in &events[2..4] {
-        serde_json::from_value::<agent_client_protocol::schema::v2::UpdateSessionNotification>(
+        serde_json::from_value::<agent_client_protocol::v2::schema::UpdateSessionNotification>(
             event["params"].clone(),
         )
         .unwrap();
@@ -1122,6 +1166,65 @@ fn no_replay_snapshot_retains_running_state_and_current_config_after_eviction() 
 }
 
 #[test]
+fn replacing_a_controller_withdraws_only_its_explicit_pending_prompt() {
+    let mut actor = isolated_actor();
+    let (writes, mut received) = mpsc::channel(2);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 60), &writes)
+        .unwrap();
+    let old = actor.attachment.as_ref().unwrap().id.clone();
+    for (id, delivery) in [(1, None), (2, Some("steer"))] {
+        actor.command(Request::Send {
+            session: "resident".into(),
+            attachment: old.clone(),
+            message: json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":"resident","delivery":delivery,"prompt":[{"type":"text","text":"work"}]}}),
+            charge: None,
+        }, &writes).unwrap();
+    }
+    // Both accepted prompts still occupy the writer when ownership changes.
+    actor
+        .command(resident_claim(&actor, false, 61), &writes)
+        .unwrap();
+    assert!(actor.next_withdrawal().is_some());
+    let ordinary = received.try_recv().unwrap().message;
+    let steer = received.try_recv().unwrap().message;
+    actor.flush_withdrawals(&writes);
+    assert!(actor.next_withdrawal().is_none());
+    let cancel = received.try_recv().unwrap().message;
+    assert_eq!(cancel["method"], "$/cancel_request");
+    assert_eq!(cancel["params"]["requestId"], steer["id"]);
+    assert_ne!(cancel["params"]["requestId"], ordinary["id"]);
+    assert!(received.try_recv().is_err());
+}
+
+#[test]
+fn overflowing_the_controller_output_withdraws_its_held_prompt() {
+    let mut actor = isolated_actor();
+    let (writes, mut received) = mpsc::channel(2);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 60), &writes)
+        .unwrap();
+    let attachment = actor.attachment.as_ref().unwrap().id.clone();
+    actor.command(Request::Send {
+        session: "resident".into(),
+        attachment,
+        message: json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"resident","delivery":"queue","prompt":[{"type":"text","text":"work"}]}}),
+        charge: None,
+    }, &writes).unwrap();
+    let prompt = received.try_recv().unwrap().message;
+    for _ in 0..=MAX_QUEUE {
+        actor.emit(state_update("running"));
+    }
+    assert!(actor.attachment.is_none());
+    actor.flush_withdrawals(&writes);
+    let cancel = received.try_recv().unwrap().message;
+    assert_eq!(cancel["method"], "$/cancel_request");
+    assert_eq!(cancel["params"]["requestId"], prompt["id"]);
+}
+
+#[test]
 fn failed_resident_snapshot_preserves_owner_and_success_fences_old_generation() {
     let mut actor = isolated_actor();
     let (writes, _receiver) = mpsc::channel(1);
@@ -1148,6 +1251,8 @@ fn failed_resident_snapshot_preserves_owner_and_success_fences_old_generation() 
             attachment: old.clone(),
             original: json!(99),
             method: "session/prompt".into(),
+            explicit_delivery: false,
+            withdrawal_pending: false,
             replay: false,
         },
     );
@@ -1304,6 +1409,8 @@ fn stale_config_response_refreshes_snapshot_without_cross_generation_response() 
             attachment: old,
             original: json!(900),
             method: "session/set_config_option".into(),
+            explicit_delivery: false,
+            withdrawal_pending: false,
             replay: false,
         },
     );
