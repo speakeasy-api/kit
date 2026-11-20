@@ -45,7 +45,8 @@ use std::{
 
 use agent_client_protocol::{
     ByteStreams,
-    schema::{MaybeUndefined, ProtocolVersion, v2 as wire},
+    schema::{MaybeUndefined, ProtocolVersion},
+    v2::schema as wire,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
@@ -111,12 +112,13 @@ struct NativeVoice {
 #[derive(Default)]
 struct VoiceHandoff {
     id: String,
-    accepted: bool,
+    accepted_message_id: Option<String>,
     user_message_id: Option<String>,
     // Only the most recent assistant message is spoken back, never thoughts or
     // tool output. Both message identity and content have bounded storage.
     message_id: String,
     text: String,
+    stopped: Option<String>,
 }
 
 impl NativeVoice {
@@ -156,7 +158,7 @@ impl NativeVoice {
 
     fn notify_state(
         &mut self,
-        connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+        connection: &agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
         current: &wire::SessionId,
     ) {
         for notice in self.state_notifications(current) {
@@ -271,7 +273,12 @@ impl NativeVoice {
         };
         match update {
             Update::VoicePromptAccepted { id, result } if id == &handoff.id => match result {
-                Ok(()) => handoff.accepted = true,
+                Ok(message_id) => {
+                    if handoff.user_message_id.as_ref() != Some(message_id) {
+                        handoff.clear_observation();
+                    }
+                    handoff.accepted_message_id = Some(message_id.clone());
+                }
                 Err(error) => {
                     let id = handoff.id.clone();
                     self.handoff = None;
@@ -279,14 +286,26 @@ impl NativeVoice {
                 }
             },
             Update::UserMessage { id, .. }
-                if handoff.accepted && handoff.user_message_id.is_none() =>
+                if id.len() <= 1024
+                    && handoff
+                        .accepted_message_id
+                        .as_ref()
+                        .is_none_or(|expected| expected == id)
+                    && handoff.user_message_id.as_ref() != Some(id) =>
             {
+                // Observe the latest candidate turn provisionally until the
+                // response identifies this handoff's user message.
+                handoff.clear_observation();
                 handoff.user_message_id = Some(id.clone());
             }
-            Update::AgentMessage { id, text, append } if handoff.user_message_id.is_some() => {
+            Update::AgentMessage { id, text, append }
+                if handoff.user_message_id.is_some() && handoff.stopped.is_none() =>
+            {
                 handoff.record(id, text, *append);
             }
-            Update::AgentParts { id, parts } if handoff.user_message_id.is_some() => {
+            Update::AgentParts { id, parts }
+                if handoff.user_message_id.is_some() && handoff.stopped.is_none() =>
+            {
                 handoff.record(id, "", false);
                 for part in parts {
                     if let AgentPart::Text(text) = part {
@@ -294,22 +313,34 @@ impl NativeVoice {
                     }
                 }
             }
-            Update::State(wire::StateUpdate::Idle(idle)) if handoff.user_message_id.is_some() => {
-                let Some(handoff) = self.handoff.take() else {
-                    return;
-                };
-                let text = format!(
-                    "Kit task stopped ({:?}).\n{}",
-                    idle.stop_reason, handoff.text
-                );
-                self.result(handoff.id, text, app);
+            Update::State(wire::StateUpdate::Idle(idle))
+                if handoff.user_message_id.is_some() && handoff.stopped.is_none() =>
+            {
+                handoff.stopped = Some(format!("Kit task stopped ({:?}).", idle.stop_reason));
             }
             _ => {}
+        }
+        if let Some(handoff) = self.handoff.as_ref()
+            && handoff.accepted_message_id.is_some()
+            && handoff.user_message_id == handoff.accepted_message_id
+            && let Some(stopped) = handoff.stopped.as_ref()
+        {
+            let text = format!("{stopped}\n{}", handoff.text);
+            let id = handoff.id.clone();
+            self.handoff = None;
+            self.result(id, text, app);
         }
     }
 }
 
 impl VoiceHandoff {
+    fn clear_observation(&mut self) {
+        self.user_message_id = None;
+        self.message_id.clear();
+        self.text.clear();
+        self.stopped = None;
+    }
+
     fn record(&mut self, id: &str, text: &str, append: bool) {
         if id.len() > 1024 {
             return;
@@ -425,7 +456,7 @@ struct ModelSwitchCompletion {
 
 /// Keep model-switch requests off the terminal loop on the normal Tokio runtime.
 fn spawn_model_switch(
-    connection: agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    connection: agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
     request: SetSessionConfigOptionRequest,
     generation: u64,
     operation: u64,
@@ -453,9 +484,8 @@ fn prepare_model_switch_request(
         } => {
             app.begin_model_switch(choice, save_defaults)
                 .ok_or_else(|| {
-                    agent_client_protocol::util::internal_error(
-                        "wait for the current operation before changing models",
-                    )
+                    agent_client_protocol::Error::internal_error()
+                        .data("wait for the current operation before changing models")
                 })?;
             None
         }
@@ -465,9 +495,8 @@ fn prepare_model_switch_request(
                 .as_ref()
                 .and_then(|pending| pending.warning.as_ref())
                 .ok_or_else(|| {
-                    agent_client_protocol::util::internal_error(
-                        "no model-switch warning to confirm",
-                    )
+                    agent_client_protocol::Error::internal_error()
+                        .data("no model-switch warning to confirm")
                 })?;
             Some(
                 serde_json::to_value(model_switch::Confirmation {
@@ -478,15 +507,14 @@ fn prepare_model_switch_request(
             )
         }
         _ => {
-            return Err(agent_client_protocol::util::internal_error(
-                "invalid model-switch action",
-            ));
+            return Err(
+                agent_client_protocol::Error::internal_error().data("invalid model-switch action")
+            );
         }
     };
-    let pending = app
-        .model_switch
-        .as_mut()
-        .ok_or_else(|| agent_client_protocol::util::internal_error("no pending model switch"))?;
+    let pending = app.model_switch.as_mut().ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("no pending model switch")
+    })?;
     let mut request =
         SetSessionConfigOptionRequest::new(session_id, MODEL_CONFIG_ID, pending.choice.id.as_str());
     if let Some(confirmation) = confirmation {
@@ -507,7 +535,7 @@ fn take_model_switch_completion(
     operation: u64,
 ) -> Result<Option<app::ModelSwitch>, agent_client_protocol::Error> {
     let route = route.lock().map_err(|_| {
-        agent_client_protocol::util::internal_error("active session route poisoned")
+        agent_client_protocol::Error::internal_error().data("active session route poisoned")
     })?;
     if route.generation != generation
         || app
@@ -861,7 +889,7 @@ fn authentication_required(
     error: &agent_client_protocol::Error,
     methods: &[wire::AuthMethodTerminal],
 ) -> bool {
-    if error.code != agent_client_protocol::ErrorCode::AuthRequired {
+    if error.code != agent_client_protocol::ErrorCode::AUTH_REQUIRED {
         return false;
     }
     error
@@ -1160,7 +1188,7 @@ async fn request_failure(
 }
 
 async fn request_initial_session(
-    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    connection: &agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
     resume_id: Option<&str>,
     root: &Path,
 ) -> Result<(wire::SessionId, Vec<SessionConfigOption>), agent_client_protocol::Error> {
@@ -1250,7 +1278,7 @@ fn active_config_matches(active: &ActiveSessionConfig, options: &[SessionConfigO
 }
 
 async fn refresh_session_after_auth(
-    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    connection: &agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
     session_id: wire::SessionId,
     active: &ActiveSessionConfig,
 ) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
@@ -1768,14 +1796,11 @@ async fn run_client(
             } else {
                 usable_terminal_auth_methods(&initialized.auth_methods)
             };
-            let can_steer = initialized.capabilities.session.as_ref()
-                .and_then(|session| session.inject.as_ref())
-                .is_some_and(|inject| {
-                    inject.modes.contains(&wire::SessionInjectMode::Steer)
-                        && inject.steer_in_stream.as_ref().is_some_and(|modes| {
-                            modes.contains(&wire::SessionInjectSteerInStream::Finish)
-                        })
-                });
+            let delivery = initialized.capabilities.session.as_ref()
+                .and_then(|session| session.prompt.as_ref())
+                .and_then(|prompt| prompt.delivery.as_ref());
+            let can_steer = delivery.is_some_and(|modes| modes.steer.is_some());
+            let can_queue = delivery.is_some_and(|modes| modes.queue.is_some());
 
             let initial = match bounded_cancellable_request(
                 request_initial_session(
@@ -1825,9 +1850,7 @@ async fn run_client(
             );
             app.voice_enabled = voice_enabled;
             app.can_steer = can_steer;
-            app.can_replace_steer = supports_pending_replace(
-                initialized.capabilities.session.as_ref().and_then(|session| session.inject.as_ref()),
-            );
+            app.can_queue = can_queue;
             app.auth_methods = auth_methods;
             // TerminalSession restores modes if spawning the reader fails.
             let mut events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -2048,7 +2071,7 @@ async fn run_client(
             }
             app.start_session(active_session_id.clone());
             if is_remote {
-                recovery_ingress.lock().map_err(|_| agent_client_protocol::util::internal_error("recovery admission poisoned"))?.confirm_session(&active_session_id);
+                recovery_ingress.lock().map_err(|_| agent_client_protocol::Error::internal_error().data("recovery admission poisoned"))?.confirm_session(&active_session_id);
                 app.gateway_epoch = if initial_remote_resume { 0 } else { 1 };
                 app.gateway_blocked = initial_remote_resume;
             }
@@ -2191,7 +2214,7 @@ async fn run_client(
                             crate::voice::VoiceEvent::Delegation { id, text } => {
                                 if app.child_focus.is_some() {
                                     voice.result(id, "Task was NOT submitted: return to the root session before delegating voice work.".into(), &mut app);
-                                } else if app.working() || app.model_switch.is_some() || voice.handoff.is_some() {
+                                } else if app.working() || app.has_unsettled_prompts() || app.model_switch.is_some() || voice.handoff.is_some() {
                                     voice.result(id, "Kit is busy. Task was NOT submitted; ask the user to try again when idle.".into(), &mut app);
                                 } else if text.trim().is_empty() || text.len() > 32_768 || id.len() > 1024 {
                                     voice.result(id, "Task was NOT submitted: empty or oversized delegation.".into(), &mut app);
@@ -2203,16 +2226,13 @@ async fn run_client(
                                         Ok(blocks) => {
                                             // This is Kit's existing session, not a second agent
                                             // or a Codex execution channel. ACP owns approvals.
-                                            // PromptResponse has no message ID. Ordered receipt
-                                            // consumption places this boundary after prior wire
-                                            // updates and before the accepted user_message.
                                             let updates = updates_tx.clone();
                                             if let Err(error) = connection
                                                 .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
                                                 .on_receiving_result(move |result| async move {
                                                     let _ = updates.send(QueuedUpdate::global(Update::VoicePromptAccepted {
                                                         id: task_id,
-                                                        result: result.map(|_| ()).map_err(|error| error.message.to_string()),
+                                                        result: result.map(|response| response.message_id.to_string()).map_err(|error| error.message.to_string()),
                                                     }));
                                                     Ok(())
                                                 })
@@ -2297,7 +2317,7 @@ async fn run_client(
                                     }
                                 }
                                 Action::Voice(control) => voice.control(&control, credential_storage, &mut app),
-                                Action::Submit { prompt, inject } => {
+                                Action::Submit { prompt, delivery } => {
 
                                     if voice.handoff.is_some() {
                                         app.paste(&prompt.text);
@@ -2314,46 +2334,16 @@ async fn run_client(
                                             continue;
                                         }
                                     };
-                                    let editable = pending_steer_is_editable(&blocks);
-                                    let outcome = if inject {
-                                        connection
-                                            .send_request(wire::InjectSessionRequest::new(
-                                                session_id.clone(),
-                                                wire::SessionInjectMode::Steer,
-                                                blocks,
-                                            ))
-                                            .block_task()
-                                            .await
-                                            .map(|response| Some(response.message_id))
-                                    } else {
-                                        connection
-                                            .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
-                                            .block_task()
-                                            .await
-                                            .map(|_| None)
-                                    };
-                                    if is_remote && !route_generation_matches(&transition_session, action_generation) {
+                                    let Some(generation) = action_generation.filter(|_| route_generation_matches(&transition_session, action_generation)) else {
                                         app.paste(&prompt.text);
                                         app.restore_attachments(prompt.attachments);
-                                        app.toast("Message acceptance unknown; not retried. Review the recovered transcript.");
+                                        app.toast("Session route changed; prompt was not submitted.");
                                         continue;
-                                    }
-                                    match outcome {
-                                        Ok(Some(message_id)) => {
-                                            app.accept_attachments(&prompt.attachments);
-                                            app.apply(Update::SteerAccepted {
-                                                id: message_id.to_string(),
-                                                text: prompt.text,
-                                                editable,
-                                            });
-                                        }
-                                        Ok(None) => app.accept_attachments(&prompt.attachments),
-                                        Err(error) => {
-                                            app.paste(&prompt.text);
-                                            app.restore_attachments(prompt.attachments);
-                                            app.note(recovery::submission_error(&error));
-                                        }
-                                    }
+                                    };
+                                    submit_prompt(
+                                        &mut app, &connection, generation, &updates_tx, prompt,
+                                        wire::PromptRequest::new(session_id.clone(), blocks).delivery(delivery),
+                                    );
                                 }
                                 Action::SteerChild { id, generation, text } => {
                                     // Route transitions and recovery admission fence writers. Snapshot its
@@ -2380,47 +2370,11 @@ async fn run_client(
                                         connection.send_request(request).block_task().await.map(|_| ())
                                     });
                                 }
-                                Action::ReplaceSteer { id, text } => {
-                                    let Ok(route) = transition_session.lock() else {
-                                        app.note("could not start pending-message edit");
+                                Action::CancelPrompt { id } => {
+                                    if !route_generation_matches(&transition_session, action_generation) {
                                         continue;
-                                    };
-                                    let generation = route.generation;
-                                    drop(route);
-                                    let Some(token) = app.begin_steer_mutation(&id, Some(text.clone())) else { continue; };
-                                    let connection = connection.clone();
-                                    let session_id = session_id.clone();
-                                    let request_id = id.clone();
-                                    spawn_steer_mutation(generation, id, token, updates_tx.clone(), async move {
-                                        connection
-                                            .send_request(wire::ReplaceInjectSessionRequest::new(
-                                                session_id,
-                                                request_id,
-                                                vec![wire::ContentBlock::Text(wire::TextContent::new(text))],
-                                            ))
-                                            .block_task()
-                                            .await
-                                            .map(|_| ())
-                                    });
-                                }
-                                Action::RevokeSteer { id } => {
-                                    let Ok(route) = transition_session.lock() else {
-                                        app.note("could not start pending-message removal");
-                                        continue;
-                                    };
-                                    let generation = route.generation;
-                                    drop(route);
-                                    let Some(token) = app.begin_steer_mutation(&id, None) else { continue; };
-                                    let connection = connection.clone();
-                                    let session_id = session_id.clone();
-                                    let request_id = id.clone();
-                                    spawn_steer_mutation(generation, id, token, updates_tx.clone(), async move {
-                                        connection
-                                            .send_request(wire::RevokeInjectSessionRequest::new(session_id, request_id))
-                                            .block_task()
-                                            .await
-                                            .map(|_| ())
-                                    });
+                                    }
+                                    cancel_prompt(&mut app, &connection, id);
                                 }
                                 Action::New { prompt: first_prompt, presentation } => {
                                     voice.stop();
@@ -2454,16 +2408,18 @@ async fn run_client(
                                     images.clear();
                                     app.start_session_with_presentation(persisted_id, presentation);
                                     refresh_config_state(&mut app, Some(&config_options));
-                                    if let Some(prompt) = first_prompt {
-                                        let outcome = connection
-                                            .send_request(wire::PromptRequest::new(
-                                                session_id.clone(),
-                                                vec![ContentBlock::Text(wire::TextContent::new(prompt))],
-                                            ))
-                                            .block_task()
-                                            .await;
-                                        if let Err(error) = outcome {
-                                            app.note(recovery::submission_error(&error));
+                                    if let Some(text) = first_prompt {
+                                        let generation = transition_session.lock().ok().map(|route| route.generation);
+                                        if let Some(generation) = generation {
+                                            let blocks = vec![ContentBlock::Text(wire::TextContent::new(text.clone()))];
+                                            let prompt = SubmittedPrompt { text, attachments: Vec::new() };
+                                            submit_prompt(
+                                                &mut app, &connection, generation, &updates_tx, prompt,
+                                                wire::PromptRequest::new(session_id.clone(), blocks),
+                                            );
+                                        } else {
+                                            app.paste(&text);
+                                            app.note("Could not submit the first prompt; it remains in the composer.");
                                         }
                                     }
                                 }
@@ -2621,7 +2577,7 @@ async fn run_client(
                                     // A poisoned route may pair a session ID with the wrong generation.
                                     // Stop explicitly rather than send a request with untrusted correlation.
                                     let generation = transition_session.lock().map_err(|_| {
-                                        agent_client_protocol::util::internal_error("active session route poisoned")
+                                        agent_client_protocol::Error::internal_error().data("active session route poisoned")
                                     })?.generation;
                                     let (operation, request) = match prepare_model_switch_request(&mut app, action, session_id.clone()) {
                                         Ok(request) => request,
@@ -3176,47 +3132,41 @@ fn spawn_child_steer(
     })
 }
 
-/// Await delivery-sensitive ACP mutations off the terminal event loop. Both
-/// session generation and the app's mutation token must match at completion.
-fn spawn_steer_mutation(
+fn cancel_prompt(
+    app: &mut App,
+    connection: &agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
+    id: wire::RequestId,
+) {
+    match connection.send_cancel_request(id.clone()) {
+        Ok(()) => app.prompt_cancel_sent(&id),
+        Err(error) => app.note(format!(
+            "could not request prompt cancellation: {}",
+            error.message
+        )),
+    }
+}
+
+fn submit_prompt(
+    app: &mut App,
+    connection: &agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
     generation: u64,
-    id: String,
-    token: u64,
-    updates: mpsc::UnboundedSender<QueuedUpdate>,
-    request: impl std::future::Future<Output = Result<(), agent_client_protocol::Error>>
-    + Send
-    + 'static,
-) -> tokio::task::JoinHandle<()> {
+    updates: &mpsc::UnboundedSender<QueuedUpdate>,
+    prompt: SubmittedPrompt,
+    request: wire::PromptRequest,
+) {
+    let delivery = request.delivery;
+    let request = connection.prepare_request(request);
+    let id = request.id().clone();
+    app.start_prompt(id.clone(), prompt, delivery);
+    let updates = updates.clone();
+    let response = request.block_task();
     tokio::spawn(async move {
-        let result = request.await.map_err(|error| app::SteerMutationError {
-            unavailable: pending_message_unavailable(&error),
-            message: format!(
-                "pending-message change failed: {}; retry or Esc to restore draft",
-                error.message
-            ),
-        });
+        let result = response.await.map(|response| response.message_id);
         let _ = updates.send(QueuedUpdate::for_session(
             generation,
-            Update::SteerMutationFinished { id, token, result },
+            Update::PromptSettled { id, result },
         ));
-    })
-}
-
-fn supports_pending_replace(inject: Option<&wire::SessionInjectCapabilities>) -> bool {
-    inject
-        .and_then(|inject| inject.pending.as_ref())
-        .is_some_and(|pending| pending.replace == Some(true))
-}
-
-fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
-    matches!(
-        error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("reason"))
-            .and_then(serde_json::Value::as_str),
-        Some("already_delivered" | "unknown_message_id")
-    )
+    });
 }
 
 /// Keep Enter behind earlier native pastes without blocking terminal events.
@@ -3391,8 +3341,7 @@ fn recovery_mutation(action: &Action) -> bool {
     matches!(
         action,
         Action::Submit { .. }
-            | Action::ReplaceSteer { .. }
-            | Action::RevokeSteer { .. }
+            | Action::CancelPrompt { .. }
             | Action::SteerChild { .. }
             | Action::SelectModel { .. }
             | Action::ConfirmModelSwitch(_)
@@ -3543,7 +3492,7 @@ fn handle_paste(app: &mut App, text: &str) -> bool {
     if paste_blocked(app) {
         return false;
     }
-    if app.session_rename_active() || app.editing_steer() {
+    if app.session_rename_active() {
         app.paste(text);
         true
     } else if let Some(attachments) = attachments_from_paste(&app.root, text) {
@@ -3674,12 +3623,6 @@ fn media_attachment(root: &Path, value: &str) -> Option<Attachment> {
         size: metadata.len(),
         temporary: None,
     })
-}
-
-fn pending_steer_is_editable(blocks: &[ContentBlock]) -> bool {
-    blocks
-        .iter()
-        .all(|block| matches!(block, ContentBlock::Text(_)))
 }
 
 fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> {
@@ -4032,7 +3975,7 @@ fn leave(terminal: &mut TerminalSession) {
 }
 
 async fn request_resume(
-    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    connection: &agent_client_protocol::v2::ConnectionTo<agent_client_protocol::Agent>,
     session_id: wire::SessionId,
     root: PathBuf,
 ) -> Result<wire::ResumeSessionResponse, agent_client_protocol::Error> {
@@ -4634,7 +4577,7 @@ mod tests {
     };
 
     use agent_client_protocol::schema::MaybeUndefined;
-    use agent_client_protocol::schema::v2::{
+    use agent_client_protocol::v2::schema::{
         AgentMessage, AgentThought, AuthMethod, AuthMethodTerminal, AvailableCommand,
         AvailableCommandsUpdate, ContentBlock, EnvVariable, IdleStateUpdate, RunningStateUpdate,
         SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption, SessionUpdate,
@@ -4774,9 +4717,8 @@ mod tests {
             "run `kit auth login openrouter` before using OpenRouter"
         );
         assert!(!authentication_required(
-            &agent_client_protocol::util::internal_error(
-                "stored OpenRouter credentials cannot be used with a noncanonical endpoint",
-            ),
+            &agent_client_protocol::Error::internal_error()
+                .data("stored OpenRouter credentials cannot be used with a noncanonical endpoint",),
             &methods,
         ));
         assert!(!authentication_required(
@@ -5450,7 +5392,7 @@ mod tests {
 
     #[test]
     fn translates_cumulative_session_cost() {
-        use agent_client_protocol::schema::v2::{Cost, UsageUpdate};
+        use agent_client_protocol::v2::schema::{Cost, UsageUpdate};
         let cost = Cost::new(1.25, "USD");
         let (session, updates) = translate(UpdateSessionNotification::new(
             "session",
@@ -5464,7 +5406,7 @@ mod tests {
 
     #[test]
     fn translates_usage_cost_omission_and_null_as_distinct_patches() {
-        use agent_client_protocol::schema::v2::UsageUpdate;
+        use agent_client_protocol::v2::schema::UsageUpdate;
         for cost in [MaybeUndefined::Undefined, MaybeUndefined::Null] {
             let (_, updates) = translate(UpdateSessionNotification::new(
                 "session",
@@ -5689,9 +5631,10 @@ mod tests {
                         "openai-subscription:gpt-5.6-terra"
                     );
                     if request.session_id.to_string() == "rejected" {
-                        responder.respond_with_error(agent_client_protocol::util::internal_error(
-                            "model switch rejected",
-                        ))
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data("model switch rejected"),
+                        )
                     } else {
                         responder.respond(wire::SetSessionConfigOptionResponse::new(vec![
                             SessionConfigOption::select(
@@ -6292,87 +6235,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_mutation_wait_does_not_block_delivery_updates_or_cancel() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut app = App::new(
-            PathBuf::from("/tmp"),
-            "provider".into(),
-            "model".into(),
-            "a2a".into(),
-        );
-        app.apply(Update::State(StateUpdate::Running(
-            RunningStateUpdate::new(),
-        )));
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "a".into(),
-            text: "pending".into(),
-        });
-        app.paste("draft");
-        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        let token = app.begin_steer_mutation("a", None).unwrap();
-        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
-            id: "session".into(),
-            generation: 1,
-        }));
-        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (release, waiting) = tokio::sync::oneshot::channel();
-        let task = super::spawn_steer_mutation(1, "a".into(), token, updates.clone(), async move {
-            waiting.await.unwrap();
+    async fn delivery_prompt_wait_is_nonblocking_and_cancel_targets_the_wire_request() {
+        let (seen, mut request_ids) = tokio::sync::mpsc::unbounded_channel();
+        let agent = agent_client_protocol::Agent
+            .v2()
+            .on_receive_request(
+                async |request: wire::InitializeRequest, responder, _| {
+                    responder.respond(wire::InitializeResponse::new(
+                        request.protocol_version,
+                        wire::Implementation::new("prompt-test-agent", "0"),
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: wire::PromptRequest, responder, _| {
+                    assert_eq!(request.delivery, Some(wire::PromptDelivery::Steer));
+                    assert_eq!(request.session_id, wire::SessionId::new("session"));
+                    seen.send(responder.id().clone()).unwrap();
+                    tokio::spawn(async move {
+                        responder.cancellation().cancelled().await;
+                        responder
+                            .respond_with_error(agent_client_protocol::Error::request_cancelled())
+                            .unwrap();
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
+        let client = agent_client_protocol::Client.v2().connect_with(client_transport, async move |connection| {
+            connection.send_request(wire::InitializeRequest::new(
+                ProtocolVersion::V2,
+                wire::Implementation::new("prompt-test-client", "0"),
+            )).block_task().await?;
+            let mut app = App::new("/tmp".into(), "provider".into(), "model".into(), "a2a".into());
+            let (updates, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            super::submit_prompt(
+                &mut app, &connection, 3, &updates,
+                super::SubmittedPrompt { text: "steer".into(), attachments: vec![] },
+                wire::PromptRequest::new("session", vec![ContentBlock::Text(TextContent::new("steer"))])
+                    .delivery(wire::PromptDelivery::Steer),
+            );
+            let wire_id = request_ids.recv().await.unwrap();
+            assert!(incoming.try_recv().is_err());
+            app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+            let Action::CancelPrompt { id } = app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)) else {
+                panic!("unresolved prompt must allow request cancellation");
+            };
+            assert_eq!(id, wire_id);
+            super::cancel_prompt(&mut app, &connection, id.clone());
+            let completion = incoming.recv().await.unwrap();
+            assert_eq!(completion.generation, Some(3));
+            assert!(matches!(&completion.update, Update::PromptSettled { id: request_id, result: Err(error) }
+                if request_id == &id && error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED));
+            app.apply(completion.update);
+            assert!(app.pending_prompts.is_empty());
             Ok(())
         });
-        tokio::task::yield_now().await;
-        assert!(!task.is_finished());
-        updates
-            .send(QueuedUpdate::for_session(
-                1,
-                Update::UserMessage {
-                    id: "a".into(),
-                    text: "delivered".into(),
-                    images: vec![],
-                    append: false,
-                },
-            ))
+        tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .unwrap()
             .unwrap();
-        let first = receiver.recv().await.unwrap();
-        apply_pending_updates(&mut app, &route, &mut receiver, first);
-        assert!(app.pending_steers.is_empty());
-        assert!(matches!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Action::Cancel
-        ));
-        assert_eq!(app.editor.text(), "draft");
-        assert!(!task.is_finished());
-        release.send(()).unwrap();
-        task.await.unwrap();
-        let completion = receiver.recv().await.unwrap();
-        apply_pending_updates(&mut app, &route, &mut receiver, completion);
-        assert!(app.pending_steers.is_empty());
-        assert_eq!(app.editor.text(), "draft");
-    }
-
-    #[tokio::test]
-    async fn queued_mutation_completion_is_scoped_to_its_starting_session_generation() {
-        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
-            id: "session".into(),
-            generation: 1,
-        }));
-        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (release, waiting) = tokio::sync::oneshot::channel();
-        let task = super::spawn_steer_mutation(1, "a".into(), 7, updates, async move {
-            waiting.await.unwrap();
-            Err(agent_client_protocol::Error::invalid_params()
-                .data(json!({"reason": "already_delivered"})))
-        });
-        super::transition_route(&route, "other-session".into());
-        release.send(()).unwrap();
-        task.await.unwrap();
-        let completion = receiver.recv().await.unwrap();
-        assert_eq!(completion.generation, Some(1));
-        assert!(
-            matches!(&completion.update, Update::SteerMutationFinished { token: 7, result: Err(error), .. } if error.unavailable)
-        );
-        assert!(accept_queued_update(&route, completion).is_none());
+        server.abort();
     }
 
     #[tokio::test]
@@ -6430,7 +6356,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_media_editability_uses_actual_submitted_content() {
+    fn steering_submits_image_and_audio_blocks() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         for (name, mime, kind) in [
             ("image.png", "image/png", super::AttachmentKind::Image),
@@ -6446,121 +6372,18 @@ mod tests {
                 "a2a".into(),
             );
             app.can_steer = true;
-            app.can_replace_steer = true;
             app.apply(Update::State(StateUpdate::Running(
                 RunningStateUpdate::new(),
             )));
             app.attach(path, mime, kind, 5);
-            let Action::Submit { prompt, inject } =
+            let Action::Submit { prompt, delivery } =
                 app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             else {
-                panic!("media steer must remain supported");
+                panic!("expected media steer");
             };
-            assert!(inject);
-            let blocks = prompt_blocks(&prompt).unwrap();
-            assert_eq!(blocks.len(), 2);
-            let editable = super::pending_steer_is_editable(&blocks);
-            assert!(!editable);
-            app.clear_attachments();
-            app.apply(Update::SteerAccepted {
-                id: "media".into(),
-                text: prompt.text,
-                editable,
-            });
-            app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-            assert!(matches!(
-                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                Action::None
-            ));
-            assert!(!app.editing_steer());
-            assert!(matches!(
-                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
-                Action::RevokeSteer { .. }
-            ));
+            assert_eq!(delivery, Some(super::wire::PromptDelivery::Steer));
+            assert_eq!(prompt_blocks(&prompt).unwrap().len(), 2);
         }
-    }
-
-    #[test]
-    fn queued_stale_attachment_metadata_does_not_disable_plain_text_editing() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut app = App::new(
-            PathBuf::from("/tmp"),
-            "provider".into(),
-            "model".into(),
-            "a2a".into(),
-        );
-        app.can_steer = true;
-        app.can_replace_steer = true;
-        app.apply(Update::State(StateUpdate::Running(
-            RunningStateUpdate::new(),
-        )));
-        app.attach(
-            PathBuf::from("nonexistent.png"),
-            "image/png",
-            super::AttachmentKind::Image,
-            5,
-        );
-        app.editor.clear(); // Remove the attachment placeholder, leaving stale metadata.
-        app.paste("plain steer");
-        assert_eq!(app.attachments.len(), 1);
-        let Action::Submit { prompt, inject } =
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("expected plain steer");
-        };
-        assert!(inject);
-        assert!(prompt.attachments.is_empty());
-        let blocks = prompt_blocks(&prompt).unwrap();
-        let editable = super::pending_steer_is_editable(&blocks);
-        assert!(editable);
-        app.clear_attachments();
-        app.apply(Update::SteerAccepted {
-            id: "plain".into(),
-            text: prompt.text,
-            editable,
-        });
-        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.editing_steer());
-    }
-
-    #[test]
-    fn queued_replace_capability_requires_explicit_true() {
-        use agent_client_protocol::schema::v2::{
-            SessionInjectCapabilities, SessionInjectPendingCapabilities,
-        };
-        assert!(!super::supports_pending_replace(None));
-        for pending in [
-            None,
-            Some(SessionInjectPendingCapabilities::new()),
-            Some(SessionInjectPendingCapabilities::new().replace(false)),
-        ] {
-            let inject = SessionInjectCapabilities::new(vec![]).pending(pending);
-            assert!(!super::supports_pending_replace(Some(&inject)));
-        }
-        let inject = SessionInjectCapabilities::new(vec![])
-            .pending(SessionInjectPendingCapabilities::new().replace(true));
-        assert!(super::supports_pending_replace(Some(&inject)));
-    }
-
-    #[test]
-    fn queued_mutation_errors_retire_only_known_missing_or_delivered_ids() {
-        for reason in [
-            "already_delivered",
-            "unknown_message_id",
-            "replace_not_supported",
-            "temporary_failure",
-        ] {
-            let error = agent_client_protocol::Error::invalid_params()
-                .data(json!({"reason": reason, "messageId": "a"}));
-            assert_eq!(
-                super::pending_message_unavailable(&error),
-                matches!(reason, "already_delivered" | "unknown_message_id")
-            );
-        }
-        assert!(!super::pending_message_unavailable(
-            &agent_client_protocol::Error::invalid_params()
-        ));
     }
 
     #[test]
@@ -6666,39 +6489,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_edit_media_paste_remains_text_and_preserves_original_attachments() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("image.png");
-        std::fs::write(&path, b"png").unwrap();
-        let mut app = App::new(
-            directory.path().into(),
-            "provider".into(),
-            "model".into(),
-            "a2a".into(),
-        );
-        app.can_replace_steer = true;
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "a".into(),
-            text: "pending".into(),
-        });
-        handle(&mut app, Event::Paste(path.display().to_string()));
-        let draft = app.editor.text().to_owned();
-        let attachments = app.attachments.clone();
-        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        handle(&mut app, Event::Paste("ignored while selecting".into()));
-        assert_eq!(app.editor.text(), draft);
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        handle(&mut app, Event::Paste(path.display().to_string()));
-        assert!(app.attachments.is_empty());
-        assert!(app.editor.text().contains(path.to_str().unwrap()));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.attachments, attachments);
-        assert_eq!(app.editor.text(), draft);
-    }
-
-    #[test]
     fn async_session_catalog_rename_paste_takes_precedence_over_queue_focus() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -6722,11 +6512,14 @@ mod tests {
             ));
             app.paste("parked draft");
             if populated {
-                app.apply(Update::SteerAccepted {
-                    id: "pending".into(),
-                    text: "queued text".into(),
-                    editable: true,
-                });
+                app.start_prompt(
+                    "pending".to_owned().into(),
+                    super::SubmittedPrompt {
+                        text: "queued text".into(),
+                        attachments: vec![],
+                    },
+                    None,
+                );
             }
             handle(
                 &mut app,
@@ -7733,7 +7526,7 @@ mod tests {
         let (text, images) = user_message_of(vec![
             ContentBlock::Text(TextContent::new(format!("describe [Image #1]({uri})"))),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(uri.into())),
             ),
         ]);
@@ -7773,11 +7566,11 @@ mod tests {
                 "[Image #1]({uri})\n[Image #2]({uri})"
             ))),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(uri.into())),
             ),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("BAUG", "image/png")
                     .uri(Some(uri.into())),
             ),
         ]);
@@ -7797,11 +7590,11 @@ mod tests {
                 "[Image #1]({uri}) [Image #2]({uri})"
             ))),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(uri.into())),
             ),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("BAUG", "image/png")
                     .uri(Some(uri.into())),
             ),
         ]);
@@ -7818,11 +7611,11 @@ mod tests {
         let uri = "file:///tmp/image.png";
         let (text, images) = user_message_of(vec![
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(uri.into())),
             ),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("BAUG", "image/png")
                     .uri(Some(uri.into())),
             ),
         ]);
@@ -7842,7 +7635,7 @@ mod tests {
                 "[reference]({uri})\n[Image #1]({uri})"
             ))),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(uri.into())),
             ),
         ]);
@@ -7858,7 +7651,7 @@ mod tests {
         let (text, images) = user_message_of(vec![
             ContentBlock::Text(TextContent::new("before")),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(uri.into())),
             ),
             ContentBlock::Text(TextContent::new("after")),
@@ -7968,7 +7761,7 @@ mod tests {
     #[test]
     fn user_image_placeholder_separator_survives_empty_text() {
         let (text, images) = user_message_of(vec![
-            ContentBlock::Image(agent_client_protocol::schema::v2::ImageContent::new(
+            ContentBlock::Image(agent_client_protocol::v2::schema::ImageContent::new(
                 "AQID",
                 "image/png",
             )),
@@ -7987,7 +7780,7 @@ mod tests {
         let (text, images) = user_message_of(vec![
             ContentBlock::Text(TextContent::new("[Image #1](file:///tmp/different.png)")),
             ContentBlock::Image(
-                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                agent_client_protocol::v2::schema::ImageContent::new("AQID", "image/png")
                     .uri(Some(actual.into())),
             ),
         ]);
@@ -8003,7 +7796,7 @@ mod tests {
     #[test]
     fn rendered_image_never_exposes_a_data_url() {
         let content = ContentBlock::Image(
-            agent_client_protocol::schema::v2::ImageContent::new("c2VjcmV0", "image/png")
+            agent_client_protocol::v2::schema::ImageContent::new("c2VjcmV0", "image/png")
                 .uri(Some("data:image/png;base64,c2VjcmV0".into())),
         );
 
@@ -8965,13 +8758,12 @@ mod native_voice_tests {
                 .handoff
                 .as_ref()
                 .expect("prior turn cannot finish handoff");
-            assert!(handoff.user_message_id.is_none());
-            assert!(handoff.text.is_empty());
+            assert!(handoff.accepted_message_id.is_none());
         }
         voice.observe(
             &Update::VoicePromptAccepted {
                 id: "task".into(),
-                result: Ok(()),
+                result: Ok("accepted-user".into()),
             },
             &mut app,
         );
@@ -9030,15 +8822,57 @@ mod native_voice_tests {
         voice.observe(
             &Update::VoicePromptAccepted {
                 id: "other-task".into(),
-                result: Ok(()),
+                result: Ok("accepted-user".into()),
             },
             &mut app,
         );
-        assert!(!voice.handoff.as_ref().unwrap().accepted);
+        assert!(
+            voice
+                .handoff
+                .as_ref()
+                .unwrap()
+                .accepted_message_id
+                .is_none()
+        );
         voice.observe(
             &Update::VoicePromptAccepted {
                 id: "task".into(),
                 result: Err("busy".into()),
+            },
+            &mut app,
+        );
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn voice_handoff_can_finish_before_prompt_response_is_observed() {
+        let mut app = voice_app();
+        let mut voice = NativeVoice::default();
+        voice.handoff = Some(VoiceHandoff {
+            id: "task".into(),
+            ..Default::default()
+        });
+        for update in [
+            Update::UserMessage {
+                id: "user".into(),
+                text: "question".into(),
+                images: vec![],
+                append: false,
+            },
+            Update::AgentMessage {
+                id: "agent".into(),
+                text: "answer".into(),
+                append: false,
+            },
+            Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new())),
+        ] {
+            voice.observe(&update, &mut app);
+            assert!(voice.handoff.is_some());
+        }
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "task".into(),
+                result: Ok("user".into()),
             },
             &mut app,
         );

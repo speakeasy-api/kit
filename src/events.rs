@@ -62,7 +62,7 @@ pub enum RuntimeEvent {
             skip_serializing_if = "agent_client_protocol::schema::MaybeUndefined::is_undefined"
         )]
         cost:
-            agent_client_protocol::schema::MaybeUndefined<agent_client_protocol::schema::v2::Cost>,
+            agent_client_protocol::schema::MaybeUndefined<agent_client_protocol::v2::schema::Cost>,
     },
     /// Steering support advertised by the child's negotiated ACP connection.
     SubagentCapabilities {

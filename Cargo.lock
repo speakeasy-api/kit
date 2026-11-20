@@ -81,13 +81,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol"
+version = "5.4.0"
+dependencies = [
+ "agent-client-protocol-derive",
+ "agentkit-acp-schema",
+ "anyhow",
+ "blocking",
+ "futures",
+ "futures-concurrency",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agent-client-protocol-derive"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2d255cb5d3afa4760084fbcaf87c7d214d316328546cd777d8736a8af6e368"
+version = "5.4.0"
 dependencies = [
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "agent-client-protocol-http"
+version = "5.4.0"
+dependencies = [
+ "agent-client-protocol",
+ "async-stream",
+ "async-tungstenite",
+ "axum",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-http 0.7.0",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -110,10 +145,8 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "965127f11f8e852bfd60ef89204fac57f1de01b6510c9fc0fee691ea8bb9a73a"
 dependencies = [
- "agentkit-acp-sdk",
+ "agent-client-protocol",
  "agentkit-core",
  "agentkit-loop",
  "agentkit-tools-core",
@@ -126,60 +159,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentkit-acp-http"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "180e490f2e7a930daee151b41e7e10da01ea5ef9b2b3010dc6221790c4b545d0"
-dependencies = [
- "agentkit-acp-sdk",
- "async-stream",
- "async-tungstenite",
- "axum",
- "eventsource-stream",
- "futures",
- "reqwest",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower-http 0.7.0",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "agentkit-acp-schema"
-version = "1.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11fceebccf753866b268d7375a9ef4904ea358019fefb16438b0146c8a56d0f6"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "derive_more",
+ "indexmap 2.14.0",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_with",
  "strum",
-]
-
-[[package]]
-name = "agentkit-acp-sdk"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34a98bcf96dbdcae3eec8a1a9f44b1c1862f1739f7f6a0e2a23fa515f2af84d3"
-dependencies = [
- "agent-client-protocol-derive",
- "agentkit-acp-schema",
- "blocking",
- "futures",
- "futures-concurrency",
- "libc",
- "rustc-hash",
- "serde",
- "serde_json",
- "tracing",
  "uuid",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -204,8 +195,6 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7193f4a771e30b61fbabecd90dba9a9bc16bdafc2cf717d086727871e9d0e3cf"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -243,8 +232,6 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2110778950cdd87cc8ea3f0697c0551eb515ef23841b9c5d255a01974be17798"
 dependencies = [
  "futures-timer",
  "serde",
@@ -275,8 +262,6 @@ dependencies = [
 [[package]]
 name = "agentkit-loop"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5e048d2be22aa27bf635b65b073cb2a396efca232200a4ba79b4f75d1513dcd"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -385,8 +370,6 @@ dependencies = [
 [[package]]
 name = "agentkit-task-manager"
 version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f893be1f3d14f060e141e6b50baa09338778f90764cc030295105e101d29c06"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -429,8 +412,6 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10b9a8af3f09c79fc0707ea87dc377edd40bdf65db11e6ebfb50783f4e8e8ff3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -3107,11 +3088,11 @@ dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
  "a2a-protocol-types",
+ "agent-client-protocol",
+ "agent-client-protocol-http",
  "agenthooksprotocol",
  "agentkit-acp",
- "agentkit-acp-http",
  "agentkit-acp-schema",
- "agentkit-acp-sdk",
  "agentkit-adapter-completions",
  "agentkit-compaction",
  "agentkit-context",
@@ -4844,6 +4825,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "dyn-clone",
+ "indexmap 2.14.0",
  "ref-cast",
  "schemars_derive",
  "serde",

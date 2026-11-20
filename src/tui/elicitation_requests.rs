@@ -7,7 +7,7 @@
 //! drops already-visible forms. No answer can be redirected to a new session.
 use std::sync::{Arc, Mutex, OnceLock};
 
-use agent_client_protocol::{Responder, schema::v2 as wire};
+use agent_client_protocol::v2::{Responder, schema as wire};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::{ActiveSessionRoute, QueuedUpdate, app::Update, elicitation::Form};

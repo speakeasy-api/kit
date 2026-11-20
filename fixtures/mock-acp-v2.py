@@ -10,9 +10,7 @@ write_lock = threading.Lock()
 log_lock = threading.Lock()
 state_lock = threading.Lock()
 next_session = 1
-next_injection = 1
-# state_lock owns IDs and pending contents; delivery removes before emitting.
-pending_injections = {}
+next_steer = 1
 supports_fork = "--no-fork" not in sys.argv
 supports_steer = "--steer" in sys.argv
 supports_models = "--models" in sys.argv
@@ -38,10 +36,7 @@ new_release = option("--new-release")
 fork_release = option("--fork-release")
 prompt_release = option("--prompt-release")
 prompt_release_text = option("--prompt-release-text")
-inject_release = option("--inject-release")
-inject_ack_release = option("--inject-ack-release")
-mutation_ack_release = option("--mutation-ack-release")
-mutation_committed = option("--mutation-committed")
+steer_ack_release = option("--steer-ack-release")
 close_release = option("--close-release")
 close_release_session = option("--close-release-session")
 fail_close_session = option("--fail-close-session")
@@ -97,9 +92,8 @@ def log_request(request):
         entry["additionalDirectories"] = params["additionalDirectories"]
     if request.get("method") == "session/prompt":
         entry["text"] = params["prompt"][0]["text"]
-    if request.get("method") == "session/inject":
-        entry["text"] = params["content"][0]["text"]
-        entry["mode"] = params["mode"]
+        if params.get("delivery") is not None:
+            entry["delivery"] = params["delivery"]
     if request.get("method") is None and "result" in request:
         entry["id"] = request.get("id")
         entry["result"] = request["result"]
@@ -305,65 +299,31 @@ def prompt(request):
         os._exit(0)
 
 
-def inject(request):
-    global next_injection
+def steer_prompt(request):
+    global next_steer
     params = request["params"]
-    text = next((block.get("text", "") for block in params["content"] if block.get("type") == "text"), "")
-    if "MOCK_AUTH_INJECT" in text:
+    text = next((block.get("text", "") for block in params["prompt"] if block.get("type") == "text"), "")
+    if "MOCK_AUTH_STEER" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {
             "code": -32000, "message": "remote-secret-message",
             "data": {"methodId": "selected-login", "token": "remote-secret-data"},
         }})
         return
-    if "MOCK_REJECT_INJECT" in text:
-        send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "injection rejected"}})
+    if "MOCK_REJECT_STEER" in text:
+        send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "steer rejected"}})
         return
     with state_lock:
-        message_id = f"injected-{next_injection}"
-        next_injection += 1
-        pending_injections[message_id] = (params["sessionId"], params["content"])
-    while inject_ack_release is not None and not os.path.exists(inject_ack_release):
+        message_id = f"steered-{next_steer}"
+        next_steer += 1
+    while steer_ack_release is not None and not os.path.exists(steer_ack_release):
         time.sleep(0.01)
     respond(request["id"], {"messageId": message_id})
-    if inject_ack_release is not None:
-        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "notice", "title": "Injection acknowledged"}}})
-    while inject_release is not None and not os.path.exists(inject_release):
-        time.sleep(0.01)
-    with state_lock:
-        pending = pending_injections.pop(message_id, None)
-    if pending is not None:
-        send({
-            "jsonrpc": "2.0", "method": "session/update",
-            "params": {"sessionId": pending[0], "update": {
-                "sessionUpdate": "user_message", "messageId": message_id, "content": pending[1],
-            }},
-        })
-
-
-def mutate_pending_injection(request):
-    params = request["params"]
-    replacement = params.get("content")
-    rejected = replacement is not None and any("MOCK_REJECT_REPLACE" in block.get("text", "") for block in replacement)
-    with state_lock:
-        pending = pending_injections.get(params["messageId"])
-        accepted = not rejected and pending is not None and pending[0] == params["sessionId"]
-        if accepted:
-            if replacement is None:
-                del pending_injections[params["messageId"]]
-            else:
-                pending_injections[params["messageId"]] = (pending[0], replacement)
-    if mutation_committed is not None:
-        with open(mutation_committed, "w", encoding="utf-8") as marker:
-            marker.write("committed" if accepted else "rejected")
-    # No I/O or callbacks while state_lock is held. Delayed replies exercise
-    # delivery racing an already committed mutation without resurrecting rows.
-    while mutation_ack_release is not None and not os.path.exists(mutation_ack_release):
-        time.sleep(0.01)
-    if accepted:
-        respond(request["id"], {})
-    else:
-        send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "pending injection unavailable or rejected"}})
-    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "notice", "title": "Mutation acknowledged"}}})
+    send({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": params["sessionId"], "update": {
+            "sessionUpdate": "user_message", "messageId": message_id, "content": params["prompt"],
+        }},
+    })
 
 
 def close(request):
@@ -404,9 +364,11 @@ for line in sys.stdin:
             "info": {"name": "mock-acp", "version": "2.0.0"},
             "authMethods": [{"type": "agent", "methodId": "browser-login", "name": "secret-name", "description": "secret-description"}],
             "capabilities": {"session": {
-                "prompt": {name: {} for name in prompt_capability_names if name},
+                "prompt": {
+                    **{name: {} for name in prompt_capability_names if name},
+                    **({"delivery": {"steer": {}}} if supports_steer else {}),
+                },
                 **({"additionalDirectories": {}} if "--additional-directories" in sys.argv else {}),
-                **({"inject": {"modes": ["steer"], "steerInStream": ["finish"], "pending": {"replace": "--pending-replace" in sys.argv}}} if supports_steer else {}),
             }},
         })
     elif method == "session/new":
@@ -524,11 +486,13 @@ for line in sys.stdin:
         else:
             respond(request["id"], {"receipt": {"accepted": True}})
     elif method == "session/prompt":
-        threading.Thread(target=prompt, args=(request,), daemon=True).start()
-    elif method == "session/inject":
-        threading.Thread(target=inject, args=(request,), daemon=True).start()
-    elif method in ("session/replace_inject", "session/revoke_inject"):
-        threading.Thread(target=mutate_pending_injection, args=(request,), daemon=True).start()
+        delivery = request["params"].get("delivery")
+        if delivery is None:
+            threading.Thread(target=prompt, args=(request,), daemon=True).start()
+        elif delivery == "steer" and supports_steer:
+            threading.Thread(target=steer_prompt, args=(request,), daemon=True).start()
+        else:
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "unsupported prompt delivery"}})
     elif method == "session/set_config_option":
         params = request["params"]
         value = params["value"]

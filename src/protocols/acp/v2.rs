@@ -9,17 +9,18 @@ use std::{
     },
 };
 
-use agent_client_protocol::{Client, ConnectTo, Handled, Responder, V2ConnectionTo};
+use agent_client_protocol::{Client, ConnectTo, Handled, v2::ConnectionTo as V2ConnectionTo};
 use agentkit_acp::{
     AcpRuntimeError,
     v2::{
-        AcpInjectionBoundary, AcpIntegration, AcpSessionBinding, AcpSessionHandle,
-        AcpSessionUpdateSink, wire,
+        AcpIntegration, AcpSessionBinding, AcpSessionHandle, AcpSessionUpdateSink,
+        delivery::{PendingPrompt, PendingPromptResponse},
+        wire,
     },
 };
 use agentkit_core::{
     CancellationController, Delta, FinishReason, Item, ItemKind, Part, PartId, PartKind, SessionId,
-    ToolOutput,
+    ToolOutput, TurnCancellation,
 };
 use agentkit_loop::{
     AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
@@ -27,7 +28,10 @@ use agentkit_loop::{
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
-use futures_util::future::{Either, select};
+use futures_util::{
+    FutureExt as _,
+    future::{Either, select},
+};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument as _;
@@ -134,7 +138,7 @@ fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     match authentication_method_id(&detail) {
         Some(method_id) => agent_client_protocol::Error::auth_required()
             .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
-        None => agent_client_protocol::util::internal_error(detail),
+        None => agent_client_protocol::Error::internal_error().data(detail),
     }
 }
 
@@ -204,15 +208,6 @@ fn loop_error_stop_reason(
     } else {
         Err(map_loop_error(session_id, error))
     }
-}
-
-// Admission excludes competing requests while the actor prepares or drains work.
-// It is not observable activity: an admitted autonomous drive may find no work.
-// SessionActivity alone owns the ACP lifecycle projected to clients.
-fn claim_prompt(busy: &AtomicBool) -> Result<(), AcpRuntimeError> {
-    busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map(|_| ())
-        .map_err(|_| AcpRuntimeError::Unsupported("session is already running a prompt".into()))
 }
 
 #[derive(Clone)]
@@ -665,24 +660,17 @@ fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<wire::Sess
     ))
 }
 
-struct PromptCommand {
-    request: wire::PromptRequest,
-    cancellation_generation: u64,
-    reply: oneshot::Sender<Result<(oneshot::Sender<()>, wire::MessageId), AcpRuntimeError>>,
-}
-
 enum Command {
     Fork {
         parent_context: Option<(String, String)>,
         reply: oneshot::Sender<Result<AcpForkState, AcpRuntimeError>>,
     },
-    Prompt(PromptCommand),
     SetConfig {
-        request: wire::SetSessionConfigOptionRequest,
+        request: Box<wire::SetSessionConfigOptionRequest>,
         reply: oneshot::Sender<
             Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
         >,
-        cancellation_generation: u64,
+        cancellation: TurnCancellation,
     },
     Close {
         reply: oneshot::Sender<Result<super::SessionCloseReport, AcpRuntimeError>>,
@@ -690,6 +678,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    prompt_keys: Arc<identity::PromptKeys>,
     cwd: PathBuf,
     mcp: crate::tools::mcp::McpRuntime,
     activity: SessionActivity,
@@ -979,6 +968,12 @@ impl Server {
         // version even when the requested version is unsupported; the client
         // then disconnects if it cannot speak v2. It does not switch wire schemas.
         let mut capabilities = agentkit_acp::v2::agent_capabilities();
+        capabilities
+            .session
+            .get_or_insert_with(wire::SessionCapabilities::new)
+            .prompt
+            .get_or_insert_with(wire::PromptCapabilities::new)
+            .delivery = Some(wire::PromptDeliveryCapabilities::new(true, true));
         capabilities
             .session
             .get_or_insert_with(wire::SessionCapabilities::new)
@@ -1316,7 +1311,12 @@ impl Server {
         let busy = Arc::new(AtomicBool::new(false));
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let metadata_observer = driver.adapter.session_observer();
+        let prompt_keys = Arc::new(identity::PromptKeys::restore(
+            &session_id,
+            &canonical_transcript,
+        ));
         let actor = SessionActor {
+            prompt_keys: Arc::clone(&prompt_keys),
             subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
@@ -1398,9 +1398,12 @@ impl Server {
         });
         let interrupt_handle = handle.clone();
         let interrupt_background_jobs = background_jobs.clone();
+        // The registry invokes this callback only for reset or shutdown. Seal
+        // admission before the close job is scheduled; unlike session/cancel,
+        // teardown must not allow a held explicit prompt to start a new turn.
         let interrupt = Arc::new(move || {
             interrupt_background_jobs.cancel_all();
-            interrupt_handle.interrupt();
+            interrupt_handle.close();
         });
         let weak = tx.downgrade();
         let close_background_jobs = background_jobs.clone();
@@ -1441,6 +1444,7 @@ impl Server {
                 completed: completion,
                 session_id: session_id.clone(),
                 session: SessionHandle {
+                    prompt_keys,
                     cwd: runtime.root().to_path_buf(),
                     mcp,
                     activity,
@@ -1482,40 +1486,42 @@ impl Server {
         })
     }
 
-    async fn prepare_prompt(
+    fn enqueue_prompt(
         &self,
         request: wire::PromptRequest,
-    ) -> Result<(oneshot::Sender<()>, wire::MessageId), AcpRuntimeError> {
-        let (sender, busy, handle) = self.prompt_route(&request.session_id)?;
-        // Reject overlaps before waiting: mailbox pressure must not queue another turn.
-        if busy.load(Ordering::Acquire) {
-            return Err(AcpRuntimeError::Unsupported(
-                "session is already running a prompt".into(),
-            ));
+        cancellation: agent_client_protocol::RequestCancellation,
+    ) -> Result<Either<wire::PromptResponse, PendingPromptResponse>, agent_client_protocol::Error>
+    {
+        let (pending, prompt_keys) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
+            let session = sessions.get(&request.session_id).ok_or_else(|| {
+                sdk_error(AcpRuntimeError::SessionNotFound(
+                    request.session_id.to_string(),
+                ))
+            })?;
+            (
+                session.integration.pending_prompts(),
+                Arc::clone(&session.prompt_keys),
+            )
+        };
+        let key = request.idempotency_key.clone();
+        let recorded = || key.as_ref().and_then(|key| prompt_keys.get(key));
+        if let Some(id) = recorded() {
+            return Ok(Either::Left(wire::PromptResponse::new(id)));
         }
-        // Claim only after capacity is available so cancellation cannot strand
-        // ownership. Recheck atomically afterward in case another request now owns it.
-        let permit = sender
-            .reserve()
-            .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        claim_prompt(&busy)?;
-        handle.prepare_injection_turn();
-        let cancellation_generation = handle.cancellation_handle().generation();
-        let (reply, response) = oneshot::channel();
-        permit.send(Command::Prompt(PromptCommand {
-            request,
-            cancellation_generation,
-            reply,
-        }));
-        match response.await {
-            Ok(response) => response,
-            Err(_) => {
-                handle.stop_injection_turn();
-                busy.store(false, Ordering::Release);
-                Err(AcpRuntimeError::ClientClosed)
-            }
+        let admission = pending.enqueue(request, cancellation);
+        // The actor records a committed key before completing its claim. A
+        // retry that raced completion either joined that live claim or sees
+        // the committed ID here, even if the now-unneeded enqueue was rejected.
+        // Dropping an extra waiter withdraws an unclaimed duplicate; the actor
+        // also rechecks after claim if it got there first.
+        if let Some(id) = recorded() {
+            return Ok(Either::Left(wire::PromptResponse::new(id)));
         }
+        admission.map(Either::Right)
     }
 
     async fn update_mcp(
@@ -1562,7 +1568,7 @@ impl Server {
         &self,
         request: wire::SetSessionConfigOptionRequest,
     ) -> Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error> {
-        let (sender, cancellation_generation) = {
+        let (sender, cancellation) = {
             // Publication holds this lock across registry registration and commit.
             // A poisoned map cannot establish that the session lifecycle is consistent.
             let sessions = self
@@ -1576,15 +1582,15 @@ impl Server {
             })?;
             (
                 session.commands.clone(),
-                session.integration.cancellation_handle().generation(),
+                session.integration.cancellation_handle().checkpoint(),
             )
         };
         let (reply, response) = oneshot::channel();
         sender
             .send(Command::SetConfig {
-                request,
+                request: Box::new(request),
                 reply,
-                cancellation_generation,
+                cancellation,
             })
             .await
             .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
@@ -1593,10 +1599,7 @@ impl Server {
             .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?
     }
 
-    async fn cancel(
-        &self,
-        notification: wire::CancelSessionNotification,
-    ) -> Result<(), AcpRuntimeError> {
+    fn cancel(&self, notification: wire::CancelSessionNotification) -> Result<(), AcpRuntimeError> {
         let session = self
             .sessions
             .lock()
@@ -1606,13 +1609,14 @@ impl Server {
                 (
                     session.integration.clone(),
                     session.background_jobs.clone(),
-                    session.tasks.clone(),
                     session.structured_completion,
                 )
             });
-        if let Some((handle, background_jobs, tasks, structured_completion)) = session {
+        if let Some((handle, background_jobs, structured_completion)) = session {
+            // Cancel already registered jobs synchronously. The actor drains
+            // their task-manager settlement before starting another turn.
             if structured_completion {
-                super::cancel_background_jobs(&tasks, &background_jobs).await;
+                background_jobs.cancel_all();
             }
             handle.interrupt();
         }
@@ -1661,6 +1665,9 @@ impl Server {
                 return Err(AcpRuntimeError::SessionNotFound(session_id.to_string()));
             }
         };
+        if let Some((session, _)) = &owned {
+            session.integration.close();
+        }
         let root = self.runtime.root().to_path_buf();
 
         // Once local ownership is removed, request cancellation cannot abandon
@@ -1669,7 +1676,6 @@ impl Server {
         tokio::spawn(async move {
             let root = if let Some((session, close)) = owned {
                 let root = session.cwd.clone();
-                session.integration.close();
                 let result = close().await;
                 drop(session);
                 result?.explicit_result()?;
@@ -1735,7 +1741,7 @@ impl Server {
         request: super::SessionStatusRequest,
     ) -> Result<super::SessionStatusResponse, AcpRuntimeError> {
         let id = wire::SessionId::new(request.session_id.clone());
-        let (activity, busy, jobs, subagents, tasks, commands, token) = {
+        let (activity, busy, jobs, subagents, tasks, commands, pending, token) = {
             let sessions = self
                 .sessions
                 .lock()
@@ -1750,6 +1756,7 @@ impl Server {
                 session.subagents.clone(),
                 session.tasks.clone(),
                 session.commands.clone(),
+                session.integration.pending_prompts(),
                 session.token,
             )
         };
@@ -1769,6 +1776,7 @@ impl Server {
         let foreground_active = before.1
             || busy.load(Ordering::Acquire)
             || commands.capacity() != commands.max_capacity()
+            || pending.ready().now_or_never().is_some()
             || running_tasks;
         let after = activity.snapshot()?;
         if before != after || background != jobs.activity() || commands.is_closed() {
@@ -1819,6 +1827,7 @@ impl Server {
 }
 
 struct SessionActor<S: ModelSession> {
+    prompt_keys: Arc<identity::PromptKeys>,
     subagents: Option<crate::tools::subagent::Subagents>,
     voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: wire::SessionId,
@@ -1842,6 +1851,7 @@ struct SessionActor<S: ModelSession> {
 
 async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
     let SessionActor {
+        prompt_keys,
         subagents,
         mut voice_monitor,
         session_id,
@@ -1864,11 +1874,13 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     } = actor;
     let mut binding = Some(binding);
     let mut model_switch = model_switch::Guard::default();
+    let pending = handle.pending_prompts();
     loop {
-        // Poll in command > MCP > task order. In particular, queued cancellation
-        // must prevent an autonomous continuation from starting.
+        // Administrative commands (notably close) take precedence over another
+        // turn. Prompt admission itself is synchronous in the receive handler.
         let event = {
             let command = std::pin::pin!(commands.recv());
+            let prompt = std::pin::pin!(pending.ready());
             let mcp = std::pin::pin!(async {
                 match mcp_events.recv().await {
                     Some(event) => event,
@@ -1876,57 +1888,59 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
             });
             let task = std::pin::pin!(tasks.next_event());
-            let work = std::pin::pin!(select(mcp, task));
+            let work = select(prompt, select(mcp, task));
             match select(command, work).await {
-                Either::Left((command, _pending)) => Either::Left(command),
-                Either::Right((work, _pending)) => Either::Right(match work {
-                    Either::Left((event, _pending)) => Either::Left(event),
-                    Either::Right((event, _pending)) => Either::Right(event),
-                }),
+                Either::Left((command, _)) => Some(Either::Left(command)),
+                Either::Right((Either::Left(((), _)), _)) => None,
+                Either::Right((Either::Right((work, _)), _)) => Some(Either::Right(match work {
+                    Either::Left((event, _)) => Either::Left(event),
+                    Either::Right((event, _)) => Either::Right(event),
+                })),
             }
-        }; // Drop the owning futures before handlers reborrow receivers/driver.
+        };
+        let Some(event) = event else {
+            busy.store(true, Ordering::Release);
+            let result = prepare_prompt(
+                TurnContext {
+                    session_id: &session_id,
+                    integration: &integration,
+                    handle: &handle,
+                    sink: &sink,
+                    activity: &activity,
+                },
+                PromptPreparation {
+                    prompt_keys: &prompt_keys,
+                    runtime: &runtime,
+                    skill_catalog: &mut skill_catalog,
+                    voice_monitor: &mut voice_monitor,
+                    tasks: &tasks,
+                    background_jobs: &background_jobs,
+                    structured_completion,
+                },
+                &mut driver,
+            )
+            .await;
+            busy.store(false, Ordering::Release);
+            if let Err(error) = result {
+                tracing::debug!(%session_id, %error, "ACP v2 prompt failed");
+            }
+            if let Some(hooks) = runtime.hooks() {
+                hooks.drain_turn_events(&session_id.to_string()).await;
+            }
+            continue;
+        };
         match event {
             Either::Left(command) => match command {
-                Some(Command::Prompt(command)) => {
-                    let span = crate::telemetry::incoming::operation(command.request.meta.as_ref());
-                    let result = prepare_prompt(
-                        TurnContext {
-                            session_id: &session_id,
-                            integration: &integration,
-                            handle: &handle,
-                            sink: &sink,
-                            activity: &activity,
-                        },
-                        PromptPreparation {
-                            runtime: &runtime,
-                            skill_catalog: &mut skill_catalog,
-                            voice_monitor: &mut voice_monitor,
-                            tasks: &tasks,
-                            background_jobs: &background_jobs,
-                            structured_completion,
-                        },
-                        &mut driver,
-                        command,
-                    )
-                    .instrument(span)
-                    .await;
-                    busy.store(false, Ordering::Release);
-                    if let Err(error) = result {
-                        eprintln!("ACP v2 prompt failed for {session_id}: {error}");
-                    }
-                }
                 Some(Command::SetConfig {
                     request,
                     reply,
-                    cancellation_generation,
+                    cancellation,
                 }) => {
+                    let request = *request;
                     let span = crate::telemetry::incoming::operation(request.meta.as_ref());
                     let model_change = request.config_id.to_string() == super::MODEL_CONFIG_ID;
                     let result = async {
-                        if handle
-                            .cancellation_handle()
-                            .is_cancelled_since(cancellation_generation)
-                        {
+                        if cancellation.is_cancelled() {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         // A terminal login since the session opened changes which
@@ -1947,7 +1961,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                                     &adapter
                                         .selection()
                                         .map_err(|error| model_switch::error(&error))?,
-                                    cancellation_generation,
+                                    cancellation.generation(),
                                 ),
                                 crate::provider::ModelSelection::from_id(&target.to_string())
                                     .map_err(|error| model_switch::error(&error))?,
@@ -1959,28 +1973,22 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                                     .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
-                                claim_prompt(&busy).map_err(sdk_error)?;
-                                handle.prepare_injection_turn();
-                                handle.start_injection_turn();
+                                busy.store(true, Ordering::Release);
                                 let compacted = compact_for_switch(
                                     &session_id,
                                     &integration,
                                     &handle,
                                     &mut driver,
                                     &sink,
-                                    cancellation_generation,
+                                    cancellation.clone(),
                                     &activity,
                                 )
                                 .await;
-                                handle.stop_injection_turn();
                                 busy.store(false, Ordering::Release);
                                 compacted?;
                             }
                         }
-                        if handle
-                            .cancellation_handle()
-                            .is_cancelled_since(cancellation_generation)
-                        {
+                        if cancellation.is_cancelled() {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         set_v2_config(&adapter, &catalog, request).map_err(sdk_error)
@@ -2111,16 +2119,32 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             },
             Either::Right(Either::Left(event)) => {
                 let result = async {
-                    match driver.submit_input(vec![Item::notification(event.message)]) {
+                    let cancellation = handle.cancellation_handle().checkpoint();
+                    match driver.commit_input(
+                        vec![Item::notification(event.message)],
+                        cancellation.clone(),
+                    ) {
                         Ok(()) => {
                             drive_autonomous(
-                                &session_id,
-                                &integration,
-                                &handle,
+                                TurnContext {
+                                    session_id: &session_id,
+                                    integration: &integration,
+                                    handle: &handle,
+                                    sink: &sink,
+                                    activity: &activity,
+                                },
                                 &busy,
                                 &mut driver,
-                                &sink,
-                                &activity,
+                                Some(PromptPreparation {
+                                    prompt_keys: &prompt_keys,
+                                    runtime: &runtime,
+                                    skill_catalog: &mut skill_catalog,
+                                    voice_monitor: &mut voice_monitor,
+                                    tasks: &tasks,
+                                    background_jobs: &background_jobs,
+                                    structured_completion,
+                                }),
+                                cancellation,
                             )
                             .await
                         }
@@ -2137,13 +2161,25 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 Some(TaskEvent::Completed(snapshot, _)) => {
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background
                         && let Err(error) = drive_autonomous(
-                            &session_id,
-                            &integration,
-                            &handle,
+                            TurnContext {
+                                session_id: &session_id,
+                                integration: &integration,
+                                handle: &handle,
+                                sink: &sink,
+                                activity: &activity,
+                            },
                             &busy,
                             &mut driver,
-                            &sink,
-                            &activity,
+                            Some(PromptPreparation {
+                                prompt_keys: &prompt_keys,
+                                runtime: &runtime,
+                                skill_catalog: &mut skill_catalog,
+                                voice_monitor: &mut voice_monitor,
+                                tasks: &tasks,
+                                background_jobs: &background_jobs,
+                                structured_completion,
+                            }),
+                            handle.cancellation_handle().checkpoint(),
                         )
                         .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
                         .await
@@ -2175,12 +2211,14 @@ struct TurnContext<'a, T> {
     activity: &'a SessionActivity,
 }
 
-struct TurnOptions<'a> {
-    cancellation_generation: u64,
+struct TurnOptions<'a, 'p> {
+    cancellation: TurnCancellation,
     structured: Option<(&'a TaskManagerHandle, &'a BackgroundJobs)>,
+    delivery: Option<&'a mut PromptPreparation<'p>>,
 }
 
 struct PromptPreparation<'a> {
+    prompt_keys: &'a identity::PromptKeys,
     runtime: &'a Arc<Runtime>,
     skill_catalog: &'a mut skill_catalog::SkillCatalogMonitor,
     voice_monitor: &'a mut crate::runtime::voice_state::VoiceMonitor,
@@ -2191,9 +2229,8 @@ struct PromptPreparation<'a> {
 
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
     context: TurnContext<'_, impl AcpSessionUpdateSink>,
-    preparation: PromptPreparation<'_>,
+    mut preparation: PromptPreparation<'_>,
     driver: &mut LoopDriver<S>,
-    command: PromptCommand,
 ) -> Result<(), AcpRuntimeError> {
     let TurnContext {
         session_id,
@@ -2202,130 +2239,243 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         sink,
         activity,
     } = context;
-    let PromptPreparation {
-        runtime,
-        skill_catalog,
-        voice_monitor,
-        tasks,
-        background_jobs,
-        structured_completion,
-    } = preparation;
-    let PromptCommand {
-        request,
-        cancellation_generation,
-        reply,
-    } = command;
-    if let Err(error) = activity.check_prompt_admission() {
-        handle.stop_injection_turn();
-        let _ = reply.send(Err(error));
-        return Ok(());
-    }
-    if structured_completion
-        && let Err(error) = super::settle_background_jobs(tasks, background_jobs).await
+    let cancellation = handle.cancellation_handle().checkpoint();
+    let structured = preparation
+        .structured_completion
+        .then_some((preparation.tasks, preparation.background_jobs));
+    // Retain cancellation up to insertion: no claim crosses skill discovery,
+    // a prior turn's background settlement, or any other await.
+    let prepare = async {
+        activity.check_prompt_admission()?;
+        if let Some((tasks, jobs)) = structured {
+            super::settle_background_jobs(tasks, jobs).await?;
+        }
+        let current = preparation
+            .runtime
+            .current_skills()
+            .await
+            .map_err(AcpRuntimeError::Loop)?;
+        integration.begin_prompt(session_id)?;
+        Ok::<_, AcpRuntimeError>(current)
+    };
+    let prepared = match select(
+        std::pin::pin!(cancellation.cancelled()),
+        std::pin::pin!(prepare),
+    )
+    .await
     {
-        handle.stop_injection_turn();
-        let _ = reply.send(Err(error));
+        Either::Left(((), _)) => return Ok(()),
+        Either::Right((result, _)) => result,
+    };
+    let batch = unrecorded_prompts(
+        preparation.prompt_keys,
+        handle.claim_pending_prompt_turn(cancellation.generation()),
+    );
+    if batch.is_empty() {
         return Ok(());
     }
-    let current = match runtime.current_skills().await {
+    let current = match prepared {
         Ok(current) => current,
         Err(error) => {
-            handle.stop_injection_turn();
-            let _ = reply.send(Err(AcpRuntimeError::Loop(error)));
-            return Ok(());
+            for prompt in batch {
+                prompt.complete(Err(sdk_error(AcpRuntimeError::Loop(error.to_string()))));
+            }
+            return Err(error);
         }
     };
-    background_jobs.begin_turn();
-    let prepared = integration.prompt_to_items(&request).and_then(|mut items| {
-        skill_catalog::expand_items(&current.skills, &mut items);
-        let message_id = identity::stamp_user(&mut items);
-        skill_catalog
-            .submit(&current.skills, items, |items| {
-                voice_monitor.submit(items, |items| driver.submit_input(items))
-            })
-            .map_err(|error| match error {
-                skill_catalog::SubmitError::Catalog(error) => {
-                    AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
-                }
-                skill_catalog::SubmitError::Submit(error) => map_loop_error(session_id, &error),
-            })?;
-        integration.begin_prompt(session_id)?;
-        Ok(message_id)
-    });
-    drop(current);
-    let user_message_id = match prepared {
-        Ok(message_id) => message_id,
-        Err(error) => {
-            handle.stop_injection_turn();
-            let _ = reply.send(Err(error));
-            return Ok(());
-        }
-    };
-    handle.start_injection_turn();
-    let (start, started) = oneshot::channel();
-    if reply.send(Ok((start, user_message_id.clone()))).is_err() || started.await.is_err() {
-        handle.stop_injection_turn();
-        integration.finish_prompt(session_id);
-        return Ok(());
+    let span = crate::telemetry::incoming::operation(
+        batch
+            .first()
+            .and_then(|prompt| prompt.request().meta.as_ref()),
+    );
+    async {
+        preparation.background_jobs.begin_turn();
+        let inserted = insert_prompts(
+            session_id,
+            &mut preparation,
+            driver,
+            batch,
+            &current.skills,
+            &cancellation,
+        )?;
+        drop(current);
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    let started = activity.start_prompt();
+                    let published = publish_prompts(session_id, sink, inserted);
+                    finish_active_turn(
+                        context,
+                        driver,
+                        TurnOptions {
+                            cancellation,
+                            structured,
+                            delivery: Some(&mut preparation),
+                        },
+                        started.and(published),
+                    )
+                    .await
+                },
+                |reason| Some(reason.clone()),
+            )
+            .await
+            .map(|_| ())
     }
-    let result = activity
-        .execute(
-            ExecutionOrigin::Prompt,
-            async {
-                let published = activity.start_prompt().and_then(|()| {
-                    sink.update(wire::UpdateSessionNotification::new(
-                        session_id.clone(),
-                        wire::SessionUpdate::UserMessage(
-                            wire::UserMessage::new(user_message_id).content(request.prompt),
-                        ),
-                    ))
-                });
-                finish_active_turn(
-                    TurnContext {
-                        session_id,
-                        integration,
-                        handle,
-                        sink,
-                        activity,
-                    },
-                    driver,
-                    TurnOptions {
-                        cancellation_generation,
-                        structured: structured_completion.then_some((tasks, background_jobs)),
-                    },
-                    published,
-                )
-                .await
-            },
-            |reason| Some(reason.clone()),
-        )
-        .await;
-    integration.finish_prompt(session_id);
-    handle.stop_injection_turn();
-    result.map(|_| ())
+    .instrument(span)
+    .await
+}
+
+fn unrecorded_prompts(
+    keys: &identity::PromptKeys,
+    batch: Vec<PendingPrompt>,
+) -> Vec<PendingPrompt> {
+    batch
+        .into_iter()
+        .filter_map(|prompt| {
+            let Some(id) = prompt
+                .request()
+                .idempotency_key
+                .as_ref()
+                .and_then(|key| keys.get(key))
+            else {
+                return Some(prompt);
+            };
+            prompt.complete(Ok(wire::PromptResponse::new(id)));
+            None
+        })
+        .collect()
+}
+
+fn insert_prompts<S: ModelSession>(
+    session_id: &wire::SessionId,
+    preparation: &mut PromptPreparation<'_>,
+    driver: &mut LoopDriver<S>,
+    batch: Vec<PendingPrompt>,
+    skills: &[agentkit_tool_skills::Skill],
+    cancellation: &TurnCancellation,
+) -> Result<Vec<(PendingPrompt, wire::MessageId)>, AcpRuntimeError> {
+    let mut input = Vec::new();
+    let mut inserted = Vec::with_capacity(batch.len());
+    for mut prompt in batch {
+        let mut items = prompt.take_items();
+        skill_catalog::expand_items(skills, &mut items);
+        let id = identity::stamp_prompt(&mut items, prompt.request());
+        inserted.push((prompt, id));
+        input.extend(items);
+    }
+    let result = preparation
+        .skill_catalog
+        .submit(skills, input, |items| {
+            preparation.voice_monitor.submit(items, |items| {
+                driver.commit_input(items, cancellation.clone())
+            })
+        })
+        .map_err(|error| match error {
+            skill_catalog::SubmitError::Catalog(error) => {
+                AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
+            }
+            skill_catalog::SubmitError::Submit(error) => map_loop_error(session_id, &error),
+        });
+    if let Err(error) = result {
+        for (prompt, _) in inserted {
+            prompt.complete(Err(sdk_error(AcpRuntimeError::Loop(error.to_string()))));
+        }
+        return Err(error);
+    }
+    for (prompt, id) in &inserted {
+        if let Some(key) = &prompt.request().idempotency_key {
+            preparation.prompt_keys.record(key.clone(), id.clone());
+        }
+    }
+    Ok(inserted)
+}
+
+fn publish_prompts(
+    session_id: &wire::SessionId,
+    sink: &impl AcpSessionUpdateSink,
+    inserted: Vec<(PendingPrompt, wire::MessageId)>,
+) -> Result<(), AcpRuntimeError> {
+    let mut result = Ok(());
+    for (prompt, message_id) in inserted {
+        let update = sink.update(wire::UpdateSessionNotification::new(
+            session_id.clone(),
+            wire::SessionUpdate::UserMessage(
+                wire::UserMessage::new(message_id.clone()).content(prompt.request().prompt.clone()),
+            ),
+        ));
+        // A transport failure does not undo a successful insertion.
+        prompt.complete(Ok(wire::PromptResponse::new(message_id)));
+        result = result.and(update);
+    }
+    result
+}
+
+async fn insert_steers<S: ModelSession>(
+    context: &TurnContext<'_, impl AcpSessionUpdateSink>,
+    preparation: &mut PromptPreparation<'_>,
+    driver: &mut LoopDriver<S>,
+    cancellation: &TurnCancellation,
+) -> Result<bool, AcpRuntimeError> {
+    let pending = context.handle.pending_prompts();
+    if !pending.has_steers() {
+        return Ok(false);
+    }
+    let current = match select(
+        std::pin::pin!(cancellation.cancelled()),
+        std::pin::pin!(preparation.runtime.current_skills()),
+    )
+    .await
+    {
+        Either::Left(((), _)) => return Ok(false),
+        Either::Right((current, _)) => current,
+    };
+    let batch = unrecorded_prompts(
+        preparation.prompt_keys,
+        context
+            .handle
+            .claim_pending_steers(cancellation.generation()),
+    );
+    if batch.is_empty() {
+        return Ok(false);
+    }
+    let current = match current {
+        Ok(current) => current,
+        Err(error) => {
+            // Reject only the uninserted steers; the already active turn can
+            // continue without them.
+            for prompt in batch {
+                prompt.complete(Err(
+                    agent_client_protocol::Error::internal_error().data(error.clone())
+                ));
+            }
+            return Ok(false);
+        }
+    };
+    let inserted = insert_prompts(
+        context.session_id,
+        preparation,
+        driver,
+        batch,
+        &current.skills,
+        cancellation,
+    )?;
+    drop(current);
+    publish_prompts(context.session_id, context.sink, inserted)?;
+    Ok(true)
 }
 
 async fn drive_prompt<S>(
-    session_id: &wire::SessionId,
+    context: &TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    handle: &AcpSessionHandle,
-    cancellation_generation: u64,
-    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    mut options: TurnOptions<'_, '_>,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
 {
-    let result = drive_prompt_inner(
-        session_id,
-        driver,
-        handle,
-        cancellation_generation,
-        structured,
-    )
-    .await;
-    if matches!(result, Ok(FinishReason::Cancelled)) {
-        // A cooperative interrupt is still a live logical turn. Retire it
-        // without another `next`, which could execute cancelled model work.
+    let result = drive_prompt_inner(context, driver, &mut options).await;
+    if result.is_err() || matches!(result, Ok(FinishReason::Cancelled)) {
+        // Do not execute another model request to retire a cancelled tool round.
         driver
             .retire_interrupted_turn()
             .await
@@ -2335,136 +2485,85 @@ where
 }
 
 async fn drive_prompt_inner<S>(
-    session_id: &wire::SessionId,
+    context: &TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    handle: &AcpSessionHandle,
-    cancellation_generation: u64,
-    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    options: &mut TurnOptions<'_, '_>,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
 {
+    let cancellation = &options.cancellation;
+    let mut background_continuation_owed = false;
     loop {
-        let step = match driver.next().await {
-            Ok(step) => step,
-            Err(error) => {
-                handle.stop_injection_turn();
-                if handle
-                    .cancellation_handle()
-                    .is_cancelled_since(cancellation_generation)
-                {
-                    return Ok(FinishReason::Cancelled);
-                }
-                return loop_error_stop_reason(session_id, &error);
-            }
-        };
-        if handle
-            .cancellation_handle()
-            .is_cancelled_since(cancellation_generation)
-        {
+        if cancellation.is_cancelled() {
             return Ok(FinishReason::Cancelled);
         }
-        match step {
-            LoopStep::Finished(result) => {
-                if result.finish_reason == FinishReason::ToolCall {
-                    continue;
-                }
-                if result.finish_reason == FinishReason::Error {
-                    handle.stop_injection_turn();
-                    if handle
-                        .cancellation_handle()
-                        .is_cancelled_since(cancellation_generation)
-                    {
-                        return Ok(FinishReason::Cancelled);
-                    }
+        let step = driver.next_with_cancellation(cancellation.clone()).await;
+        if cancellation.is_cancelled() {
+            return Ok(FinishReason::Cancelled);
+        }
+        let (terminal, model_boundary) = match step {
+            Err(error) => return loop_error_stop_reason(context.session_id, &error),
+            Ok(LoopStep::Finished(result)) => match result.finish_reason {
+                FinishReason::ToolCall => continue,
+                FinishReason::Cancelled => return Ok(FinishReason::Cancelled),
+                FinishReason::Error => {
                     return Err(AcpRuntimeError::Loop("model turn failed".into()));
                 }
-                if let Some((tasks, background_jobs)) = structured
-                    && super::settle_background_jobs(tasks, background_jobs).await?
-                {
-                    continue;
-                }
-                match handle.handle_injection_boundary(driver, true).await {
-                    Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
-                        continue;
-                    }
-                    Ok(AcpInjectionBoundary::Stopped) => {
-                        return Ok(FinishReason::Cancelled);
-                    }
-                    Ok(AcpInjectionBoundary::Finished) => {
-                        return Ok(result.finish_reason);
-                    }
-                    Err(error) => {
-                        handle.stop_injection_turn();
-                        if handle
-                            .cancellation_handle()
-                            .is_cancelled_since(cancellation_generation)
-                        {
-                            return Ok(FinishReason::Cancelled);
-                        }
-                        return Err(error);
-                    }
-                }
+                reason @ (FinishReason::Completed | FinishReason::MaxTokens) => (reason, true),
+                reason => (reason, false),
+            },
+            Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))) => {
+                (FinishReason::Completed, false)
             }
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-                if let Some((tasks, background_jobs)) = structured
-                    && super::settle_background_jobs(tasks, background_jobs).await?
-                {
-                    continue;
+            Ok(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))) => {
+                if let Some(preparation) = options.delivery.as_deref_mut() {
+                    insert_steers(context, preparation, driver, cancellation).await?;
                 }
-                match handle.handle_injection_boundary(driver, true).await {
-                    Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
-                        continue;
-                    }
-                    Ok(AcpInjectionBoundary::Stopped) => {
-                        return Ok(FinishReason::Cancelled);
-                    }
-                    Ok(AcpInjectionBoundary::Finished) => {
-                        return Ok(FinishReason::Completed);
-                    }
-                    Err(error) => {
-                        handle.stop_injection_turn();
-                        if handle
-                            .cancellation_handle()
-                            .is_cancelled_since(cancellation_generation)
-                        {
-                            return Ok(FinishReason::Cancelled);
-                        }
-                        return Err(error);
-                    }
-                }
+                continue;
             }
-            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
-                match handle.handle_injection_boundary(driver, false).await {
-                    Ok(AcpInjectionBoundary::Stopped) => {
-                        return Ok(FinishReason::Cancelled);
-                    }
-                    Err(error) => {
-                        handle.stop_injection_turn();
-                        if handle
-                            .cancellation_handle()
-                            .is_cancelled_since(cancellation_generation)
-                        {
-                            return Ok(FinishReason::Cancelled);
-                        }
-                        return Err(error);
-                    }
-                    _ => {}
-                }
-            }
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_)) => {
+            Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_))) => {
                 if let Err(error) = driver.cancel_pending_approvals().await {
-                    handle.stop_injection_turn();
-                    if handle
-                        .cancellation_handle()
-                        .is_cancelled_since(cancellation_generation)
-                    {
+                    if cancellation.is_cancelled() {
                         return Ok(FinishReason::Cancelled);
                     }
-                    return loop_error_stop_reason(session_id, &error);
+                    return loop_error_stop_reason(context.session_id, &error);
                 }
+                continue;
             }
+        };
+        let background_requires_continuation = if let Some((tasks, jobs)) = options.structured {
+            match select(
+                std::pin::pin!(cancellation.cancelled()),
+                std::pin::pin!(super::settle_background_jobs(tasks, jobs)),
+            )
+            .await
+            {
+                Either::Left(((), _)) => return Ok(FinishReason::Cancelled),
+                Either::Right((settled, _)) => settled?,
+            }
+        } else {
+            false
+        };
+        // A finished model stream is a safe boundary before the ACP turn's
+        // idle update, even when settled background work also needs a
+        // continuation. Cancelled/failed work never takes this path.
+        let steered = if model_boundary && let Some(preparation) = options.delivery.as_deref_mut() {
+            insert_steers(context, preparation, driver, cancellation).await?
+        } else {
+            false
+        };
+        background_continuation_owed |= background_requires_continuation;
+        if steered {
+            // The driver gives committed user input precedence and can defer
+            // collected task results. Keep their continuation owed until a
+            // subsequent step runs without another steer driving it.
+            continue;
         }
+        if std::mem::take(&mut background_continuation_owed) {
+            continue;
+        }
+        return Ok(terminal);
     }
 }
 
@@ -2476,7 +2575,7 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
     handle: &AcpSessionHandle,
     driver: &mut LoopDriver<S>,
     sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    cancellation_generation: u64,
+    cancellation: TurnCancellation,
     activity: &SessionActivity,
 ) -> Result<(), agent_client_protocol::Error> {
     // Require a new persisted summary as well as consumption of this marker.
@@ -2485,7 +2584,7 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
     let marker = model_switch::compact_marker();
     let marker_id = marker.id.clone();
     driver
-        .submit_input(vec![marker])
+        .commit_input(vec![marker], cancellation.clone())
         .map_err(|error| sdk_error(map_loop_error(session_id, &error)))?;
     let reason = run_active_turn(
         TurnContext {
@@ -2497,8 +2596,9 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
         },
         driver,
         TurnOptions {
-            cancellation_generation,
+            cancellation: cancellation.clone(),
             structured: None,
+            delivery: None,
         },
         ExecutionOrigin::Prompt,
     )
@@ -2509,9 +2609,7 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
         &marker_id,
         &before,
         &driver.snapshot().transcript,
-        handle
-            .cancellation_handle()
-            .is_cancelled_since(cancellation_generation),
+        cancellation.is_cancelled(),
     ) {
         return Err(model_switch::error(
             "compaction did not complete; model unchanged",
@@ -2523,7 +2621,7 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
 async fn run_active_turn<S: ModelSession + Send + 'static>(
     context: TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    options: TurnOptions<'_>,
+    options: TurnOptions<'_, '_>,
     origin: ExecutionOrigin,
 ) -> Result<FinishReason, AcpRuntimeError> {
     context
@@ -2539,40 +2637,23 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
 async fn finish_active_turn<S: ModelSession + Send + 'static>(
     context: TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    options: TurnOptions<'_>,
+    options: TurnOptions<'_, '_>,
     published: Result<(), AcpRuntimeError>,
 ) -> Result<FinishReason, AcpRuntimeError> {
     let TurnContext {
         session_id,
         integration,
-        handle,
+        handle: _,
         sink,
         activity,
     } = context;
-    let TurnOptions {
-        cancellation_generation,
-        structured,
-    } = options;
+    let cancellation = options.cancellation.clone();
+    let structured = options.structured;
     let result = match published {
-        Ok(()) => {
-            drive_prompt(
-                session_id,
-                driver,
-                handle,
-                cancellation_generation,
-                structured,
-            )
-            .await
-        }
+        Ok(()) => drive_prompt(&context, driver, options).await,
         Err(error) => Err(error),
     };
-    let outcome = super::activity::ExecutionOutcome::new(
-        result,
-        handle
-            .cancellation_handle()
-            .is_cancelled_since(cancellation_generation),
-    );
-    handle.stop_injection_turn();
+    let outcome = super::activity::ExecutionOutcome::new(result, cancellation.is_cancelled());
     let result = super::activity::finalize(
         outcome,
         structured,
@@ -2589,39 +2670,25 @@ async fn finish_active_turn<S: ModelSession + Send + 'static>(
 }
 
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
-    session_id: &wire::SessionId,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
     busy: &AtomicBool,
     driver: &mut LoopDriver<S>,
-    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    activity: &SessionActivity,
+    mut preparation: Option<PromptPreparation<'_>>,
+    cancellation: TurnCancellation,
 ) -> Result<(), AcpRuntimeError> {
-    if claim_prompt(busy).is_err() {
-        return Ok(());
-    }
-    handle.prepare_injection_turn();
-    integration.finish_prompt(session_id);
-    let cancellation_generation = handle.cancellation_handle().generation();
-    handle.start_injection_turn();
+    busy.store(true, Ordering::Release);
+    context.integration.finish_prompt(context.session_id);
     let result = run_active_turn(
-        TurnContext {
-            session_id,
-            integration,
-            handle,
-            sink,
-            activity,
-        },
+        context,
         driver,
         TurnOptions {
-            cancellation_generation,
+            cancellation,
             structured: None,
+            delivery: preparation.as_mut(),
         },
         ExecutionOrigin::Autonomous,
     )
     .await;
-    integration.finish_prompt(session_id);
-    handle.stop_injection_turn();
     busy.store(false, Ordering::Release);
     result.map(|_| ())
 }
@@ -3030,10 +3097,10 @@ fn transcript_replay(
                     .collect::<Vec<_>>();
                 if !content.is_empty() {
                     replay.push(wire::SessionUpdate::CompactionUpdate(
-                        wire::CompactionUpdate::new(
-                            format!("{session_id}-replay-{item_index}-compaction"),
-                            wire::CompactionStatus::Completed,
-                        )
+                        wire::CompactionUpdate::new(format!(
+                            "{session_id}-replay-{item_index}-compaction"
+                        ))
+                        .status(wire::CompactionStatus::Completed)
                         .summary(content),
                     ));
                 }
@@ -3302,16 +3369,23 @@ pub(crate) fn component(
                 async move |request: wire::PromptRequest, responder, cx| {
                     let span = crate::telemetry::incoming::span(request.meta.as_ref());
 
-                    let state = Arc::clone(&state);
+                    // Enqueue in receive order, before spawning any work.
+                    let pending = match state.enqueue_prompt(request, responder.cancellation()) {
+                        Ok(Either::Left(response)) => return responder.respond(response),
+                        Ok(Either::Right(pending)) => pending,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
+                    let connection = cx.clone();
                     cx.spawn(
                         async move {
-                            match state.prepare_prompt(request).await {
-                                Ok((start, message_id)) => {
-                                    responder.respond(wire::PromptResponse::new(message_id))?;
-                                    let _ = start.send(());
-                                    Ok(())
-                                }
-                                Err(error) => responder.respond_with_error(sdk_error(error)),
+                            match select(
+                                std::pin::pin!(pending.wait()),
+                                std::pin::pin!(connection.incoming_closed()),
+                            )
+                            .await
+                            {
+                                Either::Left((result, _)) => responder.respond_with_result(result),
+                                Either::Right(((), _)) => Ok(()),
                             }
                         }
                         .instrument(span),
@@ -3334,56 +3408,6 @@ pub(crate) fn component(
                             }
                             .instrument(span),
                         )?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let integration = Arc::clone(&state.integration);
-                async move |request: wire::InjectSessionRequest,
-                            responder: Responder<wire::InjectSessionResponse>,
-                            cx| {
-                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
-
-                    let integration = Arc::clone(&integration);
-                    cx.spawn(
-                        async move { integration.handle_inject_request(request, responder).await }
-                            .instrument(span),
-                    )?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let integration = Arc::clone(&state.integration);
-                async move |request: wire::RevokeInjectSessionRequest, responder, _cx| {
-                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
-                    async {
-                        responder.respond_with_result(integration.revoke_inject(request).await)
-                    }
-                    .instrument(span)
-                    .await
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let integration = Arc::clone(&state.integration);
-                async move |request: wire::ReplaceInjectSessionRequest, responder, cx| {
-                    let span = crate::telemetry::incoming::span(request.meta.as_ref());
-
-                    let integration = Arc::clone(&integration);
-                    cx.spawn(
-                        async move {
-                            responder.respond_with_result(integration.replace_inject(request).await)
-                        }
-                        .instrument(span),
-                    )?;
                     Ok(())
                 }
             },
@@ -3470,11 +3494,12 @@ pub(crate) fn component(
                 async move |request: FileSearchRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        responder.respond_with_result(
-                            state.search_files(request).await.map_err(|error| {
-                                agent_client_protocol::util::internal_error(error)
-                            }),
-                        )
+                        responder.respond_with_result(state.search_files(request).await.map_err(
+                            |error| {
+                                agent_client_protocol::Error::internal_error()
+                                    .data(error.to_string())
+                            },
+                        ))
                     })?;
                     Ok(())
                 }
@@ -3495,7 +3520,7 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |notification: wire::CancelSessionNotification, _cx| {
-                    state.cancel(notification).await.map_err(sdk_error)?;
+                    state.cancel(notification).map_err(sdk_error)?;
                     Ok(Handled::Yes)
                 }
             },
@@ -4673,7 +4698,7 @@ mod tests {
         channel
             .tx
             .unbounded_send(agent_client_protocol::TransportFrame::Single(
-                agent_client_protocol::RawJsonRpcMessage::request(method.into(), params, id.into())
+                agent_client_protocol::RawJsonRpcMessage::request(method.into(), params, id)
                     .unwrap(),
             ))
             .unwrap();
@@ -5119,8 +5144,9 @@ mod tests {
             },
             &mut driver,
             TurnOptions {
-                cancellation_generation: handle.cancellation_handle().generation(),
+                cancellation: handle.cancellation_handle().checkpoint(),
                 structured: None,
+                delivery: None,
             },
             ExecutionOrigin::Prompt,
         )
@@ -5147,186 +5173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_prompt_pre_start_failures_terminalize_and_allow_next_prompt() {
-        // A failed user publication skips driver execution. An empty prompt reaches
-        // the real AwaitingInput boundary without emitting a logical TurnStarted.
-        for failure in 0..4 {
-            let fail_user = failure == 0;
-            let root = tempfile::tempdir().unwrap();
-            let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-            let integration = AcpIntegration::default();
-            let recording = RecordingSink::default();
-            recording.fail_user.store(fail_user, Ordering::Relaxed);
-            recording
-                .fail_running
-                .store(failure == 3, Ordering::Relaxed);
-            recording.fail_flush.store(failure == 1, Ordering::Relaxed);
-            let sink = ResponseReplacementSink::new(recording.clone());
-            let session_id = wire::SessionId::new("pre-start-failure");
-            let activity = native_activity(session_id.clone(), sink.clone());
-            let handle = integration
-                .bind_session(AcpSessionBinding::new(
-                    session_id.clone(),
-                    SessionId::new("pre-start-loop"),
-                    sink.clone(),
-                ))
-                .unwrap();
-            let turns = Arc::new(AtomicU64::new(0));
-            let observer = ResponseReplacementObserver::new(
-                integration.clone(),
-                sink.clone(),
-                session_id.clone(),
-                activity.clone(),
-            );
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let mut driver = Agent::builder()
-                .model(RecordingModelAdapter {
-                    inner: TestAdapter {
-                        outcome: TestOutcome::Content,
-                        turns: turns.clone(),
-                        interrupt: None,
-                    },
-                    requests: requests.clone(),
-                })
-                .observer(observer)
-                .build()
-                .unwrap()
-                .start(SessionConfig::new(SessionId::new("pre-start-loop")).without_cache())
-                .await
-                .unwrap();
-            let task_manager = AsyncTaskManager::new();
-            let tasks = task_manager.handle();
-            let background_jobs = BackgroundJobs::default();
-            let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-            let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
-            // These monitors normally prepend their initial state to the first
-            // submission. Prime their real submit APIs so an empty prompt truly
-            // reaches AwaitingInput without starting a logical model turn.
-            let current = runtime.current_skills().await.unwrap();
-            skill_catalog
-                .submit(&current.skills, Vec::new(), |items| {
-                    voice_monitor.submit(items, |_| Ok::<(), LoopError>(()))
-                })
-                .unwrap();
-            drop(current);
-            for failed in [true, false] {
-                handle.prepare_injection_turn();
-                let (reply, response) = oneshot::channel();
-                let content = if failed && !fail_user {
-                    Vec::new()
-                } else {
-                    vec![wire::ContentBlock::Text(wire::TextContent::new(
-                        if failed {
-                            "FAILED_PUBLICATION_INPUT"
-                        } else {
-                            "FRESH_PROMPT_INPUT"
-                        },
-                    ))]
-                };
-                let command = PromptCommand {
-                    request: wire::PromptRequest::new(session_id.clone(), content),
-                    cancellation_generation: handle.cancellation_handle().generation(),
-                    reply,
-                };
-                let cancellation = handle.clone();
-                let acknowledge = async move {
-                    let response = response.await.unwrap();
-                    if !failed && failure == 3 {
-                        assert!(matches!(response, Err(AcpRuntimeError::Loop(_))));
-                        return;
-                    }
-                    let start = response.unwrap().0;
-                    if failed && failure == 2 {
-                        cancellation.interrupt();
-                    }
-                    start.send(()).unwrap();
-                };
-                let (result, ()) = tokio::join!(
-                    prepare_prompt(
-                        TurnContext {
-                            session_id: &session_id,
-                            integration: &integration,
-                            handle: &handle,
-                            sink: &sink,
-                            activity: &activity
-                        },
-                        PromptPreparation {
-                            runtime: &runtime,
-                            skill_catalog: &mut skill_catalog,
-                            voice_monitor: &mut voice_monitor,
-                            tasks: &tasks,
-                            background_jobs: &background_jobs,
-                            structured_completion: false
-                        },
-                        &mut driver,
-                        command,
-                    ),
-                    acknowledge
-                );
-                if failure == 3 {
-                    if failed {
-                        assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
-                        assert!(requests.lock().unwrap().is_empty());
-                        let updates = recording.updates.lock().unwrap();
-                        assert!(!updates.iter().any(|update| matches!(
-                            update.update,
-                            wire::SessionUpdate::StateUpdate(_)
-                        )));
-                    } else {
-                        // Even a recovered sink cannot reuse an interval whose Running
-                        // was lost: the next prompt is rejected before acceptance.
-                        result.unwrap();
-                        assert!(requests.lock().unwrap().is_empty());
-                    }
-                    recording.fail_running.store(false, Ordering::Relaxed);
-                    continue;
-                }
-                if failed {
-                    if failure == 2 {
-                        result.unwrap();
-                    } else {
-                        assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
-                    }
-                    assert_eq!(turns.load(Ordering::Relaxed), 0);
-                    assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
-                } else {
-                    result.unwrap();
-                    assert_eq!(turns.load(Ordering::Relaxed), 1);
-                    let received = requests.lock().unwrap();
-                    assert_eq!(received.len(), 1);
-                    let transcript = serde_json::to_string(&received[0]).unwrap();
-                    assert!(transcript.contains("FRESH_PROMPT_INPUT"));
-                    assert_eq!(transcript.contains("FAILED_PUBLICATION_INPUT"), fail_user);
-                    if fail_user {
-                        assert!(
-                            transcript.find("FAILED_PUBLICATION_INPUT").unwrap()
-                                < transcript.find("FRESH_PROMPT_INPUT").unwrap()
-                        );
-                    }
-                }
-                let updates = recording.updates.lock().unwrap();
-                assert_running_then_idle(
-                    &updates,
-                    if failed && failure == 2 {
-                        wire::StopReason::Cancelled
-                    } else if failed {
-                        error_stop_reason()
-                    } else {
-                        wire::StopReason::EndTurn
-                    },
-                );
-                drop(updates);
-                recording.updates.lock().unwrap().clear();
-                recording.fail_user.store(false, Ordering::Relaxed);
-                recording.fail_flush.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn foreground_provider_error_after_running_terminalizes_once() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let integration = AcpIntegration::default();
         let recording = RecordingSink::default();
         let sink = ResponseReplacementSink::new(recording.clone());
@@ -5339,9 +5186,9 @@ mod tests {
                 sink.clone(),
             ))
             .unwrap();
-        handle.prepare_injection_turn();
-        let cancellation_generation = handle.cancellation_handle().generation();
+        let cancellation = handle.cancellation_handle().checkpoint();
         let turns = Arc::new(AtomicU64::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let observer = ResponseReplacementObserver::new(
             integration.clone(),
             sink.clone(),
@@ -5349,10 +5196,13 @@ mod tests {
             activity.clone(),
         );
         let mut driver = Agent::builder()
-            .model(TestAdapter {
-                outcome: TestOutcome::ProviderError,
-                turns: turns.clone(),
-                interrupt: None,
+            .model(RecordingModelAdapter {
+                inner: TestAdapter {
+                    outcome: TestOutcome::ProviderError,
+                    turns: turns.clone(),
+                    interrupt: None,
+                },
+                requests: requests.clone(),
             })
             .observer(observer)
             .build()
@@ -5365,46 +5215,48 @@ mod tests {
             )
             .await
             .unwrap();
-        let (reply, response) = oneshot::channel();
-        let command = PromptCommand {
-            request: wire::PromptRequest::new(
-                session_id.clone(),
-                vec![wire::ContentBlock::Text(wire::TextContent::new("fail"))],
-            ),
-            cancellation_generation,
-            reply,
-        };
-        let acknowledge = async move {
-            response.await.unwrap().unwrap().0.send(()).unwrap();
-        };
-
-        let task_manager = AsyncTaskManager::new();
-        let tasks = task_manager.handle();
-        let background_jobs = BackgroundJobs::default();
-        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
-        let (result, ()) = tokio::join!(
-            prepare_prompt(
-                TurnContext {
-                    session_id: &session_id,
-                    integration: &integration,
-                    handle: &handle,
-                    sink: &sink,
-                    activity: &activity
+        let content = vec![wire::ContentBlock::Text(wire::TextContent::new("fail"))];
+        let mut items = agentkit_acp::v2::content_blocks_to_items(&content).unwrap();
+        let user_message_id = identity::stamp_user(&mut items);
+        driver.submit_input(items).unwrap();
+        let result = activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                async {
+                    activity.start_prompt().unwrap();
+                    let published = sink.update(wire::UpdateSessionNotification::new(
+                        session_id.clone(),
+                        wire::SessionUpdate::UserMessage(
+                            wire::UserMessage::new(user_message_id.clone()).content(content),
+                        ),
+                    ));
+                    finish_active_turn(
+                        TurnContext {
+                            session_id: &session_id,
+                            integration: &integration,
+                            handle: &handle,
+                            sink: &sink,
+                            activity: &activity,
+                        },
+                        &mut driver,
+                        TurnOptions {
+                            cancellation,
+                            structured: None,
+                            delivery: None,
+                        },
+                        published,
+                    )
+                    .await
                 },
-                PromptPreparation {
-                    runtime: &runtime,
-                    skill_catalog: &mut skill_catalog,
-                    voice_monitor: &mut voice_monitor,
-                    tasks: &tasks,
-                    background_jobs: &background_jobs,
-                    structured_completion: false
-                },
-                &mut driver,
-                command,
-            ),
-            acknowledge,
-        );
+                |reason| Some(reason.clone()),
+            )
+            .await;
+        let requests = requests.lock().unwrap();
+        let user_message_id = user_message_id.to_string();
+        assert!(requests[0].iter().any(|item| {
+            item.metadata.get(identity::KEY).and_then(Value::as_str)
+                == Some(user_message_id.as_str())
+        }));
 
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
         assert_eq!(turns.load(Ordering::Relaxed), 1);
@@ -5473,6 +5325,86 @@ mod tests {
                 sink.clone(),
             ))
             .unwrap();
+        let background_jobs = BackgroundJobs::default();
+        let pending = handle.pending_prompts();
+        let (client_io, agent_io) = agent_client_protocol::Channel::duplex();
+        let agent = agent_client_protocol::Agent
+            .v2()
+            .on_receive_request(
+                async |_: wire::InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        wire::InitializeResponse::new(
+                            wire::ProtocolVersion::V2,
+                            wire::Implementation::new("structured-test", "0"),
+                        )
+                        .capabilities(
+                            wire::AgentCapabilities::new().session(
+                                wire::SessionCapabilities::new().prompt(
+                                    wire::PromptCapabilities::new().delivery(
+                                        wire::PromptDeliveryCapabilities::new(true, true),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let session_id = session_id.clone();
+                    async move |_: wire::NewSessionRequest, responder, _cx| {
+                        responder.respond(wire::NewSessionResponse::new(session_id.clone()))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let pending = pending.clone();
+                    async move |request: wire::PromptRequest, responder, cx| {
+                        let wait = pending.enqueue(request, responder.cancellation())?;
+                        cx.spawn(async move { responder.respond_with_result(wait.wait().await) })?;
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let server = tokio::spawn(agent.connect_to(agent_io));
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let mut skills = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+        let mut voice = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
+        let keys = identity::PromptKeys::default();
+        let mut preparation = PromptPreparation {
+            prompt_keys: &keys,
+            runtime: &runtime,
+            skill_catalog: &mut skills,
+            voice_monitor: &mut voice,
+            tasks: &tasks,
+            background_jobs: &background_jobs,
+            structured_completion: true,
+        };
+        let mut client_io = client_io;
+        send_wire(
+            &client_io,
+            "initialize",
+            1,
+            serde_json::to_value(terminal_auth_initialize_request()).unwrap(),
+        );
+        assert!(
+            receive_wire(&mut client_io, "initialize")
+                .await
+                .get("result")
+                .is_some()
+        );
+        send_wire(&client_io, "session/new", 2, json!({"cwd": root.path()}));
+        assert!(
+            receive_wire(&mut client_io, "session/new")
+                .await
+                .get("result")
+                .is_some()
+        );
         let observer = ResponseReplacementObserver::new(
             integration.clone(),
             sink.clone(),
@@ -5497,10 +5429,7 @@ mod tests {
             .submit_input(vec![Item::text(ItemKind::User, "start background")])
             .unwrap();
 
-        handle.prepare_injection_turn();
-        handle.start_injection_turn();
-        let generation = handle.cancellation_handle().generation();
-        let background_jobs = BackgroundJobs::default();
+        let cancellation = handle.cancellation_handle().checkpoint();
         let prompt = run_active_turn(
             TurnContext {
                 session_id: &session_id,
@@ -5511,8 +5440,9 @@ mod tests {
             },
             &mut driver,
             TurnOptions {
-                cancellation_generation: generation,
+                cancellation,
                 structured: Some((&tasks, &background_jobs)),
+                delivery: Some(&mut preparation),
             },
             ExecutionOrigin::Prompt,
         );
@@ -5562,6 +5492,18 @@ mod tests {
                 .is_err(),
             "structured v2 prompt crossed the terminal publication handoff early"
         );
+        send_wire(
+            &client_io,
+            "session/prompt",
+            3,
+            json!({
+                "sessionId": session_id, "delivery": "steer",
+                "prompt": [{"type": "text", "text": "steer before synthesis"}],
+            }),
+        );
+        timeout(Duration::from_secs(1), pending.ready())
+            .await
+            .unwrap();
         release.notify_one();
         timeout(Duration::from_secs(1), &mut prompt)
             .await
@@ -5586,13 +5528,35 @@ mod tests {
             )),
             "background completion must update its tool card"
         );
-        assert_eq!(turns.load(Ordering::SeqCst), 3);
+        let steer = receive_wire(&mut client_io, "steer insertion").await;
+        let steer_id = steer["result"]["messageId"]
+            .as_str()
+            .expect("steer must insert before idle");
+        let user = updates
+            .iter()
+            .position(|update| {
+                matches!(
+                    &update.update, wire::SessionUpdate::UserMessage(message)
+                        if message.message_id.to_string() == steer_id,
+                )
+            })
+            .unwrap();
+        let synthesis = updates
+            .iter()
+            .position(|update| {
+                serde_json::to_string(&update.update)
+                    .unwrap()
+                    .contains("autonomous background completion")
+            })
+            .unwrap();
+        assert!(user < synthesis, "terminal steer must precede synthesis");
+        assert!(turns.load(Ordering::SeqCst) >= 3);
+        server.abort();
         assert!(
             timeout(Duration::from_millis(20), tasks.next_event())
                 .await
                 .is_err()
         );
-        handle.stop_injection_turn();
     }
 
     fn bind_test_session(
@@ -5600,125 +5564,100 @@ mod tests {
         session_id: &wire::SessionId,
         sink: RecordingSink,
     ) -> AcpSessionHandle {
-        let handle = integration
+        integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
                 SessionId::new(session_id.to_string()),
                 sink,
             ))
-            .unwrap();
-        handle.prepare_injection_turn();
-        handle.start_injection_turn();
-        handle
+            .unwrap()
     }
 
-    // Hold a real response-committed receipt at the external ACP transport boundary.
-    // Until activation, the real injection coordinator must wait rather than lose the steer.
-    async fn staged_injection(
-        integration: AcpIntegration,
+    async fn drive_test_prompt<S: ModelSession + Send + 'static>(
         session_id: &wire::SessionId,
-    ) -> (
-        agentkit_acp::v2::AcpInjectAcceptance,
-        agent_client_protocol::Channel,
-        tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>,
-    ) {
-        let (mut client, agent) = agent_client_protocol::Channel::duplex();
-        let (accepted, mut acceptance) = mpsc::unbounded_channel();
-        let server = tokio::spawn(async move {
-            agent_client_protocol::Agent
-                .v2()
-                .on_receive_request(
-                    async move |request: wire::InitializeRequest, responder, _cx| {
-                        responder.respond(
-                            wire::InitializeResponse::new(
-                                request.protocol_version,
-                                wire::Implementation::new("injection-test", "0"),
-                            )
-                            .capabilities(agentkit_acp::v2::agent_capabilities()),
-                        )
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |request: wire::InjectSessionRequest, responder, cx| {
-                        let integration = integration.clone();
-                        let accepted = accepted.clone();
-                        cx.spawn(async move {
-                            let reserved = integration
-                                .reserve_inject_request(request, responder)
-                                .await?
-                                .expect("inject reservation");
-                            let receipt = reserved.respond_tracked()?.expect("inject acceptance");
-                            accepted.send(receipt).ok();
-                            Ok(())
-                        })?;
-                        Ok(())
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .connect_to(agent)
-                .await
-        });
-        send_wire(
-            &client,
-            "initialize",
-            1,
-            serde_json::to_value(wire::InitializeRequest::new(
-                wire::ProtocolVersion::V2,
-                wire::Implementation::new("injection-test", "0"),
-            ))
-            .unwrap(),
-        );
-        assert!(
-            receive_wire(&mut client, "initialize response (id 1)")
-                .await
-                .get("result")
-                .is_some()
-        );
-        send_wire(
-            &client,
-            "session/inject",
-            2,
-            serde_json::to_value(wire::InjectSessionRequest::new(
-                session_id.clone(),
-                wire::SessionInjectMode::Steer,
-                vec![wire::ContentBlock::Text(wire::TextContent::new(
-                    "pending steer",
-                ))],
-            ))
-            .unwrap(),
-        );
-        let response = receive_wire(&mut client, "session/inject response (id 2)").await;
-        assert!(
-            response.get("result").is_some(),
-            "injection failed: {response}"
-        );
-        let receipt = timeout(Duration::from_secs(2), acceptance.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        (receipt, client, server)
+        integration: &AcpIntegration,
+        driver: &mut LoopDriver<S>,
+        handle: &AcpSessionHandle,
+        cancellation: TurnCancellation,
+    ) -> Result<FinishReason, AcpRuntimeError> {
+        let sink = ResponseReplacementSink::new(RecordingSink::default());
+        let activity = native_activity(session_id.clone(), sink.clone());
+        drive_prompt(
+            &TurnContext {
+                session_id,
+                integration,
+                handle,
+                sink: &sink,
+                activity: &activity,
+            },
+            driver,
+            TurnOptions {
+                cancellation,
+                structured: None,
+                delivery: None,
+            },
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn cancellation_before_tool_boundary_retires_turn() {
+    async fn cancellation_at_tool_boundary_retires_turn() {
         let integration = AcpIntegration::default();
         let session_id = wire::SessionId::new("boundary-cancel");
         let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
-        let generation = handle.cancellation_handle().generation();
-        let (mut driver, _) = test_driver_with_interrupt(
-            TestOutcome::ToolThenContent,
-            "boundary-cancel",
-            Some(handle.clone()),
-        )
-        .await;
-        driver
-            .submit_input(vec![Item::text(ItemKind::User, "first")])
+        let cancellation = handle.cancellation_handle().checkpoint();
+        let turns = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(Notify::new());
+        release.notify_one();
+        let tool = BlockingTool {
+            spec: ToolSpec {
+                name: ToolName::new("missing-tool"),
+                description: "complete one foreground round".into(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            },
+            entered: Arc::new(AtomicBool::new(false)),
+            release,
+        };
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::ToolThenContent,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .add_tool_source(ToolRegistry::new().with(tool))
+            .permissions(agentkit_tools_core::AllowAllPermissions)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("boundary-cancel").without_cache())
+            .await
             .unwrap();
-        assert_eq!(
-            drive_prompt(&session_id, &mut driver, &handle, generation, None)
+        driver
+            .commit_input(
+                vec![Item::text(ItemKind::User, "first")],
+                cancellation.clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            driver
+                .next_with_cancellation(cancellation.clone())
                 .await
                 .unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))
+        ));
+        handle.interrupt();
+        assert_eq!(
+            drive_test_prompt(
+                &session_id,
+                &integration,
+                &mut driver,
+                &handle,
+                cancellation
+            )
+            .await
+            .unwrap(),
             FinishReason::Cancelled
         );
         assert!(
@@ -5728,16 +5667,32 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == ItemKind::Tool)
         );
-        handle.prepare_injection_turn();
-        handle.start_injection_turn();
-        driver
-            .submit_input(vec![Item::text(ItemKind::User, "fresh")])
-            .unwrap();
-        let generation = handle.cancellation_handle().generation();
-        assert_eq!(
-            drive_prompt(&session_id, &mut driver, &handle, generation, None)
+
+        let cancellation = handle.cancellation_handle().checkpoint();
+        assert!(matches!(
+            driver
+                .next_with_cancellation(cancellation.clone())
                 .await
                 .unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+        driver
+            .commit_input(
+                vec![Item::text(ItemKind::User, "fresh")],
+                cancellation.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            drive_test_prompt(
+                &session_id,
+                &integration,
+                &mut driver,
+                &handle,
+                cancellation
+            )
+            .await
+            .unwrap(),
             FinishReason::Completed
         );
         assert!(
@@ -5752,190 +5707,48 @@ mod tests {
         );
     }
 
-    async fn assert_cancellation_preserves_committed_injection(outcome: TestOutcome) {
+    #[tokio::test]
+    async fn stop_before_dispatch_preserves_committed_prompt_without_starting_it() {
         let integration = AcpIntegration::default();
-        let session_id = wire::SessionId::new("injection-cancel");
-        let recording = RecordingSink::default();
-        let handle = bind_test_session(&integration, &session_id, recording.clone());
-        let (receipt, _client, server) = staged_injection(integration.clone(), &session_id).await;
-        let message_id = receipt.message_id().clone();
-        let sink = ResponseReplacementSink::new(recording.clone());
-        let activity = native_activity(session_id.clone(), sink.clone());
-        let observer = ResponseReplacementObserver::new(
-            integration,
-            sink,
-            session_id.clone(),
-            activity.clone(),
-        );
-        let mut driver = Agent::builder()
-            .model(TestAdapter {
-                outcome,
-                turns: Arc::new(AtomicU64::new(0)),
-                interrupt: None,
-            })
-            .observer(observer)
-            .build()
-            .unwrap()
-            .start(SessionConfig::new(SessionId::new("injection-cancel")).without_cache())
+        let session = wire::SessionId::new("committed-stop");
+        let handle = bind_test_session(&integration, &session, RecordingSink::default());
+        let (mut driver, turns) = test_driver(TestOutcome::Content, "committed-stop").await;
+        let key = wire::IdempotencyKey::new("committed-key").unwrap();
+        let request = wire::PromptRequest::new(
+            session.clone(),
+            vec![wire::ContentBlock::Text(wire::TextContent::new(
+                "committed",
+            ))],
+        )
+        .idempotency_key(key.clone());
+        let mut items = agentkit_acp::v2::content_blocks_to_items(&request.prompt).unwrap();
+        let id = identity::stamp_prompt(&mut items, &request);
+        let checkpoint = handle.cancellation_handle().checkpoint();
+        driver.commit_input(items, checkpoint.clone()).unwrap();
+        handle.interrupt();
+
+        let reason = drive_test_prompt(&session, &integration, &mut driver, &handle, checkpoint)
             .await
             .unwrap();
-        driver
-            .submit_input(vec![Item::text(ItemKind::User, "first")])
-            .unwrap();
-        let generation = handle.cancellation_handle().generation();
-        {
-            let turn = activity.execute(
-                ExecutionOrigin::Prompt,
-                drive_prompt(&session_id, &mut driver, &handle, generation, None),
-                |reason| Some(reason.clone()),
-            );
-            tokio::pin!(turn);
-            assert!(
-                futures_util::poll!(&mut turn).is_pending(),
-                "unactivated injection must hold the turn open"
-            );
-            handle.interrupt();
-            assert_eq!(
-                timeout(Duration::from_secs(2), &mut turn)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                FinishReason::Cancelled
-            );
-        }
-        let updates = recording.updates.lock().unwrap().clone();
-        assert!(
-            !updates
-                .iter()
-                .any(|update| matches!(update.update, wire::SessionUpdate::UserMessage(_)))
-        );
-        let states = updates
-            .into_iter()
-            .filter(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
-            .collect::<Vec<_>>();
-        assert_running_then_idle(&states, wire::StopReason::Cancelled);
-        recording.updates.lock().unwrap().clear();
-        receipt.activate_after_response().await.unwrap();
-        handle.prepare_injection_turn();
-        handle.start_injection_turn();
-        driver
-            .submit_input(vec![Item::text(ItemKind::User, "fresh")])
-            .unwrap();
-        let generation = handle.cancellation_handle().generation();
+        assert_eq!(reason, FinishReason::Cancelled);
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
         assert_eq!(
-            activity
-                .execute(
-                    ExecutionOrigin::Prompt,
-                    drive_prompt(&session_id, &mut driver, &handle, generation, None),
-                    |reason| Some(reason.clone())
-                )
-                .await
-                .unwrap(),
-            FinishReason::Completed
+            identity::PromptKeys::restore(&session, &driver.snapshot().transcript).get(&key),
+            Some(id)
         );
-        let updates = recording.updates.lock().unwrap().clone();
-        assert!(updates.iter().any(|update| matches!(&update.update,
-            wire::SessionUpdate::UserMessage(message) if message.message_id == message_id)));
-        let states = updates
-            .into_iter()
-            .filter(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
-            .collect::<Vec<_>>();
-        assert_running_then_idle(&states, wire::StopReason::EndTurn);
-        let transcript = driver.snapshot().transcript;
-        for expected in ["fresh", "pending steer"] {
-            assert!(transcript.iter().any(|item| {
-                item.kind == ItemKind::User
-                    && item
-                        .parts
-                        .iter()
-                        .any(|part| matches!(part, Part::Text(text) if text.text == expected))
-            }));
-        }
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn terminal_injection_waits_for_response_activation_and_delivers_input() {
-        let integration = AcpIntegration::default();
-        let session_id = wire::SessionId::new("terminal-inject");
-        let recording = RecordingSink::default();
-        let handle = bind_test_session(&integration, &session_id, recording.clone());
-        let (receipt, _client, server) = staged_injection(integration, &session_id).await;
-        let message_id = receipt.message_id().clone();
-        let (mut driver, _) = test_driver(TestOutcome::Content, "terminal-inject").await;
+        let fresh = handle.cancellation_handle().checkpoint();
+        assert!(matches!(
+            driver.next_with_cancellation(fresh.clone()).await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
         driver
-            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .commit_input(vec![Item::text(ItemKind::User, "fresh")], fresh.clone())
             .unwrap();
-        let generation = handle.cancellation_handle().generation();
-        {
-            let turn = drive_prompt(&session_id, &mut driver, &handle, generation, None);
-            tokio::pin!(turn);
-            assert!(futures_util::poll!(&mut turn).is_pending());
-            receipt.activate_after_response().await.unwrap();
-            assert_eq!(
-                timeout(Duration::from_secs(2), &mut turn)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                FinishReason::Completed
-            );
-        }
-        assert!(
-            recording
-                .updates
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|update| matches!(&update.update,
-            wire::SessionUpdate::UserMessage(message) if message.message_id == message_id))
-        );
-        assert!(driver.snapshot().transcript.iter().any(|item| {
-            item.kind == ItemKind::User
-                && item
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, Part::Text(text) if text.text == "pending steer"))
-        }));
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn cancellation_within_tool_boundary_preserves_committed_injection() {
-        assert_cancellation_preserves_committed_injection(TestOutcome::ToolThenContent).await;
-    }
-
-    #[tokio::test]
-    async fn cancellation_at_terminal_injection_boundary_preserves_committed_injection() {
-        assert_cancellation_preserves_committed_injection(TestOutcome::Content).await;
-    }
-
-    #[tokio::test]
-    async fn finish_error_stops_before_delivering_pending_steer() {
-        let integration = AcpIntegration::default();
-        let session_id = wire::SessionId::new("finish-error");
-        let recording = RecordingSink::default();
-        let handle = bind_test_session(&integration, &session_id, recording.clone());
-        let (receipt, _client, server) = staged_injection(integration, &session_id).await;
-        let (mut driver, _) = test_driver(TestOutcome::FinishError, "finish-error").await;
-        driver
-            .submit_input(vec![Item::text(ItemKind::User, "fail")])
+        let reason = drive_test_prompt(&session, &integration, &mut driver, &handle, fresh)
+            .await
             .unwrap();
-        let generation = handle.cancellation_handle().generation();
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
-        assert!(
-            matches!(result, Err(AcpRuntimeError::Loop(message)) if message == "model turn failed")
-        );
-        assert!(recording.updates.lock().unwrap().is_empty());
-        assert!(!driver.snapshot().transcript.iter().any(|item| {
-            item.parts
-                .iter()
-                .any(|part| matches!(part, Part::Text(text) if text.text == "pending steer"))
-        }));
-        drop(receipt);
-        server.abort();
-        let _ = server.await;
+        assert_eq!(reason, FinishReason::Completed);
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5950,17 +5763,23 @@ mod tests {
                 sink,
             ))
             .unwrap();
-        handle.prepare_injection_turn();
-        handle.start_injection_turn();
-        let generation = handle.cancellation_handle().generation();
+
+        let cancellation = handle.cancellation_handle().checkpoint();
         handle.interrupt();
-        assert!(handle.cancellation_handle().is_cancelled_since(generation));
+        assert!(cancellation.is_cancelled());
         let (mut driver, _) = test_driver(TestOutcome::ProviderError, "cancel-race-loop").await;
         driver
             .submit_input(vec![Item::text(ItemKind::User, "cancel")])
             .unwrap();
 
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
+        let result = drive_test_prompt(
+            &session_id,
+            &integration,
+            &mut driver,
+            &handle,
+            cancellation,
+        )
+        .await;
 
         assert_eq!(result.unwrap(), FinishReason::Cancelled);
     }
@@ -5974,8 +5793,15 @@ mod tests {
         driver
             .submit_input(vec![Item::text(ItemKind::User, "fail")])
             .unwrap();
-        let generation = handle.cancellation_handle().generation();
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
+        let cancellation = handle.cancellation_handle().checkpoint();
+        let result = drive_test_prompt(
+            &session_id,
+            &integration,
+            &mut driver,
+            &handle,
+            cancellation,
+        )
+        .await;
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
     }
 
@@ -6020,13 +5846,17 @@ mod tests {
         let busy = AtomicBool::new(false);
 
         drive_autonomous(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &busy,
             &mut driver,
-            &sink,
-            &activity,
+            None,
+            handle.cancellation_handle().checkpoint(),
         )
         .await
         .unwrap();
@@ -6077,13 +5907,17 @@ mod tests {
         let busy = AtomicBool::new(false);
 
         drive_autonomous(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &busy,
             &mut driver,
-            &sink,
-            &activity,
+            None,
+            handle.cancellation_handle().checkpoint(),
         )
         .await
         .unwrap();
@@ -6094,13 +5928,17 @@ mod tests {
         let update_count = recording.updates.lock().unwrap().len();
         for _ in 0..2 {
             drive_autonomous(
-                &session_id,
-                &integration,
-                &handle,
+                TurnContext {
+                    session_id: &session_id,
+                    integration: &integration,
+                    handle: &handle,
+                    sink: &sink,
+                    activity: &activity,
+                },
                 &busy,
                 &mut driver,
-                &sink,
-                &activity,
+                None,
+                handle.cancellation_handle().checkpoint(),
             )
             .await
             .unwrap();
@@ -6160,13 +5998,17 @@ mod tests {
         let busy = AtomicBool::new(false);
 
         let result = drive_autonomous(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &busy,
             &mut driver,
-            &sink,
-            &activity,
+            None,
+            handle.cancellation_handle().checkpoint(),
         )
         .await;
 
@@ -6234,13 +6076,17 @@ mod tests {
         let busy = AtomicBool::new(false);
 
         drive_autonomous(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &busy,
             &mut driver,
-            &sink,
-            &activity,
+            None,
+            handle.cancellation_handle().checkpoint(),
         )
         .await
         .unwrap();
@@ -6291,13 +6137,17 @@ mod tests {
             .submit_input(vec![Item::notification("work")])
             .unwrap();
         let result = drive_autonomous(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &AtomicBool::new(false),
             &mut driver,
-            &sink,
-            &activity,
+            None,
+            handle.cancellation_handle().checkpoint(),
         )
         .await;
         assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
@@ -6360,13 +6210,17 @@ mod tests {
         let busy = AtomicBool::new(false);
 
         let result = drive_autonomous(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &busy,
             &mut driver,
-            &sink,
-            &activity,
+            None,
+            handle.cancellation_handle().checkpoint(),
         )
         .await;
 
@@ -6458,6 +6312,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             id.clone(),
             SessionHandle {
+                prompt_keys: Arc::default(),
                 cwd: server.runtime.root().to_path_buf(),
                 mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
@@ -6502,20 +6357,6 @@ mod tests {
         assert!(server.session_status(request()).await.is_err());
     }
 
-    #[test]
-    fn concurrent_prompt_admission_is_rejected_until_the_turn_finishes() {
-        let busy = AtomicBool::new(false);
-
-        claim_prompt(&busy).unwrap();
-        assert!(matches!(
-            claim_prompt(&busy),
-            Err(AcpRuntimeError::Unsupported(_))
-        ));
-
-        busy.store(false, Ordering::Release);
-        claim_prompt(&busy).unwrap();
-    }
-
     #[tokio::test]
     async fn voice_state_routes_only_to_attached_session_without_work() {
         let root = tempfile::tempdir().unwrap();
@@ -6551,6 +6392,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             id.clone(),
             SessionHandle {
+                prompt_keys: Arc::default(),
                 cwd: server.runtime.root().to_path_buf(),
                 mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
@@ -6622,6 +6464,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                prompt_keys: Arc::default(),
                 cwd: server.runtime.root().to_path_buf(),
                 mcp: server.runtime.mcp_for_test().clone(),
                 activity: SessionActivity::new(|_| Ok(())),
@@ -6656,7 +6499,7 @@ mod tests {
             .await
             .expect("poison must return an error without waiting for the actor")
             .unwrap_err();
-            assert_eq!(error.code, agent_client_protocol::ErrorCode::InternalError);
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::INTERNAL_ERROR);
             assert_eq!(
                 error.data,
                 Some(json!(AcpRuntimeError::ClientClosed.to_string()))
@@ -6673,7 +6516,10 @@ mod tests {
     fn sdk_error_marks_only_missing_credentials_as_authentication_required() {
         let missing_detail = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
         let missing = sdk_error(AcpRuntimeError::Loop(missing_detail.into()));
-        assert_eq!(missing.code, agent_client_protocol::ErrorCode::AuthRequired);
+        assert_eq!(
+            missing.code,
+            agent_client_protocol::ErrorCode::AUTH_REQUIRED
+        );
         let data = missing.data.unwrap();
         let required = AuthenticationRequiredData::from_value(&data).unwrap();
         assert_eq!(required.method_id, "openrouter");
@@ -6684,7 +6530,7 @@ mod tests {
         ));
         assert_eq!(
             speakeasy.code,
-            agent_client_protocol::ErrorCode::AuthRequired
+            agent_client_protocol::ErrorCode::AUTH_REQUIRED
         );
         assert_eq!(
             AuthenticationRequiredData::from_value(speakeasy.data.as_ref().unwrap())
@@ -6722,7 +6568,7 @@ mod tests {
                 .unwrap_err();
             let data = error.data.unwrap();
 
-            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
             assert_eq!(data["methodId"], method_id);
             assert_eq!(data["detail"], expected_detail);
         }
@@ -6774,6 +6620,7 @@ mod tests {
                 completed: completion,
                 session_id,
                 session: SessionHandle {
+                    prompt_keys: Arc::default(),
                     cwd: server.runtime.root().to_path_buf(),
                     mcp: server.runtime.mcp_for_test().clone(),
                     activity: SessionActivity::new(|_| Ok(())),
@@ -6948,98 +6795,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_prompt_is_rejected_before_or_after_mailbox_wait() {
-        for initially_busy in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let registry = SessionRegistry::new();
-            let server = Arc::new(Server::new(
-                Runtime::new(root.path(), "gpt-5.4").unwrap(),
-                registry.clone(),
-            ));
-            let mut admission = registry.begin_attachment().unwrap();
-            let (publication, actor, mut received) = pending_publication(&server, "busy-prompt");
-            let busy = Arc::clone(&publication.session.busy);
-            let session_id = publication.session_id.clone();
-            server
-                .publish_session::<()>(&mut admission, publication, || Ok(()))
-                .unwrap();
-            let (sender, _, _) = server.prompt_route(&session_id).unwrap();
-            let (reply, _ack) = oneshot::channel();
-            sender.try_send(Command::Close { reply }).unwrap();
-            assert_eq!(sender.capacity(), 0);
-            busy.store(initially_busy, Ordering::Release);
-
-            let mut request =
-                Box::pin(server.prepare_prompt(wire::PromptRequest::new(session_id, Vec::new())));
-            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            if !initially_busy {
-                assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
-                assert!(!busy.load(Ordering::Acquire));
-                // Another request wins admission while this one waits for capacity.
-                claim_prompt(&busy).unwrap();
-                assert!(matches!(received.try_recv(), Ok(Command::Close { .. })));
-            }
-            assert!(matches!(
-                std::future::Future::poll(request.as_mut(), &mut context),
-                std::task::Poll::Ready(Err(AcpRuntimeError::Unsupported(message)))
-                    if message == "session is already running a prompt"
-            ));
-            drop(request);
-            assert!(busy.load(Ordering::Acquire));
-            if initially_busy {
-                // Rejection must not wait for or consume the occupied mailbox slot.
-                assert_eq!(sender.capacity(), 0);
-                assert!(matches!(received.try_recv(), Ok(Command::Close { .. })));
-            }
-            busy.store(false, Ordering::Release);
-            assert!(matches!(
-                received.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-            assert_eq!(sender.capacity(), 1);
-            actor.abort();
-            let _ = actor.await;
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_mailbox_wait_does_not_claim_prompt() {
-        let root = tempfile::tempdir().unwrap();
-        let registry = SessionRegistry::new();
-        let server = Arc::new(Server::new(
-            Runtime::new(root.path(), "gpt-5.4").unwrap(),
-            registry.clone(),
-        ));
-        let mut admission = registry.begin_attachment().unwrap();
-        let (publication, actor, mut received) = pending_publication(&server, "queued-prompt");
-        let busy = Arc::clone(&publication.session.busy);
-        let session_id = publication.session_id.clone();
-        server
-            .publish_session::<()>(&mut admission, publication, || Ok(()))
-            .unwrap();
-        let (reply, _ack) = oneshot::channel();
-        server
-            .prompt_route(&session_id)
-            .unwrap()
-            .0
-            .try_send(Command::Close { reply })
-            .unwrap();
-        assert!(
-            timeout(
-                Duration::from_millis(20),
-                server.prepare_prompt(wire::PromptRequest::new(session_id.clone(), Vec::new(),))
-            )
-            .await
-            .is_err()
-        );
-        assert!(!busy.load(Ordering::Acquire));
-        received.recv().await.unwrap();
-        assert!(claim_prompt(&busy).is_ok());
-        actor.abort();
-        let _ = actor.await;
-    }
-
-    #[tokio::test]
     async fn explicit_close_and_reset_join_acknowledgement_and_actor_exit() {
         for outcome in ["ok", "checkpoint", "error", "delivery", "missing_ack"] {
             for (cancel_request, reset_after_exit) in
@@ -7139,6 +6894,7 @@ mod tests {
                 server.sessions.lock().unwrap().insert(
                     id.clone(),
                     SessionHandle {
+                        prompt_keys: Arc::default(),
                         activity: SessionActivity::new(|_| Ok(())),
                         cwd: server.runtime.root().to_path_buf(),
                         mcp: server.runtime.mcp_for_test().clone(),
@@ -7298,6 +7054,7 @@ mod tests {
                     completed: completion,
                     session_id: published_session_id,
                     session: SessionHandle {
+                        prompt_keys: Arc::default(),
                         cwd: publisher_server.runtime.root().to_path_buf(),
                         mcp: publisher_server.runtime.mcp_for_test().clone(),
                         activity: SessionActivity::new(|_| Ok(())),
@@ -7920,68 +7677,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_router_advertises_and_routes_pending_injection_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = Runtime::new_with_provider_and_credentials(
-            root.path(),
-            "gpt-5.4",
-            crate::ProviderKind::OpenAiSubscription,
-            crate::credentials::CredentialStorage::Memory,
-        )
-        .unwrap();
-        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
-        let router = v2_router(runtime, SessionRegistry::new());
-        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
-        let client =
-            agent_client_protocol::Client
-                .v2()
-                .connect_with(client_transport, async move |cx| {
-                    let initialized = cx
-                        .send_request(wire::InitializeRequest::new(
-                            wire::ProtocolVersion::V2,
-                            wire::Implementation::new("replacement-test", "0"),
-                        ))
-                        .block_task()
-                        .await?;
-                    let pending = initialized
-                        .capabilities
-                        .session
-                        .expect("session capabilities")
-                        .inject
-                        .expect("injection capabilities")
-                        .pending
-                        .expect("pending injection capabilities");
-                    assert_eq!(pending.replace, Some(true));
-
-                    // A domain error, rather than method-not-found, proves that Kit's
-                    // production router forwards replacement requests to AgentKit.
-                    let error = cx
-                        .send_request(wire::ReplaceInjectSessionRequest::new(
-                            "missing-session",
-                            "pending-message",
-                            vec![wire::ContentBlock::Text(wire::TextContent::new(
-                                "replacement",
-                            ))],
-                        ))
-                        .block_task()
-                        .await
-                        .expect_err("replacement must reject an unknown session");
-                    assert_eq!(
-                        i32::from(error.code),
-                        i32::from(wire::Error::resource_not_found().code)
-                    );
-                    assert_eq!(error.data, Some(json!({ "sessionId": "missing-session" })));
-                    Ok(())
-                });
-        let result = timeout(Duration::from_secs(2), client).await;
-        server.abort();
-        let _ = server.await;
-        result
-            .expect("replacement client timed out")
-            .expect("replacement client failed");
-    }
-
-    #[tokio::test]
     async fn v2_request_cwd_isolates_durable_sessions_and_preserves_selection() {
         let root = tempfile::tempdir().unwrap();
         let workspace_b = tempfile::tempdir().unwrap();
@@ -8410,7 +8105,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn initialize_negotiates_v2_and_advertises_injection_and_authentication() {
+    fn initialize_negotiates_v2_and_advertises_delivery_and_authentication() {
         let root = tempfile::tempdir().unwrap();
         let credentials = tempfile::tempdir().unwrap();
         let mut runtime = Runtime::new_with_provider_and_credentials(
@@ -8550,7 +8245,8 @@ for line in sys.stdin:
         assert_eq!(update["method"], "_kit/session/update_mcp");
         assert_eq!(update["upsert"], true);
         assert!(update.get("replacement").is_none());
-        assert!(session.inject.is_some());
+        let delivery = session.prompt.unwrap().delivery.unwrap();
+        assert!(delivery.steer.is_some() && delivery.queue.is_some());
         assert!(session.delete.is_some());
         assert!(session.fork.is_some());
     }
@@ -8566,7 +8262,14 @@ for line in sys.stdin:
             Item::text(ItemKind::Assistant, "retained answer"),
         ];
         identity::stamp_user(&mut transcript[..1]);
-        let cursor_id = identity::stamp_user(&mut transcript[1..2]);
+        let keyed = wire::PromptRequest::new(
+            session_id.clone(),
+            vec![wire::ContentBlock::Text(wire::TextContent::new(
+                "retained question",
+            ))],
+        )
+        .idempotency_key(wire::IdempotencyKey::new("resume-retry").unwrap());
+        let cursor_id = identity::stamp_prompt(&mut transcript[1..2], &keyed);
         let Part::Text(answer) = &mut transcript[2].parts[0] else {
             unreachable!("assistant fixture is text");
         };
@@ -8648,12 +8351,26 @@ for line in sys.stdin:
                     .block_task()
                     .await?;
                 for expected in expected {
-                    assert_eq!(received.recv().await.unwrap(), expected);
+                    let update = received.recv().await.unwrap();
+                    assert_eq!(update, expected);
+                    assert!(
+                        !serde_json::to_string(&update)
+                            .unwrap()
+                            .contains("resume-retry")
+                    );
                 }
+                let retry = connection.send_request(keyed).block_task().await?;
+                assert_eq!(retry.message_id, cursor_id);
                 connection
                     .send_request(wire::CloseSessionRequest::new(session_id))
                     .block_task()
                     .await?;
+                while let Ok(update) = received.try_recv() {
+                    assert!(!matches!(
+                        update.update,
+                        wire::SessionUpdate::UserMessage(_)
+                    ));
+                }
                 Ok(())
             });
         let result = timeout(Duration::from_secs(30), client).await;
@@ -8770,6 +8487,48 @@ for line in sys.stdin:
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn keyed_prompt_restores_from_transcript_without_exposing_its_key() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let id = crate::session::new_id();
+        let session = wire::SessionId::new(id.clone());
+        let fork = wire::SessionId::new(crate::session::new_id());
+        let key = wire::IdempotencyKey::new("private retry key").unwrap();
+        let request = wire::PromptRequest::new(
+            session.clone(),
+            vec![wire::ContentBlock::Text(wire::TextContent::new("question"))],
+        )
+        .idempotency_key(key.clone());
+        let mut items = agentkit_acp::v2::content_blocks_to_items(&request.prompt).unwrap();
+        let message_id = identity::stamp_prompt(&mut items, &request);
+        // Pre-upgrade history has no private key metadata and still replays.
+        items.insert(0, Item::text(ItemKind::User, "legacy question"));
+        drop(crate::session::open(&workspace, &id, false, false, items).unwrap());
+        let reopened = crate::session::open(&workspace, &id, true, false, Vec::new()).unwrap();
+        let items = reopened.transcript;
+
+        assert_eq!(
+            identity::restored_prompt_keys(&session, &items).collect::<Vec<_>>(),
+            vec![(key.clone(), message_id.clone())],
+        );
+        assert!(
+            identity::restored_prompt_keys(&fork, &items)
+                .next()
+                .is_none()
+        );
+        let replay = transcript_replay(&session, &items);
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.update,
+            wire::SessionUpdate::UserMessage(message) if message.message_id == message_id
+        )));
+        assert!(
+            !serde_json::to_string(&replay)
+                .unwrap()
+                .contains(key.as_str())
         );
     }
 
@@ -9061,16 +8820,15 @@ for line in sys.stdin:
                 .start(SessionConfig::new(loop_id).without_cache())
                 .await
                 .unwrap();
-            handle.prepare_injection_turn();
-            handle.start_injection_turn();
-            let generation = handle.cancellation_handle().generation();
+
+            let cancellation = handle.cancellation_handle().checkpoint();
             let compacted = compact_for_switch(
                 &session_id,
                 &integration,
                 &handle,
                 &mut driver,
                 &sink,
-                generation,
+                cancellation,
                 &activity,
             )
             .await;
@@ -9285,7 +9043,7 @@ for line in sys.stdin:
         assert!(crate::protocols::acp::session_pagination::Cursor::parse("offset:nope").is_err());
         assert_eq!(
             list_sessions_error(ListSessionsError::InvalidCursor).code,
-            agent_client_protocol::ErrorCode::InvalidParams
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
         );
     }
 

@@ -90,22 +90,25 @@ final class ACPProtocolTests: XCTestCase {
         XCTAssertEqual(ACPClient.protocolVersion, 2)
     }
 
-    func testInjectionCapabilitiesAndWireModelsUseSteeringMode() throws {
-        let initialized = try JSONDecoder().decode(ACPInitializeResponse.self, from: Data(#"{"protocolVersion":2,"info":{"name":"kit","version":"1"},"capabilities":{"session":{"inject":{"modes":["steer"],"steerInStream":["finish"]}}}}"#.utf8))
-        XCTAssertEqual(initialized.capabilities?.session?.inject?.modes, ["steer"])
-        XCTAssertEqual(initialized.capabilities?.session?.inject?.steerInStream, ["finish"])
+    func testPromptDeliveryCapabilitiesAndWireModels() throws {
+        let initialized = try JSONDecoder().decode(ACPInitializeResponse.self, from: Data(#"{"protocolVersion":2,"info":{"name":"kit","version":"1"},"capabilities":{"session":{"prompt":{"delivery":{"steer":{}}}}}}"#.utf8))
+        XCTAssertNotNil(initialized.capabilities?.session?.prompt?.delivery?.steer)
+        XCTAssertNil(initialized.capabilities?.session?.prompt?.delivery?.queue)
 
-        let request = ACPInjectSessionRequest(
-            sessionId: "s-1", mode: "steer",
-            content: [.object(["type": .string("text"), "text": .string("next")])]
+        var request = ACPPromptRequest(
+            sessionId: "s-1", prompt: [.object(["type": .string("text"), "text": .string("next")])], delivery: .steer
         )
         let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
         XCTAssertEqual(encoded["sessionId"] as? String, "s-1")
-        XCTAssertEqual(encoded["mode"] as? String, "steer")
-        XCTAssertEqual((encoded["content"] as? [[String: Any]])?.first?["text"] as? String, "next")
+        XCTAssertEqual(encoded["delivery"] as? String, "steer")
+        XCTAssertEqual((encoded["prompt"] as? [[String: Any]])?.first?["text"] as? String, "next")
+        request.delivery = nil
+        let ordinary = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+        XCTAssertNil(ordinary["delivery"])
 
-        let response = try JSONDecoder().decode(ACPInjectSessionResponse.self, from: Data(#"{"messageId":"queued-1"}"#.utf8))
-        XCTAssertEqual(response.messageId, "queued-1")
+        let response = try JSONDecoder().decode(ACPPromptResponse.self, from: Data(#"{"messageId":"inserted-1"}"#.utf8))
+        XCTAssertEqual(response.messageId, "inserted-1")
+        XCTAssertThrowsError(try JSONDecoder().decode(ACPPromptResponse.self, from: Data("{}".utf8)))
     }
 
     func testLimitsOnlyOversizedMediaPayloadAndPreservesTypedMetadata() {

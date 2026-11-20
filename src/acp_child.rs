@@ -486,6 +486,7 @@ impl ChildConfig {
 pub(crate) enum ChildError {
     Cancelled,
     Failed(String),
+    DeliveryUnknown(String),
     TerminalCancelled,
     TerminalFailed(String),
 }
@@ -493,7 +494,7 @@ impl std::fmt::Display for ChildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled | Self::TerminalCancelled => f.write_str("nested agent cancelled"),
-            Self::Failed(e) | Self::TerminalFailed(e) => f.write_str(e),
+            Self::Failed(e) | Self::DeliveryUnknown(e) | Self::TerminalFailed(e) => f.write_str(e),
         }
     }
 }
@@ -504,7 +505,7 @@ pub(crate) fn subagent_usage(owner: &str, update: &Value) -> Option<crate::event
     if owner.is_empty() || update["sessionUpdate"] != "usage_update" {
         return None;
     }
-    let usage: agent_client_protocol::schema::v2::UsageUpdate =
+    let usage: agent_client_protocol::v2::schema::UsageUpdate =
         serde_json::from_value(update.clone()).ok()?;
     Some(crate::events::RuntimeEvent::SubagentUsage {
         id: owner.to_owned(),
@@ -916,8 +917,8 @@ impl ChildOutput {
         self.updates.push(value);
     }
 
-    fn record_message(&mut self, update: agent_client_protocol::schema::v2::SessionUpdate) {
-        use agent_client_protocol::schema::{MaybeUndefined, v2};
+    fn record_message(&mut self, update: agent_client_protocol::v2::schema::SessionUpdate) {
+        use agent_client_protocol::{schema::MaybeUndefined, v2::schema as v2};
         match &update {
             v2::SessionUpdate::AgentMessage(message) => {
                 if !matches!(message.content, MaybeUndefined::Undefined) {
@@ -960,9 +961,9 @@ impl ChildOutput {
     fn capture_message_block(
         &mut self,
         id: &str,
-        block: &agent_client_protocol::schema::v2::ContentBlock,
+        block: &agent_client_protocol::v2::schema::ContentBlock,
     ) {
-        use agent_client_protocol::schema::v2;
+        use agent_client_protocol::v2::schema as v2;
         if matches!(block, v2::ContentBlock::Text(_)) {
             return;
         }
@@ -1450,9 +1451,9 @@ fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
 /// contain secrets. Only bounded, control-free method identifiers are included.
 fn child_auth_required(
     error: &agent_client_protocol::Error,
-    methods: &[agent_client_protocol::schema::v1::AuthMethod],
+    methods: &[agent_client_protocol::v1::schema::AuthMethod],
 ) -> Option<String> {
-    if error.code != agent_client_protocol::ErrorCode::AuthRequired {
+    if error.code != agent_client_protocol::ErrorCode::AUTH_REQUIRED {
         return None;
     }
     let mut ids = BTreeSet::new();
@@ -1490,7 +1491,7 @@ fn child_auth_required(
 
 fn child_request_error(
     error: agent_client_protocol::Error,
-    methods: &[agent_client_protocol::schema::v1::AuthMethod],
+    methods: &[agent_client_protocol::v1::schema::AuthMethod],
 ) -> String {
     child_auth_required(&error, methods).unwrap_or_else(|| error.to_string())
 }
@@ -1784,7 +1785,7 @@ async fn run(
                 match request {
                     Request::Steer(steer) => {
                         // Routes are installed/removed only by prompt tasks. Read under
-                        // their lock, then release it before any protocol I/O. Injection
+                        // their lock, then release it before any protocol I/O. Steering
                         // never owns or changes the foreground output, gate, or idle state.
                         let (request, submitted) = {
                             let routes = match routes.lock() {
@@ -1796,7 +1797,7 @@ async fn run(
                             };
                             let route = routes.get(&steer.session_id);
                             let rejection = if !supports_steer {
-                                Some("ACP harness does not advertise v2 steer injection")
+                                Some("ACP harness does not advertise v2 prompt steering")
                             } else if route.is_none() {
                                 Some("subagent has no active prompt to steer")
                             } else if route.is_some_and(|route| steer.generation.is_some_and(|generation| generation != route.generation)) {
@@ -1816,8 +1817,13 @@ async fn run(
                         tasks.spawn(async move {
                             let result = match request {
                                 Ok(request) => match tokio::time::timeout(CANCEL_SETTLE, request).await {
-                                    Ok(result) => result.map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods))),
-                                    Err(_) => Err(ChildError::Failed("steer acknowledgement timed out; delivery is unknown".into())),
+                                    Ok(result) => result.map_err(|error| {
+                                        let unknown = agent_client_protocol::is_connection_terminated(&error)
+                                            || agent_client_protocol::is_incoming_transport_closed(&error);
+                                        let detail = child_request_error(error, &auth_methods);
+                                        if unknown { ChildError::DeliveryUnknown(detail) } else { ChildError::Failed(detail) }
+                                    }),
+                                    Err(_) => Err(ChildError::DeliveryUnknown("steer insertion response timed out; delivery is unknown".into())),
                                 },
                                 Err(error) => Err(ChildError::Failed(child_request_error(error, &auth_methods))),
                             };
@@ -4146,7 +4152,7 @@ for line in sys.stdin:
             .await
             .unwrap()
         }
-        pub(super) async fn wait_request(root: &tempfile::TempDir, method: &str) {
+        pub(super) async fn wait_prompt(root: &tempfile::TempDir, delivery: Option<&str>) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let log =
@@ -4154,7 +4160,10 @@ for line in sys.stdin:
                     if log
                         .lines()
                         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                        .any(|request| request["method"] == method)
+                        .any(|request| {
+                            request["method"] == "session/prompt"
+                                && request["delivery"].as_str() == delivery
+                        })
                     {
                         break;
                     }
@@ -4185,7 +4194,7 @@ for line in sys.stdin:
             let event = inspection_event("child", 9, update).unwrap();
             let update = event;
             assert!(
-                serde_json::from_value::<agent_client_protocol::schema::v2::SessionUpdate>(
+                serde_json::from_value::<agent_client_protocol::v2::schema::SessionUpdate>(
                     update.clone()
                 )
                 .is_ok()
@@ -4214,7 +4223,7 @@ for line in sys.stdin:
             let event = inspection_event("child", 3, update.clone()).unwrap();
             let normalized = event;
             assert!(
-                serde_json::from_value::<agent_client_protocol::schema::v2::SessionUpdate>(
+                serde_json::from_value::<agent_client_protocol::v2::schema::SessionUpdate>(
                     normalized
                 )
                 .is_ok()
@@ -4247,7 +4256,7 @@ for line in sys.stdin:
                 )
                 .await
         });
-        steering_test_support::wait_request(&root, "session/prompt").await;
+        steering_test_support::wait_prompt(&root, None).await;
         assert!(
             base.steer_generation("stale instruction".into(), Some(6))
                 .await
@@ -4258,9 +4267,9 @@ for line in sys.stdin:
                 .await
                 .is_err()
         );
-        assert!(base.steer("MOCK_REJECT_INJECT".into()).await.is_err());
+        assert!(base.steer("MOCK_REJECT_STEER".into()).await.is_err());
         let auth_error = base
-            .steer("MOCK_AUTH_INJECT".into())
+            .steer("MOCK_AUTH_STEER".into())
             .await
             .unwrap_err()
             .to_string();
@@ -4285,7 +4294,7 @@ for line in sys.stdin:
             .steer_generation("change direction".into(), Some(7))
             .await
             .unwrap();
-        assert_eq!(receipt["messageId"], "injected-1");
+        assert_eq!(receipt["messageId"], "steered-1");
         assert!(
             !turn.is_finished(),
             "acceptance must not finish the original prompt"
@@ -4321,17 +4330,18 @@ for line in sys.stdin:
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let injections: Vec<_> = requests
-            .iter()
-            .filter(|r| r["method"] == "session/inject")
-            .collect();
-        assert_eq!(injections.len(), 3);
-        assert!(injections.iter().all(|r| r["mode"] == "steer"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "session/prompt" && r["delivery"] == "steer")
+                .count(),
+            3
+        );
         assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
         assert_eq!(
             requests
                 .iter()
-                .filter(|r| r["method"] == "session/prompt")
+                .filter(|r| r["method"] == "session/prompt" && r["delivery"].is_null())
                 .count(),
             2
         );
@@ -4345,7 +4355,7 @@ for line in sys.stdin:
             let base = steering_test_support::start(
                 &root,
                 vec![format!(
-                    "--inject-ack-release={}",
+                    "--steer-ack-release={}",
                     root.path().join("ack").display()
                 )],
             )
@@ -4360,10 +4370,10 @@ for line in sys.stdin:
                     )
                     .await
             });
-            steering_test_support::wait_request(&root, "session/prompt").await;
+            steering_test_support::wait_prompt(&root, None).await;
             let child = base.clone();
             let steer = tokio::spawn(async move { child.steer("redirect".into()).await });
-            steering_test_support::wait_request(&root, "session/inject").await;
+            steering_test_support::wait_prompt(&root, Some("steer")).await;
             if drop_caller {
                 steer.abort();
                 assert!(steer.await.unwrap_err().is_cancelled());
@@ -4373,11 +4383,14 @@ for line in sys.stdin:
                     .unwrap()
                     .unwrap()
                     .unwrap_err();
-                assert!(error.to_string().contains("delivery is unknown"), "{error}");
+                assert!(
+                    matches!(error, ChildError::DeliveryUnknown(ref detail) if detail.contains("delivery is unknown")),
+                    "{error}"
+                );
             }
             assert!(!turn.is_finished());
             assert!(base.serial.try_lock().is_err());
-            // The original turn can settle while its injection acknowledgement is held.
+            // The original turn can settle while its steering acknowledgement is held.
             std::fs::write(root.path().join("release"), b"release").unwrap();
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(5), turn)
@@ -4406,11 +4419,14 @@ for line in sys.stdin:
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
-            assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
+            assert!(!requests.iter().any(|r| matches!(
+                r["method"].as_str(),
+                Some("session/cancel" | "$/cancel_request")
+            )));
             assert_eq!(
                 requests
                     .iter()
-                    .filter(|r| r["method"] == "session/prompt")
+                    .filter(|r| r["method"] == "session/prompt" && r["delivery"].is_null())
                     .count(),
                 2
             );

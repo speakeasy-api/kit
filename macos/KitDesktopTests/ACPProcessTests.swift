@@ -147,52 +147,7 @@ final class ACPProcessTests: XCTestCase {
     }
 
     @MainActor
-    func testSteeringQueuesPendingMessageUntilDeliveredAndRestoresRejectedDraft() async throws {
-        let release = temporaryDirectory().appendingPathComponent("release-injection")
-        let client = makeClient(
-            promptTimeout: 2, fixtureArguments: ["--models", "--steer", "--inject-release=" + release.path]
-        )
-        let controller = ConversationController(
-            conversation: Conversation(workspaceID: UUID()), workspacePath: repositoryRoot.path, client: client
-        )
-        controller.start()
-        try await waitUntil { controller.isReady }
-
-        controller.draft = "MOCK_HANG"
-        controller.send()
-        try await waitUntil { controller.canSteer }
-
-        controller.draft = "change direction"
-        controller.send()
-        try await waitUntil { controller.pendingSteers.count == 1 }
-        XCTAssertEqual(controller.pendingSteers.first?.summary, "change direction")
-        XCTAssertTrue(controller.draft.isEmpty)
-        XCTAssertFalse(controller.entries.contains { $0.role == .user && $0.text == "change direction" })
-
-        controller.draft = "then add tests"
-        controller.send()
-        try await waitUntil { controller.pendingSteers.count == 2 }
-        XCTAssertEqual(controller.pendingSteers.map(\.summary), ["change direction", "then add tests"])
-
-        try Data().write(to: release)
-        try await waitUntil {
-            controller.pendingSteers.isEmpty
-                && controller.entries.contains { $0.role == .user && $0.text == "change direction" }
-                && controller.entries.contains { $0.role == .user && $0.text == "then add tests" }
-        }
-
-        controller.draft = "MOCK_REJECT_INJECT"
-        controller.send()
-        try await waitUntil { controller.status.contains("injection rejected") }
-        XCTAssertEqual(controller.draft, "MOCK_REJECT_INJECT")
-
-        let closed = expectation(description: "closed")
-        controller.close { closed.fulfill() }
-        await fulfillment(of: [closed], timeout: 4)
-    }
-
-    @MainActor
-    func testRejectedPromptRestoresComposerAndRemovesOptimisticTranscript() throws {
+    func testRejectedPromptRestoresComposerWithoutAddingUserMessage() throws {
         let client = makeClient(promptTimeout: 2)
         let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: repositoryRoot.path, client: client)
         let ready = expectation(description: "ready")
@@ -380,47 +335,6 @@ final class ACPProcessTests: XCTestCase {
     }
 
     @MainActor
-    func testAttachmentOnlyEchoAppearsOnceAndExplicitEmptyReplacementWins() throws {
-        let client = makeClient(promptTimeout: 2)
-        let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: repositoryRoot.path, client: client)
-        let ready = expectation(description: "ready"); controller.onSessionReady = { _, _ in ready.fulfill() }
-        controller.start(); wait(for: [ready], timeout: 3)
-
-        let imageURL = temporaryDirectory().appendingPathComponent("echo.png"); try Data([1]).write(to: imageURL)
-        controller.attachments = [Attachment(url: imageURL, kind: .image, mimeType: "image/png", size: 1)]
-        let attachmentFinished = expectation(description: "attachment finished")
-        controller.onTurnFinished = { _ in attachmentFinished.fulfill() }
-        controller.send(); wait(for: [attachmentFinished], timeout: 3)
-        let attachmentUsers = controller.entries.filter { $0.role == .user }
-        XCTAssertEqual(attachmentUsers.count, 1)
-        XCTAssertEqual(attachmentUsers[0].presentation?.userMessage?.media.count, 1)
-
-        let replacementFinished = expectation(description: "replacement finished")
-        controller.onTurnFinished = { _ in replacementFinished.fulfill() }
-        controller.draft = "MOCK_EMPTY_REPLACEMENT"
-        controller.send(); wait(for: [replacementFinished], timeout: 3)
-        let replacement = try XCTUnwrap(controller.entries.last(where: { $0.role == .user }))
-        XCTAssertEqual(replacement.text, "")
-        XCTAssertEqual(replacement.contentBlocks, [])
-        XCTAssertEqual(replacement.presentation?.userMessage?.media, [])
-
-        let nullFinished = expectation(description: "null finished")
-        controller.onTurnFinished = { _ in nullFinished.fulfill() }
-        controller.draft = "MOCK_NULL_REPLACEMENT"
-        controller.send(); wait(for: [nullFinished], timeout: 3)
-        let nullReplacement = try XCTUnwrap(controller.entries.last(where: { $0.role == .user }))
-        XCTAssertEqual(nullReplacement.text, "")
-        XCTAssertEqual(nullReplacement.contentBlocks, [])
-
-        let omittedFinished = expectation(description: "omitted finished")
-        controller.onTurnFinished = { _ in omittedFinished.fulfill() }
-        controller.draft = "MOCK_OMITTED_REPLACEMENT"
-        controller.send(); wait(for: [omittedFinished], timeout: 3)
-        XCTAssertEqual(controller.entries.last(where: { $0.role == .user })?.text, "MOCK_OMITTED_REPLACEMENT")
-        let closed = expectation(description: "closed"); controller.close { closed.fulfill() }; wait(for: [closed], timeout: 3)
-    }
-
-    @MainActor
     func testBackgroundFlagRecomputesWhenRawInputArrivesAndClears() {
         let client = makeClient(promptTimeout: 2)
         let controller = ConversationController(conversation: Conversation(workspaceID: UUID()), workspacePath: repositoryRoot.path, client: client)
@@ -533,7 +447,7 @@ final class ACPProcessTests: XCTestCase {
         }
         wait(for: [ready], timeout: 3)
         let promptSent = expectation(description: "prompt sent")
-        client.prompt(text: "keep running", attachments: [], onSent: { promptSent.fulfill() }) { _ in }
+        client.prompt(text: "keep running", attachments: [], onSent: { _ in promptSent.fulfill() }) { _ in }
         wait(for: [promptSent], timeout: 1)
 
         let started = Date()

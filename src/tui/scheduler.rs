@@ -721,17 +721,10 @@ mod tests {
         let mut voice = NativeVoice::default();
         voice.handoff = Some(VoiceHandoff {
             id: "task".into(),
-            accepted: false,
-            user_message_id: None,
-            text: String::new(),
-            message_id: String::new(),
+            ..Default::default()
         });
         let (sender, mut completed) = mpsc::channel(16);
         let updates = [
-            Update::VoicePromptAccepted {
-                id: "task".into(),
-                result: Ok(()),
-            },
             Update::UserMessage {
                 id: "user".into(),
                 text: "question".into(),
@@ -752,6 +745,10 @@ mod tests {
                 id: "answer".into(),
                 text: " answer".into(),
                 append: true,
+            },
+            Update::VoicePromptAccepted {
+                id: "task".into(),
+                result: Ok("user".into()),
             },
         ];
         for update in updates {
@@ -787,7 +784,7 @@ mod tests {
         }
         assert!(dirty);
         let handoff = voice.handoff.as_ref().unwrap();
-        assert!(handoff.accepted);
+        assert_eq!(handoff.accepted_message_id.as_deref(), Some("user"));
         assert_eq!(handoff.user_message_id.as_deref(), Some("user"));
         assert_eq!(handoff.text, "new answer");
         assert!(matches!(app.blocks.last(), Some(Block::Agent(text)) if text == "new answer"));

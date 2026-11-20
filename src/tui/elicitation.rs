@@ -1,5 +1,5 @@
 //! Bounded, local-only ACP forms. No answer is sent before the review page.
-use agent_client_protocol::schema::v2 as wire;
+use agent_client_protocol::v2::schema as wire;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -1045,7 +1045,10 @@ mod tests {
     use super::*;
     use serde_json::json;
     fn form(properties: Value, required: Value) -> Result<Form, String> {
-        Form::new(serde_json::from_value(json!({"mode":"form", "scope":"session", "sessionId":"test", "message":"Please answer", "requestedSchema":{"type":"object", "properties":properties, "required":required}})).unwrap())
+        // Validate the original wire JSON, just as elicitation ingress does.
+        Form::from_value(
+            json!({"mode":"form", "scope":"session", "sessionId":"test", "message":"Please answer", "requestedSchema":{"type":"object", "properties":properties, "required":required}}),
+        )
     }
     fn press(form: &mut Form, code: KeyCode) -> Option<wire::CreateElicitationResponse> {
         form.key(KeyEvent::new(code, KeyModifiers::NONE))

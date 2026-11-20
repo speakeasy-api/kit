@@ -1,8 +1,8 @@
 //! Stdio relay for the SDK's ACP v2 HTTP transport.
 use super::object;
-use agent_client_protocol::schema::v1::RequestId;
+use agent_client_protocol::RawJsonRpcId as RequestId;
 #[cfg(test)]
-use agent_client_protocol::schema::v1::Response;
+use agent_client_protocol::RawJsonRpcResponse as Response;
 use agent_client_protocol::{BoundedChannel, ChargedFrame, RawJsonRpcMessage, TransportFrame};
 use agent_client_protocol_http::{
     BoundedHttpClient, HttpClient as AcpHttpClient, HttpClientLimits,
@@ -93,16 +93,8 @@ fn rewrite(
         request.params = agent_client_protocol::RawJsonRpcParams::from_value(params)?;
         Ok(())
     }
-    match frame {
-        TransportFrame::Single(value) => message(value, root, session, initial, resumed)?,
-        TransportFrame::Batch(batch) => {
-            for entry in batch.entries_mut() {
-                if let agent_client_protocol::TransportBatchEntry::Message(value) = entry {
-                    message(value, root, session, initial, resumed)?;
-                }
-            }
-        }
-        TransportFrame::Malformed { .. } => {}
+    if let TransportFrame::Single(value) = frame {
+        message(value, root, session, initial, resumed)?;
     }
     Ok(())
 }
@@ -128,16 +120,8 @@ fn restore_new_response(frame: &mut TransportFrame, resumed: &mut Option<(Reques
             }
         }
     }
-    match frame {
-        TransportFrame::Single(value) => message(value, resumed),
-        TransportFrame::Batch(batch) => {
-            for entry in batch.entries_mut() {
-                if let agent_client_protocol::TransportBatchEntry::Message(value) = entry {
-                    message(value, resumed);
-                }
-            }
-        }
-        TransportFrame::Malformed { .. } => {}
+    if let TransportFrame::Single(value) = frame {
+        message(value, resumed);
     }
 }
 
@@ -267,10 +251,8 @@ pub(super) async fn list(remote: super::Remote) -> Result<(), Box<dyn std::error
 }
 
 fn initialize_params() -> Result<Value, serde_json::Error> {
-    use agent_client_protocol::schema::{
-        ProtocolVersion,
-        v2::{Implementation, InitializeRequest},
-    };
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::v2::schema::{Implementation, InitializeRequest};
     serde_json::to_value(InitializeRequest::new(
         ProtocolVersion::V2,
         Implementation::new("kit-gateway", env!("CARGO_PKG_VERSION")),

@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn upstream_types_preserve_association_patches_and_directed_messages() {
-        use agent_client_protocol::schema::v1::{SessionUpdate, SubagentUpdate};
+        use agent_client_protocol::v1::schema::{SessionUpdate, SubagentUpdate};
         let association =
             serde_json::to_value(SessionUpdate::SubagentUpdate(SubagentUpdate::new("child")))
                 .unwrap();

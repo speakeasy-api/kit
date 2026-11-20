@@ -1407,6 +1407,15 @@ impl SdkClient {
         .expect("session did not become idle");
     }
 
+    async fn fence_prompt_admission(&mut self, session: &str) {
+        // Same-connection POSTs and child dispatch are ordered. Status can
+        // respond while inference is blocked, unlike the held prompt itself.
+        let status = self
+            .request(100, "kit/session/status", json!({"sessionId":session}))
+            .await;
+        assert_eq!(status["result"]["foregroundActive"], true, "{status}");
+    }
+
     async fn start_prompt(&mut self, request: u64, session: &str, text: &str) {
         self.updates.clear();
         let response = self
@@ -1507,9 +1516,13 @@ async fn sdk_steering_delivers_then_accepts_subsequent_prompt() {
     let id = created["result"]["sessionId"].as_str().unwrap();
     client.start_prompt(3, id, "First instruction").await;
     let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
-    let steer = client.request(4, "session/inject", json!({"sessionId":id,"mode":"steer","content":[{"type":"text","text":"Use the steered instruction"}]})).await;
-    assert!(steer.get("error").is_none(), "{steer}");
+    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":id,"delivery":"steer","prompt":[{"type":"text","text":"Use the steered instruction"}]}})));
+    client.fence_prompt_admission(id).await;
     release.send("Initial answer").unwrap();
+    let steer = client.response(4).await;
+    let message_id = steer["result"]["messageId"]
+        .as_str()
+        .expect("insertion receipt");
     let (body, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
     assert!(
         body["messages"]
@@ -1520,6 +1533,24 @@ async fn sdk_steering_delivers_then_accepts_subsequent_prompt() {
     release.send("Steered answer").unwrap();
     client.wait_idle().await;
     assert_replayed_answer(&client.updates, "Initial answerSteered answer");
+    let mut active = false;
+    let mut found_steer = false;
+    for update in &client.updates {
+        if update["sessionUpdate"] == "state_update" {
+            if update["state"] == "running" {
+                active = true;
+            } else if active && update["state"] == "idle" {
+                assert!(
+                    found_steer,
+                    "the original turn became idle before the steer was inserted"
+                );
+                break;
+            }
+        }
+        found_steer |=
+            update["sessionUpdate"] == "user_message" && update["messageId"] == message_id;
+    }
+    assert!(found_steer, "steer receipt has no matching user_message");
     client.start_prompt(5, id, "Next independent prompt").await;
     let (body, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
     assert!(
@@ -1625,10 +1656,10 @@ async fn sdk_transport_loss_preserves_running_prompt_and_replays() {
         )
         .await;
     assert!(response.get("error").is_none(), "{response}");
-    assert_replayed_answer(&resumed.updates, "Completed after HTTP transport loss");
-    // Durable output can precede the actor's terminal state. Resume preserves
-    // that still-running work; wait for its lifecycle boundary before prompting.
+    // Durable output can precede delivery of the final chunk to the resident
+    // gateway actor. A resume may therefore receive it live rather than replay.
     resumed.wait_idle().await;
+    assert_replayed_answer(&resumed.updates, "Completed after HTTP transport loss");
     resumed
         .start_prompt(3, id, "Healthy after transport loss")
         .await;
@@ -1642,57 +1673,218 @@ async fn sdk_transport_loss_preserves_running_prompt_and_replays() {
 }
 
 #[tokio::test]
-async fn sdk_revoke_injection_requires_current_controller() {
+async fn sdk_keyed_steering_reuses_the_inserted_id_after_gateway_restart() {
+    const CORRECTION: &str = "Apply this keyed correction once";
     let (fixture, mut requests, provider) = controlled_provider().await;
     let (mut gateway, url) = fixture.gateway().await;
-    let mut old = SdkClient::connect(&url).await;
-    let created = old
+    let mut client = SdkClient::connect(&url).await;
+    let created = client
         .request(2, "session/new", json!({"cwd":fixture.root}))
         .await;
-    let id = created["result"]["sessionId"].as_str().unwrap();
-    old.start_prompt(3, id, "Run while a steer is pending")
-        .await;
+    let id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    client.start_prompt(3, &id, "Original work").await;
     let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
-    let injected = old.request(4, "session/inject", json!({"sessionId":id,"mode":"steer","content":[{"type":"text","text":"Revoked instruction must not reach inference"}]})).await;
-    assert!(injected.get("error").is_none(), "{injected}");
-    let message_id = injected["result"]["messageId"].as_str().unwrap();
-    let mut current = SdkClient::connect(&url).await;
-    let resumed = current
+    let params = json!({"sessionId":id,"delivery":"steer","idempotencyKey":"test-keyed-correction","prompt":[{"type":"text","text":CORRECTION}]});
+    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":params})));
+    client.fence_prompt_admission(&id).await;
+    release.send("First answer").unwrap();
+    let response = client.response(4).await;
+    let inserted_id = response["result"]["messageId"]
+        .as_str()
+        .expect("insertion receipt");
+    let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    release.send("Corrected answer").unwrap();
+    client.wait_idle().await;
+    client.detach().await;
+    stop_gateway(&mut gateway).await;
+
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut resumed = SdkClient::connect(&url).await;
+    let response = resumed
         .request(
             2,
             "session/resume",
-            json!({"sessionId":id,"replayFrom":{"type":"start"}}),
+            json!({"sessionId":id,"cwd":fixture.root,"replayFrom":{"type":"start"}}),
         )
         .await;
-    assert!(resumed.get("error").is_none(), "{resumed}");
-    let revoke = json!({"sessionId":id,"messageId":message_id});
-    old.assert_rejected_or_closed(5, "session/revoke_inject", revoke.clone())
-        .await;
-    // The pinned capability also advertises pending.replace; exercise its
-    // companion route rather than advertising an unsupported operation.
-    let replaced = current.request(6, "session/replace_inject", json!({"sessionId":id,"messageId":message_id,"content":[{"type":"text","text":"Replacement must also be revoked"}]})).await;
-    assert!(replaced.get("error").is_none(), "{replaced}");
-    let revoked = current.request(3, "session/revoke_inject", revoke).await;
-    assert_eq!(revoked["result"], json!({}), "{revoked}");
-    release.send("Answer without revoked steer").unwrap();
-    current.wait_idle().await;
-    assert!(!current.updates.iter().any(
-        |update| update["sessionUpdate"] == "user_message" && update["messageId"] == message_id
-    ));
-    current.start_prompt(4, id, "Continue after revoke").await;
-    let (body, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    let retry = resumed.request(3, "session/prompt", params).await;
+    assert_eq!(retry["result"]["messageId"], inserted_id, "{retry}");
     assert!(
-        !body["messages"]
-            .to_string()
-            .contains("Revoked instruction must not reach inference"),
-        "{body}"
+        requests.try_recv().is_err(),
+        "retry started another inference"
     );
-    release.send("Healthy after revoke").unwrap();
-    current.wait_idle().await;
-    assert_replayed_answer(&current.updates, "Healthy after revoke");
-    old.channel.tx.close_channel();
-    let _ = timeout(WAIT, old.transport).await.unwrap();
-    current.detach().await;
+    assert!(
+        resumed
+            .updates
+            .iter()
+            .all(|update| !update.to_string().contains("test-keyed-correction"))
+    );
+    resumed.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
+#[tokio::test]
+async fn sdk_queued_prompt_starts_a_separate_turn() {
+    sdk_waiting_prompt_starts_a_separate_turn(Some("queue")).await;
+}
+
+#[tokio::test]
+async fn sdk_ordinary_prompt_can_be_submitted_while_busy() {
+    sdk_waiting_prompt_starts_a_separate_turn(None).await;
+}
+
+async fn sdk_waiting_prompt_starts_a_separate_turn(delivery: Option<&str>) {
+    const FOLLOW_UP: &str = "Do this after the first task";
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut client = SdkClient::connect(&url).await;
+    let created = client
+        .request(2, "session/new", json!({"cwd":fixture.root}))
+        .await;
+    let id = created["result"]["sessionId"].as_str().unwrap();
+    client.start_prompt(3, id, "Finish this task first").await;
+    let (first_body, release_first) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(!first_body["messages"].to_string().contains(FOLLOW_UP));
+    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":id,"delivery":delivery,"prompt":[{"type":"text","text":FOLLOW_UP}]}})));
+    client.fence_prompt_admission(id).await;
+    release_first.send("First answer").unwrap();
+    let queued = client.response(4).await;
+    let message_id = queued["result"]["messageId"]
+        .as_str()
+        .expect("insertion receipt");
+    let (second_body, release_second) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(
+        second_body["messages"].to_string().contains(FOLLOW_UP),
+        "{second_body}"
+    );
+    release_second.send("Follow-up answer").unwrap();
+    timeout(WAIT, async {
+        let mut first_idle = None;
+        let mut queued_message = None;
+        let mut idle_count = 0;
+        let mut index = 0;
+        loop {
+            while let Some(update) = client.updates.get(index) {
+                if update["sessionUpdate"] == "state_update" && update["state"] == "idle" {
+                    first_idle.get_or_insert(index);
+                    idle_count += 1;
+                }
+                if update["sessionUpdate"] == "user_message" && update["messageId"] == message_id {
+                    queued_message = Some(index);
+                }
+                if idle_count == 2
+                    && let (Some(first), Some(queued)) = (first_idle, queued_message)
+                {
+                    assert!(
+                        first < queued,
+                        "queued input appeared before the first turn ended"
+                    );
+                    return;
+                }
+                index += 1;
+            }
+            let Some(TransportFrame::Single(message)) = client.channel.rx.next().await else {
+                panic!("connection closed before queued work finished");
+            };
+            let message = serde_json::to_value(message).unwrap();
+            if message["method"] == "session/update" {
+                client.updates.push(message["params"]["update"].clone());
+            }
+        }
+    })
+    .await
+    .expect("queued turn did not finish");
+    client.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
+#[tokio::test]
+async fn sdk_stop_keeps_a_pending_explicit_steer() {
+    const CORRECTION: &str = "Act on the correction after Stop";
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut client = SdkClient::connect(&url).await;
+    let created = client
+        .request(2, "session/new", json!({"cwd":fixture.root}))
+        .await;
+    let id = created["result"]["sessionId"].as_str().unwrap();
+    client.start_prompt(3, id, "Stop this work").await;
+    let (_, _original_release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":id,"delivery":"steer","prompt":[{"type":"text","text":CORRECTION}]}})));
+    assert!(
+        client.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}))
+    );
+    let inserted = client.response(4).await;
+    assert!(inserted["result"]["messageId"].is_string(), "{inserted}");
+    let cancelled = |update: &Value| {
+        update["sessionUpdate"] == "state_update"
+            && update["state"] == "idle"
+            && update["stopReason"] == "cancelled"
+    };
+    if !client.updates.iter().any(cancelled) {
+        timeout(WAIT, async {
+            while let Some(TransportFrame::Single(message)) = client.channel.rx.next().await {
+                let message = serde_json::to_value(message).unwrap();
+                if message["method"] == "session/update" {
+                    let update = message["params"]["update"].clone();
+                    let stopped = cancelled(&update);
+                    client.updates.push(update);
+                    if stopped {
+                        return;
+                    }
+                }
+            }
+            panic!("connection closed before the cancelled turn was reported");
+        })
+        .await
+        .expect("cancelled turn was not reported");
+    }
+    let (body, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(body["messages"].to_string().contains(CORRECTION), "{body}");
+    client.updates.retain(|update| update["state"] != "idle");
+    release.send("Correction applied").unwrap();
+    client.wait_idle().await;
+    client.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
+#[tokio::test]
+async fn sdk_withdraws_a_held_steer_through_the_gateway() {
+    const WITHDRAWN: &str = "Withdraw this instruction before inference";
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut client = SdkClient::connect(&url).await;
+    let created = client
+        .request(2, "session/new", json!({"cwd":fixture.root}))
+        .await;
+    let id = created["result"]["sessionId"].as_str().unwrap();
+    client
+        .start_prompt(3, id, "Run while a steer is pending")
+        .await;
+    let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":id,"delivery":"steer","prompt":[{"type":"text","text":WITHDRAWN}]}})));
+    assert!(
+        client.send(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":4}}))
+    );
+    let withdrawn = client.response(4).await;
+    assert_eq!(withdrawn["error"]["code"], -32800, "{withdrawn}");
+    release.send("Answer without withdrawn steer").unwrap();
+    client.wait_idle().await;
+    assert!(!client.updates.iter().any(|update| {
+        update["sessionUpdate"] == "user_message" && update.to_string().contains(WITHDRAWN)
+    }));
+    client
+        .start_prompt(5, id, "Continue after withdrawal")
+        .await;
+    let (body, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(!body["messages"].to_string().contains(WITHDRAWN), "{body}");
+    release.send("Healthy after withdrawal").unwrap();
+    client.wait_idle().await;
+    client.detach().await;
     stop_gateway(&mut gateway).await;
     provider.abort();
 }
@@ -1805,7 +1997,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         initialized,
         json!({"jsonrpc":"2.0","id":1,"result":{
             "protocolVersion":2,"info":{"name":"kit-gateway","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}},
+            "capabilities":{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}},
             "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4093}}
         }})
     );
@@ -1849,8 +2041,8 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
     assert_eq!(session.headers()["acp-connection-id"], connection);
     assert_eq!(session.headers()["content-type"], "text/event-stream");
     // All HTTP entry points reject missing/wrong bearer before processing the
-    // valid connection/session IDs, including steering's mandatory companion.
-    let revoke = json!({"jsonrpc":"2.0","id":3,"method":"session/revoke_inject","params":{"sessionId":id,"messageId":"not-pending"}});
+    // valid connection/session IDs, including prompt delivery requests.
+    let invalid_prompt = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":id,"delivery":"interrupt","prompt":[{"type":"text","text":"not inserted"}]}});
     for token in [None, Some("wrong-token")] {
         for method in [
             reqwest::Method::GET,
@@ -1863,7 +2055,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
                 .header("Acp-Connection-Id", &connection)
                 .header("Acp-Session-Id", id);
             let request = if method == reqwest::Method::POST {
-                request.json(&revoke)
+                request.json(&invalid_prompt)
             } else {
                 request
             };
@@ -1884,7 +2076,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         .bearer_auth(TOKEN)
         .header("Acp-Connection-Id", &connection)
         .header("Acp-Session-Id", id)
-        .json(&revoke)
+        .json(&invalid_prompt)
         .send()
         .await
         .unwrap();
@@ -1898,8 +2090,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         assert_eq!(event["method"], "session/update");
         assert_eq!(event["params"]["sessionId"], id);
     };
-    assert_eq!(rejected["error"]["code"], -32002, "{rejected}");
-    assert_eq!(rejected["error"]["data"]["reason"], "unknown_message_id");
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
     let response = fixture
         .client
         .delete(&endpoint)

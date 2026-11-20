@@ -502,7 +502,6 @@ private struct ConversationView: View {
     @ObservedObject var controller: ConversationController
     let title: String
     @State private var choosingFiles = false
-    @State private var editingSteer: ConversationController.PendingSteer?
     @State private var followTranscript = true
     @State private var showDiagnostics = false
     @State private var showAgentRoster = false
@@ -534,9 +533,6 @@ private struct ConversationView: View {
         }
         .fileImporter(isPresented: $choosingFiles, allowedContentTypes: [.image, .audio], allowsMultipleSelection: true) { result in
             if case .success(let urls) = result { controller.addAttachments(urls) }
-        }
-        .sheet(item: $editingSteer) { item in
-            PendingSteerEditor(controller: controller, item: item)
         }
     }
 
@@ -683,19 +679,11 @@ private struct ConversationView: View {
                     Image(systemName: "clock").foregroundStyle(.secondary)
                     Text(item.summary).lineLimit(1)
                     Spacer()
-                    if controller.isMutatingSteerIDs.contains(item.id) {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Text("Pending").brandMicroLabel().foregroundStyle(.secondary)
-                    }
-                    if controller.supportsPendingSteerEdit && item.attachmentCount == 0 {
-                        Button { editingSteer = item } label: { Image(systemName: "pencil") }
-                            .buttonStyle(.plain).pointingHandCursor().help("Edit queued message")
-                            .disabled(!controller.isReady || controller.isMutatingSteerIDs.contains(item.id))
-                    }
-                    Button { controller.revokePendingSteer(id: item.id) } label: { Image(systemName: "trash") }
-                        .buttonStyle(.plain).pointingHandCursor().help("Remove queued message")
-                        .disabled(!controller.isReady || controller.isMutatingSteerIDs.contains(item.id))
+                    Text(item.isWithdrawing ? "Withdrawing…" : "Pending")
+                        .brandMicroLabel().foregroundStyle(.secondary)
+                    Button { controller.withdrawPendingSteer(id: item.id) } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).pointingHandCursor().help("Withdraw pending message")
+                        .disabled(!controller.isReady || item.requestID == nil || item.isWithdrawing)
                 }
                 .font(.caption)
                 .padding(.horizontal, 12).padding(.vertical, 8)

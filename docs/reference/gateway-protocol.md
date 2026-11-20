@@ -42,16 +42,16 @@ that controller's pending requests with errors without detaching its other sessi
 | `session/new` | Create a child in an approved host project and acquire control. |
 | `session/list` | List resident and restorable sessions; optional exact `cwd` filtering, no pagination cursor. |
 | `session/resume` | Acquire or replace control of a session; optional replay from `start` only. |
-| `session/prompt` | Submit work to the resident child. |
+| `session/prompt` | Submit work to the resident child. Use a `delivery` mode advertised under `capabilities.session.prompt.delivery` to steer or queue explicitly. The response acknowledges insertion, not receipt. |
 | `_kit/session/update_mcp` | Add or update the current controller's client-owned MCP servers; see [session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). |
-| `session/inject`, `session/replace_inject`, `session/revoke_inject` | Enqueue, replace, or revoke pending steering using the host-advertised ACP capability. |
+| `$/cancel_request` | Withdraw a held prompt on this connection by its JSON-RPC request ID. A successful withdrawal returns `-32800` on the original request. |
 | `kit/session/status` | Read current outstanding work; see [Read session settlement](#read-session-settlement). |
 | `session/close` | Close the resident session and its outstanding work; retain the transcript for explicit resume. The close response follows child cleanup. A cleanup error is reported, but does not reopen a partially closed child; resume is an explicit new restoration. |
 | `session/cancel` | Interrupt the current response; ordinary top-level sessions retain detached background jobs. This is distinct from closing a connection. |
 | `kit/background/cancel` | Request cancellation of one detached call using the existing Kit extension. |
 | `session/set_config_option` | Select configuration advertised by the child, without changing client-local defaults. |
 
-Unsupported requests fail explicitly. Client-to-agent request cancellation (`$/cancel_request`) does not interrupt accepted session work. Integrations must use `session/cancel` for that purpose, and cancel detached jobs separately. Do not automatically resend a prompt after a transport failure.
+Unsupported requests fail explicitly. Request cancellation does not interrupt work for an inserted prompt. Use `session/cancel` to stop foreground work and cancel detached jobs separately. Stopping foreground work does not withdraw pending explicit steers or queued prompts. If a prompt response is lost, inspect the session before resending. An integration that submitted an `idempotencyKey` can retry the same prompt with the same key after resuming the session; if insertion already happened, the result carries the original `messageId`.
 
 The Kit-private background operation uses **snake_case** parameters, unlike standard ACP session methods:
 
@@ -76,7 +76,7 @@ Initialize POST body (send `Authorization: Bearer TOKEN` and `Content-Type: appl
 The response is HTTP 200 JSON with `Acp-Connection-Id`. Its `result` contains `protocolVersion: 2`, `info.name: "kit-gateway"`, the running Kit version, and these capabilities:
 
 ```json
-{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}}
+{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}}
 ```
 
 Its `result._meta` explicitly identifies the experimental limits:
@@ -88,11 +88,11 @@ Its `result._meta` explicitly identifies the experimental limits:
 Both connection and session SSE GETs return HTTP 200 with `Content-Type: text/event-stream`. The session stream echoes both ACP ID headers. Accepted subsequent POSTs and successful transport DELETE return HTTP 202; DELETE failures follow the rules above. SSE `data:` contains JSON-RPC replies or notifications, for example:
 
 ```text
-data: {"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"Resource not found","data":{"reason":"unknown_message_id","messageId":"not-pending"}}}
+data: {"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params"}}
 
 ```
 
-The error above illustrates a session-routed revoke of an unknown pending message; clients should inspect the code and structured data rather than matching diagnostic text. IDs and credentials in examples are placeholders, not usable secrets.
+The error above illustrates a prompt with an invalid delivery mode. Clients should inspect the error code and any structured data rather than matching diagnostic text. IDs and credentials in examples are placeholders, not usable secrets.
 
 ### Read session settlement
 
@@ -148,7 +148,7 @@ For native stdio and Streamable HTTP entries, additive update semantics, and the
 ## Transport limits
 
 - Healthy HTTP connections have no cumulative output cap. The SDK instead limits each core direction to 16 MiB / 256 frames and each connection's HTTP egress to 4 MiB / 64 frames. Admission saturation fails explicitly and can terminate the connection; it does not silently drop output while claiming the stream is complete. Accepted resident work is not cancelled by transport failure. There is no delivery acknowledgement, and HTTP body handoff does not prove peer consumption. The bridge's stdin mailbox holds at most 16 capped frames; each frame is limited to 1 MiB before parsing.
-- The server admits at most 64 connections, 32 concurrent SDK POSTs, and 8 MiB of aggregate body reservations. Each connection permits at most 128 batch entries, 256 pending routes, 64 session registrations, and 65 streams. HTTP/core frames are limited to 1 MiB; SSE encoding and the client's 1 MiB parser limits can reject a near-limit frame. The bundled client independently caps HTTP reservations at 64 MiB / 128 slots, pending RPCs at 128, each POST lane at 32, and SSE streams at 8. Transport exhaustion is terminal rather than an unbounded wait. The gateway admits at most 32 concurrent POST/DELETE operations.
+- The server admits at most 64 connections, 32 concurrent SDK POSTs, and 8 MiB of aggregate body reservations. Each connection permits at most 256 pending routes, 64 session registrations, and 65 streams. JSON-RPC batches are not supported. HTTP/core frames are limited to 1 MiB; SSE encoding and the client's 1 MiB parser limits can reject a near-limit frame. The bundled client independently caps HTTP reservations at 64 MiB / 128 slots, pending RPCs at 128, each POST lane at 32, and SSE streams at 8. Transport exhaustion is terminal rather than an unbounded wait. The gateway admits at most 32 concurrent POST/DELETE operations.
 - These bounds exclude allocator overhead, transient JSON conversion, arbitrary application state, and HTTP/TLS/socket buffers. They are not a hard process-memory ceiling or a denial-of-service-hardening claim. The bounded transport supports HTTP/SSE, not WebSocket upgrades. SSE has no replay cursor: reopening a stream alone cannot recover lost events. Recovery uses fresh initialization and session-level resume, not SSE event IDs. There is no idle connection expiration or body-read deadline: disconnected peers that do not DELETE or otherwise terminate their transport can retain connection slots. Slot exhaustion may require restarting the gateway; do not expose it to untrusted clients.
 
 HTTP POST bodies are limited to 1 MiB, including streamed bodies. Supervisor queues and pending child requests are bounded. Child stdout frames are limited to 8 MiB before JSON parsing; oversized or malformed frames stop that child. There is no fixed resident-session count ceiling; provision host resources independently of transport limits.

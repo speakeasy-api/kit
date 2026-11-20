@@ -1,5 +1,6 @@
 //! ACP HTTP connection adapter. Only the resident actor owns execution.
 use super::*;
+use agent_client_protocol::v2::schema as wire;
 use agent_client_protocol::{
     Agent, BoundedChannel, ChannelLimits, ChargedFrame, ConnectTo, TransportFrame,
 };
@@ -138,7 +139,14 @@ impl Connection {
                 return Err(Failure::conflict("connection already initialized"));
             }
             // Use the same pinned ACP v2 schema/capabilities as the local agent.
-            let mut capabilities = serde_json::to_value(agentkit_acp::v2::agent_capabilities())
+            let mut capabilities = agentkit_acp::v2::agent_capabilities();
+            capabilities
+                .session
+                .get_or_insert_with(wire::SessionCapabilities::new)
+                .prompt
+                .get_or_insert_with(wire::PromptCapabilities::new)
+                .delivery = Some(wire::PromptDeliveryCapabilities::new(true, true));
+            let mut capabilities = serde_json::to_value(capabilities)
                 .map_err(|e| Failure::unavailable(e.to_string()))?;
             capabilities["_meta"] = object([("kit/session/status", object([]))]);
             if let Some(session) = capabilities["session"].as_object_mut() {
@@ -196,6 +204,29 @@ impl Connection {
             return Err(Failure::bad("initialize is required"));
         }
         if method == "$/cancel_request" {
+            if message.get("id").is_some() {
+                return Err(Failure::bad("request cancellation must be a notification"));
+            }
+            let Some(id) = message["params"]
+                .get("requestId")
+                .filter(|id| id.is_string() || id.as_i64().is_some() || id.as_u64().is_some())
+            else {
+                return Err(Failure::bad("valid cancellation requestId required"));
+            };
+            // Unlike session operations this notification has no sessionId.
+            // Find the pending request in this connection, never by a global ID.
+            let key = id.to_string();
+            let mut matching = self
+                .controls
+                .values_mut()
+                .filter(|control| control.pending.contains_key(&key));
+            let Some(control) = matching.next() else {
+                return Ok(None);
+            };
+            if matching.next().is_some() {
+                return Err(Failure::conflict("ambiguous cancellation request id"));
+            }
+            control.send(message, Arc::clone(charge)).await?;
             return Ok(None);
         }
         if method == "session/list" {
@@ -258,7 +289,7 @@ impl Connection {
             if let Some(servers) = message["params"].get("mcpServers")
                 && !servers.is_null()
             {
-                serde_json::from_value::<Vec<agent_client_protocol::schema::v2::McpServer>>(
+                serde_json::from_value::<Vec<agent_client_protocol::v2::schema::McpServer>>(
                     servers.clone(),
                 )
                 .map_err(|_| Failure::bad("invalid mcpServers configuration"))?;
@@ -528,54 +559,41 @@ impl Connection {
                     return Ok(());
                 };
                 let charged_frame = Arc::new(charged_frame);
-                // Retain admission through every decoded batch entry and actor await.
-                // Child-bound messages share this lease until writer serialization.
-                let messages = match charged_frame.decode() {
-                    TransportFrame::Single(message) => vec![message],
-                    TransportFrame::Batch(batch) => batch
-                        .into_entries()
-                        .map(|entry| match entry {
-                            agent_client_protocol::TransportBatchEntry::Message(message) => {
-                                Ok(message)
-                            }
-                            agent_client_protocol::TransportBatchEntry::Malformed {
-                                error, ..
-                            } => Err(error),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
+                // Retain admission through the actor await and child writer handoff.
+                let message = match charged_frame.decode() {
+                    TransportFrame::Single(message) => message,
                     TransportFrame::Malformed { error, .. } => return Err(error),
+                    _ => return Err(channel.tx.fail("unsupported ACP frame")),
                 };
-                for message in messages {
-                    let message = serde_json::to_value(message).map_err(sdk_error)?;
-                    let id = message.get("id").cloned();
-                    let response = match self.request(message, &channel, &charged_frame).await {
-                        Ok(Some(result)) => id.map(|id| {
-                            object([("jsonrpc", "2.0".into()), ("id", id), ("result", result)])
-                        }),
-                        Ok(None) => None,
-                        Err(error) => {
-                            // A notification has no reply ID. If actor admission
-                            // rejects it, fail the transport instead of hiding
-                            // accepted-but-unperformed work from the sender.
-                            let Some(id) = id else {
-                                return Err(channel.tx.fail(&error.1));
-                            };
-                            Some(object([
-                                ("jsonrpc", "2.0".into()),
-                                ("id", id),
-                                (
-                                    "error",
-                                    object([
-                                        ("code", (-32000).into()),
-                                        ("data", error.data()),
-                                        ("message", error.1.into()),
-                                    ]),
-                                ),
-                            ]))
-                        }
-                    };
-                    self.flush_with_response(&channel, response).await?;
-                }
+                let message = serde_json::to_value(message).map_err(sdk_error)?;
+                let id = message.get("id").cloned();
+                let response = match self.request(message, &channel, &charged_frame).await {
+                    Ok(Some(result)) => id.map(|id| {
+                        object([("jsonrpc", "2.0".into()), ("id", id), ("result", result)])
+                    }),
+                    Ok(None) => None,
+                    Err(error) => {
+                        // A notification has no reply ID. If actor admission
+                        // rejects it, fail the transport instead of hiding
+                        // accepted-but-unperformed work from the sender.
+                        let Some(id) = id else {
+                            return Err(channel.tx.fail(&error.1));
+                        };
+                        Some(object([
+                            ("jsonrpc", "2.0".into()),
+                            ("id", id),
+                            (
+                                "error",
+                                object([
+                                    ("code", (-32000).into()),
+                                    ("data", error.data()),
+                                    ("message", error.1.into()),
+                                ]),
+                            ),
+                        ]))
+                    }
+                };
+                self.flush_with_response(&channel, response).await?;
                 drop(charged_frame);
             }
             // Drain after every inbound frame as well as idle ticks; a busy
@@ -957,7 +975,7 @@ mod tests {
             message["params"]["update"]["_meta"]["kit/gateway"],
             json!({"reason":"controller_replaced","terminal":true})
         );
-        serde_json::from_value::<agent_client_protocol::schema::v2::UpdateSessionNotification>(
+        serde_json::from_value::<agent_client_protocol::v2::schema::UpdateSessionNotification>(
             message["params"].clone(),
         )
         .unwrap();
