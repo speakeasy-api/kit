@@ -37,15 +37,15 @@ a2a-protocol-client = { version = "=0.14.1", default-features = false, features 
 a2a-protocol-server = { version = "=0.14.1", default-features = false }
 a2a-protocol-types = "=0.14.1"
 agenthooksprotocol = { version = "=0.10.1", default-features = false, features = ["reqwest", "tokio-process"] }
-agent-client-protocol = { path = "../acp-sdk-prompt-delivery-main/src/agent-client-protocol", features = ["stdio", "unstable_session_fork", "unstable_prompt_delivery", "unstable_subagents"] }
-agent-client-protocol-schema = { package = "agentkit-acp-schema", path = "../acp-schema-prompt-delivery-main/agent-client-protocol-schema", features = ["unstable_end_turn_token_usage"] }
-agent-client-protocol-http = { path = "../acp-sdk-prompt-delivery-main/src/agent-client-protocol-http", default-features = false, features = ["server", "client"] }
-agentkit-acp = { path = "../agentkit-prompt-delivery-main/crates/agentkit-acp", features = ["unstable-prompt-delivery"] }
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=5.4.0", features = ["stdio", "unstable_session_fork", "unstable_prompt_delivery", "unstable_subagents"] }
+agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.19.0", features = ["unstable_end_turn_token_usage"] }
+agent-client-protocol-http = { package = "agentkit-acp-http", version = "=5.4.0", default-features = false, features = ["server", "client"] }
+agentkit-acp = { version = "=0.13.0", features = ["unstable-prompt-delivery"] }
 agentkit-adapter-completions = "=0.11.0"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.11.0"
-agentkit-loop = { version = "=0.11.0", features = ["otel"] }
+agentkit-loop = { version = "=0.11.1", features = ["otel"] }
 agentkit-mcp = "=0.11.3"
 agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
@@ -142,11 +142,3 @@ todo = "deny"
 unimplemented = "deny"
 disallowed_methods = "deny"
 disallowed_macros = "deny"
-
-# Local fork integration only. Keep shared AgentKit types on the same source.
-[patch.crates-io]
-agentkit-capabilities = { path = "../agentkit-prompt-delivery-main/crates/agentkit-capabilities" }
-agentkit-core = { path = "../agentkit-prompt-delivery-main/crates/agentkit-core" }
-agentkit-loop = { path = "../agentkit-prompt-delivery-main/crates/agentkit-loop" }
-agentkit-task-manager = { path = "../agentkit-prompt-delivery-main/crates/agentkit-task-manager" }
-agentkit-tools-core = { path = "../agentkit-prompt-delivery-main/crates/agentkit-tools-core" }
