@@ -462,45 +462,78 @@ impl AuthAction {
             let command = command.group(
                 clap::ArgGroup::new("Login")
                     .multiple(true)
-                    .args(["provider"]),
+                    .args(["provider", "backend"]),
             );
-            command.arg(
-                clap::Arg::new("provider")
-                    .value_name("PROVIDER")
-                    .value_parser(clap::value_parser!(AuthProvider))
-                    .action(clap::ArgAction::Set)
-                    .required(true),
-            )
+            command
+                .arg(
+                    clap::Arg::new("provider")
+                        .value_name("PROVIDER")
+                        .value_parser(clap::value_parser!(AuthProvider))
+                        .action(clap::ArgAction::Set)
+                        .required(true),
+                )
+                .arg(
+                    clap::Arg::new("backend")
+                        .value_name("BACKEND")
+                        .value_parser(clap::value_parser!(String))
+                        .action(clap::ArgAction::Set)
+                        .help("Hook backend id, for `hooks`"),
+                )
         });
         let command = command.subcommand({
             let command = clap::Command::new("status").about("Show service authentication status");
             let command = command.group(
                 clap::ArgGroup::new("Status")
                     .multiple(true)
-                    .args(["provider"]),
+                    .args(["provider", "backend"]),
             );
-            command.arg(
-                clap::Arg::new("provider")
-                    .value_name("PROVIDER")
-                    .value_parser(clap::value_parser!(AuthProvider))
-                    .action(clap::ArgAction::Set)
-                    .required(true),
-            )
+            command
+                .arg(
+                    clap::Arg::new("provider")
+                        .value_name("PROVIDER")
+                        .value_parser(clap::value_parser!(AuthProvider))
+                        .action(clap::ArgAction::Set)
+                        .required(true),
+                )
+                .arg(
+                    clap::Arg::new("backend")
+                        .value_name("BACKEND")
+                        .value_parser(clap::value_parser!(String))
+                        .action(clap::ArgAction::Set)
+                        .help("Hook backend id, for `hooks`"),
+                )
         });
         command.subcommand({
             let command = clap::Command::new("logout")
                 .about("Remove service credentials, revoking them when supported");
-            let command = command.group(
-                clap::ArgGroup::new("Logout")
-                    .multiple(true)
-                    .args(["provider", "local_only"]),
-            );
+            let command = command.group(clap::ArgGroup::new("Logout").multiple(true).args([
+                "provider",
+                "backend",
+                "local_only",
+                "all_workspaces",
+            ]));
+            let command = command
+                .arg(
+                    clap::Arg::new("provider")
+                        .value_name("PROVIDER")
+                        .value_parser(clap::value_parser!(AuthProvider))
+                        .action(clap::ArgAction::Set)
+                        .required(true),
+                )
+                .arg(
+                    clap::Arg::new("backend")
+                        .value_name("BACKEND")
+                        .value_parser(clap::value_parser!(String))
+                        .action(clap::ArgAction::Set)
+                        .help("Hook backend id, for `hooks`"),
+                );
             let command = command.arg(
-                clap::Arg::new("provider")
-                    .value_name("PROVIDER")
-                    .value_parser(clap::value_parser!(AuthProvider))
-                    .action(clap::ArgAction::Set)
-                    .required(true),
+                clap::Arg::new("all_workspaces")
+                    .long("all-workspaces")
+                    .value_name("ALL_WORKSPACES")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("For `hooks`: sign out of the backend in every workspace, including moved ones"),
             );
             command.arg(
                 clap::Arg::new("local_only")
@@ -517,13 +550,17 @@ impl AuthAction {
         match name {
             "login" => Ok(Self::Login {
                 provider: required_arg(matches, "provider")?,
+                backend: optional_arg(matches, "backend")?,
             }),
             "status" => Ok(Self::Status {
                 provider: required_arg(matches, "provider")?,
+                backend: optional_arg(matches, "backend")?,
             }),
             "logout" => Ok(Self::Logout {
                 provider: required_arg(matches, "provider")?,
+                backend: optional_arg(matches, "backend")?,
                 local_only: required_arg(matches, "local_only")?,
+                all_workspaces: required_arg(matches, "all_workspaces")?,
             }),
             _ => Err(clap::Error::raw(
                 clap::error::ErrorKind::InvalidSubcommand,
@@ -742,7 +779,15 @@ impl Command {
         ));
         let command = command.subcommand({
             let command = clap::Command::new("auth")
-                .about("Manage provider authentication without starting a runtime");
+                .about("Manage provider and hook authentication without starting a runtime")
+                .arg(
+                    clap::Arg::new("root")
+                        .long("root")
+                        .value_name("PATH")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .global(true)
+                        .help("Workspace whose hook backends need authentication"),
+                );
             let command = command.group(clap::ArgGroup::new("Auth").multiple(true));
             let command = AuthAction::augment_command(command)
                 .subcommand_required(true)
@@ -880,7 +925,7 @@ impl Command {
                     .value_name("TERMINAL_AUTH_LOGIN")
                     .value_parser(clap::value_parser!(AuthProvider))
                     .action(clap::ArgAction::Set)
-                    .help("Provider login requested by ACP terminal authentication")
+                    .help("Login requested by ACP terminal authentication")
                     .hide(true),
             );
             let command = command.arg(
@@ -966,7 +1011,7 @@ impl Command {
                     .value_name("TERMINAL_AUTH_LOGIN")
                     .value_parser(clap::value_parser!(AuthProvider))
                     .action(clap::ArgAction::Set)
-                    .help("Provider login requested by ACP terminal authentication")
+                    .help("Login requested by ACP terminal authentication")
                     .hide(true),
             );
             let command = command.arg(
@@ -1178,6 +1223,7 @@ impl Command {
                 credentials: CredentialArgs::from_matches(matches)?,
             }),
             "auth" => Ok(Self::Auth {
+                root: optional_arg(matches, "root")?,
                 action: AuthAction::from_matches(matches)?,
                 credentials: CredentialArgs::from_matches(matches)?,
             }),
@@ -1312,6 +1358,7 @@ impl ValueEnum for AuthProvider {
             Self::Speakeasy,
             Self::Typesafe,
             Self::Anthropic,
+            Self::Hooks,
         ]
     }
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -1321,6 +1368,7 @@ impl ValueEnum for AuthProvider {
             Self::Speakeasy => "speakeasy",
             Self::Typesafe => "typesafe",
             Self::Anthropic => "anthropic",
+            Self::Hooks => "hooks",
         }))
     }
 }
@@ -1706,6 +1754,7 @@ enum AcpProtocolVersion {
 
 #[derive(Clone, Copy, Debug)]
 enum AuthProvider {
+    Hooks,
     Openai,
     Openrouter,
     Speakeasy,
@@ -1715,14 +1764,25 @@ enum AuthProvider {
 
 enum AuthAction {
     /// Authenticate a service in the configured credential store.
-    Login { provider: AuthProvider },
-    /// Show service authentication status.
-    Status { provider: AuthProvider },
+    /// For `hooks`, one backend, or each backend that needs it.
+    Login {
+        provider: AuthProvider,
+        backend: Option<String>,
+    },
+    /// Show service authentication status; for `hooks`, per backend.
+    Status {
+        provider: AuthProvider,
+        backend: Option<String>,
+    },
     /// Remove service credentials, revoking them when supported.
     Logout {
         provider: AuthProvider,
+        /// For `hooks`: the backend to sign out of.
+        backend: Option<String>,
         /// Remove local credentials without attempting remote revocation.
         local_only: bool,
+        /// For `hooks`: every workspace, including ones whose hooks file moved.
+        all_workspaces: bool,
     },
 }
 
@@ -1753,8 +1813,9 @@ enum Command {
     Config {
         action: ConfigAction,
     },
-    /// Manage provider authentication without starting a runtime.
+    /// Manage provider and hook authentication without starting a runtime.
     Auth {
+        root: Option<PathBuf>,
         action: AuthAction,
 
         credentials: CredentialArgs,
@@ -1959,6 +2020,7 @@ fn validate_auth_storage(action: &AuthAction, storage: &CredentialStorage) -> io
 
 async fn execute_auth(
     action: &AuthAction,
+    root: &Path,
     storage: CredentialStorage,
     openrouter_api_key: Option<(
         kit::provider::OpenRouterApiKey,
@@ -1973,8 +2035,32 @@ async fn execute_auth(
         Anthropic(kit::provider::AnthropicAuthCommand),
         Logout(kit::ProviderKind, bool),
     }
+    if let AuthAction::Login { provider, backend }
+    | AuthAction::Status { provider, backend }
+    | AuthAction::Logout {
+        provider, backend, ..
+    } = action
+        && backend.is_some()
+        && !matches!(provider, AuthProvider::Hooks)
+    {
+        return Err(io::Error::other("a backend can only be named for `hooks`"));
+    }
     let command = match action {
-        AuthAction::Login { provider } => match provider {
+        AuthAction::Login { provider, backend } => match provider {
+            AuthProvider::Hooks => {
+                let signed_in =
+                    kit::hook_auth::login(root, &storage, backend.as_deref(), |backend, url| {
+                        eprintln!("Open this URL to sign in to hook backend `{backend}`:\n{url}");
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                if signed_in.is_empty() {
+                    println!("No hook backend needs sign-in.");
+                } else {
+                    println!("Signed in to hook backends: {}", signed_in.join(", "));
+                }
+                return Ok(());
+            }
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Login),
             AuthProvider::Anthropic => {
                 Execution::Anthropic(kit::provider::AnthropicAuthCommand::Login)
@@ -1989,7 +2075,14 @@ async fn execute_auth(
                 Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Login)
             }
         },
-        AuthAction::Status { provider } => match provider {
+        AuthAction::Status { provider, backend } => match provider {
+            AuthProvider::Hooks => {
+                let status = kit::hook_auth::status(root, &storage, backend.as_deref())
+                    .await
+                    .map_err(io::Error::other)?;
+                println!("{status}");
+                return Ok(());
+            }
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
             AuthProvider::Anthropic => {
                 Execution::Anthropic(kit::provider::AnthropicAuthCommand::Status)
@@ -2006,8 +2099,41 @@ async fn execute_auth(
         },
         AuthAction::Logout {
             provider,
+            backend,
             local_only,
+            all_workspaces,
         } => match provider {
+            AuthProvider::Hooks if *all_workspaces => {
+                let backend = backend.as_deref().ok_or_else(|| {
+                    io::Error::other(
+                        "name the hook backend to sign out of: kit auth logout hooks <backend>",
+                    )
+                })?;
+                let removed = kit::hook_auth::logout_all_workspaces(&storage, backend)
+                    .await
+                    .map_err(io::Error::other)?;
+                println!("Signed out of hook backend `{backend}` in {removed} workspace(s).");
+                return Ok(());
+            }
+            AuthProvider::Hooks => {
+                let backend = backend.as_deref().ok_or_else(|| {
+                    io::Error::other(
+                        "name the hook backend to sign out of: kit auth logout hooks <backend>",
+                    )
+                })?;
+                let removed = kit::hook_auth::logout(root, &storage, backend)
+                    .await
+                    .map_err(io::Error::other)?;
+                println!(
+                    "{}",
+                    if removed {
+                        format!("Signed out of hook backend `{backend}`.")
+                    } else {
+                        format!("Hook backend `{backend}` had no stored credentials.")
+                    }
+                );
+                return Ok(());
+            }
             AuthProvider::Openai => {
                 Execution::Logout(kit::ProviderKind::OpenAiSubscription, *local_only)
             }
@@ -2318,13 +2444,20 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{output}");
         }
         Command::Auth {
+            root,
             action,
             credentials,
         } => {
             let (config, _settings, _telemetry, openrouter_api_key) = initialize.await?;
             let storage = credentials.storage(&config)?;
             validate_auth_storage(&action, &storage)?;
-            execute_auth(&action, storage, openrouter_api_key).await?;
+            execute_auth(
+                &action,
+                &config.root(root.clone()),
+                storage,
+                openrouter_api_key,
+            )
+            .await?;
         }
         Command::Serve {
             root,
@@ -2348,10 +2481,19 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             if let Some(provider) = terminal_auth_provider {
-                let action = AuthAction::Login { provider };
+                let action = AuthAction::Login {
+                    provider,
+                    backend: None,
+                };
                 let storage = mcp.credentials.storage(&config)?;
                 validate_auth_storage(&action, &storage)?;
-                execute_auth(&action, storage, openrouter_api_key).await?;
+                execute_auth(
+                    &action,
+                    &config.root(root.clone()),
+                    storage,
+                    openrouter_api_key,
+                )
+                .await?;
                 return Ok(());
             }
             let root = config.root(root);
@@ -2465,10 +2607,19 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             if let Some(provider) = terminal_auth_provider {
-                let action = AuthAction::Login { provider };
+                let action = AuthAction::Login {
+                    provider,
+                    backend: None,
+                };
                 let storage = mcp.credentials.storage(&config)?;
                 validate_auth_storage(&action, &storage)?;
-                execute_auth(&action, storage, openrouter_api_key).await?;
+                execute_auth(
+                    &action,
+                    &config.root(root.clone()),
+                    storage,
+                    openrouter_api_key,
+                )
+                .await?;
                 return Ok(());
             }
             let root = config.root(root);
@@ -4672,6 +4823,38 @@ future_option = true
     }
 
     #[test]
+    fn hook_auth_commands_preserve_workspace() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "auth",
+            "login",
+            "hooks",
+            "--root",
+            "/tmp/hook-workspace",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Auth {
+            action: AuthAction::Login { provider: AuthProvider::Hooks, backend: None },
+            root: Some(root), ..
+        } if root == std::path::Path::new("/tmp/hook-workspace")));
+        for command in ["acp", "serve"] {
+            let cli = Cli::try_parse_from([
+                "kit",
+                command,
+                "--root",
+                "/tmp/hook-workspace",
+                "--terminal-auth-login",
+                "hooks",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.terminal_auth_login(),
+                Some((AuthProvider::Hooks, _))
+            ));
+        }
+    }
+
+    #[test]
     fn standalone_provider_login_rejects_memory_storage() {
         for provider in [
             AuthProvider::Openai,
@@ -4679,8 +4862,12 @@ future_option = true
             AuthProvider::Speakeasy,
             AuthProvider::Typesafe,
             AuthProvider::Anthropic,
+            AuthProvider::Hooks,
         ] {
-            let login = AuthAction::Login { provider };
+            let login = AuthAction::Login {
+                provider,
+                backend: None,
+            };
             assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
             assert!(validate_auth_storage(&login, &CredentialStorage::Keychain).is_ok());
         }

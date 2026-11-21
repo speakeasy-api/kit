@@ -69,6 +69,16 @@ pub enum Update {
     },
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
+    /// A hook backend's sign-in link for a session, or that it no longer
+    /// needs one, or why it could not be prepared.
+    HookSignIn {
+        session_id: String,
+        backend: String,
+        problem: Option<String>,
+        url: Option<String>,
+        expires_at_ms: Option<u64>,
+        cleared: bool,
+    },
     /// Result of listing sessions without blocking the terminal event loop.
     SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
     FileMatches {
@@ -733,6 +743,14 @@ pub enum Block {
         millis: u64,
     },
     Notice(String),
+    /// A hook backend's sign-in link, shown in full once per link. It is
+    /// for the user only and never reaches the model.
+    HookSignIn {
+        backend: String,
+        url: String,
+        /// Completed, expired or replaced: shown without its link.
+        retired: bool,
+    },
     Error(String),
 }
 
@@ -873,6 +891,12 @@ pub struct App {
     pub(super) gateway_epoch: u64,
     pub(super) gateway_blocked: bool,
     pub(super) gateway_status: Option<String>,
+    /// Pending hook sign-in links by backend, with their Unix-ms expiry.
+    /// By session and backend, so another session's late updates never
+    /// change this view, and a session's links return when it does.
+    hook_sign_ins: std::collections::BTreeMap<(String, String), (String, Option<u64>)>,
+    /// Sign-in problems already shown, by session and backend.
+    hook_problems: std::collections::BTreeMap<(String, String), String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1182,12 +1206,66 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
     }
 }
 
+fn hook_problem_text(backend: &str, problem: &str) -> String {
+    format!("Hook backend {backend} needs you to sign in, but Kit could not start it: {problem}")
+}
+
+impl App {
+    /// Shows `backend`'s sign-in links in the current view without their
+    /// link: completed, expired or replaced.
+    fn retire_hook_sign_ins(&mut self, backend: &str) {
+        let retiring: Vec<_> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                matches!(block, Block::HookSignIn { backend: shown, retired: false, .. } if shown == backend)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in retiring {
+            if let Some(Block::HookSignIn { retired, .. }) = self.blocks.get_mut(index) {
+                *retired = true;
+            }
+            self.mark_block_dirty(index);
+        }
+    }
+
+    /// The status-line hint for hook backends waiting for sign-in, while
+    /// their links last. Only the user sees it; the model never does.
+    pub(super) fn hook_sign_in_status(&self) -> Option<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let session = self.session_id.as_deref()?;
+        let live: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|((owner, _), (_, expiry))| {
+                owner == session && expiry.is_none_or(|expiry| u128::from(expiry) > now)
+            })
+            .map(|((_, backend), _)| backend)
+            .collect();
+        // Short: the full link is in the transcript, where it wraps.
+        match live.as_slice() {
+            [] => None,
+            [backend] => Some(format!("sign in to hook {backend} needed (link above)")),
+            [backend, rest @ ..] => Some(format!(
+                "sign in to hook {backend} and {} more needed (links above)",
+                rest.len()
+            )),
+        }
+    }
+}
+
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
             gateway_epoch: 0,
             gateway_blocked: false,
             gateway_status: None,
+            hook_sign_ins: Default::default(),
+            hook_problems: Default::default(),
             gateway_candidate: None,
             child_focus: None,
             session_messages: HashMap::new(),
@@ -2340,6 +2418,55 @@ impl App {
             Update::OpenUserImage(_) => {}
             Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
+            Update::HookSignIn {
+                session_id,
+                backend,
+                problem,
+                url,
+                expires_at_ms,
+                cleared,
+            } => {
+                let current = self.session_id.as_deref() == Some(session_id.as_str());
+                let key = (session_id, backend);
+                let url = url.filter(|_| !cleared);
+                let problem = problem.filter(|_| !cleared);
+                match url {
+                    Some(url) => {
+                        let new = self
+                            .hook_sign_ins
+                            .get(&key)
+                            .is_none_or(|(shown, _)| *shown != url);
+                        if new && current {
+                            self.retire_hook_sign_ins(&key.1);
+                            self.push_block(Block::HookSignIn {
+                                backend: key.1.clone(),
+                                url: url.clone(),
+                                retired: false,
+                            });
+                        }
+                        self.hook_sign_ins.insert(key.clone(), (url, expires_at_ms));
+                    }
+                    None => {
+                        if current {
+                            self.retire_hook_sign_ins(&key.1);
+                        }
+                        self.hook_sign_ins.remove(&key);
+                    }
+                }
+                match problem {
+                    Some(problem) => {
+                        if self.hook_problems.get(&key) != Some(&problem) {
+                            if current {
+                                self.push_block(Block::Notice(hook_problem_text(&key.1, &problem)));
+                            }
+                            self.hook_problems.insert(key, problem);
+                        }
+                    }
+                    None => {
+                        self.hook_problems.remove(&key);
+                    }
+                }
+            }
             Update::SessionCatalog(result) => {
                 self.session_catalog_pending = false;
                 match result {
@@ -3301,6 +3428,37 @@ impl App {
         self.row_code.clear();
         self.selection = None;
         self.press = None;
+        // The new session's pending sign-in links, including ones that
+        // arrived while it attached; an expired link is not shown again.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let links: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|((owner, _), (_, expiry))| {
+                self.session_id.as_deref() == Some(owner.as_str())
+                    && expiry.is_none_or(|expiry| u128::from(expiry) > now)
+            })
+            .map(|((_, backend), (url, _))| (backend.clone(), url.clone()))
+            .collect();
+        for (backend, url) in links {
+            self.push_block(Block::HookSignIn {
+                backend,
+                url,
+                retired: false,
+            });
+        }
+        // And its unresolved sign-in problems.
+        let problems: Vec<_> = self
+            .hook_problems
+            .iter()
+            .filter(|((owner, _), _)| self.session_id.as_deref() == Some(owner.as_str()))
+            .map(|((_, backend), problem)| hook_problem_text(backend, problem))
+            .collect();
+        for text in problems {
+            self.push_block(Block::Notice(text));
+        }
     }
 
     /// Folds a tool call's raw output open or shut. Completed compose calls

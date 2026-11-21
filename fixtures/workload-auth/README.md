@@ -1,6 +1,7 @@
 # Local HTTPS test identity
 
-These fixtures are exclusively for `src/workload_auth/https_tests.rs`. The
+These fixtures are only for tests: `src/workload_auth/https_tests.rs`, the
+inference provider tests and the hook OAuth tests in `src/ahp/auth/tests.rs`. The
 private key is a public, disposable test key, not a deployment credential.
 Never trust this CA or use this identity outside tests. The issuing CA's
 private key was discarded after signing.
