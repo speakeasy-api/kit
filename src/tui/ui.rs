@@ -5460,6 +5460,26 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("agent scout/pip"), "{screen}");
+        // Removing the grandchild retires its link, keyed under the child.
+        app.apply(crate::tui::app::Update::Runtime(
+            crate::events::RuntimeEvent::SubagentStateChanged {
+                id: "pip".into(),
+                name: "Pip".into(),
+                status: crate::events::SubagentStatus::Removed,
+                outcome: None,
+                generation: 1,
+                task: "task".into(),
+                parent_id: None,
+                parent_name: None,
+                harness: "kit".into(),
+                vendor: crate::events::HarnessVendor::Kit,
+                model: None,
+                created_at_unix_ms: 1,
+                generation_started_at_unix_ms: 1,
+                generation_finished_at_unix_ms: None,
+            },
+        ));
+        assert!(!flat(&mut app).contains("https://auth.example/grandchild"));
     }
 
     #[test]

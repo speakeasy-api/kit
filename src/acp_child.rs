@@ -596,6 +596,23 @@ fn bounded_notice(text: &str, url: Option<&str>) -> String {
     text[..end].to_owned()
 }
 
+/// Sends a child's sign-in runtime event; tests also see what was sent.
+fn emit_hook_event(event: &crate::events::RuntimeEvent) {
+    #[cfg(test)]
+    hook_event_capture::HOOK_EVENTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(event.clone());
+    crate::events::emit(event);
+}
+
+#[cfg(test)]
+pub(crate) mod hook_event_capture {
+    /// Every child sign-in runtime event this process sent.
+    pub(crate) static HOOK_EVENTS: std::sync::Mutex<Vec<crate::events::RuntimeEvent>> =
+        std::sync::Mutex::new(Vec::new());
+}
+
 /// Whether this process tells Kit's own client about a child's sign-in
 /// link through a runtime event: only the top Kit of a tree, whose events
 /// that client reads. A nested Kit relays the notice to its parent session
@@ -618,7 +635,9 @@ fn deliver_hook_hint(
 ) {
     if !nested && let Some(event) = hook_sign_in_event(owner, update) {
         // An event too large for one frame would end the runtime-event
-        // transport: the link then reaches the user only as the notice.
+        // transport, so it is not sent. Kit's own client then does not see
+        // this link (it registers no relay); every other client still gets
+        // the notice. Such links are far beyond any real authorization URL.
         if crate::diagnostic_transport::fits(&event) {
             emit(&event);
         } else {
@@ -1716,7 +1735,7 @@ async fn run(
                     if let Some((owner, transcript, update)) = notification_stream_routes
                         .hook_hint(&session_id.to_string(), params["update"].clone())
                     {
-                        deliver_hook_hint(&owner, &transcript, &update, nested, &crate::events::emit);
+                        deliver_hook_hint(&owner, &transcript, &update, nested, &emit_hook_event);
                     }
                     return Ok(());
                 }
@@ -2183,16 +2202,10 @@ async fn run(
                             let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
                             if let Some(transcript) = &prompt.transcript {
                                 // Hook sign-in hints sent before it had an owner.
-                                // Then any that arrived meanwhile, in order, before
-                                // new ones go straight through.
-                                let remote = session_id.to_string();
-                                let mut held = stream_routes.register(&remote, &prompt.owner, prompt.generation, transcript.clone());
-                                while !held.is_empty() {
-                                    for update in &held {
-                                        deliver_hook_hint(&prompt.owner, transcript, update, nested, &crate::events::emit);
-                                    }
-                                    held = stream_routes.take_replay(&remote);
-                                }
+                                // Delivered in order with any that arrive meanwhile.
+                                stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone(), |update| {
+                                    deliver_hook_hint(&prompt.owner, transcript, update, nested, &emit_hook_event);
+                                });
                             }
                             if let Ok(mut routes) = routes.lock() {
                                 routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, output: Arc::clone(&output), idle: idle_tx });

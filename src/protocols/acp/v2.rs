@@ -583,6 +583,46 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
     }
 }
 
+/// At a session's activation: relays its child agents' sign-in links to its
+/// user, unless the client is Kit's own (`kit_client`: it asked for Kit's
+/// hook notifications), which shows them from runtime events instead.
+pub(crate) fn activate_child_relay<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
+    session: wire::SessionId,
+    sink: S,
+    kit_client: bool,
+) -> Option<crate::ahp::auth::relay::ChildHintSubscription> {
+    (!kit_client).then(|| relay_child_hook_hints(session, sink))
+}
+
+/// A session update sink that records what it is sent, for tests that
+/// drive a real activation.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RecordedUpdates(pub(crate) Arc<Mutex<Vec<wire::UpdateSessionNotification>>>);
+
+#[cfg(test)]
+#[async_trait]
+impl AcpSessionUpdateSink for RecordedUpdates {
+    fn update(&self, notification: wire::UpdateSessionNotification) -> Result<(), AcpRuntimeError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(notification);
+        Ok(())
+    }
+
+    async fn update_acknowledged(
+        &self,
+        notification: wire::UpdateSessionNotification,
+    ) -> Result<(), AcpRuntimeError> {
+        self.update(notification)
+    }
+
+    async fn flush(&self) -> Result<(), AcpRuntimeError> {
+        Ok(())
+    }
+}
+
 /// A child agent's hook sign-in notices, for this session's user: marked
 /// Info notices labelled with the agent, never transcript, child output or
 /// inspection. Registered with the session's own hints, after activation.
@@ -1481,9 +1521,11 @@ impl Server {
                 // Held for the session's life, from activation on. A client
                 // that takes Kit's hook notifications is Kit, which shows a
                 // child's links from its runtime events instead.
-                let _child_hints = hook_auth_notifications
-                    .is_none()
-                    .then(|| relay_child_hook_hints(session_id.clone(), sink.inner.clone()));
+                let _child_hints = activate_child_relay(
+                    session_id.clone(),
+                    sink.inner.clone(),
+                    hook_auth_notifications.is_some(),
+                );
                 let _hook_auth = subscribe_hook_auth(
                     runtime.hooks(),
                     session_id.clone(),

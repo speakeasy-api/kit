@@ -1218,6 +1218,22 @@ fn hook_problem_text(backend: &str, problem: &str) -> String {
 }
 
 impl App {
+    /// Forgets, and retires on screen, the child sign-in links of every agent
+    /// `gone` names: links are keyed by the agent path they are for
+    /// (`a/b` for b's, relayed by a), so any agent on the path counts.
+    fn retire_subagent_hook_links(&mut self, gone: impl Fn(&str) -> bool) {
+        let retired: Vec<_> = self
+            .subagent_hook_links
+            .keys()
+            .filter(|(path, _)| path.split('/').any(&gone))
+            .cloned()
+            .collect();
+        for (path, backend) in retired {
+            self.retire_hook_sign_ins(&format!("{backend} (agent {path})"));
+            self.subagent_hook_links.remove(&(path, backend));
+        }
+    }
+
     /// Shows `backend`'s sign-in links in the current view without their
     /// link: completed, expired or replaced.
     fn retire_hook_sign_ins(&mut self, backend: &str) {
@@ -3015,9 +3031,7 @@ impl App {
                             .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
                 {
                     self.agents.remove(&id);
-                    self.subagent_hook_links.retain(|(agent, _), _| {
-                        *agent != id && !agent.starts_with(&format!("{id}/"))
-                    });
+                    self.retire_subagent_hook_links(|agent| agent == id);
                 } else {
                     if !self.agents_auto_opened && status != SubagentStatus::Removed {
                         self.agents_visible = true;
@@ -3129,12 +3143,7 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
-                // A link is an agent's own or one of its descendants' (`a/b`).
-                self.subagent_hook_links.retain(|(agent, _), _| {
-                    !removed
-                        .iter()
-                        .any(|id| agent == id || agent.starts_with(&format!("{id}/")))
-                });
+                self.retire_subagent_hook_links(|agent| removed.contains(agent));
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();

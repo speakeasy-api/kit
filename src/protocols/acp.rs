@@ -1402,10 +1402,28 @@ impl ResponseInterruptionNoticeObserver {
     }
 }
 
+/// A v1 session owns the subagents it starts: their roster updates are
+/// subscribed only for a client that asked for them, but the session is
+/// recorded as their owner in any case, so their hook sign-in links are
+/// relayed to its user.
+pub(crate) fn own_subagents(
+    subagents: &crate::tools::subagent::Subagents,
+    session: &agentkit_acp::SessionId,
+    updates: bool,
+    replay_history: bool,
+) -> Option<tokio::sync::broadcast::Receiver<(String, serde_json::Value)>> {
+    if updates {
+        Some(subagents.subscribe_updates(session.to_string(), replay_history))
+    } else {
+        subagents.own_updates(session.to_string());
+        None
+    }
+}
+
 /// A child agent's hook sign-in notices, for this session's user: marked
 /// Info notices labelled with the agent, never transcript, child output or
 /// inspection. Registered with the session's own hints, after activation.
-fn relay_child_hook_hints(
+pub(crate) fn relay_child_hook_hints(
     client: AcpClientHandle,
     session: agentkit_acp::SessionId,
 ) -> crate::ahp::auth::relay::ChildHintSubscription {
@@ -2077,11 +2095,12 @@ impl Server {
             token,
             completed,
         };
-        let subagent_updates = self.subagent_updates.load(Ordering::Acquire).then(|| {
-            driver
-                .subagents
-                .subscribe_updates(session_id.to_string(), replay_history)
-        });
+        let subagent_updates = own_subagents(
+            &driver.subagents,
+            &session_id,
+            self.subagent_updates.load(Ordering::Acquire),
+            replay_history,
+        );
         let notices_supported = self.notices_supported.load(Ordering::Acquire);
         let actor_task = tokio::spawn(async move {
             let _shutdown_bridge = shutdown_bridge;

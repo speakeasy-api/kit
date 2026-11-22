@@ -84,6 +84,36 @@ def respond(request_id, result):
     send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
+def hook_notice(session_id, url, agent=None):
+    """A Kit child's hook sign-in notice: a link, or (url None) signed in."""
+    mark = {"backend": "test.hook", "url": url, "cleared": url is None}
+    text = (f"Hook backend `test.hook` needs you to sign in. Open {url} to approve Kit."
+            if url else "Hook backend `test.hook` is signed in.")
+    title = text
+    if agent is not None:
+        # As a nested Kit relays its own child's notice.
+        mark["agent"] = agent
+        mark["text"] = text
+        title = f"Agent {agent}: {text}"
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {
+        "sessionUpdate": "notice", "severity": "info", "title": title,
+        "_meta": {"kit/hooks/auth": mark},
+    }}})
+
+
+def link(value):
+    # Never in the prompt that asks for it, so a test can tell where it went.
+    return f"https://auth.example/{value}/secret-link"
+
+
+def token(text, name):
+    prefix = name + "="
+    for word in text.split():
+        if word.startswith(prefix):
+            return word[len(prefix):]
+    return None
+
+
 def log_request(request):
     if request_log is None:
         return
@@ -281,6 +311,22 @@ def prompt(request):
                 sys.stderr.write("\x01kit-runtime\x01" + json.dumps({"event": "child_finished", "call": "call-1:compose:shell", "tool": "shell", "ok": True, "summary": "done", "millis": 2}) + "\nmock diagnostic\n")
                 sys.stderr.flush()
         text = "rich done"
+    if token(text, "MOCK_HOOK_LINK"):
+        hook_notice(session_id, link(token(text, "MOCK_HOOK_LINK")))
+    if token(text, "MOCK_HOOK_RELAYED"):
+        hook_notice(session_id, link(token(text, "MOCK_HOOK_RELAYED")), agent="s-b")
+    idle_link = token(text, "MOCK_HOOK_AFTER") and link(token(text, "MOCK_HOOK_AFTER"))
+    idle_clear = "MOCK_HOOK_CLEAR_AFTER" in text
+    if idle_link or idle_clear:
+        # Sent while idle, after the turn has ended.
+        def later():
+            time.sleep(0.3)
+            if idle_link:
+                hook_notice(session_id, idle_link)
+                time.sleep(0.3)
+            if idle_clear:
+                hook_notice(session_id, None)
+        threading.Thread(target=later, daemon=True).start()
     if "MOCK_SHARED_MESSAGE_IDS" in text:
         for role, value in [("user_message", "User text"), ("agent_thought_chunk", "Thought text"), ("agent_message_chunk", "Assistant text")]:
             content = {"type": "text", "text": value}
@@ -442,6 +488,9 @@ for line in sys.stdin:
                 {"name": "compact", "description": "Compact the session context"}
             ]},
         }})
+        if option("--hook-notice-at-start"):
+            # Before any prompt: no owner is routed yet.
+            hook_notice(result["sessionId"], link(option("--hook-notice-at-start")))
     elif method == "session/list":
         cursor = request.get("params", {}).get("cursor")
         if cursor is None:
