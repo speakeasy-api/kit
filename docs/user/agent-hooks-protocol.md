@@ -106,11 +106,16 @@ before that process removes them again. In that case a sign-in made in
 another process right after the logout can be removed with them, and you sign
 in once more.
 
-Sign-ins belong to a backend in the hooks file that declares it, so two
-projects with the same backend id sign in separately. Moving or re-cloning a
-project starts a new sign-in, and its old one is no longer found by `logout`
-with `--root`. `--all-workspaces` removes the backend's sign-ins in every
-workspace, including moved ones. ACP clients that
+A sign-in belongs to a backend id in the hooks file that declares it, not
+to a project. A backend declared in the global `~/.agents/hooks.json` has
+one sign-in for every project that uses that declaration: signing in or
+logging out from any of them applies to all, and moving or re-cloning a
+project does not change it. Only backends declared in different files sign
+in separately, for example the same backend id in two projects'
+`.agents/hooks.json`. Moving or re-cloning a project whose own file declares
+the backend starts a new sign-in, and its old one is no longer found by
+`logout` with `--root`. `--all-workspaces` removes the backend id's sign-ins
+from every declaring file, including moved ones. ACP clients that
 support terminal authentication offer one `hooks` method whenever hooks are
 enabled and credentials are stored durably. It runs `kit auth login hooks` in
 the workspace the client chooses, and says so when no backend there needs a

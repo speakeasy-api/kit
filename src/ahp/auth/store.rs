@@ -1,5 +1,5 @@
 //! SDK credential records in Kit's credential storage, one lock per record.
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use agenthooksprotocol::{
     auth::{
@@ -33,6 +33,29 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|_| unavailable())?
         .map_err(|_| unavailable())
+}
+
+/// A logout change that must reach disk before Kit goes on: file-backed
+/// storage keeps a mutation only in this process under storage pressure, so
+/// it is required on disk (as OpenAI logout does), and a failure is the
+/// operation's. The keychain is durable as written; memory storage is never
+/// shared with another process, so it has nothing to wait for.
+async fn durably(
+    entry: crate::credentials::CredentialEntry,
+    change: impl FnOnce(
+        &crate::credentials::CredentialEntry,
+    ) -> Result<(), crate::credentials::CredentialStoreError>
+    + Send
+    + 'static,
+) -> Result<(), HookError> {
+    blocking(move || {
+        change(&entry)?;
+        if entry.filesystem_path().is_some() {
+            entry.require_disk()?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// The store one backend's OAuth uses. Records are shared by every Kit
@@ -113,7 +136,7 @@ impl Store {
         if changed {
             let entry = self.storage.entry(SCOPES.0, SCOPES.1);
             let bytes = serde_json::to_vec(&scopes).map_err(|_| unavailable())?;
-            blocking(move || entry.save(&bytes)).await?;
+            durably(entry, move |entry| entry.save(&bytes)).await?;
         }
         Ok(())
     }
@@ -131,9 +154,19 @@ impl Store {
             // The record and its index entry go together, under the record's
             // lock (taken before the index, as everywhere): a writer that
             // recreates the record afterwards also re-indexes it.
+            // Each deletion reaches disk, under the record's lock, before
+            // its index entry goes: logout never reports a removal that
+            // another process can still read.
             let _record = self.lock(namespace, identity, budget).await?;
             let entry = self.storage.entry(namespace, identity);
-            if blocking(move || entry.delete()).await? {
+            let existed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let found = Arc::clone(&existed);
+            durably(entry, move |entry| {
+                found.store(entry.delete()?, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
+            .await?;
+            if existed.load(std::sync::atomic::Ordering::Relaxed) {
                 deleted += 1;
             }
             let _index = self.lock(INDEX, &self.backend, budget).await?;
@@ -141,10 +174,12 @@ impl Store {
             current.remove(&(namespace.clone(), identity.clone()));
             if current.is_empty() {
                 let entry = self.storage.entry(INDEX, &self.backend);
-                blocking(move || entry.delete()).await?;
+                durably(entry, |entry| entry.delete().map(|_| ())).await?;
                 self.list_scope(false, budget).await?;
             } else {
-                self.save_index(&current).await?;
+                let entry = self.storage.entry(INDEX, &self.backend);
+                let bytes = serde_json::to_vec(&current).map_err(|_| unavailable())?;
+                durably(entry, move |entry| entry.save(&bytes)).await?;
             }
         }
         Ok(deleted)
@@ -213,8 +248,9 @@ pub(super) async fn mark_logout(
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
+    // On disk before any record is removed, or the logout fails.
     let entry = storage.entry(LOGOUTS, &identity);
-    blocking(move || entry.save(marker.as_bytes())).await
+    durably(entry, move |entry| entry.save(marker.as_bytes())).await
 }
 
 /// Every scope that has stored records.
@@ -326,6 +362,156 @@ mod tests {
             "destination": "https://hooks.example/ahp", "purpose": "event"
         }))
         .unwrap()
+    }
+
+    /// The credential directory the child process fills up.
+    #[cfg(unix)]
+    const FULL_DIRECTORY: &str = "KIT_AHP_STORE_FULL_DIRECTORY";
+
+    /// Disk full for files under one directory once armed: replacing or
+    /// removing them fails ENOSPC, which the resilient filesystem accepts
+    /// and keeps only in this process.
+    #[cfg(unix)]
+    struct Full {
+        directory: std::path::PathBuf,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl Full {
+        fn check(&self, path: &std::path::Path) -> std::io::Result<()> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst)
+                && path.starts_with(&self.directory)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::resilient_fs::Backend for Full {
+        fn open(
+            &self,
+            path: &std::path::Path,
+            options: &crate::resilient_fs::DiskOpenOptions,
+        ) -> std::io::Result<Box<dyn crate::resilient_fs::BackendFile>> {
+            crate::resilient_fs::DiskBackend.open(path, options)
+        }
+        fn metadata(
+            &self,
+            path: &std::path::Path,
+            follow: bool,
+        ) -> std::io::Result<std::fs::Metadata> {
+            crate::resilient_fs::DiskBackend.metadata(path, follow)
+        }
+        fn identity(
+            &self,
+            path: &std::path::Path,
+            follow: bool,
+        ) -> std::io::Result<Option<crate::resilient_fs::FileIdentity>> {
+            crate::resilient_fs::DiskBackend.identity(path, follow)
+        }
+        fn read_dir(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<Vec<crate::resilient_fs::DiskEntry>> {
+            crate::resilient_fs::DiskBackend.read_dir(path)
+        }
+        fn read_link(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+            crate::resilient_fs::DiskBackend.read_link(path)
+        }
+        fn canonicalize(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+            crate::resilient_fs::DiskBackend.canonicalize(path)
+        }
+        fn create_dir(&self, path: &std::path::Path, private: bool) -> std::io::Result<()> {
+            crate::resilient_fs::DiskBackend.create_dir(path, private)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+            self.check(path)?;
+            crate::resilient_fs::DiskBackend.remove_file(path)
+        }
+        fn remove_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+            crate::resilient_fs::DiskBackend.remove_dir(path)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            self.check(to)?;
+            crate::resilient_fs::DiskBackend.rename(from, to)
+        }
+        fn set_permissions(
+            &self,
+            path: &std::path::Path,
+            permissions: std::fs::Permissions,
+        ) -> std::io::Result<()> {
+            crate::resilient_fs::DiskBackend.set_permissions(path, permissions)
+        }
+        fn sync_directory(&self, path: &std::path::Path) -> std::io::Result<()> {
+            crate::resilient_fs::DiskBackend.sync_directory(path)
+        }
+        fn acquire_lease(
+            &self,
+            request: &crate::resilient_fs::LeaseRequest,
+        ) -> std::io::Result<Box<dyn crate::resilient_fs::BackendLease>> {
+            crate::resilient_fs::DiskBackend.acquire_lease(request)
+        }
+        fn open_beneath(
+            &self,
+            root: &std::path::Path,
+            relative: &std::path::Path,
+        ) -> std::io::Result<Box<dyn crate::resilient_fs::BackendFile>> {
+            crate::resilient_fs::DiskBackend.open_beneath(root, relative)
+        }
+    }
+
+    /// Runs in its own process: the filesystem is global and set only once.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "run by logout_fails_when_its_changes_cannot_reach_disk in its own process"]
+    async fn logout_durability_child() {
+        let directory = std::path::PathBuf::from(std::env::var_os(FULL_DIRECTORY).unwrap());
+        let directory = std::fs::canonicalize(directory).unwrap();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            crate::resilient_fs::initialize_global(crate::resilient_fs::Fs::new(Arc::new(Full {
+                directory: directory.clone(),
+                armed: Arc::clone(&armed),
+            })))
+            .is_ok()
+        );
+        let storage = CredentialStorage::Filesystem(directory.clone());
+        let store = Store::new(storage.clone(), "test#durable");
+        store.remember(SECRETS, "secret", budget()).await.unwrap();
+        let entry = storage.entry(SECRETS, "secret");
+        let path = entry.filesystem_path().unwrap().to_path_buf();
+        blocking(move || entry.save(b"value")).await.unwrap();
+        assert!(path.is_file());
+        // The disk fills up.
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(mark_logout(&storage, "test#durable", false).await.is_err());
+        assert!(store.forget(budget()).await.is_err());
+        // What logout could not remove is still on disk, and was not
+        // reported removed.
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_fails_when_its_changes_cannot_reach_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ahp::auth::store::tests::logout_durability_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(FULL_DIRECTORY, directory.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
     }
 
     #[tokio::test]

@@ -901,6 +901,8 @@ pub struct App {
     /// state is dropped on leaving and late hints for them are ignored: a
     /// new attachment's replay is the authority.
     hook_detached: std::collections::BTreeSet<String>,
+    /// Hook sign-in links of child agents shown here, by agent and backend.
+    subagent_hook_links: std::collections::BTreeMap<(String, String), String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1272,6 +1274,7 @@ impl App {
             hook_sign_ins: Default::default(),
             hook_problems: Default::default(),
             hook_detached: Default::default(),
+            subagent_hook_links: Default::default(),
             gateway_candidate: None,
             child_focus: None,
             session_messages: HashMap::new(),
@@ -3126,6 +3129,39 @@ impl App {
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
+            }
+            RuntimeEvent::SubagentHookSignIn {
+                id,
+                backend,
+                url,
+                cleared,
+                text,
+                ..
+            } => {
+                // A child's link, shown to the user under the agent's name:
+                // the child's hook waits for it.
+                let label = format!("{backend} (agent {id})");
+                let key = (id, backend);
+                match url.filter(|_| !cleared) {
+                    Some(url) => {
+                        if self.subagent_hook_links.get(&key) != Some(&url) {
+                            self.retire_hook_sign_ins(&label);
+                            self.push_block(Block::HookSignIn {
+                                backend: label,
+                                url: url.clone(),
+                                retired: false,
+                            });
+                            self.subagent_hook_links.insert(key, url);
+                        }
+                    }
+                    None => {
+                        self.retire_hook_sign_ins(&label);
+                        self.subagent_hook_links.remove(&key);
+                        if let Some(text) = text.filter(|_| !cleared) {
+                            self.push_block(Block::Notice(format!("Agent {}: {text}", key.0)));
+                        }
+                    }
+                }
             }
         }
     }

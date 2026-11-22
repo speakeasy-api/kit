@@ -528,7 +528,6 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
 struct ResponseReplacementObserver<S> {
     retry: super::retry_projection::Projection,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
-    hook_auth: Option<Arc<crate::ahp::auth::HintSubscription>>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
     compaction: super::compaction_projection::Projection,
@@ -547,7 +546,6 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
             retry: super::retry_projection::Projection::default(),
             compaction: super::compaction_projection::Projection::default(),
             hook_messages: None,
-            hook_auth: None,
             inner,
             sink,
             activity,
@@ -585,44 +583,38 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
     }
 }
 
-impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
-    /// Hook sign-in links go to the user only, never the transcript: to a
-    /// client's status line through [`HookAuthNotification`] when it asked
-    /// for them, else as one notice per link.
-    fn with_hook_auth(
-        mut self,
-        hooks: Option<&crate::ahp::Hooks>,
-        notifications: Option<V2ConnectionTo<Client>>,
-    ) -> Self {
-        let Some(hooks) = hooks else {
-            return self;
-        };
-        let session = self.session_id.clone();
-        self.hook_auth = match notifications {
-            Some(connection) => hooks.subscribe_auth_hints(move |hint| {
-                let _ = connection.send_notification(HookAuthNotification {
-                    session_id: session.clone(),
-                    backend: hint.backend.clone(),
-                    url: hint.url.clone(),
-                    expires_at: hint.expires_at_ms,
-                    cleared: hint.cleared,
-                    problem: hint.problem.clone(),
-                });
-            }),
-            None => {
-                let sink = self.sink.inner.clone();
-                hooks.subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
-                    let _ = sink.update(wire::UpdateSessionNotification::new(
-                        session.clone(),
-                        wire::SessionUpdate::Notice(
-                            wire::Notice::new(wire::NoticeSeverity::Info, text).meta(hint.meta()),
-                        ),
-                    ));
-                }))
-            }
-        }
-        .map(Arc::new);
-        self
+/// Hook sign-in links go to the user only, never the transcript: to a
+/// client's status line through [`HookAuthNotification`] when it asked for
+/// them, else as one notice per link. Subscribed once the session is
+/// activated, after the client has its response: the hints replayed on
+/// subscribing name a session the client knows, and an attachment that
+/// fails never sends any.
+fn subscribe_hook_auth<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
+    hooks: Option<&crate::ahp::Hooks>,
+    session: wire::SessionId,
+    sink: S,
+    notifications: Option<V2ConnectionTo<Client>>,
+) -> Option<crate::ahp::auth::HintSubscription> {
+    let hooks = hooks?;
+    match notifications {
+        Some(connection) => hooks.subscribe_auth_hints(move |hint| {
+            let _ = connection.send_notification(HookAuthNotification {
+                session_id: session.clone(),
+                backend: hint.backend.clone(),
+                url: hint.url.clone(),
+                expires_at: hint.expires_at_ms,
+                cleared: hint.cleared,
+                problem: hint.problem.clone(),
+            });
+        }),
+        None => hooks.subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
+            let _ = sink.update(wire::UpdateSessionNotification::new(
+                session.clone(),
+                wire::SessionUpdate::Notice(
+                    wire::Notice::new(wire::NoticeSeverity::Info, text).meta(hint.meta()),
+                ),
+            ));
+        })),
     }
 }
 
@@ -1378,13 +1370,11 @@ impl Server {
             session_id.clone(),
             activity.clone(),
         )
-        .with_hook_messages(runtime.hooks())
-        .with_hook_auth(
-            runtime.hooks(),
-            self.hook_auth_notifications
-                .load(Ordering::Acquire)
-                .then(|| connection.clone()),
-        );
+        .with_hook_messages(runtime.hooks());
+        let hook_auth_notifications = self
+            .hook_auth_notifications
+            .load(Ordering::Acquire)
+            .then(|| connection.clone());
         let context = AcpDriverContext {
             activity: activity.clone(),
             ask_user,
@@ -1467,6 +1457,13 @@ impl Server {
                 let sink = actor.sink.clone();
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
+                // Held for the session's life, from activation on.
+                let _hook_auth = subscribe_hook_auth(
+                    runtime.hooks(),
+                    session_id.clone(),
+                    sink.inner.clone(),
+                    hook_auth_notifications,
+                );
                 if let Some((used, size)) = restored_context {
                     let _ = sink.update(wire::UpdateSessionNotification::new(
                         session_id.clone(),
@@ -3949,16 +3946,9 @@ mod tests {
     async fn hook_sign_in_links_reach_the_user_not_the_transcript() {
         let (_root, hooks) = crate::ahp::auth::test_support::hooks("test.v2-sign-in");
         let recording = RecordingSink::default();
-        let sink = ResponseReplacementSink::new(recording.clone());
         let session_id = wire::SessionId::new("v2-hook-sign-in");
-        let activity = native_activity(session_id.clone(), sink.clone());
-        let _observer = ResponseReplacementObserver::new(
-            AcpIntegration::default(),
-            sink,
-            session_id.clone(),
-            activity,
-        )
-        .with_hook_auth(Some(&hooks), None);
+        let _subscription =
+            subscribe_hook_auth(Some(&hooks), session_id.clone(), recording.clone(), None);
         let pending = crate::ahp::auth::test_support::hint(
             &hooks,
             "test.v2-sign-in",
@@ -5008,6 +4998,83 @@ mod tests {
                     .is_some()
             );
         }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn hook_sign_in_replay_follows_the_session_response() {
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            json!({"protocolVersion": "draft", "hooks": [{
+                "id": "test.replay-order",
+                "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "subscriptions": [crate::ahp::test_support::observe(&["context.compact.before"])],
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::with_hooks(
+            Runtime::new_with_provider_credentials_and_effort(
+                root.path(),
+                "test-model",
+                crate::ProviderKind::OpenRouter,
+                credentials,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // A link is already shown when the session is created.
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::test_support::hint(
+            runtime.hooks().unwrap(),
+            "test.replay-order",
+            "https://auth.example/authorize?state=replay-order",
+        ));
+        let (mut client, agent) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent).await });
+        send_wire(
+            &client,
+            "initialize",
+            1,
+            serde_json::to_value(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("replay-order-test", "0"),
+            ))
+            .unwrap(),
+        );
+        receive_wire(&mut client, "initialize response").await;
+        send_wire(
+            &client,
+            "session/new",
+            2,
+            serde_json::to_value(wire::NewSessionRequest::new(root.path().to_path_buf())).unwrap(),
+        );
+        let response = receive_wire(&mut client, "session/new response").await;
+        assert_eq!(
+            response["id"], 2,
+            "the response must come first: {response}"
+        );
+        let session_id = response["result"]["sessionId"].clone();
+        let mut replayed = false;
+        for _ in 0..10 {
+            let frame = receive_wire(&mut client, "session update").await;
+            if frame["params"]["update"]["_meta"]
+                .get(HOOK_AUTH_META)
+                .is_some()
+            {
+                assert_eq!(frame["params"]["sessionId"], session_id);
+                replayed = true;
+                break;
+            }
+        }
+        assert!(replayed, "the shown link is replayed after the response");
         server.abort();
         let _ = server.await;
     }

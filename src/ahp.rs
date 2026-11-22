@@ -409,10 +409,8 @@ pub(crate) fn effective_registration_sources(
         let path = directory.join(CONFIG_FILE);
         match read(&path) {
             Ok(Some(registration)) => {
-                let source = std::fs::canonicalize(&path)
-                    .unwrap_or_else(|_| path.clone())
-                    .to_string_lossy()
-                    .into_owned();
+                let source =
+                    source_identity(&std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()));
                 for backend in &registration.hooks {
                     sources.insert(backend.id.to_string(), source.clone());
                 }
@@ -423,6 +421,30 @@ pub(crate) fn effective_registration_sources(
         }
     }
     merged.map(|registration| (registration, sources))
+}
+
+/// The identity of a declaring hooks file in credential scopes: the path
+/// itself when it is UTF-8 (as it always was, so stored sign-ins are still
+/// found), else a lossless encoding of its native bytes. A canonical path is
+/// absolute, so the `os:` prefix never collides with a UTF-8 one, and two
+/// distinct non-UTF-8 paths never share an identity.
+fn source_identity(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_owned();
+    }
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec();
+    #[cfg(windows)]
+    let bytes: Vec<u8> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .flat_map(u16::to_be_bytes)
+        .collect();
+    #[cfg(not(any(unix, windows)))]
+    let bytes = path.to_string_lossy().into_owned().into_bytes();
+    let mut identity = String::from("os:");
+    for byte in bytes {
+        identity.push_str(&format!("{byte:02x}"));
+    }
+    identity
 }
 
 fn read(path: &Path) -> Result<Option<Registration>, String> {

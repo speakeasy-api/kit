@@ -5392,6 +5392,45 @@ mod tests {
     }
 
     #[test]
+    fn a_child_agents_sign_in_link_reaches_the_user() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("parent".into());
+        app.apply(crate::tui::app::Update::Runtime(
+            crate::events::RuntimeEvent::SessionStarted {
+                session_id: "parent".into(),
+            },
+        ));
+        let event = |url: Option<&str>, cleared: bool| {
+            crate::tui::app::Update::Runtime(crate::events::RuntimeEvent::SubagentHookSignIn {
+                id: "scout".into(),
+                backend: "com.example".into(),
+                url: url.map(str::to_owned),
+                expires_at: None,
+                cleared,
+                text: None,
+            })
+        };
+        let flat = |app: &mut App| {
+            render(app, 120, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        app.apply(event(Some("https://auth.example/child"), false));
+        let screen = flat(&mut app);
+        assert!(screen.contains("https://auth.example/child"), "{screen}");
+        assert!(screen.contains("agent scout"), "{screen}");
+        // Signed in: the link is retired.
+        app.apply(event(None, true));
+        assert!(!flat(&mut app).contains("https://auth.example/child"));
+    }
+
+    #[test]
     fn a_reattached_session_shows_only_what_its_replay_sends() {
         let mut app = App::new(
             PathBuf::from("/tmp"),

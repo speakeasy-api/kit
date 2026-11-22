@@ -1281,6 +1281,44 @@ async fn a_logout_elsewhere_withdraws_links_at_the_next_turn() {
 }
 
 #[tokio::test]
+async fn retiring_links_from_before_a_logout_keeps_needs_recorded_since() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.logout-keeps-needs";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    let event = context(&auth, id);
+    let _ = credential(&auth, event.clone()).await;
+    auth.turn_started();
+    let old = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    logout_elsewhere(&auth, id, false).await;
+    // After the logout, an upload on another resource needs a sign-in too.
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/uploads", issuer.origin)}));
+    assert!(credential(&auth, upload.clone()).await.is_err());
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    // Only the old link went; both needs stay, and each has a fresh link.
+    assert!(!states(&scope).contains(&query(&old, "state")));
+    let needs = login::registry().needs(&scope);
+    for target in [&event, &upload] {
+        assert!(
+            needs
+                .iter()
+                .any(|need| need.context.purpose == target.purpose
+                    && need.context.destination == target.destination),
+            "lost the need of {:?}",
+            target.purpose
+        );
+    }
+    assert_eq!(states(&scope).len(), 2);
+}
+
+#[tokio::test]
 async fn a_scope_denial_is_not_replayed_to_a_later_session() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();

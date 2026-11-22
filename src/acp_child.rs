@@ -522,6 +522,21 @@ fn user_only(update: &Value) -> bool {
         .is_some()
 }
 
+/// The user's copy of a child's hook sign-in hint (see [`user_only`]), as
+/// the owning agent's runtime event: the parent's UI shows it, so the user
+/// can unblock the child's hook, and nothing the model reads carries it.
+fn hook_sign_in_event(owner: &str, update: &Value) -> Option<crate::events::RuntimeEvent> {
+    let meta = update["_meta"].get(crate::ahp::auth::HOOK_AUTH_META)?;
+    Some(crate::events::RuntimeEvent::SubagentHookSignIn {
+        id: owner.to_owned(),
+        backend: meta["backend"].as_str()?.to_owned(),
+        url: meta["url"].as_str().map(str::to_owned),
+        expires_at: meta["expiresAt"].as_u64(),
+        cleared: meta["cleared"].as_bool().unwrap_or(false),
+        text: update["title"].as_str().map(str::to_owned),
+    })
+}
+
 fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActivity> {
     use crate::events::SubagentActivity;
     use agent_client_protocol::schema::MaybeUndefined;
@@ -1597,7 +1612,19 @@ async fn run(
                 if message.method != "session/update" { return Ok(()); }
                 let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
                 let mut params = message.params;
-                if user_only(&params["update"]) { return Ok(()); }
+                if user_only(&params["update"]) {
+                    // To the user's UI only, never routed into child output.
+                    let owner = notification_routes
+                        .lock()
+                        .ok()
+                        .and_then(|routes| routes.get(&session_id).map(|route| route.owner.clone()));
+                    if let Some(owner) = owner
+                        && let Some(event) = hook_sign_in_event(&owner, &params["update"])
+                    {
+                        crate::events::emit(&event);
+                    }
+                    return Ok(());
+                }
                 protocol::normalize_config_options(&mut params["update"]);
                 let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
                 if let Some(notification) = &notification
@@ -3090,6 +3117,20 @@ mod tests {
             "title": format!("Hook backend `x` needs you to sign in. Open {link} to approve Kit."),
             "_meta": {"kit/hooks/auth": {"backend": "x", "url": link, "cleared": false}}});
         assert!(user_only(&notice));
+        // The user gets it through the parent's UI, as the owning agent's.
+        assert_eq!(
+            hook_sign_in_event("scout", &notice),
+            Some(crate::events::RuntimeEvent::SubagentHookSignIn {
+                id: "scout".into(),
+                backend: "x".into(),
+                url: Some(link.into()),
+                expires_at: None,
+                cleared: false,
+                text: Some(format!(
+                    "Hook backend `x` needs you to sign in. Open {link} to approve Kit."
+                )),
+            })
+        );
         let mut output = ChildOutput::default();
         output.record(update(notice));
         output.record(update(json!({

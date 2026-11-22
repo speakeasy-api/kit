@@ -575,12 +575,11 @@ impl HookAuth {
 
     async fn prepare_backend(&self, backend: &Backend) {
         // A logout in another Kit process withdraws this process's links
-        // from before it, and what it knew the backend needed. Two
+        // from before it; what the backend needs is kept, so this turn
+        // offers fresh links for it. Two
         // credential-entry reads: the scope's marker and the backend id's.
-        if let Ok(generation) = store::logout_generation(&self.0.storage, &backend.scope).await
-            && login::registry().superseded(&backend.scope, &generation)
-        {
-            login::registry().reset(&backend.scope, &backend.id);
+        if let Ok(generation) = store::logout_generation(&self.0.storage, &backend.scope).await {
+            login::registry().retire_superseded(&backend.scope, &backend.id, &generation);
         }
         let mut needs = login::registry().needs(&backend.scope);
         if needs.is_empty() {

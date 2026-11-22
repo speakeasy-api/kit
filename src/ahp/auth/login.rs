@@ -199,7 +199,8 @@ pub(super) fn query(url: &url::Url, name: &str) -> Option<String> {
 
 /// A subscriber: each hint arrives with its sequence number, so one that
 /// was overtaken on the way is dropped (see [`ordered`]).
-type Sink = dyn Fn(u64, &AuthHint) + Send + Sync;
+/// `true` marks a persistent hint, `false` a transient diagnostic.
+type Sink = dyn Fn(u64, bool, &AuthHint) + Send + Sync;
 
 /// What a subscriber has been shown last for each scope: the sequence
 /// number of its latest hint.
@@ -561,13 +562,39 @@ impl Registry {
         }
     }
 
-    /// Whether this process shows a link for `scope` prepared before its
-    /// current logout generation: a logout elsewhere superseded it.
-    pub(super) fn superseded(&self, scope: &str, generation: &str) -> bool {
-        self.lock()
-            .pending
-            .get(scope)
-            .is_some_and(|logins| logins.iter().any(|login| login.generation.at != generation))
+    /// A logout (elsewhere) moved `scope` to `generation`: this process's
+    /// links prepared before it are withdrawn, and only those. Needs stay,
+    /// those recorded since and before alike (a logout leaves the backend
+    /// needing a sign-in all the more), as do links prepared since; the hint
+    /// moves on to the next link, or clears.
+    pub(super) fn retire_superseded(&self, scope: &str, backend: &str, generation: &str) {
+        let (stopped, delivery) = {
+            let mut state = self.lock();
+            let Some(logins) = state.pending.get_mut(scope) else {
+                return;
+            };
+            let mut stopped = Vec::new();
+            logins.retain(|login| {
+                let stale = login.generation.at != generation;
+                if stale {
+                    stopped.push(Arc::clone(&login.stop));
+                }
+                !stale
+            });
+            if stopped.is_empty() {
+                return;
+            }
+            let next = logins.first().map(Login::hint);
+            if next.is_none() {
+                state.pending.remove(scope);
+            }
+            let hint = next.unwrap_or_else(|| cleared(scope, backend, false));
+            (stopped, stage(&mut state, hint))
+        };
+        for stop in stopped {
+            stop.notify_one();
+        }
+        deliver(delivery);
     }
 
     /// Forgets everything about a scope, as after logging out.
@@ -589,6 +616,8 @@ impl Registry {
 /// state change that produced it, and run outside it.
 struct Delivery {
     sequence: u64,
+    /// A scope's current hint, rather than a transient diagnostic.
+    persistent: bool,
     hint: AuthHint,
     sinks: Vec<Arc<Sink>>,
     line: Option<String>,
@@ -625,16 +654,19 @@ fn stage(state: &mut State, hint: AuthHint) -> Option<Delivery> {
     };
     Some(Delivery {
         sequence,
+        persistent: true,
         hint,
         sinks,
         line,
     })
 }
 
-/// Numbers `hint` and picks its sinks without making it the scope's current
-/// hint: a later subscriber is not shown it.
+/// Picks `hint`'s sinks without making it the scope's current hint: a later
+/// subscriber is not shown it. It takes the number of the latest persistent
+/// hint, without advancing it: delivered late, it never hides a persistent
+/// hint staged before it, and overtaken by a newer one it is dropped, so
+/// its snapshot of the link cannot bring back a link that was cleared.
 fn stage_transient(state: &mut State, hint: AuthHint) -> Delivery {
-    state.sequence += 1;
     state.sinks.retain(|(_, sink)| sink.strong_count() != 0);
     let sinks: Vec<_> = state
         .sinks
@@ -649,6 +681,7 @@ fn stage_transient(state: &mut State, hint: AuthHint) -> Delivery {
     };
     Delivery {
         sequence: state.sequence,
+        persistent: false,
         hint,
         sinks,
         line,
@@ -659,6 +692,7 @@ fn stage_transient(state: &mut State, hint: AuthHint) -> Delivery {
 fn deliver(delivery: Option<Delivery>) {
     let Some(Delivery {
         sequence,
+        persistent,
         hint,
         sinks,
         line,
@@ -672,23 +706,29 @@ fn deliver(delivery: Option<Delivery>) {
         eprintln!("{line}");
     }
     for sink in sinks {
-        sink(sequence, &hint);
+        sink(sequence, persistent, &hint);
     }
 }
 
 /// A subscriber's sink: its deliveries are serialized, and a hint older
 /// than the last one it was shown for the scope (overtaken between the
-/// registry lock and delivery) is dropped.
+/// registry lock and delivery) is dropped. A transient diagnostic is shown
+/// unless a newer persistent hint was, and never moves the watermark.
 fn ordered(inner: Arc<dyn Fn(&AuthHint) + Send + Sync>) -> (Arc<Sink>, Arc<Shown>) {
     let shown: Arc<Shown> = Arc::default();
     let sink: Arc<Sink> = Arc::new({
         let shown = Arc::clone(&shown);
-        move |sequence: u64, hint: &AuthHint| {
+        move |sequence: u64, persistent: bool, hint: &AuthHint| {
             let mut shown = shown.lock().unwrap_or_else(|poison| poison.into_inner());
-            if shown.get(&hint.scope).is_some_and(|&last| last >= sequence) {
+            let last = shown.get(&hint.scope).copied();
+            if persistent {
+                if last.is_some_and(|last| last >= sequence) {
+                    return;
+                }
+                shown.insert(hint.scope.clone(), sequence);
+            } else if last.is_some_and(|last| last > sequence) {
                 return;
             }
-            shown.insert(hint.scope.clone(), sequence);
             inner(hint);
         }
     });
@@ -1084,9 +1124,48 @@ mod tests {
         let done = cleared("test#test.order", "test.order", true);
         // The later state (signed in) arrives first; the older link that
         // was staged before it must not replace it.
-        sink(2, &done);
-        sink(1, &link);
+        sink(2, true, &done);
+        sink(1, true, &link);
         assert_eq!(*seen.lock().unwrap(), [true]);
+    }
+
+    #[test]
+    fn a_diagnostic_neither_hides_nor_outlives_a_persistent_hint() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (sink, _) = ordered(Arc::new({
+            let seen = Arc::clone(&seen);
+            move |hint: &AuthHint| {
+                seen.lock()
+                    .unwrap()
+                    .push((hint.url.is_some(), hint.cleared))
+            }
+        }));
+        let scope = "test#test.diagnostic-order";
+        let link = AuthHint {
+            scope: scope.into(),
+            backend: "test.diagnostic-order".into(),
+            url: Some("https://auth.example/a".into()),
+            expires_at_ms: None,
+            cleared: false,
+            signed_in: false,
+            problem: Some("requires scopes (x) outside the ones Kit allows for it.".into()),
+        };
+        let done = cleared(scope, "test.diagnostic-order", true);
+        // A diagnostic staged after the clear (number 5) is delivered first:
+        // the clear still arrives.
+        sink(
+            5,
+            false,
+            &AuthHint {
+                url: None,
+                ..link.clone()
+            },
+        );
+        sink(5, true, &done);
+        // One staged before a newer clear, delivered after it, is dropped:
+        // its link snapshot does not come back.
+        sink(4, false, &link);
+        assert_eq!(*seen.lock().unwrap(), [(false, false), (false, true)]);
     }
 
     #[test]
