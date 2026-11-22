@@ -3015,8 +3015,9 @@ impl App {
                             .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
                 {
                     self.agents.remove(&id);
-                    self.subagent_hook_links
-                        .retain(|(agent, _), _| *agent != id);
+                    self.subagent_hook_links.retain(|(agent, _), _| {
+                        *agent != id && !agent.starts_with(&format!("{id}/"))
+                    });
                 } else {
                     if !self.agents_auto_opened && status != SubagentStatus::Removed {
                         self.agents_visible = true;
@@ -3128,8 +3129,12 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
-                self.subagent_hook_links
-                    .retain(|(agent, _), _| !removed.contains(agent));
+                // A link is an agent's own or one of its descendants' (`a/b`).
+                self.subagent_hook_links.retain(|(agent, _), _| {
+                    !removed
+                        .iter()
+                        .any(|id| agent == id || agent.starts_with(&format!("{id}/")))
+                });
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
@@ -3138,10 +3143,12 @@ impl App {
                 id,
                 backend,
                 url,
+                expires_at,
                 cleared,
                 text,
-                ..
             } => {
+                // An expired link is never shown; it counts as a clear.
+                let cleared = cleared || expires_at.is_some_and(|at| at <= now_unix_ms);
                 // A child's link, shown to the user under the agent's name:
                 // the child's hook waits for it.
                 let label = format!("{backend} (agent {id})");

@@ -1192,6 +1192,12 @@ pub mod cli {
         ))
     }
 
+    /// This process is a Kit subagent (`--subagent-depth` above 0): its
+    /// stderr is its parent's to log, so no sign-in link is printed there.
+    pub fn mark_subagent_process() {
+        super::login::mark_subagent_process();
+    }
+
     /// `backend: status` lines, for `backend` or every backend.
     pub async fn status(
         root: &Path,

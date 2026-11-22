@@ -177,6 +177,12 @@ fn write_frame(writer: &mut impl Write, event: &RuntimeEvent) -> io::Result<()> 
     writer.write_all(&encode_frame(event)?)
 }
 
+/// Whether `event` fits one runtime-event frame; one that does not would
+/// disable the transport.
+pub(crate) fn fits(event: &RuntimeEvent) -> bool {
+    encode_frame(event).is_ok()
+}
+
 fn encode_frame(event: &RuntimeEvent) -> io::Result<Vec<u8>> {
     // A bounded writer, not an unbounded serialization followed by a size check.
     let mut frame = vec![0; MAX_FRAME_BYTES];

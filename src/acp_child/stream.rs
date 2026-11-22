@@ -401,9 +401,31 @@ pub(crate) struct Routes(Mutex<RoutesState>);
 struct RoutesState {
     live: HashMap<String, Route>,
     resume: Option<Resume>,
-    /// Hook sign-in hints from child sessions not yet routed to an owner:
-    /// the latest per (session, backend), bounded, until registration.
+    /// Hook sign-in hints from child sessions not yet routed to an owner, or
+    /// arriving while a registration replays: the latest per (session,
+    /// originating agent and backend), bounded.
     held: Vec<(String, String, Value)>,
+    /// Sessions whose held hints are being replayed: hints that arrive
+    /// meanwhile are held too, so none overtakes an older one.
+    replaying: std::collections::HashSet<String>,
+}
+
+/// A held hint's key within its session: the agent that originated it
+/// (relayed from further down the tree) and its backend.
+fn hint_key(update: &Value) -> Option<String> {
+    let mark = &update["_meta"][crate::ahp::auth::HOOK_AUTH_META];
+    let backend = mark["backend"].as_str()?;
+    Some(format!(
+        "{}\n{backend}",
+        mark["agent"].as_str().unwrap_or("")
+    ))
+}
+
+/// Whether a hint's link has expired: it is not replayed.
+fn expired(update: &Value) -> bool {
+    update["_meta"][crate::ahp::auth::HOOK_AUTH_META]["expiresAt"]
+        .as_u64()
+        .is_some_and(|at| at <= crate::events::now_millis())
 }
 
 /// The most hook sign-in hints held for unrouted child sessions.
@@ -549,14 +571,34 @@ impl Routes {
         if !state.live.contains_key(remote) {
             return Vec::new();
         }
+        // Until the replay drains (see `take_replay`), new hints queue behind.
+        state.replaying.insert(remote.to_owned());
+        Self::take_held(&mut state, remote)
+    }
+
+    fn take_held(state: &mut RoutesState, remote: &str) -> Vec<Value> {
         let mut held = Vec::new();
         state.held.retain(|(session, _, update)| {
             let mine = session == remote;
-            if mine {
+            if mine && !expired(update) {
                 held.push(update.clone());
             }
             !mine
         });
+        held
+    }
+
+    /// After delivering what [`Self::register`] returned: the hints that
+    /// arrived meanwhile, in order; empty once the replay is done, and from
+    /// then on hints go straight to the owner.
+    pub(crate) fn take_replay(&self, remote: &str) -> Vec<Value> {
+        let Ok(mut state) = self.0.lock() else {
+            return Vec::new();
+        };
+        let held = Self::take_held(&mut state, remote);
+        if held.is_empty() {
+            state.replaying.remove(remote);
+        }
         held
     }
 
@@ -572,20 +614,22 @@ impl Routes {
         let Ok(mut state) = self.0.lock() else {
             return None;
         };
-        if let Some(route) = state.live.get(remote) {
+        if !state.replaying.contains(remote)
+            && let Some(route) = state.live.get(remote)
+        {
             return Some((route.owner.clone(), route.transcript.clone(), update));
         }
-        let backend = update["_meta"][crate::ahp::auth::HOOK_AUTH_META]["backend"]
-            .as_str()?
-            .to_owned();
+        let key = hint_key(&update)?;
         let held = &mut state.held;
-        if let Some(existing) = held
-            .iter_mut()
-            .find(|(session, held, _)| session == remote && *held == backend)
+        if let Some(index) = held
+            .iter()
+            .position(|(session, held, _)| session == remote && *held == key)
         {
-            existing.2 = update;
+            // The latest goes last, after anything held before it.
+            held.remove(index);
+            held.push((remote.to_owned(), key, update));
         } else if held.len() < HELD_HINTS {
-            held.push((remote.to_owned(), backend, update));
+            held.push((remote.to_owned(), key, update));
         }
         None
     }
@@ -913,6 +957,7 @@ mod tests {
                 hook_hint("b", Some("https://b/1"), false)
             ]
         );
+        assert!(routes.take_replay("child").is_empty());
         // Registered once, it stays routed between prompts: a link or clear
         // published while idle reaches the owner.
         let (owner, _, update) = routes
@@ -931,6 +976,49 @@ mod tests {
             routes
                 .register("other", "owner", 1, transcripts.get("owner", 1).unwrap())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_hint_during_replay_never_overtakes_an_older_one() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.hook_hint("child", hook_hint("a", Some("https://a/1"), false));
+        let held = routes.register("child", "owner", 1, transcripts.get("owner", 1).unwrap());
+        assert_eq!(held, [hook_hint("a", Some("https://a/1"), false)]);
+        // A clear arrives before the replay is delivered: it queues behind.
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_none()
+        );
+        assert_eq!(routes.take_replay("child"), [hook_hint("a", None, true)]);
+        assert!(routes.take_replay("child").is_empty());
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn expired_held_links_are_not_replayed_and_agents_do_not_collide() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        let mut expired = hook_hint("a", Some("https://a/old"), false);
+        expired["_meta"][crate::ahp::auth::HOOK_AUTH_META]["expiresAt"] = 1.into();
+        routes.hook_hint("child", expired);
+        // A grandchild's link for the same backend, relayed by the child.
+        let mut relayed = hook_hint("b", Some("https://b/grandchild"), false);
+        relayed["_meta"][crate::ahp::auth::HOOK_AUTH_META]["agent"] = "s-grandchild".into();
+        routes.hook_hint("child", hook_hint("b", Some("https://b/own"), false));
+        routes.hook_hint("child", relayed.clone());
+        let held = routes.register("child", "owner", 1, transcripts.get("owner", 1).unwrap());
+        assert_eq!(
+            held,
+            [hook_hint("b", Some("https://b/own"), false), relayed]
         );
     }
 

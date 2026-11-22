@@ -2666,6 +2666,9 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
+            if subagent_depth > 0 {
+                kit::hook_auth::mark_subagent_process();
+            }
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let runtime = kit::Runtime::with_subagent_parent_context(
                 runtime,

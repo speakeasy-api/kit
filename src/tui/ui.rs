@@ -5439,6 +5439,27 @@ mod tests {
         ));
         app.apply(event(Some("https://auth.example/child"), false));
         assert!(flat(&mut app).contains("https://auth.example/child"));
+        let other = |id: &str, url: &str, expires_at: Option<u64>| {
+            crate::tui::app::Update::Runtime(crate::events::RuntimeEvent::SubagentHookSignIn {
+                id: id.into(),
+                backend: "com.example".into(),
+                url: Some(url.into()),
+                expires_at,
+                cleared: false,
+                text: None,
+            })
+        };
+        // An expired link is never shown.
+        app.apply(other("scout", "https://auth.example/expired", Some(1)));
+        assert!(!flat(&mut app).contains("auth.example/expired"));
+        // A grandchild's link for the same backend sits beside the child's.
+        app.apply(other("scout/pip", "https://auth.example/grandchild", None));
+        let screen = flat(&mut app);
+        assert!(
+            screen.contains("https://auth.example/grandchild"),
+            "{screen}"
+        );
+        assert!(screen.contains("agent scout/pip"), "{screen}");
     }
 
     #[test]

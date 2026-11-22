@@ -2981,6 +2981,7 @@ mod steer_tests {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         });
         let state = Arc::new(AsyncMutex::new(State {
             name: "Scout".into(),

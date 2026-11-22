@@ -441,6 +441,10 @@ pub(crate) struct ChildConfig {
     /// The parent's `tool.before` event that started this child, passed to a
     /// Kit child so its `session.start` can name it as `parentEventId`.
     pub ahp_parent_event: Option<String>,
+    /// This runtime is itself a Kit subagent (`--subagent-depth` above 0):
+    /// its stderr and runtime events go to a Kit parent, not to Kit's own
+    /// client. Unlike `parent_id`, spawning a child never changes it.
+    pub nested_runtime: bool,
 }
 
 impl ChildConfig {
@@ -526,41 +530,78 @@ fn user_only(update: &Value) -> bool {
 /// the owning agent's runtime event: the parent's UI shows it, so the user
 /// can unblock the child's hook, and nothing the model reads carries it.
 fn hook_sign_in_event(owner: &str, update: &Value) -> Option<crate::events::RuntimeEvent> {
-    let meta = update["_meta"].get(crate::ahp::auth::HOOK_AUTH_META)?;
+    let mark = update["_meta"].get(crate::ahp::auth::HOOK_AUTH_META)?;
     Some(crate::events::RuntimeEvent::SubagentHookSignIn {
-        id: owner.to_owned(),
-        backend: meta["backend"].as_str()?.to_owned(),
-        url: meta["url"].as_str().map(str::to_owned),
-        expires_at: meta["expiresAt"].as_u64(),
-        cleared: meta["cleared"].as_bool().unwrap_or(false),
-        text: update["title"].as_str().map(bounded_notice),
+        id: origin(owner, mark),
+        backend: mark["backend"].as_str()?.to_owned(),
+        url: mark["url"].as_str().map(str::to_owned),
+        expires_at: mark["expiresAt"].as_u64(),
+        cleared: mark["cleared"].as_bool().unwrap_or(false),
+        text: notice_text(update),
     })
 }
 
 /// The same hint, for the parent session's ACP client: the child's notice
 /// text and its sign-in mark only (nothing else of the child's `_meta`),
-/// relayed to that session's user only.
+/// relayed to that session's user only. The mark names the agent the link
+/// is for and keeps its unlabelled text, so a Kit further up labels it once.
 fn child_hint(owner: &str, update: &Value) -> Option<crate::ahp::auth::relay::ChildHint> {
-    let mark = update["_meta"].get(crate::ahp::auth::HOOK_AUTH_META)?;
+    let mut mark = update["_meta"]
+        .get(crate::ahp::auth::HOOK_AUTH_META)?
+        .clone();
+    let agent = origin(owner, &mark);
+    let text = notice_text(update)?;
+    mark["agent"] = Value::String(agent.clone());
+    mark["text"] = Value::String(text.clone());
     Some(crate::ahp::auth::relay::ChildHint {
-        agent: owner.to_owned(),
-        text: bounded_notice(update["title"].as_str()?),
-        meta: serde_json::Map::from_iter([(
-            crate::ahp::auth::HOOK_AUTH_META.to_owned(),
-            mark.clone(),
-        )]),
+        agent,
+        text,
+        meta: serde_json::Map::from_iter([(crate::ahp::auth::HOOK_AUTH_META.to_owned(), mark)]),
     })
+}
+
+/// The agent a link is for: `owner`, or, relayed by `owner` from one of its
+/// own children, that child under it.
+fn origin(owner: &str, mark: &Value) -> String {
+    match mark["agent"].as_str() {
+        Some(below) => format!("{owner}/{below}"),
+        None => owner.to_owned(),
+    }
 }
 
 /// The longest child notice text relayed, in bytes.
 const MAX_CHILD_NOTICE: usize = 2048;
 
-fn bounded_notice(text: &str) -> String {
+/// The child's notice text, unlabelled: what a Kit below kept in the mark,
+/// else the notice's title. Bounded, and a link that does not fit is left
+/// out rather than cut (the whole link stays in the mark).
+fn notice_text(update: &Value) -> Option<String> {
+    let mark = &update["_meta"][crate::ahp::auth::HOOK_AUTH_META];
+    let text = mark["text"].as_str().or(update["title"].as_str())?;
+    Some(bounded_notice(text, mark["url"].as_str()))
+}
+
+fn bounded_notice(text: &str, url: Option<&str>) -> String {
+    if text.len() <= MAX_CHILD_NOTICE {
+        return text.to_owned();
+    }
+    let text = match url {
+        Some(url) if text.contains(url) => text.replace(url, "(the link is too long to show)"),
+        _ => text.to_owned(),
+    };
     let mut end = text.len().min(MAX_CHILD_NOTICE);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// Whether this process tells Kit's own client about a child's sign-in
+/// link through a runtime event: only the top Kit of a tree, whose events
+/// that client reads. A nested Kit relays the notice to its parent session
+/// instead and emits nothing.
+fn emits_hook_events(config: &ChildConfig) -> bool {
+    !config.nested_runtime
 }
 
 /// Delivers a child session's hook sign-in hint to its user: through
@@ -573,9 +614,16 @@ fn deliver_hook_hint(
     transcript: &transcript::Transcript,
     update: &Value,
     nested: bool,
+    emit: &dyn Fn(&crate::events::RuntimeEvent),
 ) {
     if !nested && let Some(event) = hook_sign_in_event(owner, update) {
-        crate::events::emit(&event);
+        // An event too large for one frame would end the runtime-event
+        // transport: the link then reaches the user only as the notice.
+        if crate::diagnostic_transport::fits(&event) {
+            emit(&event);
+        } else {
+            tracing::warn!(agent = %owner, "a child's hook sign-in link is too long for a runtime event");
+        }
     }
     if let Some(parent) = transcript.stream_parent(owner)
         && let Some(hint) = child_hint(owner, update)
@@ -1648,8 +1696,8 @@ async fn run(
     let notification_configs = Arc::clone(&config_snapshots);
     let stream_routes = Arc::new(stream::Routes::default());
     let notification_stream_routes = Arc::clone(&stream_routes);
-    // A Kit nested under another Kit: its runtime events go to that parent.
-    let nested = config.parent_id.is_some();
+    // This process's own place in the tree, not the spawned child's.
+    let nested = !emits_hook_events(&config);
     let root = config.root.clone();
     let additional_directories = config.additional_directories.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
@@ -1668,7 +1716,7 @@ async fn run(
                     if let Some((owner, transcript, update)) = notification_stream_routes
                         .hook_hint(&session_id.to_string(), params["update"].clone())
                     {
-                        deliver_hook_hint(&owner, &transcript, &update, nested);
+                        deliver_hook_hint(&owner, &transcript, &update, nested, &crate::events::emit);
                     }
                     return Ok(());
                 }
@@ -2135,8 +2183,15 @@ async fn run(
                             let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
                             if let Some(transcript) = &prompt.transcript {
                                 // Hook sign-in hints sent before it had an owner.
-                                for update in stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone()) {
-                                    deliver_hook_hint(&prompt.owner, transcript, &update, nested);
+                                // Then any that arrived meanwhile, in order, before
+                                // new ones go straight through.
+                                let remote = session_id.to_string();
+                                let mut held = stream_routes.register(&remote, &prompt.owner, prompt.generation, transcript.clone());
+                                while !held.is_empty() {
+                                    for update in &held {
+                                        deliver_hook_hint(&prompt.owner, transcript, update, nested, &crate::events::emit);
+                                    }
+                                    held = stream_routes.take_replay(&remote);
                                 }
                             }
                             if let Ok(mut routes) = routes.lock() {
@@ -2992,6 +3047,7 @@ mod tests {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         for resume in [false, true] {
             let command = harnesses
@@ -3125,6 +3181,7 @@ mod tests {
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -3547,6 +3604,7 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             };
             let result = ChildSession::start(
                 config,
@@ -3636,6 +3694,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let result = ChildSession::start(
             config,
@@ -3703,6 +3762,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
 
         let error = match ChildSession::start(
@@ -3765,6 +3825,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -3822,6 +3883,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -3959,6 +4021,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let starts = (0..64)
             .map(|_| {
@@ -4030,6 +4093,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let base = ChildSession::start(
             config,
@@ -4112,6 +4176,7 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             };
             let base = ChildSession::start(
                 config,
@@ -4279,6 +4344,7 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             };
             ChildSession::start(
                 config,
@@ -4627,6 +4693,7 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             };
             let (child, _) = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -4729,6 +4796,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let base = ChildSession::start(
             config.clone(),
@@ -5000,6 +5068,7 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            nested_runtime: false,
         };
         let base = ChildSession::start(
             config,
@@ -5133,6 +5202,7 @@ for line in sys.stdin:
                     tree_slots: None,
                     prompt_cache_key: None,
                     ahp_parent_event: None,
+                    nested_runtime: false,
                 },
                 "acp.mock".into(),
                 None,
@@ -5277,6 +5347,7 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             };
             let base = ChildSession::start(
                 config,
@@ -5607,6 +5678,125 @@ for line in sys.stdin:
         }
     }
 
+    /// How a link from `owner` (or a descendant of it, `below`) reaches the
+    /// user from this process: the runtime events emitted and the notices
+    /// relayed to the owning parent session.
+    fn deliveries(
+        nested: bool,
+        below: Option<&str>,
+    ) -> (
+        Vec<crate::events::RuntimeEvent>,
+        Vec<crate::ahp::auth::relay::ChildHint>,
+    ) {
+        let session = format!("parent-{nested}-{below:?}");
+        let transcripts = transcript::Transcripts::default();
+        let _subscription = transcripts.stream.subscribe(session.clone(), false);
+        transcripts.stream.announce(
+            "s-child",
+            "Scout",
+            "task",
+            crate::events::SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
+        transcripts.start("s-child", 1);
+        let relayed = Arc::new(Mutex::new(Vec::new()));
+        let _relay = crate::ahp::auth::relay::subscribe(session, {
+            let relayed = Arc::clone(&relayed);
+            move |hint| relayed.lock().unwrap().push(hint.clone())
+        });
+        let mut mark = json!({"backend": "x", "url": "https://auth.example/a", "cleared": false});
+        if let Some(below) = below {
+            mark["agent"] = below.into();
+        }
+        let update = json!({"sessionUpdate": "notice", "severity": "info",
+            "title": "Hook backend `x` needs you to sign in.", "_meta": {HOOK_AUTH_META_KEY: mark}});
+        let emitted = Mutex::new(Vec::new());
+        deliver_hook_hint(
+            "s-child",
+            &transcripts.get("s-child", 1).unwrap(),
+            &update,
+            nested,
+            &|event| emitted.lock().unwrap().push(event.clone()),
+        );
+        let relayed = relayed.lock().unwrap().clone();
+        (emitted.into_inner().unwrap(), relayed)
+    }
+    const HOOK_AUTH_META_KEY: &str = crate::ahp::auth::HOOK_AUTH_META;
+
+    #[test]
+    fn only_the_top_kit_emits_a_childs_sign_in_whatever_its_spawn_config_says() {
+        // The production spawn path: a child of the top Kit gets its own id
+        // as `parent_id`, which says nothing about this process's place.
+        let root = tempfile::tempdir().unwrap();
+        let top = crate::runtime::Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let spawned = top
+            .child_config_for_test()
+            .with_parent_context("s-child".into(), "Scout".into());
+        assert!(emits_hook_events(&spawned));
+        // A Kit that is itself a subagent never emits; its parent relays.
+        let nested = crate::runtime::Runtime::with_depth(top, 1).unwrap();
+        let spawned = nested
+            .child_config_for_test()
+            .with_parent_context("s-grandchild".into(), "Pip".into());
+        assert!(!emits_hook_events(&spawned));
+    }
+
+    #[test]
+    fn a_childs_sign_in_reaches_each_kind_of_client_once() {
+        for below in [None, Some("s-grandchild")] {
+            let id = below.map_or("s-child".to_owned(), |below| format!("s-child/{below}"));
+            // The top Kit: one runtime event (Kit's own client reads it; it
+            // registers no relay) and one relayed notice (any other client's;
+            // it reads no runtime events). Both name the agent the link is for.
+            let (events, relayed) = deliveries(false, below);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert!(matches!(&events[0],
+                crate::events::RuntimeEvent::SubagentHookSignIn { id: event_id, url: Some(_), .. } if *event_id == id));
+            assert_eq!(relayed.len(), 1);
+            assert_eq!(relayed[0].agent, id);
+            assert_eq!(relayed[0].meta[HOOK_AUTH_META_KEY]["agent"], id.as_str());
+            // A nested Kit: no runtime event, only the notice to its parent.
+            let (events, relayed) = deliveries(true, below);
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(relayed.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_link_too_long_for_a_runtime_event_is_left_to_the_notice() {
+        let transcripts = transcript::Transcripts::default();
+        transcripts.start("s-child", 1);
+        let url = format!("https://auth.example/{}", "a".repeat(20 * 1024));
+        let update = json!({"sessionUpdate": "notice", "severity": "info",
+            "title": format!("Hook backend `x` needs you to sign in. Open {url} to approve Kit."),
+            "_meta": {HOOK_AUTH_META_KEY: {"backend": "x", "url": url, "cleared": false}}});
+        let emitted = Mutex::new(0);
+        deliver_hook_hint(
+            "s-child",
+            &transcripts.get("s-child", 1).unwrap(),
+            &update,
+            false,
+            &|_| *emitted.lock().unwrap() += 1,
+        );
+        assert_eq!(*emitted.lock().unwrap(), 0);
+        // The notice text leaves the link out rather than cutting it.
+        let hint = child_hint("s-child", &update).unwrap();
+        assert!(
+            !hint.text.contains("https://auth.example/a"),
+            "{}",
+            hint.text
+        );
+        assert!(hint.text.contains("too long to show"));
+        assert_eq!(hint.meta[HOOK_AUTH_META_KEY]["url"], url.as_str());
+    }
+
     #[tokio::test]
     async fn a_childs_sign_in_event_never_becomes_a_diagnostic() {
         let link = "https://auth.example/authorize?state=grandchild";
@@ -5780,6 +5970,7 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                nested_runtime: false,
             }
         }
 

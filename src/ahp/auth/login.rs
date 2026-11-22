@@ -740,7 +740,15 @@ fn ordered(inner: Arc<dyn Fn(&AuthHint) + Send + Sync>) -> (Arc<Sink>, Arc<Shown
 /// printed there would be logged; that parent shows links through its own
 /// channels instead.
 fn stderr_is_logged() -> bool {
-    crate::events::enabled()
+    crate::events::enabled() || SUBAGENT_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This process is a Kit subagent: its stderr goes to its Kit parent.
+static SUBAGENT_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as a Kit subagent (see [`stderr_is_logged`]).
+pub(super) fn mark_subagent_process() {
+    SUBAGENT_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The stderr line for a session nobody is attached to: once per link.
