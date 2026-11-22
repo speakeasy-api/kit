@@ -738,7 +738,7 @@ fn ordered(inner: Arc<dyn Fn(&AuthHint) + Send + Sync>) -> (Arc<Sink>, Arc<Shown
 /// above a nested one), which keeps it as a diagnostic log. A sign-in link
 /// printed there would be logged; that parent shows links through its own
 /// channels instead.
-fn stderr_is_logged() -> bool {
+pub(super) fn stderr_is_logged() -> bool {
     crate::events::enabled() || SUBAGENT_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 

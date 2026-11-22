@@ -749,7 +749,11 @@ pub enum Block {
     /// A hook backend's sign-in link, shown in full once per link. It is
     /// for the user only and never reaches the model.
     HookSignIn {
-        backend: String,
+        /// Which sign-in it is: the agent path it is for (`None` for the
+        /// session's own) and the backend id.
+        id: HookId,
+        /// How it is named on screen.
+        label: String,
         url: String,
         /// Completed, expired or replaced: shown without its link.
         retired: bool,
@@ -894,19 +898,16 @@ pub struct App {
     pub(super) gateway_epoch: u64,
     pub(super) gateway_blocked: bool,
     pub(super) gateway_status: Option<String>,
-    /// Pending hook sign-in links by backend, with their Unix-ms expiry.
-    /// By session and backend, so another session's late updates never
-    /// change this view, and a session's links return when it does.
-    hook_sign_ins: std::collections::BTreeMap<(String, String), (String, Option<u64>)>,
-    /// Sign-in problems already shown, by session and backend.
-    hook_problems: std::collections::BTreeMap<(String, String), String>,
+    /// Pending hook sign-in links, with their Unix-ms expiry. By session,
+    /// agent and backend, so another session's late updates never change
+    /// this view, and a session's links return when it does.
+    hook_sign_ins: std::collections::BTreeMap<HookKey, (String, Option<u64>)>,
+    /// Sign-in problems already shown, by session, agent and backend.
+    hook_problems: std::collections::BTreeMap<HookKey, String>,
     /// Sessions left since they were last attached. Their cached sign-in
     /// state is dropped on leaving and late hints for them are ignored: a
     /// new attachment's replay is the authority.
     hook_detached: std::collections::BTreeSet<String>,
-    /// The child agent each child sign-in link or problem is for, by session
-    /// and label, so removing an agent retires them.
-    hook_agents: std::collections::BTreeMap<(String, String), String>,
     /// Agents removed here: a late sign-in hint for one is ignored.
     removed_hook_agents: std::collections::BTreeSet<String>,
     gateway_candidate: Option<recovery::Candidate>,
@@ -1220,6 +1221,13 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 
 /// How a hook sign-in is named on screen: its backend, and for a child
 /// agent's, the agent it is for.
+/// A hook sign-in within a session: the agent path it is for (`None` for
+/// the session's own) and the backend id. Its label is only for display:
+/// two sign-ins can share one.
+pub(super) type HookId = (Option<String>, String);
+/// A hook sign-in across sessions: the session, then its [`HookId`].
+type HookKey = (String, HookId);
+
 fn hook_label(backend: &str, agent: Option<&str>) -> String {
     match agent {
         Some(agent) if backend == crate::ahp::auth::hint::MORE_BACKENDS => {
@@ -1240,11 +1248,18 @@ impl App {
     /// `gone` names: links are keyed by the agent path they are for
     /// (`a/b` for b's, relayed by a), so any agent on the path counts.
     fn retire_subagent_hook_links(&mut self, gone: impl Fn(&str) -> bool) {
-        let retired: Vec<_> = self
-            .hook_agents
-            .iter()
-            .filter(|(_, path)| path.split('/').any(&gone))
-            .map(|(key, _)| key.clone())
+        let for_gone = |key: &HookKey| {
+            key.1
+                .0
+                .as_deref()
+                .is_some_and(|path| path.split('/').any(&gone))
+        };
+        let retired: std::collections::BTreeSet<_> = self
+            .hook_sign_ins
+            .keys()
+            .chain(self.hook_problems.keys())
+            .filter(|key| for_gone(key))
+            .cloned()
             .collect();
         for key in retired {
             if self.session_id.as_deref() == Some(key.0.as_str()) {
@@ -1252,7 +1267,6 @@ impl App {
             }
             self.hook_sign_ins.remove(&key);
             self.hook_problems.remove(&key);
-            self.hook_agents.remove(&key);
         }
     }
 
@@ -1275,15 +1289,15 @@ impl App {
         }
     }
 
-    /// Shows `backend`'s sign-in links in the current view without their
-    /// link: completed, expired or replaced.
-    fn retire_hook_sign_ins(&mut self, backend: &str) {
+    /// Shows sign-in `id`'s links in the current view without their link:
+    /// completed, expired or replaced.
+    fn retire_hook_sign_ins(&mut self, id: &HookId) {
         let retiring: Vec<_> = self
             .blocks
             .iter()
             .enumerate()
             .filter(|(_, block)| {
-                matches!(block, Block::HookSignIn { backend: shown, retired: false, .. } if shown == backend)
+                matches!(block, Block::HookSignIn { id: shown, retired: false, .. } if shown == id)
             })
             .map(|(index, _)| index)
             .collect();
@@ -1308,7 +1322,7 @@ impl App {
             .filter(|((owner, _), (_, expiry))| {
                 owner == session && expiry.is_none_or(|expiry| u128::from(expiry) > now)
             })
-            .map(|((_, backend), _)| backend)
+            .map(|((_, (agent, backend)), _)| hook_label(backend, agent.as_deref()))
             .collect();
         // Short: the full link is in the transcript, where it wraps.
         match live.as_slice() {
@@ -1331,7 +1345,6 @@ impl App {
             hook_sign_ins: Default::default(),
             hook_problems: Default::default(),
             hook_detached: Default::default(),
-            hook_agents: Default::default(),
             removed_hook_agents: Default::default(),
             gateway_candidate: None,
             child_focus: None,
@@ -2508,15 +2521,7 @@ impl App {
                 }
                 let current = self.session_id.as_deref() == Some(session_id.as_str());
                 let label = hook_label(&backend, agent.as_deref());
-                let key = (session_id, label);
-                match &agent {
-                    Some(agent) => {
-                        self.hook_agents.insert(key.clone(), agent.clone());
-                    }
-                    None => {
-                        self.hook_agents.remove(&key);
-                    }
-                }
+                let key: HookKey = (session_id, (agent.clone(), backend.clone()));
                 // An expired link is never shown.
                 let cleared =
                     cleared || expires_at_ms.is_some_and(|at| at <= crate::events::now_millis());
@@ -2531,7 +2536,8 @@ impl App {
                         if new && current {
                             self.retire_hook_sign_ins(&key.1);
                             self.push_block(Block::HookSignIn {
-                                backend: key.1.clone(),
+                                id: key.1.clone(),
+                                label: label.clone(),
                                 url: url.clone(),
                                 retired: false,
                             });
@@ -2554,7 +2560,7 @@ impl App {
                                     "Agent {agent}: more hook backends need you to sign in {problem}"
                                 )
                             }
-                            _ => hook_problem_text(&key.1, &problem),
+                            _ => hook_problem_text(&label, &problem),
                         };
                         if self.hook_problems.get(&key) != Some(&text) {
                             if current {
@@ -3557,11 +3563,12 @@ impl App {
                 self.session_id.as_deref() == Some(owner.as_str())
                     && expiry.is_none_or(|expiry| u128::from(expiry) > now)
             })
-            .map(|((_, backend), (url, _))| (backend.clone(), url.clone()))
+            .map(|((_, id), (url, _))| (id.clone(), url.clone()))
             .collect();
-        for (backend, url) in links {
+        for (id, url) in links {
             self.push_block(Block::HookSignIn {
-                backend,
+                label: hook_label(&id.1, id.0.as_deref()),
+                id,
                 url,
                 retired: false,
             });

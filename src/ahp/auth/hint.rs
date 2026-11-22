@@ -102,20 +102,34 @@ fn code(text: &str) -> String {
     }
 }
 
+/// What to say, after "Hook backend `<id>` ", for a link too long to show
+/// or pass on: what to run instead.
+fn run_instead(backend: &str) -> String {
+    // The id goes into a command only if it cannot change it.
+    let command = if shell_safe(backend) {
+        format!("kit auth login hooks {backend}")
+    } else {
+        "kit auth login hooks".to_owned()
+    };
+    format!(
+        "needs you to sign in; its link is too long to show here. Run `{command}` in its workspace."
+    )
+}
+
 impl HookHint {
-    /// Accepts a hint from a child only if every field is well formed.
-    pub(crate) fn validated(self) -> Option<Self> {
+    /// The one check every hint that enters this process from another (a
+    /// child, or the agent a client is attached to) passes before it is
+    /// used: `None` if any field is malformed. An otherwise valid link too
+    /// long to pass on becomes a hint without it that says what to run.
+    pub(crate) fn validated(mut self) -> Option<Self> {
         let agent_ok = self.agent.as_deref().is_none_or(|agent| {
             agent.len() <= MAX_AGENT && agent.split('/').all(|segment| plain(segment, MAX_AGENT))
         });
         let url_ok = self.url.as_deref().is_none_or(|url| {
-            url.starts_with("https://")
-                && url.len() <= MAX_URL * 2
-                && !url.contains(char::is_whitespace)
-                && displayable(url)
+            url.starts_with("https://") && !url.contains(char::is_whitespace) && displayable(url)
         });
         let consistent = self.cleared || self.reason.is_none();
-        (plain(&self.backend, MAX_BACKEND)
+        if !(plain(&self.backend, MAX_BACKEND)
             && agent_ok
             && url_ok
             && self
@@ -123,7 +137,25 @@ impl HookHint {
                 .as_deref()
                 .is_none_or(|problem| plain(problem, MAX_PROBLEM))
             && consistent)
-            .then_some(self)
+        {
+            return None;
+        }
+        if self.url.as_ref().is_some_and(|url| url.len() > MAX_URL * 2) {
+            self.url = None;
+            if !self.cleared {
+                let instead = run_instead(&self.backend);
+                self.problem = Some(match self.problem.take() {
+                    Some(problem)
+                        if instead.len() + problem.len() + " Also, the backend ".len()
+                            <= MAX_PROBLEM =>
+                    {
+                        format!("{instead} Also, the backend {problem}")
+                    }
+                    _ => instead,
+                });
+            }
+        }
+        Some(self)
     }
 
     /// The `_meta` of a marked notice carrying this hint.
@@ -156,15 +188,7 @@ impl HookHint {
                 "Hook backend {name} needs you to sign in. Open {url} to approve Kit."
             )),
             Some(_) if !self.cleared => {
-                // The id goes into a command only if it cannot change it.
-                let command = if shell_safe(backend) {
-                    format!("kit auth login hooks {backend}")
-                } else {
-                    "kit auth login hooks".to_owned()
-                };
-                Some(format!(
-                    "Hook backend {name} needs you to sign in; its link is too long to show here. Run `{command}` in its workspace."
-                ))
+                Some(format!("Hook backend {name} {}", run_instead(backend)))
             }
             _ => None,
         };
@@ -309,5 +333,47 @@ mod tests {
         ] {
             assert!(bad.clone().validated().is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_link_too_long_to_pass_on_becomes_what_to_run() {
+        let long = format!("https://auth.example/{}", "l".repeat(2 * MAX_URL));
+        let hint = link(&long).validated().unwrap();
+        assert_eq!(hint.url, None);
+        let problem = hint.problem.clone().unwrap();
+        assert!(
+            problem.contains("Run `kit auth login hooks com.example`"),
+            "{problem}"
+        );
+        // It passes again, unchanged, at the next level up.
+        assert_eq!(hint.clone().validated(), Some(hint.clone()));
+        let text = hint.notice_text().unwrap();
+        assert_eq!(
+            text,
+            "Agent scout: Hook backend `com.example` needs you to sign in; its link is too long to show here. Run `kit auth login hooks com.example` in its workspace."
+        );
+        // Beside a problem, both; a clear only loses the link.
+        let both = HookHint {
+            problem: Some("could not refresh its grant.".into()),
+            ..link(&long)
+        }
+        .validated()
+        .unwrap();
+        assert!(
+            both.problem
+                .unwrap()
+                .ends_with("Also, the backend could not refresh its grant.")
+        );
+        let cleared = HookHint {
+            cleared: true,
+            reason: Some(ClearReason::Expired),
+            ..link(&long)
+        }
+        .validated()
+        .unwrap();
+        assert_eq!((cleared.url, cleared.problem), (None, None));
+        // Malformed is still refused, whatever its length.
+        let bad = format!("http://auth.example/{}", "l".repeat(2 * MAX_URL));
+        assert!(link(&bad).validated().is_none());
     }
 }

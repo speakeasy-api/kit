@@ -2009,7 +2009,7 @@ fn single_transcript_block_rows(
             None,
         ),
         Block::HookSignIn {
-            backend,
+            label: backend,
             retired: true,
             ..
         } => (
@@ -2019,7 +2019,11 @@ fn single_transcript_block_rows(
             ))])),
             None,
         ),
-        Block::HookSignIn { backend, url, .. } => {
+        Block::HookSignIn {
+            label: backend,
+            url,
+            ..
+        } => {
             let link = |text: String, style| LinkedSpan {
                 span: Span::styled(text, style),
                 url: Some(url.clone()),
@@ -5315,6 +5319,104 @@ mod tests {
             agent: None,
         });
         assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
+    }
+
+    #[test]
+    fn the_agents_sign_in_hints_are_checked_before_their_link_is_shown() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("current".into());
+        // As the receiver takes them off the wire.
+        let receive = |params: serde_json::Value| {
+            let notification: crate::protocols::acp::v2::HookAuthNotification =
+                serde_json::from_value(params).unwrap();
+            crate::tui::hook_sign_in(notification)
+        };
+        for url in [
+            "http://plain.example/login",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://auth.example/\u{202e}gnp",
+        ] {
+            let hint = receive(serde_json::json!({
+                "sessionId": "current", "backend": "com.example", "url": url
+            }));
+            assert!(hint.is_none(), "{url}");
+        }
+        assert!(
+            receive(serde_json::json!({
+                "sessionId": "current", "backend": "com.example", "reason": "signed_in"
+            }))
+            .is_none(),
+            "a reason without a clear"
+        );
+        // A link too long to pass on: what to run instead, and no link.
+        let long = format!("https://auth.example/{}", "l".repeat(17 * 1024));
+        let update = receive(serde_json::json!({
+            "sessionId": "current", "backend": "com.example", "url": long
+        }))
+        .unwrap();
+        app.apply(update);
+        let screen = render(&mut app, 200, 24);
+        let flat: String = screen.lines().map(str::trim).collect();
+        assert!(
+            flat.contains("Hook backend com.example needs you to sign in; its link is too long to show here. Run `kit auth login hooks com.example` in its workspace."),
+            "{screen}"
+        );
+        assert!(!flat.contains("https://auth.example/l"), "{screen}");
+        assert!(!screen.contains("open the sign-in page"), "{screen}");
+        // A valid link is shown.
+        app.apply(
+            receive(serde_json::json!({
+                "sessionId": "current", "backend": "com.example", "url": "https://auth.example/ok"
+            }))
+            .unwrap(),
+        );
+        let flat: String = render(&mut app, 200, 24).lines().map(str::trim).collect();
+        assert!(flat.contains("https://auth.example/ok"));
+    }
+
+    #[test]
+    fn sign_ins_that_share_a_label_stay_apart() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("current".into());
+        // Agent a's backend `x`, and the session's own backend whose id
+        // reads the same on screen.
+        let hint = |agent: Option<&str>, backend: &str, url: Option<&str>| {
+            crate::tui::app::Update::HookSignIn {
+                session_id: "current".into(),
+                backend: backend.into(),
+                problem: None,
+                url: url.map(str::to_owned),
+                expires_at_ms: None,
+                cleared: url.is_none(),
+                agent: agent.map(str::to_owned),
+            }
+        };
+        app.apply(hint(Some("a"), "x", Some("https://a.example/one")));
+        app.apply(hint(None, "x (agent a)", Some("https://b.example/two")));
+        let screen = render(&mut app, 120, 24);
+        assert!(screen.contains("and 1 more needed"), "{screen}");
+        // Clearing one leaves the other's link live.
+        app.apply(hint(Some("a"), "x", None));
+        let screen = render(&mut app, 120, 24);
+        let flat: String = screen.lines().map(str::trim).collect();
+        assert!(flat.contains("https://b.example/two"), "{screen}");
+        assert!(!flat.contains("https://a.example/one"), "{screen}");
+        assert!(
+            screen.contains("sign in to hook x (agent a) needed"),
+            "{screen}"
+        );
+        assert_eq!(flat.matches("no longer valid").count(), 1, "{screen}");
     }
 
     #[test]

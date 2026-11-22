@@ -2054,6 +2054,21 @@ impl Runtime {
                         error,
                     )
                 })?;
+            // No client is attached: the session's hook sign-in hints, its
+            // child agents' included, go to the user's terminal, unless a
+            // Kit parent keeps this stderr as a log.
+            let hook_hints = crate::ahp::auth::stderr_is_the_users().then(|| {
+                crate::ahp::auth::subscribe_terminal(
+                    &subagents,
+                    self.hooks(),
+                    session_id.clone(),
+                    |line| {
+                        // The link is shown, never logged.
+                        tracing::info!("shown a hook sign-in hint");
+                        eprintln!("{line}");
+                    },
+                )
+            });
             let trigger = if request.resume {
                 SessionStartInputTrigger::Resume
             } else {
@@ -2120,13 +2135,13 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation))
+            Ok::<_, String>((driver, pending_creation, hook_hints))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation) = {
+        let (mut driver, pending_creation, _hook_hints) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {

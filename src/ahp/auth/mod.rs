@@ -69,6 +69,30 @@ pub(crate) fn subscribe_session(
     }
 }
 
+/// Whether this process's stderr is its user's terminal, rather than a
+/// log a Kit parent keeps: only then is a sign-in link printed there.
+pub(crate) fn stderr_is_the_users() -> bool {
+    !login::stderr_is_logged()
+}
+
+/// A session run with no client attached (`kit prompt`): it owns the child
+/// agents `subagents` starts, and its hints, its own and theirs, go to
+/// `print` as a line each (for its user's terminal). The same single path
+/// as an attached session's; held for the run.
+pub(crate) fn subscribe_terminal(
+    subagents: &crate::tools::subagent::Subagents,
+    hooks: Option<&crate::ahp::Hooks>,
+    session: String,
+    print: impl Fn(String) + Send + Sync + 'static,
+) -> SessionHints {
+    subagents.own_updates(session.clone());
+    subscribe_session(
+        hooks,
+        session,
+        notices(move |_, text| print(format!("kit: {text}"))),
+    )
+}
+
 /// The credential namespace of Kit's hook grants.
 const NAMESPACE: &str = "kit";
 const OPERATION: Duration = Duration::from_secs(30);

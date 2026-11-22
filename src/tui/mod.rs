@@ -1748,16 +1748,9 @@ async fn run_client(
         .on_receive_notification(
             async move |notification: crate::protocols::acp::v2::HookAuthNotification, _cx| {
                 // Kept per session: the app shows only the current session's.
-                let hint = notification.hint;
-                let _ = hook_sign_ins.send(QueuedUpdate::global(Update::HookSignIn {
-                    session_id: notification.session_id.to_string(),
-                    backend: hint.backend,
-                    problem: hint.problem,
-                    url: hint.url,
-                    expires_at_ms: hint.expires_at,
-                    cleared: hint.cleared,
-                    agent: hint.agent,
-                }));
+                if let Some(update) = hook_sign_in(notification) {
+                    let _ = hook_sign_ins.send(QueuedUpdate::global(update));
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -4100,6 +4093,25 @@ fn previous_session_for_resume(
 }
 
 /// Maps one ACP session notification onto client updates.
+/// The update for a `kit/hooks/auth` notification from the agent, local
+/// or remote: its hint passes the check every hint entering a Kit process
+/// passes, or it is dropped, since the app makes its link clickable.
+fn hook_sign_in(notification: crate::protocols::acp::v2::HookAuthNotification) -> Option<Update> {
+    let Some(hint) = notification.hint.validated() else {
+        tracing::warn!("dropped a malformed hook sign-in hint from the agent");
+        return None;
+    };
+    Some(Update::HookSignIn {
+        session_id: notification.session_id.to_string(),
+        backend: hint.backend,
+        problem: hint.problem,
+        url: hint.url,
+        expires_at_ms: hint.expires_at,
+        cleared: hint.cleared,
+        agent: hint.agent,
+    })
+}
+
 fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
     let session_id = notification.session_id.to_string();
     let updates = match notification.update {

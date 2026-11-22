@@ -3672,6 +3672,8 @@ mod hook_sign_in_tests {
             tokio::sync::mpsc::UnboundedReceiver<agentkit_acp::AcpClientMessage>,
             Vec<String>,
         ),
+        /// No client (`kit prompt`): lines on the user's terminal.
+        Terminal(crate::ahp::auth::SessionHints, Arc<Mutex<Vec<String>>>),
         /// Kit's own client (its TUI): `kit/hooks/auth` notifications.
         Kit(
             crate::ahp::auth::SessionHints,
@@ -3702,6 +3704,17 @@ mod hook_sign_in_tests {
                 messages,
                 Vec::new(),
             )
+        }
+
+        /// As `kit prompt` wires its session, printing to a record instead
+        /// of stderr.
+        fn terminal(manager: &Subagents, session: &str) -> Self {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let hints = crate::ahp::auth::subscribe_terminal(manager, None, session.into(), {
+                let lines = Arc::clone(&lines);
+                move |line| lines.lock().unwrap().push(line)
+            });
+            Self::Terminal(hints, lines)
         }
 
         fn kit(manager: &Subagents, session: &str) -> Self {
@@ -3762,6 +3775,14 @@ mod hook_sign_in_tests {
                         .cloned()
                         .collect()
                 }
+                Self::Terminal(_, lines) => lines
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("kit: "))
+                    .filter(|line| line.starts_with(&format!("Agent {agent}: ")))
+                    .map(str::to_owned)
+                    .collect(),
                 Self::Kit(_, sent, _) => sent
                     .lock()
                     .unwrap()
@@ -3786,7 +3807,7 @@ mod hook_sign_in_tests {
         fn updates(&mut self) -> Vec<Value> {
             let receiver = match self {
                 Self::V2(_, _, updates) | Self::Kit(_, _, updates) => updates,
-                Self::V1(..) => return Vec::new(),
+                Self::V1(..) | Self::Terminal(..) => return Vec::new(),
             };
             let mut seen = Vec::new();
             while let Ok((_, update)) = receiver.try_recv() {
@@ -3800,11 +3821,12 @@ mod hook_sign_in_tests {
         match kind {
             "v2" => Parent::v2(manager, session),
             "v1" => Parent::v1(manager, session),
+            "terminal" => Parent::terminal(manager, session),
             _ => Parent::kit(manager, session),
         }
     }
 
-    const KINDS: [&str; 3] = ["kit", "v2", "v1"];
+    const KINDS: [&str; 4] = ["kit", "v2", "v1", "terminal"];
 
     /// Waits until `count` deliveries reached the user, and returns them.
     async fn wait_for(parent: &mut Parent, agent: &str, count: usize) -> Vec<String> {
@@ -3889,6 +3911,32 @@ mod hook_sign_in_tests {
                 "{kind}: {seen:?}"
             );
             assert_contained(&manager, &mut parent, &[&first, &second]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_too_long_to_pass_on_reaches_each_client_as_what_to_run() {
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &[]);
+            let mut parent = parent(kind, &manager, &format!("parent-long-{kind}"));
+            let first = create(
+                &manager,
+                &format!("MOCK_HOOK_LINK={}", "l".repeat(17 * 1024)),
+            )
+            .await;
+            let seen = wait_for(&mut parent, &first.id, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(
+                seen[0].contains("its link is too long to show here. Run `kit auth login hooks"),
+                "{kind}: {seen:?}"
+            );
+            assert!(!seen[0].contains("https://auth.example/"), "{kind}");
+            assert_contained(&manager, &mut parent, &[&first]).await;
             manager
                 .close(&first.id, &TurnCancellation::default())
                 .await
