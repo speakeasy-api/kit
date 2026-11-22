@@ -1234,11 +1234,12 @@ impl Runtime {
         self.hooks.as_deref()
     }
 
-    /// Hook sign-in applies to HTTP hook backends that may use OAuth, and
-    /// stores grants, so it needs durable credential storage.
+    /// Hook sign-in stores grants, so it needs durable credential storage,
+    /// and hooks enabled. It is offered whatever the launch workspace's
+    /// hooks: a session may attach to another workspace, and the method
+    /// checks which of that workspace's backends need sign-in when it runs.
     pub(crate) fn supports_hook_authentication(&self) -> bool {
-        self.credential_storage.is_persistent()
-            && self.hooks().is_some_and(crate::ahp::Hooks::may_sign_in)
+        self.credential_storage.is_persistent() && self.hooks_enabled
     }
 
     pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {

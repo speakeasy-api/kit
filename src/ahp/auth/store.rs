@@ -150,9 +150,71 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Every record and secret indexed for this backend.
+    #[cfg(test)]
+    pub(super) async fn indexed(&self) -> BTreeSet<(String, String)> {
+        self.index().await.unwrap_or_default()
+    }
+
     pub(super) fn storage(&self) -> &CredentialStorage {
         &self.storage
     }
+}
+
+/// Logout markers, shared by every Kit process using the storage: one per
+/// scope, and one per backend id for `--all-workspaces`.
+const LOGOUTS: &str = "ahp-oauth-logout";
+
+/// The marker `logout --all-workspaces` moves for every scope of `backend`.
+fn everywhere(backend: &str) -> String {
+    format!("*#{backend}")
+}
+
+/// Where `scope` is in its logout history: it changes with every logout of
+/// the scope, in any Kit process, and every `--all-workspaces` logout of its
+/// backend id. A login prepared at one generation must not complete at
+/// another.
+pub(super) async fn logout_generation(
+    storage: &CredentialStorage,
+    scope: &str,
+) -> Result<String, HookError> {
+    let backend = scope.rsplit_once('#').map_or(scope, |(_, id)| id);
+    let mut generation = String::new();
+    for identity in [scope.to_owned(), everywhere(backend)] {
+        let entry = storage.entry(LOGOUTS, &identity);
+        let bytes = blocking(move || entry.load()).await?;
+        generation.push_str(&bytes.map_or_else(String::new, |bytes| {
+            String::from_utf8_lossy(&bytes).into_owned()
+        }));
+        generation.push('|');
+    }
+    Ok(generation)
+}
+
+/// Moves `scope`'s logout marker, or with `all_workspaces` the marker of
+/// every scope of the backend id `scope`. Written before any record is
+/// removed, so a login that completes meanwhile sees it afterwards.
+pub(super) async fn mark_logout(
+    storage: &CredentialStorage,
+    scope: &str,
+    all_workspaces: bool,
+) -> Result<(), HookError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let identity = if all_workspaces {
+        everywhere(scope)
+    } else {
+        scope.to_owned()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let marker = format!(
+        "{nanos}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let entry = storage.entry(LOGOUTS, &identity);
+    blocking(move || entry.save(marker.as_bytes())).await
 }
 
 /// Every scope that has stored records.

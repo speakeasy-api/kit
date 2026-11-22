@@ -897,6 +897,10 @@ pub struct App {
     hook_sign_ins: std::collections::BTreeMap<(String, String), (String, Option<u64>)>,
     /// Sign-in problems already shown, by session and backend.
     hook_problems: std::collections::BTreeMap<(String, String), String>,
+    /// Sessions left since they were last attached. Their cached sign-in
+    /// state is dropped on leaving and late hints for them are ignored: a
+    /// new attachment's replay is the authority.
+    hook_detached: std::collections::BTreeSet<String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1267,6 +1271,7 @@ impl App {
             gateway_status: None,
             hook_sign_ins: Default::default(),
             hook_problems: Default::default(),
+            hook_detached: Default::default(),
             gateway_candidate: None,
             child_focus: None,
             session_messages: HashMap::new(),
@@ -2427,6 +2432,10 @@ impl App {
                 expires_at_ms,
                 cleared,
             } => {
+                // From an attachment that has ended: its replacement replays.
+                if self.hook_detached.contains(&session_id) {
+                    return;
+                }
                 let current = self.session_id.as_deref() == Some(session_id.as_str());
                 let key = (session_id, backend);
                 let url = url.filter(|_| !cleared);
@@ -3353,6 +3362,18 @@ impl App {
         session_id: String,
         presentation: SessionPresentation,
     ) {
+        // Leaving a session ends its attachment: what it cached may clear
+        // while detached, so the next attachment rebuilds it from replay.
+        if let Some(previous) = self.session_id.clone()
+            && previous != session_id
+        {
+            self.hook_sign_ins
+                .retain(|(owner, _), _| *owner != previous);
+            self.hook_problems
+                .retain(|(owner, _), _| *owner != previous);
+            self.hook_detached.insert(previous);
+        }
+        self.hook_detached.remove(&session_id);
         self.session_presentation = presentation;
         self.elicitations.clear();
         self.model_switch = None;

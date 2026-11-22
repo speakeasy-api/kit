@@ -114,12 +114,6 @@ impl Hooks {
         }
     }
 
-    /// Some backend may need a sign-in: an HTTP backend not authenticated
-    /// by a header or a bearer binding.
-    pub(crate) fn may_sign_in(&self) -> bool {
-        self.auth.as_ref().is_some_and(auth::HookAuth::may_sign_in)
-    }
-
     /// Shows hook sign-in hints for this workspace's backends to `sink`.
     pub(crate) fn subscribe_auth_hints(
         &self,

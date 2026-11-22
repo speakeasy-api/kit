@@ -116,8 +116,39 @@ pub(super) struct Login {
     pub(super) required: Vec<String>,
     pub(super) url: String,
     pub(super) expires_at: SystemTime,
+    /// The logout generation it was prepared at: a logout since, in any Kit
+    /// process, supersedes it.
+    pub(super) generation: Generation,
     /// Stops the login's listener once it is no longer wanted.
     stop: Arc<Notify>,
+}
+
+/// A scope's logout generation when a login was prepared, and the storage
+/// that holds the current one.
+#[derive(Clone)]
+pub(super) struct Generation {
+    pub(super) storage: crate::credentials::CredentialStorage,
+    pub(super) at: String,
+}
+
+impl Generation {
+    pub(super) async fn read(
+        storage: &crate::credentials::CredentialStorage,
+        scope: &str,
+    ) -> Result<Self, agenthooksprotocol::client::HookError> {
+        Ok(Self {
+            storage: storage.clone(),
+            at: super::store::logout_generation(storage, scope).await?,
+        })
+    }
+
+    /// Whether no logout happened since. An unreadable marker does not
+    /// block a sign-in: the grant it would store is then as current as any.
+    pub(super) async fn current(&self, scope: &str) -> bool {
+        super::store::logout_generation(&self.storage, scope)
+            .await
+            .map_or(true, |now| now == self.at)
+    }
 }
 
 impl Login {
@@ -127,6 +158,7 @@ impl Login {
         context: &AuthContext,
         required: &[String],
         pending: PendingLogin,
+        generation: Generation,
     ) -> Self {
         Self {
             scope: scope.to_owned(),
@@ -137,6 +169,7 @@ impl Login {
             url: pending.authorization_url().to_string(),
             expires_at: pending.expires_at(),
             pending,
+            generation,
             stop: Arc::default(),
         }
     }
@@ -269,7 +302,19 @@ impl Registry {
             required: required.to_vec(),
         };
         match needs.iter_mut().find(|n| same_target(&n.context, context)) {
-            Some(existing) => *existing = need,
+            // A pending step-up is kept: a plain observation (or another
+            // step-up) adds to its scopes, so only a grant with all of them
+            // settles it.
+            Some(existing) => {
+                let mut required = existing.required.clone();
+                for scope in need.required {
+                    if !required.contains(&scope) {
+                        required.push(scope);
+                    }
+                }
+                required.sort();
+                *existing = Need { required, ..need };
+            }
             None => needs.push(need),
         }
     }
@@ -378,6 +423,30 @@ impl Registry {
         deliver(delivery);
     }
 
+    /// Tells the scope's subscribers about a problem that belongs to one
+    /// operation, not to a sign-in (a scope denial, say): beside any link
+    /// shown, once per subscriber, and never replayed to a later one, since
+    /// nothing would clear it.
+    pub(super) fn diagnostic(&self, scope: &str, backend: &str, problem: String) {
+        let delivery = {
+            let mut state = self.lock();
+            let link = state
+                .pending
+                .get(scope)
+                .and_then(|logins| logins.first())
+                .map(Login::hint);
+            let hint = AuthHint {
+                problem: Some(problem),
+                ..link.unwrap_or_else(|| AuthHint {
+                    cleared: false,
+                    ..cleared(scope, backend, false)
+                })
+            };
+            stage_transient(&mut state, hint)
+        };
+        deliver(Some(delivery));
+    }
+
     /// `login` completed: its listener is gone, so it is withdrawn, and it
     /// meets its target's need if its scopes cover it. The scope's other
     /// targets (an upload on another resource, say) keep their logins.
@@ -474,6 +543,15 @@ impl Registry {
         deliver(delivery);
     }
 
+    /// Whether this process shows a link for `scope` prepared before its
+    /// current logout generation: a logout elsewhere superseded it.
+    pub(super) fn superseded(&self, scope: &str, generation: &str) -> bool {
+        self.lock()
+            .pending
+            .get(scope)
+            .is_some_and(|logins| logins.iter().any(|login| login.generation.at != generation))
+    }
+
     /// Forgets everything about a scope, as after logging out.
     pub(super) fn reset(&self, scope: &str, backend: &str) {
         let (stopped, delivery) = {
@@ -535,6 +613,30 @@ fn stage(state: &mut State, hint: AuthHint) -> Option<Delivery> {
     })
 }
 
+/// Numbers `hint` and picks its sinks without making it the scope's current
+/// hint: a later subscriber is not shown it.
+fn stage_transient(state: &mut State, hint: AuthHint) -> Delivery {
+    state.sequence += 1;
+    state.sinks.retain(|(_, sink)| sink.strong_count() != 0);
+    let sinks: Vec<_> = state
+        .sinks
+        .iter()
+        .filter(|(scopes, _)| scopes.contains(&hint.scope))
+        .filter_map(|(_, sink)| sink.upgrade())
+        .collect();
+    let line = if sinks.is_empty() {
+        headless_line(&mut state.printed, &hint)
+    } else {
+        None
+    };
+    Delivery {
+        sequence: state.sequence,
+        hint,
+        sinks,
+        line,
+    }
+}
+
 /// Runs a staged delivery, outside the registry lock.
 fn deliver(delivery: Option<Delivery>) {
     let Some(Delivery {
@@ -576,16 +678,33 @@ fn ordered(inner: Arc<dyn Fn(&AuthHint) + Send + Sync>) -> (Arc<Sink>, Arc<Shown
 }
 
 /// The stderr line for a session nobody is attached to: once per link.
+/// The link and the problem are printed once each, independently: a new
+/// problem beside a link already printed is printed without the link.
 fn headless_line(printed: &mut HashSet<String>, hint: &AuthHint) -> Option<String> {
-    let key = match (&hint.url, &hint.problem) {
-        (Some(url), _) => url.clone(),
-        (None, Some(problem)) => format!("{}\n{problem}", hint.scope),
-        (None, None) => return None,
-    };
-    if hint.cleared || !printed.insert(key) {
+    if hint.cleared {
         return None;
     }
-    hint.notice().map(|text| format!("kit: {text}"))
+    let link = hint
+        .url
+        .as_ref()
+        .is_some_and(|url| printed.insert(url.clone()));
+    let problem = hint
+        .problem
+        .as_ref()
+        .is_some_and(|problem| printed.insert(format!("{}\n{problem}", hint.scope)));
+    let shown = match (link, problem) {
+        (false, false) => return None,
+        (true, true) => hint.clone(),
+        (true, false) => AuthHint {
+            problem: None,
+            ..hint.clone()
+        },
+        (false, true) => AuthHint {
+            url: None,
+            ..hint.clone()
+        },
+    };
+    shown.notice().map(|text| format!("kit: {text}"))
 }
 
 /// What an operation learned about a target's sign-in.
@@ -626,6 +745,9 @@ pub(super) enum Outcome {
     NotGranted(Vec<String>),
     /// The login is no longer wanted, as when another process signed in.
     Stopped,
+    /// The backend was logged out (in any Kit process) after the login was
+    /// prepared: it stores no grant.
+    LoggedOut,
 }
 
 /// Receives `login`'s callback on its own `listener` and completes the
@@ -685,6 +807,16 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             respond(&mut stream, false).await;
             continue;
         }
+        // A link shown before a logout never signs in.
+        if !login.generation.current(&login.scope).await {
+            respond(&mut stream, false).await;
+            let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
+            let _ = login
+                .oauth
+                .cancel_login(login.pending.clone(), budget)
+                .await;
+            return Outcome::LoggedOut;
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = AuthContext {
             deadline,
@@ -694,6 +826,16 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             .oauth
             .complete(context, callback, OperationBudget::until(deadline))
             .await;
+        // A logout during the exchange: its marker was moved before it
+        // removed anything, so the grant just stored is removed again here.
+        if completed.is_ok() && !login.generation.current(&login.scope).await {
+            let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
+            let _ = super::store::Store::new(login.generation.storage.clone(), &login.scope)
+                .forget(budget)
+                .await;
+            respond(&mut stream, false).await;
+            return Outcome::LoggedOut;
+        }
         respond(&mut stream, completed.is_ok()).await;
         let error = match completed {
             Ok(_) => return Outcome::Completed,
@@ -921,5 +1063,31 @@ mod tests {
             ..hint("https://auth.example/c")
         };
         assert_eq!(headless_line(&mut printed, &cleared), None);
+    }
+
+    #[test]
+    fn a_headless_problem_beside_a_printed_link_is_printed_once_without_it() {
+        let mut printed = HashSet::new();
+        let link = AuthHint {
+            scope: "test#test.headless-problem".into(),
+            backend: "test.headless-problem".into(),
+            url: Some("https://auth.example/a".into()),
+            expires_at_ms: None,
+            cleared: false,
+            signed_in: false,
+            problem: None,
+        };
+        assert!(headless_line(&mut printed, &link).is_some());
+        let with_problem = AuthHint {
+            problem: Some("could not prepare the upload sign-in.".into()),
+            ..link.clone()
+        };
+        let line = headless_line(&mut printed, &with_problem).unwrap();
+        assert!(
+            line.contains("could not prepare the upload sign-in"),
+            "{line}"
+        );
+        assert!(!line.contains("https://auth.example/a"), "{line}");
+        assert_eq!(headless_line(&mut printed, &with_problem), None);
     }
 }

@@ -103,10 +103,18 @@ impl Backend {
     }
 }
 
-/// Backend scope, whether the flow is PKCE, the preset's client, the
-/// target's sorted scopes, and the scopes the manager requires (none but
-/// for a step-up check).
-type ManagerKey = (String, bool, Option<String>, Vec<String>, Vec<String>);
+/// Backend scope, whether the flow is PKCE, the effective client, the
+/// target's sorted scopes, the scopes the manager requires (none but for a
+/// step-up check), and a confidential client's secret reference (never the
+/// secret itself).
+type ManagerKey = (
+    String,
+    bool,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+);
 
 /// Where hook credentials live: Kit's credential storage.
 #[derive(Clone)]
@@ -185,6 +193,22 @@ impl HookAuth {
         sources: &BTreeMap<String, String>,
         client: network::ClientBuilder,
     ) -> Self {
+        Self::with_references(
+            storage,
+            registration,
+            sources,
+            client,
+            secrets::references(),
+        )
+    }
+
+    fn with_references(
+        storage: CredentialStorage,
+        registration: &Value,
+        sources: &BTreeMap<String, String>,
+        client: network::ClientBuilder,
+        references: BTreeMap<String, String>,
+    ) -> Self {
         let mut backends = BTreeMap::new();
         for value in registration["hooks"].as_array().into_iter().flatten() {
             let id = value["id"].as_str().unwrap_or_default();
@@ -199,22 +223,11 @@ impl HookAuth {
             storage,
             backends,
             managers: Mutex::default(),
-            references: secrets::references(),
+            references,
             client,
             skipped: Mutex::default(),
             last_ready: Mutex::default(),
         }))
-    }
-
-    pub(crate) fn may_sign_in(&self) -> bool {
-        self.0.backends.values().any(|backend| {
-            backend.url.is_some()
-                && !backend.header_authorization
-                && backend
-                    .preset
-                    .as_ref()
-                    .is_none_or(|preset| preset["type"] != "bearer")
-        })
     }
 
     /// Credential references for bearer `tokenRef` bindings.
@@ -351,12 +364,28 @@ impl HookAuth {
         let mut required = required.to_vec();
         required.sort();
         required.dedup();
+        let client = settings.client_id.clone().or(preset_client);
+        // A confidential client's secret reference is resolved before the
+        // cache: targets naming different references never share a manager,
+        // and a target naming none fails even when another is cached.
+        let secret_reference = if !pkce && client.is_some() {
+            Some(
+                settings
+                    .client_secret_ref
+                    .clone()
+                    .or_else(|| target.client_secret_ref().map(str::to_owned))
+                    .ok_or_else(|| fail(AuthErrorCode::CredentialUnavailable))?,
+            )
+        } else {
+            None
+        };
         let key = (
             backend.scope.clone(),
             pkce,
-            preset_client.clone(),
+            client.clone(),
             scopes.clone(),
             required.clone(),
+            secret_reference.clone(),
         );
         let mut managers = self
             .0
@@ -367,7 +396,6 @@ impl HookAuth {
             return Ok(Arc::clone(manager));
         }
         let store = store::Store::new(self.0.storage.clone(), &backend.scope);
-        let client = settings.client_id.clone().or(preset_client);
         let mut config = match &client {
             Some(client) => OAuthClientConfig::new(NAMESPACE, client, flow),
             None => {
@@ -408,12 +436,7 @@ impl HookAuth {
             .scopes(scopes, ceiling)
             .required_scopes(required)
             .client_secret_storage(Arc::new(secrets::Secrets(store.clone())));
-        if !pkce && client.is_some() {
-            let reference = settings
-                .client_secret_ref
-                .as_deref()
-                .or(target.client_secret_ref())
-                .ok_or_else(|| fail(AuthErrorCode::CredentialUnavailable))?;
+        if let Some(reference) = &secret_reference {
             let secret = self
                 .0
                 .references
@@ -486,7 +509,8 @@ impl HookAuth {
                 required.join(" ")
             )
         };
-        login::registry().problem(&backend.scope, &backend.id, message);
+        // One operation's denial, not a sign-in: shown, never replayed.
+        login::registry().diagnostic(&backend.scope, &backend.id, message);
     }
 
     /// The ids of backends whose sign-in hints a session of these hooks shows.
@@ -547,6 +571,13 @@ impl HookAuth {
     }
 
     async fn prepare_backend(&self, backend: &Backend) {
+        // A logout in another Kit process withdraws this process's links
+        // from before it, and what it knew the backend needed.
+        if let Ok(generation) = store::logout_generation(&self.0.storage, &backend.scope).await
+            && login::registry().superseded(&backend.scope, &generation)
+        {
+            login::registry().reset(&backend.scope, &backend.id);
+        }
         let mut needs = login::registry().needs(&backend.scope);
         if needs.is_empty() {
             // Not yet seen failing, or signed in already (perhaps by another
@@ -741,6 +772,12 @@ impl HookAuth {
     ) -> Result<Option<url::Url>, HookError> {
         let manager = self.manager(context)?;
         let context = with_deadline(context);
+        let scope = self
+            .scope(&context)
+            .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?
+            .to_owned();
+        // Read before the login exists: a logout from now on supersedes it.
+        let generation = login::Generation::read(&self.0.storage, &scope).await?;
         let mut options = PrepareOptions::new().required(required.to_vec());
         // Only a PKCE login has a callback; client credentials never listen.
         let listener = if self.pkce(&context)? {
@@ -762,12 +799,9 @@ impl HookAuth {
             }
             Preparation::InteractionRequired(pending) => {
                 let listener = listener.ok_or_else(|| fail(AuthErrorCode::ProviderFailed))?;
-                let scope = self
-                    .scope(&context)
-                    .ok_or_else(|| fail(AuthErrorCode::InvalidConfiguration))?
-                    .to_owned();
                 let url = pending.authorization_url().clone();
-                let login = login::Login::new(&scope, manager, &context, required, pending);
+                let login =
+                    login::Login::new(&scope, manager, &context, required, pending, generation);
                 login::registry().offer(login.clone());
                 // Listening already: the link works as soon as it is shown.
                 let auth = self.clone();
@@ -787,6 +821,7 @@ impl HookAuth {
                                 not_granted(&scopes),
                             );
                         }
+                        login::Outcome::LoggedOut => login::registry().ended(&login),
                         login::Outcome::Stopped => {}
                     }
                 });
@@ -915,6 +950,9 @@ impl HookAuth {
         } else {
             None
         };
+        let generation = login::Generation::read(&self.0.storage, &backend.scope)
+            .await
+            .map_err(|error| describe(&error))?;
         let prepared = manager
             .prepare_with(with_deadline(&context), options, budget())
             .await;
@@ -942,11 +980,20 @@ impl HookAuth {
             return Err(describe(&fail(AuthErrorCode::ProviderFailed)));
         };
         present(&backend.id, pending.authorization_url());
-        let candidate =
-            login::Login::new(&backend.scope, Arc::clone(&manager), &context, &[], pending);
+        let candidate = login::Login::new(
+            &backend.scope,
+            Arc::clone(&manager),
+            &context,
+            &[],
+            pending,
+            generation,
+        );
         match login::serve(&listener, &candidate).await {
             login::Outcome::Completed => {}
             login::Outcome::NotGranted(scopes) => return Err(not_granted(&scopes)),
+            login::Outcome::LoggedOut => {
+                return Err("the backend was logged out while signing in".into());
+            }
             _ => return Err("the sign-in link expired or was not approved".into()),
         }
         login::registry().usable(&backend.scope, &context);
@@ -960,6 +1007,12 @@ impl HookAuth {
         let Some(scope) = self.0.backends.get(backend).map(|b| b.scope.clone()) else {
             return Err(format!("no hook backend `{backend}` is configured"));
         };
+        // The marker first, even with nothing stored: every Kit process's
+        // links from before it stop working, and a grant one stores while
+        // this runs is removed again by the process that stored it.
+        store::mark_logout(&self.0.storage, &scope, false)
+            .await
+            .map_err(|error| describe(&error))?;
         let removed = store::Store::new(self.0.storage.clone(), &scope)
             .forget(budget())
             .await
@@ -1031,6 +1084,11 @@ pub(crate) async fn logout_everywhere(
     storage: &CredentialStorage,
     backend: &str,
 ) -> Result<usize, String> {
+    // As for one workspace, and for every scope of the backend id, including
+    // ones that have stored nothing yet.
+    store::mark_logout(storage, backend, true)
+        .await
+        .map_err(|error| describe(&error))?;
     let scopes = store::scopes(storage)
         .await
         .map_err(|error| describe(&error))?;
@@ -1204,6 +1262,17 @@ pub(crate) mod test_support {
         client: fn() -> reqwest::ClientBuilder,
     ) -> super::HookAuth {
         super::HookAuth::with_client(storage, registration, sources, client)
+    }
+
+    /// [`hook_auth`] with these secret references instead of the user's.
+    pub(crate) fn hook_auth_with_references(
+        storage: crate::credentials::CredentialStorage,
+        registration: &serde_json::Value,
+        sources: &std::collections::BTreeMap<String, String>,
+        client: fn() -> reqwest::ClientBuilder,
+        references: std::collections::BTreeMap<String, String>,
+    ) -> super::HookAuth {
+        super::HookAuth::with_references(storage, registration, sources, client, references)
     }
 
     /// Shows `hint` as a turn start would.

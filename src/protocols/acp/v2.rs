@@ -3995,21 +3995,11 @@ mod tests {
     }
 
     #[test]
-    fn hook_sign_in_is_advertised_only_for_http_hooks_with_durable_storage() {
+    fn hook_sign_in_is_advertised_with_durable_storage_whatever_the_launch_hooks() {
+        // The launch workspace has no hooks: a session may attach to one
+        // that does, and the method checks that workspace when it runs.
         let root = tempfile::tempdir().unwrap();
         let credentials = tempfile::tempdir().unwrap();
-        let agents = root.path().join(".agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        std::fs::write(
-            agents.join("hooks.json"),
-            json!({"protocolVersion": "draft", "hooks": [{
-                "id": "test.advertised",
-                "transport": {"type": "http", "url": "https://hooks.example/ahp"},
-                "subscriptions": [crate::ahp::test_support::observe(&["session.start"])],
-            }]})
-            .to_string(),
-        )
-        .unwrap();
         for (storage, expected) in [
             (crate::credentials::CredentialStorage::Memory, false),
             (

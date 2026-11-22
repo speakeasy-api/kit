@@ -1155,6 +1155,157 @@ async fn checking_a_live_step_up_registers_no_client() {
     assert!(states(&scope).is_empty());
 }
 
+#[test]
+fn confidential_targets_with_different_secret_references_never_share_a_manager() {
+    let storage = tempfile::tempdir().unwrap();
+    let preset = |reference: &str, resource: &str| {
+        json!({"type": "oauth", "flow": "client_credentials", "issuer": "https://auth.example",
+            "clientId": "kit", "clientSecretRef": reference, "resource": resource})
+    };
+    let backend = json!({"id": "test.secrets", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+        "authentication": preset("event-secret", "https://hooks.example/ahp")});
+    let auth = super::test_support::hook_auth_with_references(
+        CredentialStorage::Filesystem(storage.path().to_path_buf()),
+        &json!({"protocolVersion": "draft", "hooks": [backend]}),
+        &BTreeMap::from([("test.secrets".to_owned(), "/project/hooks.json".to_owned())]),
+        trusting_client,
+        BTreeMap::from([
+            ("event-secret".to_owned(), "a".to_owned()),
+            ("upload-secret".to_owned(), "b".to_owned()),
+        ]),
+    );
+    let event = context(&auth, "test.secrets");
+    let upload = |reference: &str| AuthContext {
+        purpose: AuthPurpose::Upload,
+        destination: "https://hooks.example/uploads".into(),
+        authentication: Some(preset(reference, "https://hooks.example/uploads")),
+        ..event.clone()
+    };
+    let event_manager = auth.manager(&event).unwrap();
+    // Same client, flow and scopes, another secret reference.
+    let upload_manager = auth.manager(&upload("upload-secret")).unwrap();
+    assert!(!Arc::ptr_eq(&event_manager, &upload_manager));
+    assert!(Arc::ptr_eq(&event_manager, &auth.manager(&event).unwrap()));
+    // A reference with no secret fails though another target is cached.
+    let error = auth.manager(&upload("missing-secret")).err().unwrap();
+    assert_eq!(
+        error.auth_code(),
+        Some(AuthErrorCode::CredentialUnavailable)
+    );
+}
+
+#[tokio::test]
+async fn a_plain_observation_keeps_a_pending_step_up() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.keeps-step-up";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    // A later operation only needs a sign-in.
+    login::registry().needs_login(&scope, &target, &[]);
+    assert_eq!(login::registry().needs(&scope)[0].required, ["hooks:admin"]);
+    // So a base credential does not settle it.
+    login::registry().usable(&scope, &target);
+    assert!(login::registry().has_needs(&scope));
+    // Another step-up adds its scopes.
+    login::registry().needs_login(&scope, &target, &["hooks:upload".into()]);
+    assert_eq!(
+        login::registry().needs(&scope)[0].required,
+        ["hooks:admin", "hooks:upload"]
+    );
+}
+
+/// Logs `id` out as another Kit process would when nothing is stored for
+/// it yet: only the logout marker moves, and this process's registry is left
+/// alone.
+async fn logout_elsewhere(auth: &HookAuth, id: &str, all_workspaces: bool) {
+    let scope = auth.0.backends[id].scope.clone();
+    let marked = if all_workspaces { id } else { scope.as_str() };
+    store::mark_logout(&auth.0.storage, marked, all_workspaces)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_link_shown_before_a_logout_elsewhere_never_signs_in() {
+    for all_workspaces in [false, true] {
+        let issuer = Issuer::start().await;
+        let storage = tempfile::tempdir().unwrap();
+        let id = if all_workspaces {
+            "test.logout-everywhere"
+        } else {
+            "test.logout-elsewhere"
+        };
+        let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+        let (tx, mut hints) = mpsc::unbounded_channel();
+        let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+        let _ = credential(&auth, context(&auth, id)).await;
+        auth.turn_started();
+        let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+        logout_elsewhere(&auth, id, all_workspaces).await;
+        // Approving the old link stores nothing, and the link is withdrawn.
+        assert!(!approve(&url).await);
+        let cleared = next_hint(&mut hints).await;
+        assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+        assert_eq!(issuer.exchanges(), 0);
+        assert!(credential(&auth, context(&auth, id)).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn a_logout_elsewhere_withdraws_links_at_the_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.logout-reconcile";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, context(&auth, id)).await;
+    auth.turn_started();
+    let old = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    logout_elsewhere(&auth, id, false).await;
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the old link is withdrawn");
+    assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+    assert!(!states(&scope).contains(&query(&old, "state")));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while TcpStream::connect(("127.0.0.1", port(&old))).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the old link stops listening");
+}
+
+#[tokio::test]
+async fn a_scope_denial_is_not_replayed_to_a_later_session() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.denial");
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    sign_in(&auth, "test.denial").await;
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let error = challenge(
+        &auth,
+        "test.denial",
+        403,
+        r#"Bearer error="insufficient_scope", scope="hooks:admin""#,
+    )
+    .await;
+    assert_eq!(error.auth_code(), Some(AuthErrorCode::AccessDenied));
+    // The session attached now is told.
+    assert!(next_hint(&mut hints).await.problem.is_some());
+    // A session attached later is not: nothing would clear it.
+    let (later_tx, mut later) = mpsc::unbounded_channel();
+    let _later = auth.subscribe(move |hint| later_tx.send(hint.clone()).unwrap());
+    assert!(later.try_recv().is_err());
+}
+
 /// A backend whose binding declares `hooks:invoke`, and that Kit may also
 /// ask for `hooks:admin`: a scope outside the binding's, so a need for it
 /// is a step-up.

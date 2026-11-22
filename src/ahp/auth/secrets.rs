@@ -26,8 +26,11 @@ impl ClientSecretStorage for Secrets {
         budget: OperationBudget,
     ) -> LocalFuture<'_, Result<(), HookError>> {
         Box::pin(async move {
-            self.0.remember(SECRETS, &reference, budget).await?;
+            // The record lock first, held through the save, then the index
+            // (the order logout takes them): a logout cannot remove the
+            // index entry between indexing and saving.
             let _lock = self.0.lock(SECRETS, &reference, budget).await?;
+            self.0.remember(SECRETS, &reference, budget).await?;
             let entry = self.0.storage().entry(SECRETS, &reference);
             let bytes = Zeroizing::new(secret.secret().as_bytes().to_vec());
             tokio::task::spawn_blocking(move || entry.save(&bytes))
@@ -150,8 +153,46 @@ fn references_in(path: &std::path::Path) -> std::collections::BTreeMap<String, S
 )]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
 
-    use super::references_in;
+    use agenthooksprotocol::auth::managed::{ClientSecret, ClientSecretStorage, OperationBudget};
+
+    use super::{SECRETS, Secrets, Store, references_in};
+    use crate::credentials::CredentialStorage;
+
+    #[tokio::test]
+    async fn a_secret_is_indexed_only_under_its_record_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let store = Store::new(storage, "test#secret-lock");
+        let budget = || OperationBudget::until(Instant::now() + Duration::from_secs(10));
+        // Logout holds the record lock: the writer must not index meanwhile.
+        let held = store.lock(SECRETS, "dcr-secret", budget()).await.unwrap();
+        let secrets = Secrets(store.clone());
+        let write = secrets.store(
+            "dcr-secret".into(),
+            ClientSecret::new("value".into()),
+            budget(),
+        );
+        let check = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                store.indexed().await.is_empty(),
+                "indexed before taking the record lock"
+            );
+            drop(held);
+        };
+        let (written, ()) = tokio::join!(write, check);
+        written.unwrap();
+        assert!(
+            store
+                .indexed()
+                .await
+                .contains(&(SECRETS.to_owned(), "dcr-secret".to_owned()))
+        );
+        // And logout finds it.
+        assert_eq!(store.forget(budget()).await.unwrap(), 1);
+    }
 
     #[test]
     fn the_secrets_file_must_be_private() {

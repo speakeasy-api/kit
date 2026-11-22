@@ -98,13 +98,23 @@ kit auth logout hooks com.example.policy --all-workspaces
 until you approve it. `logout` removes the backend's tokens, pending sign-in
 and registered client, and nothing of any other backend.
 
+A sign-in link that another running Kit process showed before the logout no
+longer signs in: approving it stores nothing, and that process withdraws the
+link at its next turn start. One case remains: if a sign-in elsewhere
+completes at the very moment of the logout, its tokens can be stored briefly
+before that process removes them again. In that case a sign-in made in
+another process right after the logout can be removed with them, and you sign
+in once more.
+
 Sign-ins belong to a backend in the hooks file that declares it, so two
 projects with the same backend id sign in separately. Moving or re-cloning a
 project starts a new sign-in, and its old one is no longer found by `logout`
 with `--root`. `--all-workspaces` removes the backend's sign-ins in every
 workspace, including moved ones. ACP clients that
-support terminal authentication offer one `hooks` method, which runs
-`kit auth login hooks`.
+support terminal authentication offer one `hooks` method whenever hooks are
+enabled and credentials are stored durably. It runs `kit auth login hooks` in
+the workspace the client chooses, and says so when no backend there needs a
+sign-in.
 
 Sign-in requires a persistent credential store (`--credential-store file` or
 `keychain`), as MCP authentication does. Memory-only storage cannot keep a

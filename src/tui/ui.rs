@@ -5392,6 +5392,42 @@ mod tests {
     }
 
     #[test]
+    fn a_reattached_session_shows_only_what_its_replay_sends() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let flat = |app: &mut App| {
+            render(app, 100, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        app.start_session("first".into());
+        app.apply(crate::tui::app::Update::HookSignIn {
+            session_id: "first".into(),
+            backend: "com.example".into(),
+            problem: Some(
+                "requires scopes (hooks:admin) outside the ones Kit allows for it.".into(),
+            ),
+            url: Some("https://auth.example/consumed".into()),
+            expires_at_ms: None,
+            cleared: false,
+        });
+        assert!(flat(&mut app).contains("auth.example/consumed"));
+        // Detached, the session signs in; its clear never reaches this view.
+        app.start_session("other".into());
+        app.start_session("first".into());
+        // The new attachment replays nothing: neither the consumed link nor
+        // the resolved problem comes back.
+        let screen = flat(&mut app);
+        assert!(!screen.contains("auth.example/consumed"), "{screen}");
+        assert!(!screen.contains("hooks:admin"), "{screen}");
+    }
+
+    #[test]
     fn hook_sign_in_links_follow_their_session() {
         let mut app = App::new(
             PathBuf::from("/tmp"),
@@ -5416,10 +5452,11 @@ mod tests {
         app.start_session("first".into());
         app.apply(hint("first", "https://auth.example/first"));
         // The next session's link arrives while it attaches, before it is
-        // the current session; the first session's arrives late.
+        // the current session; the first session's ended attachment sends
+        // one late, which is ignored.
         app.apply(hint("next", "https://auth.example/next"));
         app.start_session("next".into());
-        app.apply(hint("first", "https://auth.example/first-again"));
+        app.apply(hint("first", "https://auth.example/first-late"));
         let screen = flat(&mut app);
         assert!(screen.contains("https://auth.example/next"), "{screen}");
         assert!(
@@ -5430,8 +5467,11 @@ mod tests {
         // Replaying the same link does not duplicate it.
         app.apply(hint("next", "https://auth.example/next"));
         assert_eq!(flat(&mut app).matches("open the sign-in page").count(), 1);
-        // Returning to the first session restores its link.
+        // Returning to the first session shows what its new attachment
+        // replays, not the late link.
         app.start_session("first".into());
+        assert!(!flat(&mut app).contains("first-late"));
+        app.apply(hint("first", "https://auth.example/first-again"));
         let screen = flat(&mut app);
         assert!(
             screen.contains("https://auth.example/first-again"),
