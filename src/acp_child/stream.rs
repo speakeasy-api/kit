@@ -425,7 +425,13 @@ struct RoutesState {
     /// Sessions removed here: a late hint from one is ignored, though its
     /// remote close may not have settled.
     ended: std::collections::HashSet<String>,
+    /// The last hint passed on per (session, agent and backend): an identical
+    /// one right after it (the same hint in the other form, say) is dropped.
+    last: HashMap<(String, String), Hint>,
 }
+
+/// The most (session, agent and backend) pairs whose last hint is kept.
+const LAST_HINTS: usize = 256;
 
 type Hint = crate::ahp::auth::hint::HookHint;
 
@@ -670,6 +676,13 @@ impl Routes {
             }
             !mine
         });
+        // Replayed hints count as passed on, for the duplicate check.
+        for hint in &held {
+            let key = (remote.to_owned(), hint_key(hint));
+            if state.last.len() < LAST_HINTS || state.last.contains_key(&key) {
+                state.last.insert(key, hint.clone());
+            }
+        }
         held
     }
 
@@ -692,7 +705,15 @@ impl Routes {
         if !state.replaying.contains(remote)
             && let Some(route) = state.live.get(remote)
         {
-            return Some((route.owner.clone(), route.transcript.clone(), update));
+            let route = (route.owner.clone(), route.transcript.clone());
+            let key = (remote.to_owned(), hint_key(&update));
+            if state.last.get(&key) == Some(&update) {
+                return None;
+            }
+            if state.last.len() < LAST_HINTS || state.last.contains_key(&key) {
+                state.last.insert(key, update.clone());
+            }
+            return Some((route.0, route.1, update));
         }
         let key = hint_key(&update);
         let state = &mut *state;
@@ -723,6 +744,7 @@ impl Routes {
         if let Ok(mut state) = self.0.lock() {
             // Its hints no longer have an owner to go to.
             state.live.remove(remote);
+            state.last.retain(|(session, _), _| session != remote);
             state.held.retain(|(session, _, _)| session != remote);
             state.replaying.remove(remote);
             state.overflowed.remove(remote);
@@ -1125,7 +1147,7 @@ mod tests {
         // The replay is over: hints go straight through.
         assert!(
             routes
-                .hook_hint("child", hook_hint("a", None, true))
+                .hook_hint("child", hook_hint("a", Some("https://a/2"), false))
                 .is_some()
         );
     }
@@ -1232,6 +1254,30 @@ mod tests {
                 .is_some(),
             "a later hint is held after the overflow notice panicked"
         );
+    }
+
+    #[test]
+    fn the_same_hint_in_the_other_form_is_passed_on_once() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.register(
+            "child",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |_| {},
+        );
+        let link = hook_hint("a", Some("https://a/1"), false);
+        assert!(routes.hook_hint("child", link.clone()).is_some());
+        assert!(routes.hook_hint("child", link.clone()).is_none());
+        // A change goes through, and then the earlier one again.
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some()
+        );
+        assert!(routes.hook_hint("child", link).is_some());
     }
 
     #[test]

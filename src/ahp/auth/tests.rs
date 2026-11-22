@@ -1630,6 +1630,53 @@ async fn a_sign_in_whose_logout_state_cannot_be_read_is_refused() {
 }
 
 #[tokio::test]
+async fn undoing_an_under_granted_exchange_keeps_another_targets_new_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.undo-one-target";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let other = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let event = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // An upload target on another resource of the same backend.
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/uploads", issuer.origin)}));
+    login::registry().needs_login(&scope, &event, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // This session's under-granted step-up is slow; the logout lands
+    // while it runs.
+    issuer.delay_ms.store(2500, Ordering::SeqCst);
+    let code = issue_code_granting(&url, "hooks:invoke");
+    let (callback_port, state) = (port(&url), query(&url, "state"));
+    let callback = tokio::spawn(async move { call_back_with(callback_port, &state, &code).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while issuer.received.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exchange starts");
+    logout_elsewhere(&auth, id, false).await;
+    // After the logout, another process signs in for the upload target,
+    // and finishes while this exchange still runs.
+    issuer.delay_ms.store(200, Ordering::SeqCst);
+    let (upload_url, complete) = elsewhere_at(&other, upload.clone(), &[]).await;
+    complete(issue_code(&upload_url)).await;
+    assert!(credential(&other, upload.clone()).await.unwrap().is_some());
+    assert!(!callback.await.unwrap());
+    // This exchange's grant is gone; the other target's, new in the same
+    // window, stays.
+    assert!(credential(&auth, event).await.is_err());
+    assert!(credential(&other, upload).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn a_logout_during_an_under_granted_step_up_leaves_no_grant() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
@@ -2105,7 +2152,18 @@ async fn elsewhere_requiring(
     url::Url,
     impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
 ) {
-    let target = context(auth, id);
+    elsewhere_at(auth, context(auth, id), required).await
+}
+
+/// [`elsewhere_requiring`], for any target of the backend.
+async fn elsewhere_at(
+    auth: &HookAuth,
+    target: AuthContext,
+    required: &[&str],
+) -> (
+    url::Url,
+    impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
     let manager = auth.manager(&target).unwrap();
     let redirect = "http://127.0.0.1:9/callback";
     let Preparation::InteractionRequired(pending) = manager

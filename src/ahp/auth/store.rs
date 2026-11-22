@@ -240,6 +240,78 @@ impl Store {
         Ok(removed)
     }
 
+    /// Removes the grant an exchange for one target wrote when it returned
+    /// no credential (an under-granted step-up stores its grant and still
+    /// fails): read raw, not through the SDK's usability check, which
+    /// refuses a grant narrower than the required scopes. The target's grant
+    /// key cannot be derived outside the SDK, so the grant is the record for
+    /// the target's `resource` and `client_id` (the login's own authorization
+    /// request names both) whose token generation is new since `before`, or,
+    /// without that snapshot, whatever that record now holds. It is checked
+    /// again under its lock before it goes; a grant for any other target is
+    /// never touched. Returns how many it removed.
+    pub(super) async fn discard_new_grant(
+        &self,
+        before: Option<&std::collections::HashMap<String, String>>,
+        resource: &str,
+        client_id: &str,
+        budget: OperationBudget,
+    ) -> Result<usize, HookError> {
+        let index = {
+            let _lock = self.lock(INDEX, &self.backend, budget).await?;
+            self.index().await?
+        };
+        let mut removed = 0;
+        for (namespace, identity) in index {
+            if namespace != RECORDS {
+                continue;
+            }
+            let Some((generation, target)) = self.grant_of(&identity).await? else {
+                continue;
+            };
+            if target != (resource.to_owned(), client_id.to_owned())
+                || before.is_some_and(|before| before.get(&identity) == Some(&generation))
+            {
+                continue;
+            }
+            let _record = self.lock(RECORDS, &identity, budget).await?;
+            if self.generation_of(&identity).await?.as_deref() != Some(generation.as_str()) {
+                continue;
+            }
+            let entry = self.storage.entry(RECORDS, &identity);
+            durably(entry, |entry| entry.delete().map(|_| ())).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// A grant record's token generation, resource and client, read raw.
+    async fn grant_of(
+        &self,
+        identity: &str,
+    ) -> Result<Option<(String, (String, String))>, HookError> {
+        let entry = self.storage.entry(RECORDS, identity);
+        let bytes = blocking(move || entry.load()).await?;
+        let Some(record) =
+            bytes.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            return Ok(None);
+        };
+        let field = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+        Ok(
+            match (
+                field(&record["token"]["generation"]),
+                field(&record["metadata"]["resource"]),
+                field(&record["client_id"]),
+            ) {
+                (Some(generation), Some(resource), Some(client)) => {
+                    Some((generation, (resource, client)))
+                }
+                _ => None,
+            },
+        )
+    }
+
     /// Every record and secret indexed for this backend.
     #[cfg(test)]
     pub(super) async fn indexed(&self) -> BTreeSet<(String, String)> {
@@ -610,6 +682,39 @@ mod tests {
         assert_eq!(generations.len(), 3);
         // Only the record of our exchange's generation goes.
         assert_eq!(store.discard_exchange("g-ours", budget()).await.unwrap(), 1);
+        // Without a generation: only the record for the exchange's target
+        // that is new since it began (fixtures: resource
+        // https://hooks.example/ahp, client kit).
+        let before = store.token_generations(budget()).await.unwrap();
+        let mut guard = store.acquire(key("stepped-up"), budget()).await.unwrap();
+        assert!(
+            guard
+                .compare_and_swap(None, grant("v1", "g-step"))
+                .await
+                .unwrap()
+        );
+        drop(guard);
+        assert_eq!(
+            store
+                .discard_new_grant(Some(&before), "https://other.example/ahp", "kit", budget())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .discard_new_grant(Some(&before), "https://hooks.example/ahp", "kit", budget())
+                .await
+                .unwrap(),
+            1
+        );
+        let left: std::collections::BTreeSet<_> = store
+            .token_generations(budget())
+            .await
+            .unwrap()
+            .into_values()
+            .collect();
+        assert_eq!(left, ["g-newer".to_owned(), "g-old".to_owned()].into());
         let left: std::collections::BTreeSet<_> = store
             .token_generations(budget())
             .await

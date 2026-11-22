@@ -928,44 +928,33 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
         let verified = login.generation.current(&login.scope).await;
         if !matches!(verified, Ok(true)) {
             let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
-            // The grant this exchange wrote: the credential it returned, or
-            // for an under-granted step-up (which stores its grant and still
-            // fails) the target's grant now, if it is new since the exchange
-            // began. Nothing else of the scope is touched.
+            // Undo the grant this exchange wrote, and nothing else of the
+            // scope, whether a logout happened or cannot be ruled out: the
+            // record of the credential it returned, or for an under-granted
+            // step-up (which stores its grant and still fails, with no
+            // credential) the record for this login's target that is new
+            // since the exchange began. Either way no sign-in is reported.
             let under_granted = completed.as_ref().is_err_and(|error| {
                 error.auth_code() == Some(AuthErrorCode::AccessDenied)
                     && error.login_ended() == Some(true)
             });
-            let ours = match &completed {
-                Ok(credential) => Some(credential.attempt_id.clone()),
+            let discarded = match &completed {
+                Ok(credential) => store.discard_exchange(&credential.attempt_id, budget).await,
                 Err(_) if under_granted => {
-                    agenthooksprotocol::adapters::registered::AuthProvider::credential(
-                        &*login.oauth,
-                        AuthContext {
-                            deadline: Instant::now() + Duration::from_secs(30),
-                            ..login.context.clone()
-                        },
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|credential| credential.attempt_id)
-                    .filter(|attempt| {
-                        before
-                            .as_ref()
-                            .is_some_and(|before| !before.values().any(|known| known == attempt))
-                    })
+                    let url = login.pending.authorization_url();
+                    match (query(url, "resource"), query(url, "client_id")) {
+                        (Some(resource), Some(client)) => {
+                            store
+                                .discard_new_grant(before.as_ref(), &resource, &client, budget)
+                                .await
+                        }
+                        // Not a request this Kit made: remove what the
+                        // backend holds, as a logout does.
+                        _ => store.forget(budget).await,
+                    }
                 }
-                Err(_) => None,
-            };
-            let discarded = match (ours.as_deref(), &verified) {
-                (Some(ours), _) => store.discard_exchange(ours, budget).await,
-                // Logged out, and what the exchange wrote cannot be told
-                // apart: remove the backend's state, as the logout did.
-                (None, Ok(false)) if under_granted && before.is_none() => {
-                    store.forget(budget).await
-                }
-                (None, _) => Ok(0),
+                // Nothing was written.
+                Err(_) => Ok(0),
             };
             if let Err(error) = discarded {
                 let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);

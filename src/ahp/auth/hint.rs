@@ -69,7 +69,13 @@ fn displayable(text: &str) -> bool {
         c.is_control()
             || matches!(
                 c,
-                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
             )
     })
 }
@@ -78,10 +84,22 @@ fn plain(text: &str, max: usize) -> bool {
     !text.is_empty() && text.len() <= max && displayable(text)
 }
 
-/// A backend id that can be put in a suggested shell command as is.
+/// A backend id that can be put in a suggested shell command, or between
+/// backticks, as is: not an option (`-…`), no backtick or shell syntax.
 fn shell_safe(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    !text.starts_with('-')
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+/// `text` as code in notice text, or quoted when backticks would break.
+fn code(text: &str) -> String {
+    if text.contains('`') {
+        format!("\"{text}\"")
+    } else {
+        format!("`{text}`")
+    }
 }
 
 impl HookHint {
@@ -132,9 +150,10 @@ impl HookHint {
                 .map(|problem| format!("{label}More hook backends need you to sign in {problem}"));
         }
         let backend = &self.backend;
+        let name = code(backend);
         let link = match &self.url {
             Some(url) if !self.cleared && url.len() <= MAX_URL => Some(format!(
-                "Hook backend `{backend}` needs you to sign in. Open {url} to approve Kit."
+                "Hook backend {name} needs you to sign in. Open {url} to approve Kit."
             )),
             Some(_) if !self.cleared => {
                 // The id goes into a command only if it cannot change it.
@@ -144,7 +163,7 @@ impl HookHint {
                     "kit auth login hooks".to_owned()
                 };
                 Some(format!(
-                    "Hook backend `{backend}` needs you to sign in; its link is too long to show here. Run `{command}` in its workspace."
+                    "Hook backend {name} needs you to sign in; its link is too long to show here. Run `{command}` in its workspace."
                 ))
             }
             _ => None,
@@ -155,9 +174,9 @@ impl HookHint {
                 Some(format!("{label}{link} Also, the backend {problem}"))
             }
             (Some(link), None) => Some(format!("{label}{link}")),
-            (None, Some(problem)) => Some(format!("{label}Hook backend `{backend}` {problem}")),
+            (None, Some(problem)) => Some(format!("{label}Hook backend {name} {problem}")),
             (None, None) if self.reason == Some(ClearReason::SignedIn) => {
-                Some(format!("{label}Hook backend `{backend}` is signed in."))
+                Some(format!("{label}Hook backend {name} is signed in."))
             }
             (None, None) => None,
         }
@@ -231,6 +250,15 @@ mod tests {
         };
         let text = hint.notice_text().unwrap();
         assert!(text.contains("Run `kit auth login hooks` in"), "{text}");
+        for backend in ["-rf", "x`whoami`"] {
+            let hint = HookHint {
+                backend: backend.into(),
+                ..link(&long)
+            };
+            let text = hint.notice_text().unwrap();
+            assert!(text.contains("Run `kit auth login hooks` in"), "{text}");
+            assert!(!text.contains("``"), "{text}");
+        }
     }
 
     #[test]
@@ -256,6 +284,18 @@ mod tests {
             link("https://auth.example/\u{202e}gnp.exe"),
             HookHint {
                 backend: "x\u{2066}y".into(),
+                ..link("https://auth.example/a")
+            },
+            HookHint {
+                backend: "x\u{061c}y".into(),
+                ..link("https://auth.example/a")
+            },
+            HookHint {
+                problem: Some("line\u{2028}break".into()),
+                ..link("https://auth.example/a")
+            },
+            HookHint {
+                agent: Some("a\u{2029}b".into()),
                 ..link("https://auth.example/a")
             },
             HookHint {
