@@ -18,6 +18,10 @@ pub(crate) enum ClearReason {
     Withdrawn,
     /// The backend was logged out.
     LoggedOut,
+    /// A reason this Kit does not know (from a newer child): a clear all
+    /// the same.
+    #[serde(other)]
+    Other,
 }
 
 /// The backend of an overflow hint: more of an agent's backends need a
@@ -58,8 +62,26 @@ const MAX_AGENT: usize = 1024;
 const MAX_URL: usize = 8 * 1024;
 const MAX_PROBLEM: usize = 1024;
 
+/// Text that shows as written: no control characters (ESC, BEL, NUL...) and
+/// no bidirectional controls that would reorder it.
+fn displayable(text: &str) -> bool {
+    !text.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+    })
+}
+
 fn plain(text: &str, max: usize) -> bool {
-    !text.is_empty() && text.len() <= max && !text.chars().any(char::is_control)
+    !text.is_empty() && text.len() <= max && displayable(text)
+}
+
+/// A backend id that can be put in a suggested shell command as is.
+fn shell_safe(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
 }
 
 impl HookHint {
@@ -72,6 +94,7 @@ impl HookHint {
             url.starts_with("https://")
                 && url.len() <= MAX_URL * 2
                 && !url.contains(char::is_whitespace)
+                && displayable(url)
         });
         let consistent = self.cleared || self.reason.is_none();
         (plain(&self.backend, MAX_BACKEND)
@@ -113,9 +136,17 @@ impl HookHint {
             Some(url) if !self.cleared && url.len() <= MAX_URL => Some(format!(
                 "Hook backend `{backend}` needs you to sign in. Open {url} to approve Kit."
             )),
-            Some(_) if !self.cleared => Some(format!(
-                "Hook backend `{backend}` needs you to sign in; its link is too long to show here. Run `kit auth login hooks {backend}` in its workspace."
-            )),
+            Some(_) if !self.cleared => {
+                // The id goes into a command only if it cannot change it.
+                let command = if shell_safe(backend) {
+                    format!("kit auth login hooks {backend}")
+                } else {
+                    "kit auth login hooks".to_owned()
+                };
+                Some(format!(
+                    "Hook backend `{backend}` needs you to sign in; its link is too long to show here. Run `{command}` in its workspace."
+                ))
+            }
             _ => None,
         };
         let problem = self.problem.as_ref().filter(|_| !self.cleared);
@@ -186,6 +217,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_reason_is_a_clear_and_an_unsafe_id_never_enters_a_command() {
+        let hint: HookHint = serde_json::from_value(serde_json::json!({
+            "backend": "x", "cleared": true, "reason": "revoked_by_policy"
+        }))
+        .unwrap();
+        assert_eq!(hint.reason, Some(ClearReason::Other));
+        assert!(hint.validated().is_some());
+        let long = format!("https://auth.example/{}", "b".repeat(MAX_URL));
+        let hint = HookHint {
+            backend: "x;rm -rf ~".into(),
+            ..link(&long)
+        };
+        let text = hint.notice_text().unwrap();
+        assert!(text.contains("Run `kit auth login hooks` in"), "{text}");
+    }
+
+    #[test]
     fn malformed_hints_are_refused() {
         assert!(link("https://auth.example/a").validated().is_some());
         for bad in [
@@ -203,6 +251,13 @@ mod tests {
             },
             link("javascript:alert(1)"),
             link("https://auth.example/a b"),
+            link("https://auth.example/a\u{1b}[2J"),
+            link("https://auth.example/a\u{7}"),
+            link("https://auth.example/\u{202e}gnp.exe"),
+            HookHint {
+                backend: "x\u{2066}y".into(),
+                ..link("https://auth.example/a")
+            },
             HookHint {
                 problem: Some("line\nbreak".into()),
                 ..link("https://auth.example/a")

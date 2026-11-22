@@ -584,11 +584,7 @@ impl Routes {
         mut deliver: impl FnMut(&Hint),
     ) {
         let (mut held, overflowed) = self.register_locked(remote, owner, generation, transcript);
-        if overflowed {
-            // What could not be held: the user is told where to look.
-            deliver(&crate::ahp::auth::hint::more_backends());
-        }
-        if held.is_empty() {
+        if held.is_empty() && !overflowed {
             return;
         }
         // Ends the replay however this returns, a panic in `deliver` too, so
@@ -597,6 +593,10 @@ impl Routes {
             routes: self,
             remote,
         };
+        if overflowed {
+            // What could not be held: the user is told where to look.
+            deliver(&crate::ahp::auth::hint::more_backends());
+        }
         while !held.is_empty() {
             for update in &held {
                 deliver(update);
@@ -721,6 +721,8 @@ impl Routes {
     /// A child session ended: nothing is held for it any longer.
     pub(crate) fn end_session(&self, remote: &str) {
         if let Ok(mut state) = self.0.lock() {
+            // Its hints no longer have an owner to go to.
+            state.live.remove(remote);
             state.held.retain(|(session, _, _)| session != remote);
             state.replaying.remove(remote);
             state.overflowed.remove(remote);
@@ -1203,6 +1205,66 @@ mod tests {
                 .is_some(),
             "a later hint is held after the replay panicked"
         );
+        // So too when the panic is in delivering the overflow notice.
+        for backend in 0..HELD_HINTS + 1 {
+            routes.hook_hint(
+                "over",
+                hook_hint(&backend.to_string(), Some("https://x"), false),
+            );
+        }
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            routes.register(
+                "over",
+                "owner",
+                1,
+                transcripts.get("owner", 1).unwrap(),
+                |hint| {
+                    if hint.backend == crate::ahp::auth::hint::MORE_BACKENDS {
+                        panic!("delivery failed");
+                    }
+                },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            routes
+                .hook_hint("over", hook_hint("0", None, true))
+                .is_some(),
+            "a later hint is held after the overflow notice panicked"
+        );
+    }
+
+    #[test]
+    fn a_closed_session_routes_no_late_hint_however_many_closed_before() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.register(
+            "first",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |_| {},
+        );
+        routes.end_session("first");
+        // Many more sessions close on the same connection.
+        for session in 0..REMEMBERED_SESSIONS + 8 {
+            let session = format!("other-{session}");
+            routes.register(
+                &session,
+                "owner",
+                1,
+                transcripts.get("owner", 1).unwrap(),
+                |_| {},
+            );
+            routes.end_session(&session);
+        }
+        assert!(
+            routes
+                .hook_hint("first", hook_hint("a", Some("https://late"), false))
+                .is_none()
+        );
+        assert!(!routes.0.lock().unwrap().live.contains_key("first"));
     }
 
     #[test]

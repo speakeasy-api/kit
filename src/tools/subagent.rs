@@ -3607,8 +3607,15 @@ mod hook_sign_in_tests {
     /// Every link the scripted child sends ends so; prompts never contain it.
     const SECRET: &str = "/secret-link";
 
-    /// `Subagents` as a runtime builds them, launching the scripted child.
+    /// `Subagents` as a runtime builds them, launching the scripted child as
+    /// Kit's own.
     fn manager(root: &std::path::Path, nested: bool, args: &[&str]) -> Subagents {
+        manager_as(root, nested, args, true)
+    }
+
+    /// [`manager`], the scripted child as Kit's own (`kit`) or as another
+    /// harness.
+    fn manager_as(root: &std::path::Path, nested: bool, args: &[&str], kit: bool) -> Subagents {
         let runtime = crate::runtime::Runtime::new_with_provider_and_credentials(
             root,
             "gpt-5.4",
@@ -3626,8 +3633,10 @@ mod hook_sign_in_tests {
             env!("CARGO_MANIFEST_DIR")
         )];
         command.extend(args.iter().map(|arg| (*arg).to_owned()));
+        // Run as Kit's own child (the `acp.kit` profile a user may set):
+        // only a Kit child's hints are relayed.
         let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "mock".into(),
+            if kit { "kit" } else { "other" }.into(),
             crate::acp_child::AcpHarnessProfile {
                 command: "python3".into(),
                 args: command,
@@ -3635,8 +3644,13 @@ mod hook_sign_in_tests {
             },
         )]))
         .unwrap();
+        let default = if kit {
+            crate::acp_child::BUILTIN_HARNESS
+        } else {
+            "acp.other"
+        };
         let runtime =
-            crate::runtime::Runtime::with_acp_harnesses(runtime, harnesses, "acp.mock".into())
+            crate::runtime::Runtime::with_acp_harnesses(runtime, harnesses, default.into())
                 .unwrap();
         Subagents::new(runtime.child_config_for_test())
     }
@@ -3967,6 +3981,40 @@ mod hook_sign_in_tests {
     }
 
     #[tokio::test]
+    async fn a_kit_child_sending_marked_notices_reaches_the_user_once() {
+        // As a v1 Kit child does: its hints are marked notices.
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &["--hook-marked"]);
+            let mut parent = parent(kind, &manager, &format!("parent-marked-{kind}"));
+            let first = create(&manager, &format!("MOCK_HOOK_LINK=marked-{kind}")).await;
+            let seen = wait_for(&mut parent, &first.id, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(seen[0].contains(&format!("https://auth.example/marked-{kind}/secret-link")));
+            assert_contained(&manager, &mut parent, &[&first]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_is_not_kit_relays_no_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager_as(root.path(), false, &[], false);
+        let mut parent = parent("kit", &manager, "parent-not-kit");
+        let first = create(&manager, "MOCK_HOOK_LINK=injected").await;
+        let seen = wait_for(&mut parent, &first.id, 1).await;
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_contained(&manager, &mut parent, &[&first]).await;
+        manager
+            .close(&first.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn a_malformed_hint_is_dropped_without_harm() {
         let root = tempfile::tempdir().unwrap();
         let manager = manager(root.path(), false, &[]);
@@ -3995,6 +4043,8 @@ mod hook_sign_in_tests {
         let mut parent = parent("v2", &manager, "parent-overflow");
         let first = create(&manager, "hello").await;
         let seen = wait_for(&mut parent, &first.id, 5).await;
+        // The four held each come once; the two dropped at the bound are
+        // named by one line.
         assert_eq!(seen.len(), 5, "{seen:?}");
         assert!(
             seen.iter().any(

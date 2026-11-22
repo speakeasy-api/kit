@@ -215,25 +215,18 @@ impl Store {
     }
 
     /// Removes the grant one code exchange wrote, and nothing else: the
-    /// record whose token generation is `ours`, or, when the exchange
-    /// returned none (an under-granted step-up still stores its grant), the
-    /// records whose generation is new since `before`. Each is checked
-    /// again under its lock before it goes, so a newer grant written
-    /// meanwhile stays. Returns how many it removed.
+    /// record whose token generation is `ours`. It is checked again under
+    /// its lock before it goes, so a newer grant written meanwhile stays.
+    /// Returns how many it removed.
     pub(super) async fn discard_exchange(
         &self,
-        before: &std::collections::HashMap<String, String>,
-        ours: Option<&str>,
+        ours: &str,
         budget: OperationBudget,
     ) -> Result<usize, HookError> {
         let now = self.token_generations(budget).await?;
         let mut removed = 0;
         for (identity, generation) in now {
-            let written = match ours {
-                Some(ours) => generation == ours,
-                None => before.get(&identity) != Some(&generation),
-            };
-            if !written {
+            if generation != ours {
                 continue;
             }
             let _record = self.lock(RECORDS, &identity, budget).await?;
@@ -615,14 +608,8 @@ mod tests {
         }
         let generations = store.token_generations(budget()).await.unwrap();
         assert_eq!(generations.len(), 3);
-        // Our exchange's generation is known: only that record goes.
-        assert_eq!(
-            store
-                .discard_exchange(&generations, Some("g-ours"), budget())
-                .await
-                .unwrap(),
-            1
-        );
+        // Only the record of our exchange's generation goes.
+        assert_eq!(store.discard_exchange("g-ours", budget()).await.unwrap(), 1);
         let left: std::collections::BTreeSet<_> = store
             .token_generations(budget())
             .await
@@ -630,24 +617,6 @@ mod tests {
             .into_values()
             .collect();
         assert_eq!(left, ["g-newer".to_owned(), "g-old".to_owned()].into());
-        // Unknown: only what is new since before the exchange goes.
-        let before = store.token_generations(budget()).await.unwrap();
-        let mut guard = store.acquire(key("stepped-up"), budget()).await.unwrap();
-        assert!(
-            guard
-                .compare_and_swap(None, grant("v1", "g-step"))
-                .await
-                .unwrap()
-        );
-        drop(guard);
-        assert_eq!(
-            store
-                .discard_exchange(&before, None, budget())
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(store.token_generations(budget()).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

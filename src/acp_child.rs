@@ -544,6 +544,45 @@ fn origin(owner: &str, below: Option<&str>) -> String {
     }
 }
 
+/// Takes a child's hook sign-in hint, in either form a Kit child sends it:
+/// the structured [`HOOK_HINT_METHOD`] notification (a v2 Kit, asked for
+/// it), or a marked notice (a v1 Kit, which has no such notification) whose
+/// mark is the same hint. Only Kit's own child (`kit_child`) is trusted to
+/// send them; from any other, and whenever malformed, they are dropped.
+/// Either way the hint goes to the user, while the child session lives and
+/// held until it has an owner. Returns whether the message was a hint (and
+/// so never reaches child output, inspection or a model).
+fn hook_hint_ingress(
+    routes: &stream::Routes,
+    method: &str,
+    params: &Value,
+    kit_child: bool,
+) -> bool {
+    let hint = if method == HOOK_HINT_METHOD {
+        child_hook_hint(params)
+    } else if method == "session/update" && user_only(&params["update"]) {
+        params["sessionId"].as_str().and_then(|session| {
+            let mark = params["update"]["_meta"][crate::ahp::auth::HOOK_AUTH_META].clone();
+            serde_json::from_value::<crate::ahp::auth::hint::HookHint>(mark)
+                .ok()?
+                .validated()
+                .map(|hint| (session.to_owned(), hint))
+        })
+    } else {
+        return false;
+    };
+    match hint {
+        Some((session, hint)) if kit_child => {
+            if let Some((owner, transcript, hint)) = routes.hook_hint(&session, hint) {
+                deliver_hook_hint(&owner, &transcript, &hint);
+            }
+        }
+        Some(_) => tracing::warn!("dropped a hook sign-in hint from a child that is not Kit"),
+        None => tracing::warn!("dropped a malformed hook sign-in hint from a child"),
+    }
+    true
+}
+
 /// Relays a child session's hook sign-in hint to the user of the session
 /// that owns the agent, labelled with the agent it is for.
 fn deliver_hook_hint(
@@ -1634,25 +1673,14 @@ async fn run(
     let connected = agent_client_protocol::Builder::new(protocol::Client)
         .on_receive_notification(
             async move |message: UntypedMessage, _cx| {
-                if message.method == HOOK_HINT_METHOD {
-                    // To the user only, never into child output: whenever the
-                    // child session lives, not only during a prompt, and held
-                    // until it has an owner. Malformed hints are dropped.
-                    match child_hook_hint(&message.params) {
-                        Some((session, hint)) => {
-                            if let Some((owner, transcript, hint)) = notification_stream_routes.hook_hint(&session, hint) {
-                                deliver_hook_hint(&owner, &transcript, &hint);
-                            }
-                        }
-                        None => tracing::warn!("dropped a malformed hook sign-in hint from a child"),
-                    }
+                // A hook sign-in hint, in either form: to the user only,
+                // never into child output, inspection or a model.
+                if hook_hint_ingress(&notification_stream_routes, &message.method, &message.params, kit_child) {
                     return Ok(());
                 }
                 if message.method != "session/update" { return Ok(()); }
                 let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
                 let mut params = message.params;
-                // A marked notice is for a user: never child output.
-                if user_only(&params["update"]) { return Ok(()); }
                 protocol::normalize_config_options(&mut params["update"]);
                 let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
                 if let Some(notification) = &notification
@@ -3141,6 +3169,79 @@ mod tests {
         assert_eq!(output.updates[1]["sessionUpdate"], "tool_call");
         assert_eq!(output.updates[2]["sessionUpdate"], "plan");
         assert!(!output.updates_truncated);
+    }
+
+    /// A v1 Kit child's hook sign-in hint, as its real v1 server sends it
+    /// (a marked notice), taken by the parent's real ingress.
+    fn v1_kit_child_hint(kit_child: bool) -> Vec<crate::ahp::auth::hint::HookHint> {
+        let backend = format!("test.v1-kit-{kit_child}");
+        let (_root, hooks) = crate::ahp::auth::test_support::hooks(&backend);
+        let child_session = agentkit_acp::SessionId::new(format!("v1-child-{kit_child}"));
+        let (client, mut messages) = agentkit_acp::AcpClientHandle::channel();
+        let _hints = crate::protocols::acp::subscribe_hook_hints(
+            Some(&hooks),
+            client,
+            child_session.clone(),
+        );
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::test_support::hint(
+            &hooks,
+            &backend,
+            "https://auth.example/authorize?state=v1-kit",
+        ));
+        let agentkit_acp::AcpClientMessage::SessionNotification(notification) =
+            messages.try_recv().unwrap()
+        else {
+            panic!("the v1 server sends a notice");
+        };
+        let params = serde_json::to_value(&notification).unwrap();
+        // The parent: the child session routed to its owning agent, whose
+        // parent session's user receives relayed hints.
+        let parent = format!("parent-v1-{kit_child}");
+        let transcripts = transcript::Transcripts::default();
+        let _parent_updates = transcripts.stream.subscribe(parent.clone(), false);
+        transcripts.stream.announce(
+            "s-v1",
+            "Scout",
+            "task",
+            crate::events::SubagentStatus::Working,
+            1,
+            &crate::events::SubagentRuntime::default(),
+        );
+        transcripts.start("s-v1", 1);
+        let routes = stream::Routes::default();
+        routes.register(
+            &child_session.to_string(),
+            "s-v1",
+            1,
+            transcripts.get("s-v1", 1).unwrap(),
+            |_| {},
+        );
+        let relayed = Arc::new(Mutex::new(Vec::new()));
+        let _relay = crate::ahp::auth::relay::subscribe(parent, {
+            let relayed = Arc::clone(&relayed);
+            move |hint| relayed.lock().unwrap().push(hint.clone())
+        });
+        // Never child output, whoever sent it.
+        assert!(hook_hint_ingress(
+            &routes,
+            "session/update",
+            &params,
+            kit_child
+        ));
+        relayed.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_v1_kit_childs_marked_hint_reaches_the_user_and_no_other_childs_does() {
+        let relayed = v1_kit_child_hint(true);
+        assert_eq!(relayed.len(), 1, "{relayed:?}");
+        assert_eq!(relayed[0].agent.as_deref(), Some("s-v1"));
+        assert_eq!(
+            relayed[0].url.as_deref(),
+            Some("https://auth.example/authorize?state=v1-kit")
+        );
+        // From a harness that is not Kit, a Kit-styled hint is dropped.
+        assert!(v1_kit_child_hint(false).is_empty());
     }
 
     #[test]
