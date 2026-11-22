@@ -39,6 +39,8 @@ struct Issuer {
     received: Arc<AtomicUsize>,
     /// Every request received.
     hits: Arc<AtomicUsize>,
+    /// Client registrations received (with [`Issuer::start_registering`]).
+    registrations: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -78,6 +80,16 @@ async fn read_request(stream: &mut (impl AsyncReadExt + Unpin)) -> (String, Stri
 
 impl Issuer {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// An issuer that also registers clients (RFC 7591) and whose resource
+    /// publishes protected resource metadata, for a backend without a preset.
+    async fn start_registering() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(registering: bool) -> Self {
         let provider = rustls::crypto::aws_lc_rs::default_provider();
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
@@ -102,6 +114,8 @@ impl Issuer {
         let served_received = Arc::clone(&received);
         let hits = Arc::new(AtomicUsize::new(0));
         let served_hits = Arc::clone(&hits);
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let served_registrations = Arc::clone(&registrations);
         let task = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
@@ -111,6 +125,7 @@ impl Issuer {
                 let delay = Duration::from_millis(served_delay.load(Ordering::SeqCst));
                 let received = Arc::clone(&served_received);
                 let hit = Arc::clone(&served_hits);
+                let registered = Arc::clone(&served_registrations);
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(socket).await else {
                         return;
@@ -122,8 +137,9 @@ impl Issuer {
                         .nth(1)
                         .unwrap_or_default()
                         .to_owned();
+                    let mut created = false;
                     let body = if path.starts_with("/.well-known/oauth-authorization-server") {
-                        json!({
+                        let mut metadata = json!({
                             "issuer": origin,
                             "authorization_endpoint": format!("{origin}/authorize"),
                             "token_endpoint": format!("{origin}/token"),
@@ -131,7 +147,25 @@ impl Issuer {
                             "grant_types_supported": ["authorization_code", "refresh_token"],
                             "code_challenge_methods_supported": ["S256"],
                             "token_endpoint_auth_methods_supported": ["none"],
-                        })
+                        });
+                        if registering {
+                            metadata["registration_endpoint"] = format!("{origin}/register").into();
+                        }
+                        metadata
+                    } else if registering
+                        && path.starts_with("/.well-known/oauth-protected-resource")
+                    {
+                        json!({"resource": format!("{origin}/ahp"), "authorization_servers": [origin]})
+                    } else if registering && path == "/register" {
+                        let n = registered.fetch_add(1, Ordering::SeqCst) + 1;
+                        let request: Value =
+                            serde_json::from_str(&request_body).unwrap_or_default();
+                        created = true;
+                        json!({"client_id": format!("registered-{n}"),
+                            "redirect_uris": request["redirect_uris"],
+                            "grant_types": ["authorization_code", "refresh_token"],
+                            "response_types": ["code"],
+                            "token_endpoint_auth_method": "none"})
                     } else if path == "/token" && {
                         received.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(delay).await;
@@ -149,7 +183,9 @@ impl Issuer {
                     } else {
                         json!({"error": "not_found"})
                     };
-                    let status = if body.get("error").is_none() {
+                    let status = if created {
+                        "201 Created"
+                    } else if body.get("error").is_none() {
                         "200 OK"
                     } else if path == "/token" {
                         "400 Bad Request"
@@ -172,6 +208,7 @@ impl Issuer {
             delay_ms,
             received,
             hits,
+            registrations,
             task,
         }
     }
@@ -1065,15 +1102,57 @@ async fn reconfiguring_without_a_credential_never_offers_a_link() {
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let scope = auth.0.backends[id].scope.clone();
     // The credential is gone by the time the configuration is prepared.
-    assert!(
-        !auth
-            .prepare_quietly(&context(&auth, id), &[])
-            .await
-            .unwrap()
-    );
+    assert!(!auth.prepare_quietly(&context(&auth, id)).await.unwrap());
     assert!(login::test_support::pending(&scope).is_empty());
     assert!(hints.try_recv().is_err());
     assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 0);
+}
+
+#[tokio::test]
+async fn checking_a_live_step_up_registers_no_client() {
+    let issuer = Issuer::start_registering().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.dcr-step-up";
+    // No preset: the issuer is configured, and Kit registers its client.
+    let backend = json!({"id": id,
+        "transport": {"type": "http", "url": format!("{}/ahp", issuer.origin)},
+        "oauth": {"issuer": issuer.origin, "registration": true, "allowPrivateNetwork": true,
+            "scopes": ["hooks:invoke", "hooks:admin"]}});
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let other = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // Signed in (elsewhere) without `hooks:admin`.
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code_granting(&url, "hooks:invoke")).await;
+    assert!(credential(&auth, target.clone()).await.unwrap().is_some());
+    // A 403 asked for `hooks:admin`: the step-up link is shown.
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    let link = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
+    let (registered, hits) = (
+        issuer.registrations.load(Ordering::SeqCst),
+        issuer.hits.load(Ordering::SeqCst),
+    );
+    assert!(registered > 0, "the issuer registered no client");
+    // Later turns keep the link and send the authorization server nothing.
+    for _ in 0..3 {
+        auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    }
+    assert_eq!(issuer.registrations.load(Ordering::SeqCst), registered);
+    assert_eq!(issuer.hits.load(Ordering::SeqCst), hits);
+    assert_eq!(states(&scope), [query(&link, "state")]);
+    assert!(hints.try_recv().is_err());
+    // A step-up granted elsewhere still clears the link at the next turn.
+    let (url, complete) = elsewhere_requiring(&other, id, &["hooks:admin"]).await;
+    complete(issue_code(&url)).await;
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the link is withdrawn");
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
 }
 
 /// A backend whose binding declares `hooks:invoke`, and that Kit may also

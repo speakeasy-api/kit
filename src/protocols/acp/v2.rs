@@ -79,7 +79,8 @@ pub(crate) struct HookAuthNotification {
     /// Unix milliseconds.
     pub expires_at: Option<u64>,
     pub cleared: bool,
-    /// Why Kit could not prepare a needed sign-in, with what to check.
+    /// What went wrong with the backend's sign-in, with what to check: a
+    /// clause that follows "Hook backend <id> ".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
 }

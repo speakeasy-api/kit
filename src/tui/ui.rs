@@ -5359,13 +5359,18 @@ mod tests {
             "model".into(),
             String::new(),
         );
-        let problem = || crate::tui::app::Update::HookSignIn {
+        let problem = || {
+            crate::tui::app::Update::HookSignIn {
             session_id: "first".into(),
             backend: "com.example".into(),
-            problem: Some("untrusted_destination. Check oauth.issuer.".into()),
+            problem: Some(
+                "needs you to sign in, but Kit could not start it: untrusted_destination. Check oauth.issuer."
+                    .into(),
+            ),
             url: None,
             expires_at_ms: None,
             cleared: false,
+        }
         };
         let count = |app: &mut App| {
             render(app, 100, 24)
@@ -5446,13 +5451,18 @@ mod tests {
         assert!(!flat(&mut app).contains("next-expired"));
         app.start_session("first".into());
         // A problem is shown once, as a notice.
-        let problem = || crate::tui::app::Update::HookSignIn {
+        let problem = || {
+            crate::tui::app::Update::HookSignIn {
             session_id: "first".into(),
             backend: "com.example".into(),
-            problem: Some("untrusted_destination. Check oauth.issuer.".into()),
+            problem: Some(
+                "needs you to sign in, but Kit could not start it: untrusted_destination. Check oauth.issuer."
+                    .into(),
+            ),
             url: None,
             expires_at_ms: None,
             cleared: false,
+        }
         };
         app.apply(problem());
         app.apply(problem());

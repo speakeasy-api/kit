@@ -1206,8 +1206,9 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
     }
 }
 
+/// A problem is a clause that says what went wrong with the sign-in.
 fn hook_problem_text(backend: &str, problem: &str) -> String {
-    format!("Hook backend {backend} needs you to sign in, but Kit could not start it: {problem}")
+    format!("Hook backend {backend} {problem}")
 }
 
 impl App {

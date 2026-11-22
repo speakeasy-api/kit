@@ -30,8 +30,9 @@ pub(crate) struct AuthHint {
     pub cleared: bool,
     /// Cleared because sign-in finished, rather than because the link expired.
     pub signed_in: bool,
-    /// Why Kit could not prepare a sign-in the backend needs, with what to
-    /// check: sanitized, never a provider message.
+    /// What went wrong with the backend's sign-in, as a clause after
+    /// "Hook backend `<id>` ", with what to check: sanitized, never a
+    /// provider message.
     pub problem: Option<String>,
 }
 
@@ -59,17 +60,15 @@ impl AuthHint {
     /// the next turn shows its replacement.
     pub(crate) fn notice(&self) -> Option<String> {
         match (&self.url, &self.problem) {
+            // A problem is a clause that says what went wrong.
             (Some(url), Some(problem)) if !self.cleared => {
                 return Some(format!(
-                    "Hook backend `{}` needs you to sign in. Open {url} to approve Kit. Another of its endpoints could not be prepared: {problem}",
+                    "Hook backend `{}` needs you to sign in. Open {url} to approve Kit. Also, the backend {problem}",
                     self.backend
                 ));
             }
             (None, Some(problem)) if !self.cleared => {
-                return Some(format!(
-                    "Hook backend `{}` needs you to sign in, but Kit could not start it: {problem}",
-                    self.backend
-                ));
+                return Some(format!("Hook backend `{}` {problem}", self.backend));
             }
             _ => {}
         }
@@ -703,6 +702,15 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
         // The SDK says whether the login is still pending: after an invalid
         // callback, say, its link still works and Kit keeps listening.
         if error.login_ended() == Some(false) {
+            // An invalid callback (access_denied) changes nothing; a host
+            // refusal is shown beside the link, which still works.
+            if error.auth_code() != Some(AuthErrorCode::AccessDenied) {
+                registry().problem(
+                    &login.scope,
+                    &login.context.backend_id,
+                    super::not_completed(&error),
+                );
+            }
             continue;
         }
         return if error.auth_code() == Some(AuthErrorCode::AccessDenied)

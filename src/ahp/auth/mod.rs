@@ -103,9 +103,10 @@ impl Backend {
     }
 }
 
-/// Backend scope, whether the flow is PKCE, the preset's client, and the
-/// target's sorted scopes.
-type ManagerKey = (String, bool, Option<String>, Vec<String>);
+/// Backend scope, whether the flow is PKCE, the preset's client, the
+/// target's sorted scopes, and the scopes the manager requires (none but
+/// for a step-up check).
+type ManagerKey = (String, bool, Option<String>, Vec<String>, Vec<String>);
 
 /// Where hook credentials live: Kit's credential storage.
 #[derive(Clone)]
@@ -320,6 +321,16 @@ impl HookAuth {
     }
 
     fn manager(&self, context: &AuthContext) -> Result<Arc<ManagedOAuth>, HookError> {
+        self.manager_requiring(context, &[])
+    }
+
+    /// [`Self::manager`], requiring `required` scopes of every operation. It
+    /// shares the backend's grant and store, but not the preparation count.
+    fn manager_requiring(
+        &self,
+        context: &AuthContext,
+        required: &[String],
+    ) -> Result<Arc<ManagedOAuth>, HookError> {
         let target = context.target()?;
         let backend = self
             .0
@@ -337,11 +348,15 @@ impl HookAuth {
         // share one. They still share the backend's grant.
         let scopes = policy.requested(&target);
         let ceiling = policy.ceiling(&target);
+        let mut required = required.to_vec();
+        required.sort();
+        required.dedup();
         let key = (
             backend.scope.clone(),
             pkce,
             preset_client.clone(),
             scopes.clone(),
+            required.clone(),
         );
         let mut managers = self
             .0
@@ -391,6 +406,7 @@ impl HookAuth {
             .grant_partition(&backend.scope)
             .login_lifetime(settings.login_lifetime)
             .scopes(scopes, ceiling)
+            .required_scopes(required)
             .client_secret_storage(Arc::new(secrets::Secrets(store.clone())));
         if !pkce && client.is_some() {
             let reference = settings
@@ -461,12 +477,12 @@ impl HookAuth {
             // Within what Kit accepts, yet refused: the authorization server
             // did not grant them, or the backend refuses a token that has them.
             format!(
-                "access_denied. The authorization server did not grant the scopes the backend requires ({}), or the backend refuses them.",
+                "requires scopes ({}) that the authorization server did not grant Kit, or refuses a token that has them: access_denied.",
                 required.join(" ")
             )
         } else {
             format!(
-                "access_denied. The backend requires scopes ({}) outside the ones Kit allows for it. Review oauth.scopes in hooks.json.",
+                "requires scopes ({}) outside the ones Kit allows for it: access_denied. Review oauth.scopes in hooks.json.",
                 required.join(" ")
             )
         };
@@ -573,11 +589,9 @@ impl HookAuth {
             // another Kit process, say); one that would not meet the need
             // (the need grew) is replaced.
             if login::registry().has_live_login(&backend.scope, &need.context, &need.required) {
-                if !need.required.is_empty()
-                    && let Err(error) = self.prepare_quietly(&need.context, &need.required).await
-                {
-                    let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
-                    tracing::warn!(backend = %backend.id, code, "hook step-up could not be checked");
+                if !need.required.is_empty() {
+                    self.check_step_up(backend, &need.context, &need.required)
+                        .await;
                 }
                 continue;
             }
@@ -626,7 +640,7 @@ impl HookAuth {
             }
             last.insert(backend.id.clone(), credential.attempt_id.clone())
         };
-        let counted = self.prepare_quietly(&context, &[]).await;
+        let counted = self.prepare_quietly(&context).await;
         if !matches!(counted, Ok(true)) {
             let mut last = self
                 .0
@@ -646,18 +660,36 @@ impl HookAuth {
         }
     }
 
-    /// Prepares `context`'s target with `required` scopes without ever
-    /// offering a login: should no grant have them, the login the SDK
-    /// created is cancelled, and the recorded need keeps (or gets, at the
-    /// next turn) its link. `Ok(true)` when the SDK counted a preparation.
-    async fn prepare_quietly(
-        &self,
-        context: &AuthContext,
-        required: &[String],
-    ) -> Result<bool, HookError> {
+    /// Whether a grant (from another Kit process, say) already has a live
+    /// step-up's `required` scopes; if so the need is met and its link
+    /// withdrawn. Looked up through a manager that requires them: a token
+    /// that has them is returned, one without them is `interaction_required`.
+    /// Neither sends an authorization-server request or registers a client,
+    /// so this is cheap at every turn.
+    async fn check_step_up(&self, backend: &Backend, context: &AuthContext, required: &[String]) {
+        let result = match self.manager_requiring(context, required) {
+            Ok(manager) => manager.credential(with_deadline(context)).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(Some(_)) => login::registry().prepared(&backend.scope, context, required),
+            Ok(None) => {}
+            Err(error) if needs_login(&error) => {}
+            Err(error) => {
+                let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
+                tracing::warn!(backend = %backend.id, code, "hook step-up could not be checked");
+            }
+        }
+    }
+
+    /// Prepares `context`'s target without ever offering a login: should
+    /// the grant have gone meanwhile, the login the SDK created is
+    /// cancelled, and the recorded need gets its link at the next turn.
+    /// `Ok(true)` when the SDK counted a preparation.
+    async fn prepare_quietly(&self, context: &AuthContext) -> Result<bool, HookError> {
         let manager = self.manager(context)?;
         let context = with_deadline(context);
-        let mut options = PrepareOptions::new().required(required.to_vec());
+        let mut options = PrepareOptions::new();
         // A PKCE preparation needs a redirect even when it finds a grant;
         // the listener is never served.
         let _listener = if self.pkce(&context)? {
@@ -673,10 +705,9 @@ impl HookAuth {
             .prepare_with(context.clone(), options, budget())
             .await?
         {
-            // A need for no more than `required` is met; a step-up need
-            // asking for more, and its link, stay.
+            // A plain need is met; a step-up need, and its link, stay.
             Preparation::Ready(credential) => {
-                self.granted(&context, &credential, required);
+                self.granted(&context, &credential, &[]);
                 Ok(true)
             }
             Preparation::InteractionRequired(pending) => {
@@ -940,7 +971,27 @@ impl HookAuth {
 
 /// What to tell the user when a backend's sign-in cannot be prepared: the
 /// safe error code and the setting to check, never a provider message.
+///
+/// Every problem is a clause that follows "Hook backend `<id>` ", so each
+/// says what actually went wrong (see [`login::AuthHint::notice`]).
 fn guidance(error: &HookError) -> String {
+    format!(
+        "needs you to sign in, but Kit could not start it: {}",
+        advice(error)
+    )
+}
+
+/// A callback for a still-pending login that Kit could not complete (host
+/// policy refused it, say): the link still works.
+pub(super) fn not_completed(error: &HookError) -> String {
+    format!(
+        "could not finish signing in: {} The sign-in link still works.",
+        advice(error)
+    )
+}
+
+/// The safe error code and the setting to check.
+fn advice(error: &HookError) -> String {
     match error.auth_code() {
         Some(AuthErrorCode::UntrustedDestination) => "untrusted_destination. Check oauth.issuer, oauth.trustAdvertisedIssuer and oauth.allowPrivateNetwork in hooks.json.".into(),
         Some(
@@ -956,10 +1007,10 @@ fn guidance(error: &HookError) -> String {
     }
 }
 
-/// The issuer granted a sign-in fewer than the scopes it required.
+/// The issuer granted a step-up fewer than the scopes it required.
 fn not_granted(scopes: &[String]) -> String {
     format!(
-        "access_denied. The authorization server did not grant the scopes Kit needs ({}). Check which scopes it allows Kit.",
+        "requires scopes the authorization server did not grant Kit ({}): access_denied. Check which scopes it allows Kit.",
         scopes.join(" ")
     )
 }

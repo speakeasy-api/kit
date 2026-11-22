@@ -186,8 +186,10 @@ over all of the above: Kit sends that header and nothing else.
 A backend that answers `403 insufficient_scope` asks for more scopes. If
 they are within the ones Kit accepts, its next sign-in link asks for them; if
 the authorization server then grants fewer, Kit keeps the narrower sign-in
-and says which scopes it did not grant, rather than reporting the backend as
-signed in. A `401` asks only for a sign-in, whatever scopes it names.
+and names the scopes the step-up required, rather than reporting the backend
+as signed in. A `401` asks only for a sign-in, whatever scopes it names; for
+client credentials, Kit also asks for the `401`'s scopes when it obtains the
+token for that request.
 
 ### Backends that supply their own subscriptions
 

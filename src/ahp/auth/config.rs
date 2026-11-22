@@ -64,6 +64,14 @@ fn strings(value: &Value) -> Option<Vec<String>> {
         .collect()
 }
 
+/// An RFC 6749 scope-token: one or more of `%x21 / %x23-5B / %x5D-7E`.
+fn scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+}
+
 fn text(value: &Value) -> Option<String> {
     value.as_str().filter(|s| !s.is_empty()).map(str::to_owned)
 }
@@ -126,8 +134,13 @@ impl Settings {
             }
         }
         if let Some(scopes) = given("scopes") {
+            // An invalid token would fail every operation; it is ignored
+            // here, with the rest of the list.
             match strings(scopes) {
-                Some(scopes) => settings.scopes = Some(scopes),
+                Some(scopes) if scopes.iter().all(|scope| scope_token(scope)) => {
+                    settings.scopes = Some(scopes);
+                }
+                Some(_) => ignore("scopes", "has a scope that is not an OAuth scope token"),
                 None => ignore("scopes", "is not a list of strings"),
             }
         }
@@ -251,5 +264,20 @@ mod tests {
         assert_eq!(settings.login_lifetime, MAX_LIFETIME);
         let (unconfigured, problems) = Settings::parse(&json!({"id": "b"}));
         assert!(problems.is_empty() && !unconfigured.configured);
+    }
+
+    #[test]
+    fn scopes_must_be_oauth_scope_tokens() {
+        for scope in ["hooks invoke", "", "hooks\"x", "h\u{e9}"] {
+            let (settings, problems) =
+                Settings::parse(&json!({"id": "b", "oauth": {"scopes": ["hooks", scope]}}));
+            assert!(settings.scopes.is_none(), "{scope:?}");
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("oauth.scopes"), "{problems:?}");
+        }
+        let (settings, problems) =
+            Settings::parse(&json!({"id": "b", "oauth": {"scopes": ["hooks:invoke", "a/b!~"]}}));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(settings.scopes.unwrap(), ["hooks:invoke", "a/b!~"]);
     }
 }
