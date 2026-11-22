@@ -583,6 +583,27 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
     }
 }
 
+/// A child agent's hook sign-in notices, for this session's user: marked
+/// Info notices labelled with the agent, never transcript, child output or
+/// inspection. Registered with the session's own hints, after activation.
+fn relay_child_hook_hints<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
+    session: wire::SessionId,
+    sink: S,
+) -> crate::ahp::auth::relay::ChildHintSubscription {
+    crate::ahp::auth::relay::subscribe(session.to_string(), move |hint| {
+        let _ = sink.update(wire::UpdateSessionNotification::new(
+            session.clone(),
+            wire::SessionUpdate::Notice(
+                wire::Notice::new(
+                    wire::NoticeSeverity::Info,
+                    format!("Agent {}: {}", hint.agent, hint.text),
+                )
+                .meta(hint.meta.clone()),
+            ),
+        ));
+    })
+}
+
 /// Hook sign-in links go to the user only, never the transcript: to a
 /// client's status line through [`HookAuthNotification`] when it asked for
 /// them, else as one notice per link. Subscribed once the session is
@@ -1457,7 +1478,12 @@ impl Server {
                 let sink = actor.sink.clone();
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
-                // Held for the session's life, from activation on.
+                // Held for the session's life, from activation on. A client
+                // that takes Kit's hook notifications is Kit, which shows a
+                // child's links from its runtime events instead.
+                let _child_hints = hook_auth_notifications
+                    .is_none()
+                    .then(|| relay_child_hook_hints(session_id.clone(), sink.inner.clone()));
                 let _hook_auth = subscribe_hook_auth(
                     runtime.hooks(),
                     session_id.clone(),
@@ -5000,6 +5026,43 @@ mod tests {
         }
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn a_child_agents_sign_in_link_reaches_the_owning_sessions_user() {
+        let recording = RecordingSink::default();
+        let session_id = wire::SessionId::new("v2-child-sign-in");
+        let link = "https://auth.example/authorize?state=child";
+        let hint = crate::ahp::auth::relay::ChildHint {
+            agent: "scout".into(),
+            text: format!("Hook backend `x` needs you to sign in. Open {link} to approve Kit."),
+            meta: serde_json::Map::from_iter([(
+                HOOK_AUTH_META.to_owned(),
+                json!({"backend": "x", "url": link, "cleared": false}),
+            )]),
+        };
+        // Nobody attached yet: dropped.
+        crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
+        assert!(recording.updates.lock().unwrap().is_empty());
+        let subscription = relay_child_hook_hints(session_id.clone(), recording.clone());
+        crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
+        // Another session's child is not this session's.
+        crate::ahp::auth::relay::relay("another-session", &hint);
+        {
+            let updates = recording.updates.lock().unwrap();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].session_id, session_id);
+            let wire::SessionUpdate::Notice(notice) = &updates[0].update else {
+                panic!("a child's link is a notice, got {:?}", updates[0].update);
+            };
+            assert_eq!(notice.severity, wire::NoticeSeverity::Info);
+            assert!(notice.title.starts_with("Agent scout: ") && notice.title.contains(link));
+            // Marked: a Kit above never hands it to its model.
+            assert!(notice.meta.as_ref().unwrap().contains_key(HOOK_AUTH_META));
+        }
+        drop(subscription);
+        crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
+        assert_eq!(recording.updates.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

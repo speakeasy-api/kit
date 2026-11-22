@@ -13,6 +13,7 @@ mod config;
 mod login;
 mod network;
 mod policy;
+pub(crate) mod relay;
 mod secrets;
 mod store;
 

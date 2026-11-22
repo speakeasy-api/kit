@@ -1347,7 +1347,6 @@ struct ResponseInterruptionNoticeObserver {
     retry: Option<retry_projection::Projection>,
     compaction: Option<compaction_projection::Projection>,
     hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
-    hook_auth: Option<Arc<crate::ahp::auth::HintSubscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1365,7 +1364,6 @@ impl ResponseInterruptionNoticeObserver {
             retry: None,
             compaction: None,
             hook_messages: None,
-            hook_auth: None,
             activity,
             inner,
             client,
@@ -1400,21 +1398,46 @@ impl ResponseInterruptionNoticeObserver {
                     .is_ok()
             },
         ));
-        // Sign-in links are for the user only, never the transcript.
-        let auth_client = self.client.clone();
-        let auth_session = self.session_id.clone();
-        self.hook_auth = hooks
-            .subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
-                let _ = auth_client.notify_session(SessionNotification::new(
-                    auth_session.clone(),
-                    SessionUpdate::Notice(
-                        Notice::new(NoticeSeverity::Info, text).meta(hint.meta()),
-                    ),
-                ));
-            }))
-            .map(Arc::new);
         self
     }
+}
+
+/// A child agent's hook sign-in notices, for this session's user: marked
+/// Info notices labelled with the agent, never transcript, child output or
+/// inspection. Registered with the session's own hints, after activation.
+fn relay_child_hook_hints(
+    client: AcpClientHandle,
+    session: agentkit_acp::SessionId,
+) -> crate::ahp::auth::relay::ChildHintSubscription {
+    crate::ahp::auth::relay::subscribe(session.to_string(), move |hint| {
+        let _ = client.notify_session(SessionNotification::new(
+            session.clone(),
+            SessionUpdate::Notice(
+                Notice::new(
+                    NoticeSeverity::Info,
+                    format!("Agent {}: {}", hint.agent, hint.text),
+                )
+                .meta(hint.meta.clone()),
+            ),
+        ));
+    })
+}
+
+/// Hook sign-in links are for the user only, never the transcript: one
+/// marked notice per link. Subscribed once the session is activated, after
+/// the client has its response: the hints replayed on subscribing name a
+/// session the client knows, and an attachment that fails never sends any.
+fn subscribe_hook_auth(
+    hooks: Option<&crate::ahp::Hooks>,
+    client: AcpClientHandle,
+    session: agentkit_acp::SessionId,
+) -> Option<crate::ahp::auth::HintSubscription> {
+    hooks?.subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
+        let _ = client.notify_session(SessionNotification::new(
+            session.clone(),
+            SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text).meta(hint.meta())),
+        ));
+    }))
 }
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
@@ -2025,6 +2048,7 @@ impl Server {
         let (tx, rx) = mpsc::channel(8);
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let metadata_observer = driver.adapter.session_observer();
+        let hook_auth_client = client.clone();
         let actor = SessionActor {
             client,
             subagents: Some(driver.subagents.clone()),
@@ -2065,6 +2089,11 @@ impl Server {
             if activated.await.is_ok() {
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
+                // Held for the session's life, from activation on.
+                let _child_hints =
+                    relay_child_hook_hints(hook_auth_client.clone(), session_id.clone());
+                let _hook_auth =
+                    subscribe_hook_auth(runtime.hooks(), hook_auth_client, session_id.clone());
                 // Clients discard non-transcript updates during replay, so these
                 // follow the response rather than joining the replay stream.
                 if let Some((used, size)) = restored_context {
@@ -6266,6 +6295,214 @@ pub(super) mod tests {
                 assert!(updates.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_hook_sign_in_replay_follows_the_session_response() {
+        use futures_util::StreamExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            json!({"protocolVersion": "draft", "hooks": [{
+                "id": "test.legacy-replay-order",
+                "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "subscriptions": [crate::ahp::test_support::observe(&["context.compact.before"])],
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::with_hooks(
+            Runtime::new_with_provider_credentials_and_effort(
+                root.path(),
+                "test-model",
+                crate::ProviderKind::OpenRouter,
+                credentials,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // A link is already shown when the session is created.
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::test_support::hint(
+            runtime.hooks().unwrap(),
+            "test.legacy-replay-order",
+            "https://auth.example/authorize?state=legacy-replay-order",
+        ));
+        let (mut client, agent) = Channel::duplex();
+        let router = component(runtime, SessionRegistry::new()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent).await });
+        let tx = client.tx.clone();
+        let send = |method: &str, id: i64, params: serde_json::Value| {
+            tx.unbounded_send(agent_client_protocol::TransportFrame::Single(
+                agent_client_protocol::RawJsonRpcMessage::request(method.into(), params, id.into())
+                    .unwrap(),
+            ))
+            .unwrap();
+        };
+        send(
+            "initialize",
+            1,
+            serde_json::to_value(InitializeRequest::new(ProtocolVersion::V1)).unwrap(),
+        );
+        let mut next = async || {
+            let frame = timeout(Duration::from_secs(30), client.rx.next())
+                .await
+                .expect("an ACP frame")
+                .expect("an open transport");
+            let agent_client_protocol::TransportFrame::Single(message) = frame else {
+                panic!("expected a single ACP message, got {frame:?}");
+            };
+            serde_json::to_value(message).unwrap()
+        };
+        assert_eq!(next().await["id"], 1);
+        send(
+            "session/new",
+            2,
+            serde_json::to_value(NewSessionRequest::new(root.path().to_path_buf())).unwrap(),
+        );
+        let response = next().await;
+        assert_eq!(
+            response["id"], 2,
+            "the response must come first: {response}"
+        );
+        let session_id = response["result"]["sessionId"].clone();
+        let mut replayed = false;
+        for _ in 0..10 {
+            let frame = next().await;
+            if frame["params"]["update"]["_meta"]
+                .get(crate::ahp::auth::HOOK_AUTH_META)
+                .is_some()
+            {
+                assert_eq!(frame["params"]["sessionId"], session_id);
+                replayed = true;
+                break;
+            }
+        }
+        assert!(replayed, "the shown link is replayed after the response");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_legacy_attachment_sends_no_hook_sign_in_hint() {
+        use futures_util::StreamExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            json!({"protocolVersion": "draft", "hooks": [{
+                "id": "test.legacy-failed-attach",
+                "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "subscriptions": [crate::ahp::test_support::observe(&["context.compact.before"])],
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        // No provider credentials: the driver cannot start, after the
+        // session's observer exists.
+        let runtime = Runtime::with_hooks(
+            Runtime::new_with_provider_and_credentials(
+                root.path(),
+                "gpt-5.4",
+                crate::ProviderKind::OpenAiSubscription,
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::test_support::hint(
+            runtime.hooks().unwrap(),
+            "test.legacy-failed-attach",
+            "https://auth.example/authorize?state=legacy-failed-attach",
+        ));
+        let (mut client, agent) = Channel::duplex();
+        let router = component(runtime, SessionRegistry::new()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent).await });
+        let tx = client.tx.clone();
+        let send = |method: &str, id: i64, params: serde_json::Value| {
+            tx.unbounded_send(agent_client_protocol::TransportFrame::Single(
+                agent_client_protocol::RawJsonRpcMessage::request(method.into(), params, id.into())
+                    .unwrap(),
+            ))
+            .unwrap();
+        };
+        let mut frames = Vec::new();
+        let mut next = async |wait: Duration| {
+            let frame = timeout(wait, client.rx.next()).await.ok()??;
+            let agent_client_protocol::TransportFrame::Single(message) = frame else {
+                return None;
+            };
+            Some(serde_json::to_value(message).unwrap())
+        };
+        send(
+            "initialize",
+            1,
+            serde_json::to_value(InitializeRequest::new(ProtocolVersion::V1)).unwrap(),
+        );
+        assert_eq!(next(Duration::from_secs(30)).await.unwrap()["id"], 1);
+        send(
+            "session/new",
+            2,
+            serde_json::to_value(NewSessionRequest::new(root.path().to_path_buf())).unwrap(),
+        );
+        while let Some(frame) = next(Duration::from_secs(2)).await {
+            frames.push(frame);
+        }
+        let response = frames
+            .iter()
+            .find(|frame| frame["id"] == 2)
+            .expect("a session/new response");
+        assert!(response.get("error").is_some(), "{response}");
+        assert!(
+            !frames.iter().any(|frame| frame["params"]["update"]["_meta"]
+                .get(crate::ahp::auth::HOOK_AUTH_META)
+                .is_some()),
+            "a failed attachment sent a sign-in hint: {frames:?}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn a_child_agents_sign_in_link_reaches_the_owning_legacy_session() {
+        let session_id = agentkit_acp::SessionId::new("v1-child-sign-in");
+        let (client, mut messages) = AcpClientHandle::channel();
+        let _relay = relay_child_hook_hints(client, session_id.clone());
+        crate::ahp::auth::relay::relay(
+            &session_id.to_string(),
+            &crate::ahp::auth::relay::ChildHint {
+                agent: "scout".into(),
+                text: "Hook backend `x` needs you to sign in.".into(),
+                meta: serde_json::Map::from_iter([(
+                    crate::ahp::auth::HOOK_AUTH_META.to_owned(),
+                    json!({"backend": "x", "cleared": false}),
+                )]),
+            },
+        );
+        let AcpClientMessage::SessionNotification(notification) = messages.try_recv().unwrap()
+        else {
+            panic!("expected a session notification");
+        };
+        assert_eq!(notification.session_id, session_id);
+        let SessionUpdate::Notice(notice) = notification.update else {
+            panic!("a child's link is a notice");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert_eq!(
+            notice.title,
+            "Agent scout: Hook backend `x` needs you to sign in."
+        );
+        assert!(
+            notice
+                .meta
+                .unwrap()
+                .contains_key(crate::ahp::auth::HOOK_AUTH_META)
+        );
     }
 
     #[tokio::test]

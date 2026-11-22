@@ -537,6 +537,18 @@ fn hook_sign_in_event(owner: &str, update: &Value) -> Option<crate::events::Runt
     })
 }
 
+/// The same hint, for the parent session's ACP client: the child's notice
+/// text and marked `_meta`, relayed to that session's user only.
+fn child_hint(owner: &str, update: &Value) -> Option<crate::ahp::auth::relay::ChildHint> {
+    let meta = update["_meta"].as_object()?;
+    meta.get(crate::ahp::auth::HOOK_AUTH_META)?;
+    Some(crate::ahp::auth::relay::ChildHint {
+        agent: owner.to_owned(),
+        text: update["title"].as_str()?.to_owned(),
+        meta: meta.clone(),
+    })
+}
+
 fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActivity> {
     use crate::events::SubagentActivity;
     use agent_client_protocol::schema::MaybeUndefined;
@@ -1614,14 +1626,24 @@ async fn run(
                 let mut params = message.params;
                 if user_only(&params["update"]) {
                     // To the user's UI only, never routed into child output.
-                    let owner = notification_routes
+                    let route = notification_routes
                         .lock()
                         .ok()
-                        .and_then(|routes| routes.get(&session_id).map(|route| route.owner.clone()));
-                    if let Some(owner) = owner
-                        && let Some(event) = hook_sign_in_event(&owner, &params["update"])
-                    {
-                        crate::events::emit(&event);
+                        .and_then(|routes| routes.get(&session_id).cloned());
+                    if let Some(route) = route {
+                        // Kit's own UI, through its runtime events.
+                        if let Some(event) = hook_sign_in_event(&route.owner, &params["update"]) {
+                            crate::events::emit(&event);
+                        }
+                        // Any other ACP client of the session that owns the agent.
+                        if let Some(parent) = route
+                            .transcript
+                            .as_ref()
+                            .and_then(|transcript| transcript.stream_parent(&route.owner))
+                            && let Some(hint) = child_hint(&route.owner, &params["update"])
+                        {
+                            crate::ahp::auth::relay::relay(&parent, &hint);
+                        }
                     }
                     return Ok(());
                 }
@@ -3117,6 +3139,11 @@ mod tests {
             "title": format!("Hook backend `x` needs you to sign in. Open {link} to approve Kit."),
             "_meta": {"kit/hooks/auth": {"backend": "x", "url": link, "cleared": false}}});
         assert!(user_only(&notice));
+        // And a non-Kit client of the owning session gets the marked notice.
+        let relayed = child_hint("scout", &notice).unwrap();
+        assert_eq!(relayed.agent, "scout");
+        assert!(relayed.meta.contains_key(crate::ahp::auth::HOOK_AUTH_META));
+        assert!(relayed.text.contains(link));
         // The user gets it through the parent's UI, as the owning agent's.
         assert_eq!(
             hook_sign_in_event("scout", &notice),
