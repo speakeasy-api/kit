@@ -1,0 +1,2444 @@
+//! Sign-in against a local HTTPS authorization server, through the real SDK
+//! managed OAuth, Kit's credential storage and its loopback callback.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use agenthooksprotocol::adapters::registered::AuthPurpose;
+use serde_json::json;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+};
+use tokio_rustls::{TlsAcceptor, rustls};
+
+use super::*;
+
+const CA: &[u8] = include_bytes!("../../../fixtures/workload-auth/ca.pem");
+const CERT: &[u8] = include_bytes!("../../../fixtures/workload-auth/server.der");
+const KEY: &[u8] = include_bytes!("../../../fixtures/workload-auth/server-key.der");
+
+/// An authorization server issuing a fresh token per code exchange. It is
+/// also the protected resource's origin.
+struct Issuer {
+    origin: String,
+    exchanges: Arc<AtomicUsize>,
+    /// Holds each token response this long.
+    delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Token requests received, answered or not.
+    received: Arc<AtomicUsize>,
+    /// Every request received.
+    hits: Arc<AtomicUsize>,
+    /// Client registrations received (with [`Issuer::start_registering`]).
+    registrations: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Issuer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn read_request(stream: &mut (impl AsyncReadExt + Unpin)) -> (String, String) {
+    let mut data = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "request ended early");
+        data.extend_from_slice(&chunk[..n]);
+        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8(data[..end].to_vec()).unwrap();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while data.len() < end + 4 + length {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&chunk[..n]);
+            }
+            let body = String::from_utf8(data[end + 4..end + 4 + length].to_vec()).unwrap();
+            return (head, body);
+        }
+    }
+}
+
+impl Issuer {
+    async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// An issuer that also registers clients (RFC 7591) and whose resource
+    /// publishes protected resource metadata, for a backend without a preset.
+    async fn start_registering() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(registering: bool) -> Self {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(CERT.to_vec())],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(KEY.to_vec()).into(),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (served_origin, counter) = (origin.clone(), Arc::clone(&exchanges));
+        let served_delay = Arc::clone(&delay_ms);
+        let received = Arc::new(AtomicUsize::new(0));
+        let served_received = Arc::clone(&received);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served_hits = Arc::clone(&hits);
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let served_registrations = Arc::clone(&registrations);
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                let origin = served_origin.clone();
+                let counter = Arc::clone(&counter);
+                let delay = Duration::from_millis(served_delay.load(Ordering::SeqCst));
+                let received = Arc::clone(&served_received);
+                let hit = Arc::clone(&served_hits);
+                let registered = Arc::clone(&served_registrations);
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let (head, request_body) = read_request(&mut stream).await;
+                    hit.fetch_add(1, Ordering::SeqCst);
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let mut created = false;
+                    let body = if path.starts_with("/.well-known/oauth-authorization-server") {
+                        let mut metadata = json!({
+                            "issuer": origin,
+                            "authorization_endpoint": format!("{origin}/authorize"),
+                            "token_endpoint": format!("{origin}/token"),
+                            "response_types_supported": ["code"],
+                            "grant_types_supported": ["authorization_code", "refresh_token"],
+                            "code_challenge_methods_supported": ["S256"],
+                            "token_endpoint_auth_methods_supported": ["none"],
+                        });
+                        if registering {
+                            metadata["registration_endpoint"] = format!("{origin}/register").into();
+                        }
+                        metadata
+                    } else if registering
+                        && path.starts_with("/.well-known/oauth-protected-resource")
+                    {
+                        json!({"resource": format!("{origin}/ahp"), "authorization_servers": [origin]})
+                    } else if registering && path == "/register" {
+                        let n = registered.fetch_add(1, Ordering::SeqCst) + 1;
+                        let request: Value =
+                            serde_json::from_str(&request_body).unwrap_or_default();
+                        created = true;
+                        json!({"client_id": format!("registered-{n}"),
+                            "redirect_uris": request["redirect_uris"],
+                            "grant_types": ["authorization_code", "refresh_token"],
+                            "response_types": ["code"],
+                            "token_endpoint_auth_method": "none"})
+                    } else if path == "/token" && {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        verified(&request_body)
+                    } {
+                        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut body = json!({"access_token": format!("token-{n}"), "token_type": "Bearer",
+                            "expires_in": 3600, "refresh_token": format!("refresh-{n}")});
+                        if let Some(scope) = narrowed(&request_body) {
+                            body["scope"] = scope.into();
+                        }
+                        body
+                    } else if path == "/token" {
+                        json!({"error": "invalid_grant"})
+                    } else {
+                        json!({"error": "not_found"})
+                    };
+                    let status = if created {
+                        "201 Created"
+                    } else if body.get("error").is_none() {
+                        "200 OK"
+                    } else if path == "/token" {
+                        "400 Bad Request"
+                    } else {
+                        "404 Not Found"
+                    };
+                    let body = body.to_string();
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Self {
+            origin,
+            exchanges,
+            delay_ms,
+            received,
+            hits,
+            registrations,
+            task,
+        }
+    }
+
+    fn exchanges(&self) -> usize {
+        self.exchanges.load(Ordering::SeqCst)
+    }
+
+    /// A PKCE backend whose preset names this issuer.
+    fn backend(&self, id: &str) -> Value {
+        json!({
+            "id": id,
+            "transport": {"type": "http", "url": format!("{}/ahp", self.origin)},
+            "authentication": {"type": "oauth", "flow": "authorization_code_pkce",
+                "issuer": self.origin, "clientId": "kit", "resource": format!("{}/ahp", self.origin)},
+            "oauth": {"allowPrivateNetwork": true},
+        })
+    }
+}
+
+/// Hook auth for `backends`, trusting the test authorization server.
+fn hook_auth(storage: &tempfile::TempDir, backends: Vec<Value>) -> HookAuth {
+    hook_auth_in(storage, backends, "/project/.agents/hooks.json")
+}
+
+/// [`hook_auth`] for backends declared by the hooks file `source`.
+fn hook_auth_in(storage: &tempfile::TempDir, backends: Vec<Value>, source: &str) -> HookAuth {
+    let sources = backends
+        .iter()
+        .map(|backend| {
+            (
+                backend["id"].as_str().unwrap().to_owned(),
+                source.to_owned(),
+            )
+        })
+        .collect();
+    super::test_support::hook_auth(
+        CredentialStorage::Filesystem(storage.path().to_path_buf()),
+        &json!({"protocolVersion": "draft", "hooks": backends}),
+        &sources,
+        trusting_client,
+    )
+}
+
+/// Trusts only the test CA.
+fn trusting_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().tls_certs_only([reqwest::Certificate::from_pem(CA).unwrap()])
+}
+
+/// Codes the fake authorization server issued, with their PKCE challenge.
+static AUTHORIZATIONS: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Codes whose grant has fewer scopes than were asked for, with the scope
+/// the token response reports.
+static NARROWED: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// The scope a code exchange's token response reports, if the user
+/// granted fewer scopes than Kit asked for.
+fn narrowed(body: &str) -> Option<String> {
+    let form: BTreeMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    NARROWED.lock().unwrap().remove(form.get("code")?)
+}
+
+/// Issues a code for the login at `url` that grants only `scope`.
+fn issue_code_granting(url: &url::Url, scope: &str) -> String {
+    let code = issue_code(url);
+    NARROWED
+        .lock()
+        .unwrap()
+        .insert(code.clone(), scope.to_owned());
+    code
+}
+
+/// Whether a token request redeems an issued code with its PKCE verifier,
+/// or presents a refresh token. A code is redeemed once.
+fn verified(body: &str) -> bool {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let form: BTreeMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    match form.get("grant_type").map(String::as_str) {
+        Some("refresh_token") => form.contains_key("refresh_token"),
+        Some("authorization_code") => {
+            let (Some(code), Some(verifier)) = (form.get("code"), form.get("code_verifier")) else {
+                return false;
+            };
+            let Some(challenge) = AUTHORIZATIONS.lock().unwrap().remove(code) else {
+                return false;
+            };
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(verifier.as_bytes()))
+                == challenge
+        }
+        _ => false,
+    }
+}
+
+fn query(url: &url::Url, name: &str) -> String {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
+        .unwrap()
+        .1
+        .into_owned()
+}
+
+/// The loopback port of the login at `url`: its redirect's.
+fn port(url: &url::Url) -> u16 {
+    let redirect = url::Url::parse(&query(url, "redirect_uri")).unwrap();
+    assert_eq!(redirect.host_str(), Some("127.0.0.1"));
+    redirect.port().unwrap()
+}
+
+/// Issues a code bound to the PKCE challenge of the login at `url`.
+fn issue_code(url: &url::Url) -> String {
+    assert_eq!(query(url, "code_challenge_method"), "S256");
+    let code = format!("code-{}", next_code());
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert(code.clone(), query(url, "code_challenge"));
+    code
+}
+
+/// Plays the browser: the user approves the login at `url`, the server
+/// issues a code bound to its PKCE challenge, and the browser calls back
+/// to the login's redirect.
+async fn approve(url: &url::Url) -> bool {
+    let code = issue_code(url);
+    call_back_with(port(url), &query(url, "state"), &code).await
+}
+
+fn next_code() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+async fn call_back_with(port: u16, state: &str, code: &str) -> bool {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(
+            format!("GET /callback?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    response.starts_with(b"HTTP/1.1 200")
+}
+
+fn context(auth: &HookAuth, id: &str) -> AuthContext {
+    auth.0.backends[id].context().unwrap()
+}
+
+async fn credential(auth: &HookAuth, context: AuthContext) -> Result<Option<String>, HookError> {
+    Provider(auth.clone())
+        .credential(context)
+        .await
+        .map(|credential| credential.map(|credential| credential.token))
+}
+
+/// Signs `id` in through `kit auth login hooks <id>`.
+async fn sign_in(auth: &HookAuth, id: &str) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let browser = tokio::spawn(async move {
+        let url: url::Url = rx.recv().await.unwrap();
+        assert!(approve(&url).await);
+    });
+    let signed_in = auth
+        .login(Some(id), |_, url| {
+            // Kit listens before it shows the link, so it can be opened at once.
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", port(url))).is_ok(),
+                "the link was shown before Kit listened for its callback"
+            );
+            tx.send(url.clone()).unwrap();
+        })
+        .await
+        .unwrap();
+    assert_eq!(signed_in, [id]);
+    browser.await.unwrap();
+}
+
+async fn next_hint(hints: &mut mpsc::UnboundedReceiver<AuthHint>) -> AuthHint {
+    tokio::time::timeout(Duration::from_secs(30), hints.recv())
+        .await
+        .expect("a sign-in hint")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_backend_with_a_grant_is_never_prompted_again() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.granted")]);
+    sign_in(&auth, "test.granted").await;
+    assert_eq!(issuer.exchanges(), 1);
+
+    // A new process sharing the storage finds the grant.
+    let again = hook_auth(&storage, vec![issuer.backend("test.granted")]);
+    let signed_in = again
+        .login(None, |backend, _| panic!("{backend} was prompted again"))
+        .await
+        .unwrap();
+    assert!(signed_in.is_empty());
+    assert_eq!(
+        credential(&again, context(&again, "test.granted"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("token-1")
+    );
+    // Turn starts leave it alone: no hint, no new login.
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = again.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    again.turn_started();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(hints.try_recv().is_err());
+    assert_eq!(issuer.exchanges(), 1);
+}
+
+#[tokio::test]
+async fn turns_repeat_one_link_until_sign_in_clears_it() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.hinted")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+
+    // Delivery never signs in; it fails and records the need.
+    let error = credential(&auth, context(&auth, "test.hinted"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.auth_code(), Some(AuthErrorCode::InteractionRequired));
+
+    auth.turn_started();
+    let first = next_hint(&mut hints).await;
+    assert_eq!(first.backend, "test.hinted");
+    assert!(!first.cleared);
+    let url = url::Url::parse(first.url.as_deref().unwrap()).unwrap();
+    // The next turn keeps this process's pending login: the same link, so
+    // no new hint, and nothing is exchanged.
+    let backend = auth.0.backends["test.hinted"].clone();
+    let states = || -> Vec<String> {
+        login::test_support::pending(&backend.scope)
+            .into_iter()
+            .map(|login| login.state)
+            .collect()
+    };
+    assert_eq!(states(), [query(&url, "state")]);
+    auth.prepare_backend(&backend).await;
+    assert_eq!(states(), [query(&url, "state")]);
+    assert!(hints.try_recv().is_err());
+
+    assert!(approve(&url).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert_eq!(
+        cleared.notice().as_deref(),
+        Some("Hook backend `test.hinted` is signed in.")
+    );
+    assert_eq!(
+        credential(&auth, context(&auth, "test.hinted"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("token-1")
+    );
+}
+
+#[tokio::test]
+async fn event_and_upload_endpoints_share_one_consent() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.upload")]);
+    sign_in(&auth, "test.upload").await;
+    let mut upload = context(&auth, "test.upload");
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/ahp/uploads", issuer.origin);
+    assert_eq!(
+        credential(&auth, upload).await.unwrap().as_deref(),
+        Some("token-1")
+    );
+    assert_eq!(issuer.exchanges(), 1);
+}
+
+#[tokio::test]
+async fn logout_from_another_process_always_finds_the_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let backends = || vec![issuer.backend("test.relogin")];
+    let live = hook_auth(&storage, backends());
+    for round in 0..2 {
+        sign_in(&live, "test.relogin").await;
+        // A separate process, sharing the storage, logs out.
+        let other = hook_auth(&storage, backends());
+        assert!(other.logout("test.relogin").await.unwrap(), "round {round}");
+        let status: BTreeMap<_, _> = other.status(None).await.unwrap().into_iter().collect();
+        assert_eq!(status["test.relogin"], "needs-login", "round {round}");
+    }
+}
+
+#[tokio::test]
+async fn logout_and_status_are_per_backend() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            issuer.backend("test.first"),
+            issuer.backend("test.second"),
+            json!({"id": "test.stdio", "transport": {"type": "stdio", "command": "true", "lifecycle": "persistent"}}),
+            json!({"id": "test.bearer", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "authentication": {"type": "bearer", "tokenEnv": "TEST_HOOK_TOKEN"}}),
+        ],
+    );
+    sign_in(&auth, "test.first").await;
+    sign_in(&auth, "test.second").await;
+    assert!(auth.logout("test.first").await.unwrap());
+    assert!(!auth.logout("test.first").await.unwrap());
+    // Logging out also stops a pending link's listener.
+    let url = auth
+        .prepare(&context(&auth, "test.first"), &[])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(TcpStream::connect(("127.0.0.1", port(&url))).await.is_ok());
+    auth.logout("test.first").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while TcpStream::connect(("127.0.0.1", port(&url))).await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("logout stops the link's listener");
+    let status: BTreeMap<_, _> = auth.status(None).await.unwrap().into_iter().collect();
+    assert_eq!(status["test.first"], "needs-login");
+    assert_eq!(status["test.second"], "authorized");
+    assert_eq!(status["test.stdio"], "no authentication (stdio)");
+    assert_eq!(status["test.bearer"], "bearer token");
+    assert!(auth.logout("test.missing").await.is_err());
+}
+
+/// A protected resource that rejects every request as unauthorized, and
+/// counts the requests it received.
+async fn rejecting_resource() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/ahp",
+        listener.local_addr().unwrap().port()
+    );
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&received);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    (url, received, task)
+}
+
+#[tokio::test]
+async fn a_fail_closed_backend_without_a_grant_denies() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let (url, received, task) = rejecting_resource().await;
+    let backend = json!({
+        "id": "test.closed",
+        "transport": {"type": "http", "url": url},
+        "authentication": {"type": "oauth", "flow": "authorization_code_pkce",
+            "issuer": issuer.origin, "clientId": "kit", "resource": url},
+        "oauth": {"allowPrivateNetwork": true},
+        "subscriptions": [crate::ahp::test_support::intercept(&["context.compact.before"])],
+    });
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let registration =
+        serde_json::from_value(json!({"protocolVersion": "draft", "hooks": [backend]})).unwrap();
+    let mut options = crate::ahp::options().unwrap();
+    options.backend.allow_loopback_http = true;
+    options.backend.auth_provider = Some(Arc::new(auth.providers()));
+    let hooks = crate::ahp::Hooks::new(registration, options).unwrap();
+    let items = [agentkit_core::Item::text(
+        agentkit_core::ItemKind::User,
+        "old",
+    )];
+    let compaction = hooks
+        .compact_before("closed", &items, true, "summarize", None)
+        .await;
+    assert!(
+        matches!(compaction, Some(crate::ahp::Compaction::Denied(_))),
+        "a backend that cannot authenticate must deny"
+    );
+    // The event was never sent without its credential.
+    assert_eq!(received.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[test]
+fn notices_show_each_link_once_and_completion_once() {
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&shown);
+    let sink = notices(move |_, text| recorded.lock().unwrap().push(text));
+    let pending = AuthHint {
+        scope: "test#test.notice".into(),
+        backend: "test.notice".into(),
+        url: Some("https://auth.example/authorize?state=1".into()),
+        expires_at_ms: Some(1),
+        cleared: false,
+        signed_in: false,
+        reason: None,
+        problem: None,
+    };
+    sink(&hint::HookHint::from(&pending));
+    sink(&hint::HookHint::from(&pending));
+    let cleared = AuthHint {
+        url: None,
+        cleared: true,
+        signed_in: true,
+        reason: Some(hint::ClearReason::SignedIn),
+        ..pending.clone()
+    };
+    sink(&hint::HookHint::from(&cleared));
+    sink(&hint::HookHint::from(&cleared));
+    assert_eq!(
+        *shown.lock().unwrap(),
+        [
+            "Hook backend `test.notice` needs you to sign in. Open https://auth.example/authorize?state=1 to approve Kit.",
+            "Hook backend `test.notice` is signed in.",
+        ]
+    );
+}
+
+#[test]
+fn an_advertised_issuer_is_trusted_only_on_opt_in() {
+    use agenthooksprotocol::auth::managed::{OAuthPolicy as _, ResourceMetadata};
+    let target = login::event_context("test.trust", "https://hooks.example/ahp", None)
+        .target()
+        .unwrap();
+    let resource = ResourceMetadata::new(
+        "https://hooks.example/ahp".into(),
+        vec!["https://auth.example".into()],
+    );
+    let policy = |oauth: Value| policy::Policy {
+        settings: config::Settings::parse(&json!({"id": "test.trust", "oauth": oauth})).0,
+    };
+    assert!(policy(json!({})).select(&target, &resource, &[]).is_err());
+    let trusted = policy(json!({"trustAdvertisedIssuer": true}))
+        .select(&target, &resource, &[])
+        .unwrap();
+    assert_eq!(trusted.issuer, "https://auth.example");
+    // A configured issuer the backend does not advertise is refused.
+    assert!(
+        policy(json!({"issuer": "https://other.example"}))
+            .select(&target, &resource, &[])
+            .is_err()
+    );
+    // A pin that is not an https URL refuses OAuth rather than unpinning it.
+    assert!(
+        policy(json!({"issuer": "http://auth.example", "trustAdvertisedIssuer": true}))
+            .select(&target, &resource, &[])
+            .is_err()
+    );
+    // Client credentials never trust an advertised issuer.
+    assert!(
+        policy(json!({"trustAdvertisedIssuer": true, "flow": "client_credentials"}))
+            .select(&target, &resource, &[])
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_callback_the_server_rejects_completes_nothing() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.rejected")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.rejected")).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The right state, but a code issued for another PKCE challenge.
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert("stolen-code".into(), "another-challenge".into());
+    assert!(!call_back_with(port(&url), &query(&url, "state"), "stolen-code").await);
+    // The SDK ended the login, so its dead link is withdrawn, not signed in.
+    let cleared = next_hint(&mut hints).await;
+    assert!(
+        cleared.cleared && !cleared.signed_in,
+        "a rejected exchange is not a sign-in: {cleared:?}"
+    );
+    assert_eq!(issuer.exchanges(), 0);
+    assert!(
+        credential(&auth, context(&auth, "test.rejected"))
+            .await
+            .is_err()
+    );
+    // The next turn shows a fresh link.
+    auth.turn_started();
+    let fresh = next_hint(&mut hints).await;
+    let fresh = url::Url::parse(fresh.url.as_deref().unwrap()).unwrap();
+    assert_ne!(query(&fresh, "state"), query(&url, "state"));
+    assert!(approve(&fresh).await);
+}
+
+#[tokio::test]
+async fn finishing_one_target_keeps_the_others_link() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.two-targets")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The event endpoint, and an upload endpoint on another resource.
+    let event = context(&auth, "test.two-targets");
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/uploads", issuer.origin)}));
+    for target in [&event, &upload] {
+        assert!(credential(&auth, target.clone()).await.is_err());
+    }
+    auth.turn_started();
+    // Wait until both targets' logins are pending, each with its own
+    // listener.
+    let scope = auth.0.backends["test.two-targets"].scope.clone();
+    let logins = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let logins = login::test_support::pending(&scope);
+            if logins.len() >= 2 {
+                return logins;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending logins");
+    let (first, second) = (&logins[0], &logins[1]);
+    assert_ne!(first.url, second.url);
+    assert_ne!(
+        port(&url::Url::parse(&first.url).unwrap()),
+        port(&url::Url::parse(&second.url).unwrap())
+    );
+    assert!(approve(&url::Url::parse(&first.url).unwrap()).await);
+    // The other target's link is shown next, not cleared.
+    let next = loop {
+        let hint = next_hint(&mut hints).await;
+        if hint.url.as_deref() != Some(first.url.as_str()) {
+            break hint;
+        }
+    };
+    assert!(!next.cleared, "{next:?}");
+    assert_eq!(next.url.as_deref(), Some(second.url.as_str()));
+    assert!(approve(&url::Url::parse(&second.url).unwrap()).await);
+    assert!(next_hint(&mut hints).await.signed_in);
+    assert!(credential(&auth, event).await.unwrap().is_some());
+    assert!(credential(&auth, upload).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn logout_all_workspaces_finds_grants_of_a_moved_project() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let old = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.moved")],
+        "/old/hooks.json",
+    );
+    sign_in(&old, "test.moved").await;
+    // The project moved: its new hooks file has no state, and plain logout
+    // finds nothing.
+    let moved = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.moved")],
+        "/new/hooks.json",
+    );
+    assert!(!moved.logout("test.moved").await.unwrap());
+    let backend = CredentialStorage::Filesystem(storage.path().to_path_buf());
+    assert_eq!(
+        super::logout_everywhere(&backend, "test.moved")
+            .await
+            .unwrap(),
+        1
+    );
+    // Nothing is left anywhere.
+    assert_eq!(
+        super::logout_everywhere(&backend, "test.moved")
+            .await
+            .unwrap(),
+        0
+    );
+    let status: BTreeMap<_, _> = old.status(None).await.unwrap().into_iter().collect();
+    assert_eq!(status["test.moved"], "needs-login");
+}
+
+#[tokio::test]
+async fn an_exchange_whose_request_was_sent_commits_after_the_caller_leaves() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // No listener: the test completes the login itself.
+    let auth = hook_auth(&storage, vec![issuer.backend("test.written")]);
+    let target = context(&auth, "test.written");
+    let manager = auth.manager(&target).unwrap();
+    let redirect = "http://127.0.0.1:9/callback";
+    let Preparation::InteractionRequired(pending) = manager
+        .prepare_with(
+            with_deadline(&target),
+            PrepareOptions::new().redirect_uri(redirect),
+            budget(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a login is needed");
+    };
+    let url = pending.authorization_url();
+    AUTHORIZATIONS
+        .lock()
+        .unwrap()
+        .insert("written-code".into(), query(url, "code_challenge"));
+    let callback = url::Url::parse(&format!(
+        "{redirect}?code=written-code&state={}",
+        query(url, "state")
+    ))
+    .unwrap();
+    issuer.delay_ms.store(1000, Ordering::SeqCst);
+    // The caller gives up once the server has the request but before it
+    // answers. The request was marked written once connected, so the SDK
+    // still commits the response.
+    let exchange = manager.complete(with_deadline(&target), callback, budget());
+    let request_arrived = async {
+        while issuer.received.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        _ = exchange => panic!("the response was held back"),
+        () = request_arrived => {}
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(issuer.exchanges(), 1);
+    assert!(credential(&auth, target).await.unwrap().is_some());
+}
+
+/// A hook server behind OAuth whose subscriptions come from
+/// hooks/configuration. It answers only once Kit holds a token for it.
+struct ProtectedServer {
+    oauth: Arc<ManagedOAuth>,
+    endpoint: AuthContext,
+    events: Mutex<Vec<Value>>,
+}
+
+impl agenthooksprotocol::adapters::registered::ManagedBackend for ProtectedServer {
+    fn call(&self, request: Value, _: Duration) -> LocalFuture<'_, Result<Value, HookError>> {
+        Box::pin(async move {
+            // The resource refuses a request without a usable token.
+            if !matches!(
+                self.oauth.credential(with_deadline(&self.endpoint)).await,
+                Ok(Some(_))
+            ) {
+                return Err(HookError::authentication(
+                    AuthErrorCode::InteractionRequired,
+                ));
+            }
+            if request["method"] == "hooks/configuration" {
+                return Ok(json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "protocolVersion": "draft",
+                    "configuration": {"subscriptions": [
+                        crate::ahp::test_support::observe(&["context.compact.before"])
+                    ]},
+                }}));
+            }
+            self.events
+                .lock()
+                .unwrap()
+                .push(request["params"]["event"].clone());
+            Ok(Value::Null)
+        })
+    }
+
+    fn shutdown(&self) -> LocalFuture<'_, Result<(), HookError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn a_backend_configured_after_sign_in_is_delivered_to_in_the_same_session() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.configured");
+    backend.as_object_mut().unwrap().remove("subscriptions");
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let endpoint = context(&auth, "test.configured");
+    let server = Arc::new(ProtectedServer {
+        oauth: auth.manager(&endpoint).unwrap(),
+        endpoint: endpoint.clone(),
+        events: Mutex::default(),
+    });
+    let registration =
+        serde_json::from_value(json!({"protocolVersion": "draft", "hooks": [backend]})).unwrap();
+    let options = crate::ahp::options()
+        .unwrap()
+        .with_backend("test.configured", Arc::clone(&server) as _);
+    let hooks = crate::ahp::Hooks::new(registration, auth.install(options)).unwrap();
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+
+    // Configuration needs a sign-in: the backend is skipped, and the
+    // configuration diagnostic records the need.
+    hooks.sdk.initialize().await.unwrap();
+    let scope = auth.0.backends["test.configured"].scope.clone();
+    assert!(login::registry().has_needs(&scope));
+
+    // The next turn shows the link; signing in completes it.
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    assert!(approve(&url).await);
+    assert!(next_hint(&mut hints).await.signed_in);
+
+    // The same Hooks configure the backend now and deliver to it.
+    hooks.sdk.initialize().await.unwrap();
+    let items = [agentkit_core::Item::text(
+        agentkit_core::ItemKind::User,
+        "old",
+    )];
+    hooks
+        .compact_before("configured", &items, true, "summarize", None)
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.events.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the event reaches the backend configured after sign-in");
+    assert_eq!(
+        server.events.lock().unwrap()[0]["type"],
+        "context.compact.before"
+    );
+}
+
+/// A session whose backend `id` supplies its subscriptions through
+/// hooks/configuration, which needs a sign-in: initialized, so the
+/// configuration was skipped.
+async fn skipped_configuration(
+    issuer: &Issuer,
+    storage: &tempfile::TempDir,
+    id: &str,
+) -> (HookAuth, Arc<crate::ahp::Hooks>, Arc<ProtectedServer>) {
+    let mut backend = issuer.backend(id);
+    backend.as_object_mut().unwrap().remove("subscriptions");
+    let auth = hook_auth(storage, vec![backend.clone()]);
+    let endpoint = context(&auth, id);
+    let server = Arc::new(ProtectedServer {
+        oauth: auth.manager(&endpoint).unwrap(),
+        endpoint,
+        events: Mutex::default(),
+    });
+    let registration =
+        serde_json::from_value(json!({"protocolVersion": "draft", "hooks": [backend]})).unwrap();
+    let options = crate::ahp::options()
+        .unwrap()
+        .with_backend(id, Arc::clone(&server) as _);
+    let hooks = Arc::new(crate::ahp::Hooks::new(registration, auth.install(options)).unwrap());
+    hooks.sdk.initialize().await.unwrap();
+    assert!(auth.was_skipped(&auth.0.backends[id]));
+    (auth, hooks, server)
+}
+
+/// After a turn start, the session configures the backend it skipped and
+/// delivers an event to it.
+async fn delivered_after_turn(
+    auth: &HookAuth,
+    hooks: &crate::ahp::Hooks,
+    server: &ProtectedServer,
+    id: &str,
+) {
+    auth.turn_started();
+    let endpoint = context(auth, id);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while Provider(auth.clone()).preparations(&endpoint) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the turn start prepares the signed-in backend");
+    hooks.sdk.initialize().await.unwrap();
+    let items = [agentkit_core::Item::text(
+        agentkit_core::ItemKind::User,
+        "old",
+    )];
+    hooks
+        .compact_before("configured", &items, true, "summarize", None)
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.events.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the event reaches the backend configured after sign-in");
+    assert!(!auth.was_skipped(&auth.0.backends[id]));
+}
+
+#[tokio::test]
+async fn a_sign_in_elsewhere_configures_a_skipped_backend_at_the_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.configured-elsewhere";
+    let (auth, hooks, server) = skipped_configuration(&issuer, &storage, id).await;
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The session shows its link; the user signs in from another process
+    // (`kit auth login hooks` in another terminal, say) instead.
+    auth.turn_started();
+    assert!(next_hint(&mut hints).await.url.is_some());
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    delivered_after_turn(&auth, &hooks, &server, id).await;
+}
+
+#[tokio::test]
+async fn a_sign_in_by_another_session_configures_a_skipped_backend() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.configured-by-session";
+    let (auth, hooks, server) = skipped_configuration(&issuer, &storage, id).await;
+    // Another session of this process signs in: the need it shares with
+    // this one is cleared, but this session's configuration is still skipped.
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    sign_in(&other, id).await;
+    assert!(
+        credential(&other, context(&other, id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!login::registry().has_needs(&auth.0.backends[id].scope));
+    delivered_after_turn(&auth, &hooks, &server, id).await;
+}
+
+#[tokio::test]
+async fn a_skipped_configuration_is_prepared_once_per_credential() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.rejects-token";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    let backend = auth.0.backends[id].clone();
+    let prepared = || Provider(auth.clone()).preparations(&context(&auth, id));
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+
+    auth.configuration_needs_login(id);
+    auth.prepare_backend(&backend).await;
+    assert_eq!(prepared(), 1);
+    // The backend rejects that token and its configuration is skipped
+    // again: Kit does not prepare it again for the same credential.
+    auth.configuration_needs_login(id);
+    auth.prepare_backend(&backend).await;
+    assert_eq!(prepared(), 1);
+    assert!(auth.was_skipped(&backend));
+    // A new sign-in brings a new credential, which is tried once.
+    assert!(other.logout(id).await.unwrap());
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    auth.prepare_backend(&backend).await;
+    assert_eq!(prepared(), 2);
+}
+
+#[tokio::test]
+async fn reconfiguring_without_a_credential_never_offers_a_link() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.quiet";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    // The credential is gone by the time the configuration is prepared.
+    assert!(!auth.prepare_quietly(&context(&auth, id)).await.unwrap());
+    assert!(login::test_support::pending(&scope).is_empty());
+    assert!(hints.try_recv().is_err());
+    assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 0);
+}
+
+#[tokio::test]
+async fn checking_a_live_step_up_registers_no_client() {
+    let issuer = Issuer::start_registering().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.dcr-step-up";
+    // No preset: the issuer is configured, and Kit registers its client.
+    let backend = json!({"id": id,
+        "transport": {"type": "http", "url": format!("{}/ahp", issuer.origin)},
+        "oauth": {"issuer": issuer.origin, "registration": true, "allowPrivateNetwork": true,
+            "scopes": ["hooks:invoke", "hooks:admin"]}});
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let other = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // Signed in (elsewhere) without `hooks:admin`.
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code_granting(&url, "hooks:invoke")).await;
+    assert!(credential(&auth, target.clone()).await.unwrap().is_some());
+    // A 403 asked for `hooks:admin`: the step-up link is shown.
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    let link = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
+    let (registered, hits) = (
+        issuer.registrations.load(Ordering::SeqCst),
+        issuer.hits.load(Ordering::SeqCst),
+    );
+    assert!(registered > 0, "the issuer registered no client");
+    // Later turns keep the link and send the authorization server nothing.
+    for _ in 0..3 {
+        auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    }
+    assert_eq!(issuer.registrations.load(Ordering::SeqCst), registered);
+    assert_eq!(issuer.hits.load(Ordering::SeqCst), hits);
+    assert_eq!(states(&scope), [query(&link, "state")]);
+    assert!(hints.try_recv().is_err());
+    // A step-up granted elsewhere still clears the link at the next turn.
+    let (url, complete) = elsewhere_requiring(&other, id, &["hooks:admin"]).await;
+    complete(issue_code(&url)).await;
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the link is withdrawn");
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+}
+
+#[test]
+fn confidential_targets_with_different_secret_references_never_share_a_manager() {
+    let storage = tempfile::tempdir().unwrap();
+    let preset = |reference: &str, resource: &str| {
+        json!({"type": "oauth", "flow": "client_credentials", "issuer": "https://auth.example",
+            "clientId": "kit", "clientSecretRef": reference, "resource": resource})
+    };
+    let backend = json!({"id": "test.secrets", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+        "authentication": preset("event-secret", "https://hooks.example/ahp")});
+    let auth = super::test_support::hook_auth_with_references(
+        CredentialStorage::Filesystem(storage.path().to_path_buf()),
+        &json!({"protocolVersion": "draft", "hooks": [backend]}),
+        &BTreeMap::from([("test.secrets".to_owned(), "/project/hooks.json".to_owned())]),
+        trusting_client,
+        BTreeMap::from([
+            ("event-secret".to_owned(), "a".to_owned()),
+            ("upload-secret".to_owned(), "b".to_owned()),
+        ]),
+    );
+    let event = context(&auth, "test.secrets");
+    let upload = |reference: &str| AuthContext {
+        purpose: AuthPurpose::Upload,
+        destination: "https://hooks.example/uploads".into(),
+        authentication: Some(preset(reference, "https://hooks.example/uploads")),
+        ..event.clone()
+    };
+    let event_manager = auth.manager(&event).unwrap();
+    // Same client, flow and scopes, another secret reference.
+    let upload_manager = auth.manager(&upload("upload-secret")).unwrap();
+    assert!(!Arc::ptr_eq(&event_manager, &upload_manager));
+    assert!(Arc::ptr_eq(&event_manager, &auth.manager(&event).unwrap()));
+    // A reference with no secret fails though another target is cached.
+    let error = auth.manager(&upload("missing-secret")).err().unwrap();
+    assert_eq!(
+        error.auth_code(),
+        Some(AuthErrorCode::CredentialUnavailable)
+    );
+}
+
+#[tokio::test]
+async fn a_plain_observation_keeps_a_pending_step_up() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.keeps-step-up";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    // A later operation only needs a sign-in.
+    login::registry().needs_login(&scope, &target, &[]);
+    assert_eq!(login::registry().needs(&scope)[0].required, ["hooks:admin"]);
+    // So a base credential does not settle it.
+    login::registry().usable(&scope, &target);
+    assert!(login::registry().has_needs(&scope));
+    // Another step-up adds its scopes.
+    login::registry().needs_login(&scope, &target, &["hooks:upload".into()]);
+    assert_eq!(
+        login::registry().needs(&scope)[0].required,
+        ["hooks:admin", "hooks:upload"]
+    );
+}
+
+/// Logs `id` out as another Kit process would when nothing is stored for
+/// it yet: only the logout marker moves, and this process's registry is left
+/// alone.
+async fn logout_elsewhere(auth: &HookAuth, id: &str, all_workspaces: bool) {
+    let scope = auth.0.backends[id].scope.clone();
+    let marked = if all_workspaces { id } else { scope.as_str() };
+    store::mark_logout(&auth.0.storage, marked, all_workspaces)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_link_shown_before_a_logout_elsewhere_never_signs_in() {
+    for all_workspaces in [false, true] {
+        let issuer = Issuer::start().await;
+        let storage = tempfile::tempdir().unwrap();
+        let id = if all_workspaces {
+            "test.logout-everywhere"
+        } else {
+            "test.logout-elsewhere"
+        };
+        let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+        let (tx, mut hints) = mpsc::unbounded_channel();
+        let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+        let _ = credential(&auth, context(&auth, id)).await;
+        auth.turn_started();
+        let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+        logout_elsewhere(&auth, id, all_workspaces).await;
+        // Approving the old link stores nothing, and the link is withdrawn.
+        assert!(!approve(&url).await);
+        let cleared = next_hint(&mut hints).await;
+        assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+        assert_eq!(issuer.exchanges(), 0);
+        assert!(credential(&auth, context(&auth, id)).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn a_logout_elsewhere_withdraws_links_at_the_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.logout-reconcile";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, context(&auth, id)).await;
+    auth.turn_started();
+    let old = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    logout_elsewhere(&auth, id, false).await;
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the old link is withdrawn");
+    assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+    assert!(!states(&scope).contains(&query(&old, "state")));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while TcpStream::connect(("127.0.0.1", port(&old))).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the old link stops listening");
+}
+
+#[tokio::test]
+async fn retiring_links_from_before_a_logout_keeps_needs_recorded_since() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.logout-keeps-needs";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    let event = context(&auth, id);
+    let _ = credential(&auth, event.clone()).await;
+    auth.turn_started();
+    let old = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    logout_elsewhere(&auth, id, false).await;
+    // After the logout, an upload on another resource needs a sign-in too.
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/uploads", issuer.origin)}));
+    assert!(credential(&auth, upload.clone()).await.is_err());
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    // Only the old link went; both needs stay, and each has a fresh link.
+    assert!(!states(&scope).contains(&query(&old, "state")));
+    let needs = login::registry().needs(&scope);
+    for target in [&event, &upload] {
+        assert!(
+            needs
+                .iter()
+                .any(|need| need.context.purpose == target.purpose
+                    && need.context.destination == target.destination),
+            "lost the need of {:?}",
+            target.purpose
+        );
+    }
+    assert_eq!(states(&scope).len(), 2);
+}
+
+#[tokio::test]
+async fn a_scope_denial_is_not_replayed_to_a_later_session() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.denial");
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    sign_in(&auth, "test.denial").await;
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let error = challenge(
+        &auth,
+        "test.denial",
+        403,
+        r#"Bearer error="insufficient_scope", scope="hooks:admin""#,
+    )
+    .await;
+    assert_eq!(error.auth_code(), Some(AuthErrorCode::AccessDenied));
+    // The session attached now is told.
+    assert!(next_hint(&mut hints).await.problem.is_some());
+    // A session attached later is not: nothing would clear it.
+    let (later_tx, mut later) = mpsc::unbounded_channel();
+    let _later = auth.subscribe(move |hint| later_tx.send(hint.clone()).unwrap());
+    assert!(later.try_recv().is_err());
+}
+
+/// A backend whose binding declares `hooks:invoke`, and that Kit may also
+/// ask for `hooks:admin`: a scope outside the binding's, so a need for it
+/// is a step-up.
+fn step_up_backend(issuer: &Issuer, id: &str) -> Value {
+    let mut backend = issuer.backend(id);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    backend["oauth"]["scopes"] = json!(["hooks:admin"]);
+    backend
+}
+
+/// The states of this process's pending logins for `scope`.
+fn states(scope: &str) -> Vec<String> {
+    login::test_support::pending(scope)
+        .into_iter()
+        .map(|login| login.state)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_plain_need_of_a_scoped_binding_clears_once_signed_in_elsewhere() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.scoped-plain";
+    let mut backend = issuer.backend(id);
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend.clone()]);
+    let other = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // A preset's scopes are requested, never required: a plain "not signed
+    // in" requires nothing, so it is not a step-up.
+    let error = credential(&auth, target.clone()).await.unwrap_err();
+    assert!(error.required_scopes().is_empty(), "{error:?}");
+    assert!(login::registry().needs(&scope)[0].required.is_empty());
+    auth.turn_started();
+    assert!(next_hint(&mut hints).await.url.is_some());
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    // The next turn finds the grant: the link is withdrawn, signed in.
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the hint clears");
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_login_completed_for_less_than_the_need_is_replaced_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.need-grows";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let first = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // While that plain link is live, an operation needs `hooks:admin` too.
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    // The user approves the first link, granting only the binding's scope.
+    let code = issue_code_granting(&first, "hooks:invoke");
+    assert!(call_back_with(port(&first), &query(&first, "state"), &code).await);
+    // Its listener is gone, so it is withdrawn; the need stays, and so the
+    // hint clears without saying signed in.
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+    assert!(login::registry().has_needs(&scope));
+    // The next turn offers a link for the step-up.
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let next = hints.try_recv().expect("a new link");
+    let second = url::Url::parse(next.url.as_deref().unwrap()).unwrap();
+    assert_ne!(query(&second, "state"), query(&first, "state"));
+    assert!(
+        query(&second, "scope")
+            .split(' ')
+            .any(|s| s == "hooks:admin")
+    );
+    assert_eq!(states(&scope), [query(&second, "state")]);
+}
+
+#[tokio::test]
+async fn a_live_link_for_less_than_the_need_is_replaced_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.need-grows-live";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let first = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    // The plain link would not meet the step-up: the next turn replaces it.
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let next = hints.try_recv().expect("a new link");
+    let second = url::Url::parse(next.url.as_deref().unwrap()).unwrap();
+    assert_ne!(query(&second, "state"), query(&first, "state"));
+    assert_eq!(states(&scope), [query(&second, "state")]);
+    assert!(approve(&second).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+/// A challenge from the hook endpoint of `auth`'s backend `id`.
+async fn challenge(auth: &HookAuth, id: &str, status: u16, header: &str) -> HookError {
+    Provider(auth.clone())
+        .challenge(
+            context(auth, id),
+            AuthChallenge {
+                status,
+                headers: BTreeMap::from([("www-authenticate".to_owned(), header.to_owned())]),
+                attempt_id: None,
+            },
+        )
+        .await
+        .unwrap_err()
+}
+
+#[tokio::test]
+async fn only_a_403_records_a_step_up() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.challenges";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 401 that names scopes asks to sign in: a plain need.
+    let error = challenge(&auth, id, 401, r#"Bearer scope="hooks:admin""#).await;
+    assert!(needs_login(&error), "{error:?}");
+    assert!(login::registry().needs(&scope)[0].required.is_empty());
+    // A 403 insufficient_scope asks for more: a step-up need.
+    let error = challenge(
+        &auth,
+        id,
+        403,
+        r#"Bearer error="insufficient_scope", scope="hooks:admin""#,
+    )
+    .await;
+    assert!(needs_login(&error), "{error:?}");
+    assert_eq!(login::registry().needs(&scope)[0].required, ["hooks:admin"]);
+}
+
+#[tokio::test]
+async fn a_step_up_granted_elsewhere_clears_its_link_next_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.step-up-elsewhere";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let other = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    assert!(shown.url.is_some());
+    // Another process steps up too, and its grant includes `hooks:admin`.
+    let (url, complete) = elsewhere_requiring(&other, id, &["hooks:admin"]).await;
+    complete(issue_code(&url)).await;
+    auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    let cleared = hints.try_recv().expect("the link is withdrawn");
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(states(&scope).is_empty());
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_step_up_granted_too_few_scopes_says_so() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.too-few";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 403 asked for `hooks:admin`: the step-up link is shown.
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The issuer grants only the preset's `hooks:invoke`.
+    let code = issue_code_granting(&url, "hooks:invoke");
+    assert!(!call_back_with(port(&url), &query(&url, "state"), &code).await);
+    // The link is withdrawn and the user told why, never "signed in".
+    let mut seen = Vec::new();
+    let problem = loop {
+        let hint = next_hint(&mut hints).await;
+        seen.push(hint.clone());
+        if let Some(problem) = hint.problem {
+            break problem;
+        }
+    };
+    assert!(seen.iter().all(|hint| !hint.signed_in), "{seen:?}");
+    assert!(
+        problem.contains("did not grant") && problem.contains("hooks:admin"),
+        "{problem}"
+    );
+    assert!(states(&scope).is_empty());
+    assert!(login::registry().has_needs(&scope));
+    // The scopes it would not grant are no longer asked for.
+    assert!(login::registry().needs(&scope)[0].required.is_empty());
+    // The SDK kept the narrower grant.
+    assert!(credential(&auth, target).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_step_up_not_granted_is_not_asked_for_again_every_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.not-granted-loop";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    let code = issue_code_granting(&url, "hooks:invoke");
+    assert!(!call_back_with(port(&url), &query(&url, "state"), &code).await);
+    while next_hint(&mut hints).await.problem.is_none() {}
+    // The next turns offer no new link: the narrower grant meets the need
+    // that is left, until a backend asks for `hooks:admin` again.
+    for _ in 0..2 {
+        auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    }
+    while let Ok(hint) = hints.try_recv() {
+        assert!(hint.url.is_none(), "a new link: {hint:?}");
+    }
+    assert!(states(&scope).is_empty());
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_sign_in_whose_logout_state_cannot_be_read_is_refused() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.unverified";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    issuer.delay_ms.store(1500, Ordering::SeqCst);
+    let code = issue_code(&url);
+    let (callback_port, state) = (port(&url), query(&url, "state"));
+    let callback = tokio::spawn(async move { call_back_with(callback_port, &state, &code).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while issuer.received.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exchange starts");
+    // While the exchange runs, the logout marker becomes unreadable.
+    let marker = store::logout_marker_path(&auth.0.storage, &scope).unwrap();
+    let _ = std::fs::remove_file(&marker);
+    std::fs::create_dir_all(&marker).unwrap();
+    // The grant is not accepted: the callback is refused, the exchange's
+    // grant removed, and the user told, never that it signed in.
+    assert!(!callback.await.unwrap());
+    std::fs::remove_dir(&marker).unwrap();
+    assert!(credential(&auth, target).await.is_err());
+    let problem = loop {
+        let hint = next_hint(&mut hints).await;
+        assert!(!hint.signed_in, "{hint:?}");
+        if let Some(problem) = hint.problem {
+            break problem;
+        }
+    };
+    assert!(problem.contains("could not finish signing in"), "{problem}");
+}
+
+#[tokio::test]
+async fn undoing_an_under_granted_exchange_keeps_another_targets_new_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.undo-one-target";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let other = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let event = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // An upload target on another resource of the same backend.
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/uploads", issuer.origin);
+    upload.authentication = Some(json!({"type": "oauth", "flow": "authorization_code_pkce",
+        "issuer": issuer.origin, "clientId": "kit", "resource": format!("{}/uploads", issuer.origin)}));
+    login::registry().needs_login(&scope, &event, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // This session's under-granted step-up is slow; the logout lands
+    // while it runs.
+    issuer.delay_ms.store(2500, Ordering::SeqCst);
+    let code = issue_code_granting(&url, "hooks:invoke");
+    let (callback_port, state) = (port(&url), query(&url, "state"));
+    let callback = tokio::spawn(async move { call_back_with(callback_port, &state, &code).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while issuer.received.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exchange starts");
+    logout_elsewhere(&auth, id, false).await;
+    // After the logout, another process signs in for the upload target,
+    // and finishes while this exchange still runs.
+    issuer.delay_ms.store(200, Ordering::SeqCst);
+    let (upload_url, complete) = elsewhere_at(&other, upload.clone(), &[]).await;
+    complete(issue_code(&upload_url)).await;
+    assert!(credential(&other, upload.clone()).await.unwrap().is_some());
+    assert!(!callback.await.unwrap());
+    // This exchange's grant is gone; the other target's, new in the same
+    // window, stays.
+    assert!(credential(&auth, event).await.is_err());
+    assert!(credential(&other, upload).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_logout_during_an_under_granted_step_up_leaves_no_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.logout-under-granted";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The exchange is slow; the user logs out (in another process) while it
+    // runs, and the issuer grants only `hooks:invoke`.
+    issuer.delay_ms.store(1500, Ordering::SeqCst);
+    let code = issue_code_granting(&url, "hooks:invoke");
+    let (callback_port, state) = (port(&url), query(&url, "state"));
+    let callback = tokio::spawn(async move { call_back_with(callback_port, &state, &code).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while issuer.received.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exchange starts");
+    // That logout already removed what was stored: only its marker moves
+    // now, and the exchange still stores its (narrower) grant.
+    logout_elsewhere(&auth, id, false).await;
+    assert!(!callback.await.unwrap());
+    // The grant the exchange stored is gone, and the user is not told the
+    // step-up was refused: the backend was logged out.
+    assert!(credential(&auth, target).await.is_err());
+    let cleared = loop {
+        let hint = next_hint(&mut hints).await;
+        assert!(hint.problem.is_none(), "{hint:?}");
+        if hint.cleared {
+            break hint;
+        }
+    };
+    assert!(!cleared.signed_in, "{cleared:?}");
+}
+
+#[tokio::test]
+async fn an_invalid_callback_keeps_the_link_live() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.stray-callback";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, context(&auth, id)).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // A callback with the login's state but a duplicated `code`: the SDK
+    // refuses it and reports the login still pending.
+    let mut stream = TcpStream::connect(("127.0.0.1", port(&url))).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /callback?code=a&code=b&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                query(&url, "state")
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 400"));
+    // Kit keeps listening, the link stays, and it still signs in.
+    assert_eq!(states(&scope), [query(&url, "state")]);
+    assert!(hints.try_recv().is_err());
+    assert!(approve(&url).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+#[tokio::test]
+async fn concurrent_turns_retry_a_configuration_once_per_credential() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.concurrent-reconfigure";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let other = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (url, complete) = elsewhere(&other, id).await;
+    complete(issue_code(&url)).await;
+    auth.configuration_needs_login(id);
+    let backend = auth.0.backends[id].clone();
+    tokio::join!(
+        auth.reconfigure(&backend, None),
+        auth.reconfigure(&backend, None)
+    );
+    assert_eq!(Provider(auth.clone()).preparations(&context(&auth, id)), 1);
+}
+
+/// What happens, besides a delivery, once a credential with only the
+/// binding's scope exists while a step-up link is shown.
+#[derive(Clone, Copy)]
+enum BaseCredential {
+    /// The next turn finds it.
+    NextTurn,
+    /// The backend's configuration was skipped: the next turn prepares it
+    /// again, with the binding's scope.
+    SkippedConfiguration,
+    /// A preparation for the binding's scope that started before the 403
+    /// finishes after it.
+    BasePreparation,
+}
+
+/// A step-up link stays live through `then`, and still completes.
+async fn a_step_up_link_stays(id: &str, then: BaseCredential) {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let other = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 403 asked for `hooks:admin`: the step-up link is shown.
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    let url = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
+    assert_eq!(states(&scope), [query(&url, "state")]);
+    // A credential with only the binding's scope exists (signed in
+    // elsewhere), and a delivery finds it.
+    let (base, complete) = elsewhere(&other, id).await;
+    complete(issue_code_granting(&base, "hooks:invoke")).await;
+    assert!(credential(&auth, target.clone()).await.unwrap().is_some());
+    match then {
+        BaseCredential::NextTurn => auth.prepare_backend(&auth.0.backends[id].clone()).await,
+        BaseCredential::SkippedConfiguration => {
+            auth.configuration_needs_login(id);
+            auth.prepare_backend(&auth.0.backends[id].clone()).await;
+            // The configuration is still retried with that credential.
+            assert_eq!(Provider(auth.clone()).preparations(&target), 1);
+        }
+        BaseCredential::BasePreparation => {
+            assert_eq!(auth.prepare(&target, &[]).await.unwrap(), None);
+        }
+    }
+    assert_eq!(states(&scope), [query(&url, "state")]);
+    assert!(login::registry().has_needs(&scope));
+    assert!(hints.try_recv().is_err());
+    // The earlier link still completes the step-up.
+    assert!(approve(&url).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_step_up_link_stays_while_the_base_credential_works() {
+    a_step_up_link_stays("test.step-up", BaseCredential::NextTurn).await;
+}
+
+#[tokio::test]
+async fn reconfiguring_with_the_base_credential_keeps_the_step_up_link() {
+    a_step_up_link_stays("test.step-up-skipped", BaseCredential::SkippedConfiguration).await;
+}
+
+#[tokio::test]
+async fn a_late_base_preparation_keeps_the_step_up_link() {
+    a_step_up_link_stays("test.step-up-race", BaseCredential::BasePreparation).await;
+}
+
+#[tokio::test]
+async fn scope_settings_widen_what_a_preset_backend_may_step_up_to() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.scopes";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let target = context(&auth, id);
+    // A sign-in asks for exactly the preset's scopes.
+    let url = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    assert_eq!(query(&url, "scope"), "hooks:invoke");
+    assert!(approve(&url).await);
+    assert!(credential(&auth, target.clone()).await.unwrap().is_some());
+    // `oauth.scopes` allow a step-up to `hooks:admin`, which asks for both.
+    let url = auth
+        .prepare(&target, &["hooks:admin".into()])
+        .await
+        .unwrap()
+        .unwrap();
+    let mut requested: Vec<_> = query(&url, "scope").split(' ').map(str::to_owned).collect();
+    requested.sort();
+    assert_eq!(requested, ["hooks:admin", "hooks:invoke"]);
+}
+
+#[tokio::test]
+async fn a_configuration_need_is_this_workspaces_only() {
+    let storage = tempfile::tempdir().unwrap();
+    let backend = json!({"id": "test.same-id", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+        "oauth": {"issuer": "https://auth.example"}});
+    let first = hook_auth_in(&storage, vec![backend.clone()], "/first/hooks.json");
+    let second = hook_auth_in(&storage, vec![backend], "/second/hooks.json");
+    first.configuration_needs_login("test.same-id");
+    assert!(login::registry().has_needs(&first.0.backends["test.same-id"].scope));
+    assert!(!login::registry().has_needs(&second.0.backends["test.same-id"].scope));
+}
+
+#[test]
+fn a_backend_with_an_authorization_header_never_needs_a_login() {
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            json!({"id": "test.header-auth", "transport": {"type": "http",
+            "url": "https://hooks.example/ahp", "headers": {"Authorization": "Bearer fixed"}},
+            "oauth": {"issuer": "https://auth.example"}}),
+        ],
+    );
+    auth.configuration_needs_login("test.header-auth");
+    assert!(!login::registry().has_needs(&auth.0.backends["test.header-auth"].scope));
+}
+
+#[tokio::test]
+async fn status_for_one_backend_checks_only_that_backend() {
+    let (first, second) = (Issuer::start().await, Issuer::start().await);
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            first.backend("test.status-one"),
+            second.backend("test.status-other"),
+        ],
+    );
+    let lines = auth.status(Some("test.status-one")).await.unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].0, "test.status-one");
+    assert_eq!(
+        second.hits.load(Ordering::SeqCst),
+        0,
+        "another backend's issuer was contacted"
+    );
+    // Not signed in needs no authorization-server request to tell.
+    assert_eq!(lines[0].1, "needs-login");
+    // A typo is refused before any credential check.
+    let checked = first.hits.load(Ordering::SeqCst);
+    assert!(auth.status(Some("test.typo")).await.is_err());
+    assert_eq!(first.hits.load(Ordering::SeqCst), checked);
+    assert_eq!(second.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_sign_in_that_cannot_be_prepared_says_why() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.unprepared");
+    // The issuer is on loopback, which this backend does not allow.
+    backend["oauth"]["allowPrivateNetwork"] = json!(false);
+    let auth = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    auth.configuration_needs_login("test.unprepared");
+    auth.turn_started();
+    let hint = next_hint(&mut hints).await;
+    assert_eq!(hint.url, None);
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains("untrusted_destination") && notice.contains("oauth.allowPrivateNetwork"),
+        "{notice}"
+    );
+}
+
+#[tokio::test]
+async fn event_and_upload_targets_with_different_scopes_each_get_their_own_ceiling() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.scoped-targets");
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    let event = context(&auth, "test.scoped-targets");
+    let mut upload = event.clone();
+    upload.purpose = AuthPurpose::Upload;
+    upload.destination = format!("{}/ahp/uploads", issuer.origin);
+    let mut binding = event.authentication.clone().unwrap();
+    binding["scopes"] = json!(["hooks:upload"]);
+    upload.authentication = Some(binding);
+    // The event target builds its manager first.
+    assert!(credential(&auth, event).await.is_err());
+    // The upload target's own scope is requested, not refused against the
+    // event target's ceiling.
+    let url = auth.prepare(&upload, &[]).await.unwrap().unwrap();
+    assert_eq!(query(&url, "scope"), "hooks:upload");
+}
+
+#[tokio::test]
+async fn a_problem_with_one_target_keeps_the_others_link() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.link-and-problem")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let event = context(&auth, "test.link-and-problem");
+    let url = auth.prepare(&event, &[]).await.unwrap().unwrap();
+    assert_eq!(
+        next_hint(&mut hints).await.url.as_deref(),
+        Some(url.as_str())
+    );
+    // Another target of the backend fails to prepare.
+    let scope = auth.0.backends["test.link-and-problem"].scope.clone();
+    login::registry().problem(&scope, "test.link-and-problem", "access_denied.".into());
+    let hint = next_hint(&mut hints).await;
+    assert_eq!(
+        hint.url.as_deref(),
+        Some(url.as_str()),
+        "the live link was dropped"
+    );
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains(url.as_str()) && notice.contains("access_denied"),
+        "{notice}"
+    );
+}
+
+#[test]
+fn a_replayed_link_reaches_a_new_subscriber_before_its_completion() {
+    let scope = "test#test.replay-order".to_owned();
+    let link = AuthHint {
+        scope: scope.clone(),
+        backend: "test.replay-order".into(),
+        url: Some("https://auth.example/replay".into()),
+        expires_at_ms: None,
+        cleared: false,
+        signed_in: false,
+        reason: None,
+        problem: None,
+    };
+    login::registry().publish(link.clone());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let completer = Arc::new(Mutex::new(None));
+    let _subscription = login::registry().subscribe(HashSet::from([scope.clone()]), {
+        let (seen, completer, scope) = (Arc::clone(&seen), Arc::clone(&completer), scope.clone());
+        move |hint: &AuthHint| {
+            if hint.url.is_some() {
+                // While the link is replayed, the login completes elsewhere.
+                let scope = scope.clone();
+                *completer.lock().unwrap() = Some(std::thread::spawn(move || {
+                    login::registry().publish(AuthHint {
+                        scope,
+                        backend: "test.replay-order".into(),
+                        url: None,
+                        expires_at_ms: None,
+                        cleared: true,
+                        signed_in: true,
+                        reason: Some(hint::ClearReason::SignedIn),
+                        problem: None,
+                    });
+                }));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            seen.lock().unwrap().push(hint.cleared);
+        }
+    });
+    let completer = completer.lock().unwrap().take().unwrap();
+    completer.join().unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [false, true],
+        "the completion overtook the replayed link"
+    );
+}
+
+#[tokio::test]
+async fn a_scope_outside_the_allowed_set_is_explained_not_signed_in() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.ceiling");
+    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
+    let auth = hook_auth(&storage, vec![backend]);
+    let target = context(&auth, "test.ceiling");
+    sign_in(&auth, "test.ceiling").await;
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    // The backend asks for a scope Kit does not allow it.
+    let challenge = agenthooksprotocol::adapters::registered::AuthChallenge {
+        status: 403,
+        headers: BTreeMap::from([(
+            "WWW-Authenticate".to_owned(),
+            r#"Bearer error="insufficient_scope", scope="hooks:admin""#.to_owned(),
+        )]),
+        attempt_id: None,
+    };
+    let error = Provider(auth.clone())
+        .challenge(target, challenge)
+        .await
+        .unwrap_err();
+    assert_eq!(error.auth_code(), Some(AuthErrorCode::AccessDenied));
+    let hint = next_hint(&mut hints).await;
+    let notice = hint.notice().unwrap();
+    assert!(
+        notice.contains("hooks:admin") && notice.contains("oauth.scopes"),
+        "{notice}"
+    );
+    assert!(!login::registry().has_needs(&auth.0.backends["test.ceiling"].scope));
+}
+
+#[tokio::test]
+async fn two_workspaces_with_one_backend_id_sign_in_separately() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // The same backend id, declared by two workspaces' hooks files.
+    let first = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.shared")],
+        "/a/hooks.json",
+    );
+    let second = hook_auth_in(
+        &storage,
+        vec![issuer.backend("test.shared")],
+        "/b/hooks.json",
+    );
+    let (first_tx, mut first_hints) = mpsc::unbounded_channel();
+    let _first = first.subscribe(move |hint| first_tx.send(hint.clone()).unwrap());
+    let (second_tx, mut second_hints) = mpsc::unbounded_channel();
+    let _second = second.subscribe(move |hint| second_tx.send(hint.clone()).unwrap());
+    for auth in [&first, &second] {
+        let error = credential(auth, context(auth, "test.shared"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.auth_code(), Some(AuthErrorCode::InteractionRequired));
+        auth.turn_started();
+    }
+    let first_url = url::Url::parse(&next_hint(&mut first_hints).await.url.unwrap()).unwrap();
+    let second_url = url::Url::parse(&next_hint(&mut second_hints).await.url.unwrap()).unwrap();
+    assert_ne!(port(&first_url), port(&second_url));
+
+    // A callback with an unknown state completes nothing.
+    assert!(!call_back_with(port(&first_url), "forged-state", "never-issued").await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(first_hints.try_recv().is_err() && second_hints.try_recv().is_err());
+    assert_eq!(issuer.exchanges(), 0);
+
+    assert!(approve(&second_url).await);
+    assert!(next_hint(&mut second_hints).await.signed_in);
+    assert!(
+        first_hints.try_recv().is_err(),
+        "the other workspace is still pending"
+    );
+    assert!(approve(&first_url).await);
+    assert!(next_hint(&mut first_hints).await.signed_in);
+    assert_eq!(issuer.exchanges(), 2);
+    // Logging out of one workspace's backend leaves the other's.
+    assert!(first.logout("test.shared").await.unwrap());
+    let first_status: BTreeMap<_, _> = first.status(None).await.unwrap().into_iter().collect();
+    let second_status: BTreeMap<_, _> = second.status(None).await.unwrap().into_iter().collect();
+    assert_eq!(first_status["test.shared"], "needs-login");
+    assert_eq!(second_status["test.shared"], "authorized");
+}
+
+/// A sign-in to `id` by another Kit process sharing the credential store:
+/// its own provider prepares the login, and completing it with a code
+/// touches nothing of this process's sign-in state.
+async fn elsewhere(
+    auth: &HookAuth,
+    id: &str,
+) -> (
+    url::Url,
+    impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
+    elsewhere_requiring(auth, id, &[]).await
+}
+
+/// [`elsewhere`], for a sign-in that requires `required` scopes.
+async fn elsewhere_requiring(
+    auth: &HookAuth,
+    id: &str,
+    required: &[&str],
+) -> (
+    url::Url,
+    impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
+    elsewhere_at(auth, context(auth, id), required).await
+}
+
+/// [`elsewhere_requiring`], for any target of the backend.
+async fn elsewhere_at(
+    auth: &HookAuth,
+    target: AuthContext,
+    required: &[&str],
+) -> (
+    url::Url,
+    impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
+    let manager = auth.manager(&target).unwrap();
+    let redirect = "http://127.0.0.1:9/callback";
+    let Preparation::InteractionRequired(pending) = manager
+        .prepare_with(
+            with_deadline(&target),
+            PrepareOptions::new()
+                .redirect_uri(redirect)
+                .required(required.iter().map(|scope| (*scope).to_owned()).collect()),
+            budget(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a login is needed");
+    };
+    let url = pending.authorization_url().clone();
+    let state = query(&url, "state");
+    let complete = move |code: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+        Box::pin(async move {
+            let callback =
+                url::Url::parse(&format!("{redirect}?code={code}&state={state}")).unwrap();
+            manager
+                .complete(with_deadline(&target), callback, budget())
+                .await
+                .unwrap();
+        })
+    };
+    (url, complete)
+}
+
+/// Starts `kit auth login hooks <id>` for `auth`, as another Kit process
+/// would, and returns its link once it is shown.
+fn cli_login(
+    auth: &HookAuth,
+    id: &'static str,
+) -> (
+    tokio::task::JoinHandle<Result<Vec<String>, String>>,
+    mpsc::UnboundedReceiver<url::Url>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let auth = auth.clone();
+    let task = tokio::spawn(async move {
+        auth.login(Some(id), move |_, url| tx.send(url.clone()).unwrap())
+            .await
+    });
+    (task, rx)
+}
+
+#[tokio::test]
+async fn processes_sign_in_to_one_backend_concurrently_and_share_the_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // Two Kit processes for one workspace, sharing the credential store.
+    let session = hook_auth(&storage, vec![issuer.backend("test.concurrent")]);
+    let cli = hook_auth(&storage, vec![issuer.backend("test.concurrent")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = session.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&session, "test.concurrent");
+    assert!(credential(&session, target.clone()).await.is_err());
+    session.turn_started();
+    let session_url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The other process signs in at the same time, with its own login.
+    let (other_url, complete) = elsewhere(&cli, "test.concurrent").await;
+    assert_ne!(query(&session_url, "state"), query(&other_url, "state"));
+
+    // Only the process that prepared a login completes it: the other
+    // process's callback, delivered to this one, is refused.
+    let code = issue_code(&other_url);
+    assert!(!call_back_with(port(&session_url), &query(&other_url, "state"), &code).await);
+    assert_eq!(issuer.exchanges(), 0);
+    complete(code).await;
+    assert_eq!(issuer.exchanges(), 1);
+
+    // The grant is shared: the session's next delivery uses it, and its
+    // own hint clears without the user opening its link.
+    assert_eq!(
+        credential(&session, target).await.unwrap().as_deref(),
+        Some("token-1")
+    );
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+    // Its listener is gone, so its link no longer completes anything.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while TcpStream::connect(("127.0.0.1", port(&session_url)))
+            .await
+            .is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the session stops listening once signed in elsewhere");
+    assert_eq!(issuer.exchanges(), 1);
+}
+
+#[tokio::test]
+async fn a_turn_start_sees_a_grant_from_another_process() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let session = hook_auth(&storage, vec![issuer.backend("test.elsewhere")]);
+    let other = hook_auth(&storage, vec![issuer.backend("test.elsewhere")]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = session.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    assert!(
+        credential(&session, context(&session, "test.elsewhere"))
+            .await
+            .is_err()
+    );
+    session.turn_started();
+    assert!(next_hint(&mut hints).await.url.is_some());
+    let (url, complete) = elsewhere(&other, "test.elsewhere").await;
+    complete(issue_code(&url)).await;
+    // The next turn start finds the grant instead of showing the link again.
+    session.turn_started();
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
+}
+
+#[tokio::test]
+async fn the_newest_completed_sign_in_wins() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let first = hook_auth(&storage, vec![issuer.backend("test.newest")]);
+    let second = hook_auth(&storage, vec![issuer.backend("test.newest")]);
+    let (first_login, mut first_links) = cli_login(&first, "test.newest");
+    let (second_login, mut second_links) = cli_login(&second, "test.newest");
+    let first_url = first_links.recv().await.unwrap();
+    let second_url = second_links.recv().await.unwrap();
+    assert!(approve(&first_url).await);
+    first_login.await.unwrap().unwrap();
+    assert!(approve(&second_url).await);
+    second_login.await.unwrap().unwrap();
+    for auth in [&first, &second] {
+        assert_eq!(
+            credential(auth, context(auth, "test.newest"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("token-2")
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_expired_link_is_withdrawn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut backend = issuer.backend("test.expires");
+    // A link that lasts under two seconds.
+    backend["oauth"]["loginLifetimeMinutes"] = json!(0.03);
+    let auth = hook_auth(&storage, vec![backend]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let _ = credential(&auth, context(&auth, "test.expires")).await;
+    auth.turn_started();
+    let shown = next_hint(&mut hints).await;
+    let url = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
+    // At expiry the link is withdrawn, not left clickable.
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && !cleared.signed_in, "{cleared:?}");
+    assert!(
+        TcpStream::connect(("127.0.0.1", port(&url))).await.is_err(),
+        "the listener outlived its link"
+    );
+    // The next turn prepares a new link.
+    auth.turn_started();
+    let again = next_hint(&mut hints).await;
+    assert!(again.url.is_some() && again.url != shown.url, "{again:?}");
+}
+
+#[tokio::test]
+async fn denying_consent_ends_the_login() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.denied")]);
+    let (tx, mut links) = mpsc::unbounded_channel();
+    let browser = tokio::spawn(async move {
+        let url: url::Url = links.recv().await.unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port(&url))).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /callback?error=access_denied&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                    query(&url, "state")
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+    });
+    let error = auth
+        .login(Some("test.denied"), |_, url| tx.send(url.clone()).unwrap())
+        .await
+        .unwrap_err();
+    assert!(error.contains("not approved"), "{error}");
+    browser.await.unwrap();
+    assert_eq!(issuer.exchanges(), 0);
+}
+
+#[tokio::test]
+async fn an_ended_login_never_withdraws_its_replacement() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(&storage, vec![issuer.backend("test.replaced")]);
+    let target = context(&auth, "test.replaced");
+    let scope = auth.0.backends["test.replaced"].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    let first = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    let old = login::test_support::pending(&scope).remove(0);
+    // A newer login for the same target replaces the first.
+    let second = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    assert_ne!(query(&first, "state"), query(&second, "state"));
+    // The first login's listener ending late withdraws only itself.
+    login::registry().ended(&old);
+    let states: Vec<_> = login::test_support::pending(&scope)
+        .into_iter()
+        .map(|login| login.state)
+        .collect();
+    assert_eq!(states, [query(&second, "state")]);
+    assert!(approve(&second).await);
+}
+
+#[tokio::test]
+async fn signing_in_to_every_backend_tries_them_all_and_reports_each_failure() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    // Sorted first, and its client secret reference resolves to nothing.
+    let broken = json!({"id": "test.a-broken", "transport": {"type": "http", "url": format!("{}/ahp", issuer.origin)},
+        "oauth": {"issuer": issuer.origin, "flow": "client_credentials", "clientId": "kit",
+            "clientSecretRef": "test.missing", "allowPrivateNetwork": true}});
+    let auth = hook_auth(&storage, vec![broken, issuer.backend("test.b-working")]);
+    let (tx, mut links) = mpsc::unbounded_channel();
+    let browser = tokio::spawn(async move {
+        let url: url::Url = links.recv().await.unwrap();
+        assert!(approve(&url).await);
+    });
+    let error = auth
+        .login(None, |_, url| tx.send(url.clone()).unwrap())
+        .await
+        .unwrap_err();
+    browser.await.unwrap();
+    assert!(
+        error.contains("test.a-broken: failing (credential_unavailable)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Signed in to hook backends: test.b-working"),
+        "{error}"
+    );
+    assert!(
+        credential(&auth, context(&auth, "test.b-working"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn only_pkce_targets_listen_for_a_callback() {
+    let storage = tempfile::tempdir().unwrap();
+    let auth = hook_auth(
+        &storage,
+        vec![
+            json!({"id": "test.pkce", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "oauth": {"issuer": "https://auth.example"}}),
+            json!({"id": "test.machine", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "oauth": {"issuer": "https://auth.example", "flow": "client_credentials"}}),
+            json!({"id": "test.preset-machine", "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "authentication": {"type": "oauth", "flow": "client_credentials",
+                    "issuer": "https://auth.example", "clientId": "kit", "resource": "https://hooks.example/ahp"}}),
+        ],
+    );
+    assert!(auth.pkce(&context(&auth, "test.pkce")).unwrap());
+    assert!(!auth.pkce(&context(&auth, "test.machine")).unwrap());
+    assert!(!auth.pkce(&context(&auth, "test.preset-machine")).unwrap());
+}

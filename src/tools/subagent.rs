@@ -524,6 +524,12 @@ impl Subagents {
         self.transcripts.stream.subscribe(parent_id, replay_history)
     }
 
+    /// Records `parent_id` as these subagents' owning session without
+    /// subscribing to their updates (see [`Self::subscribe_updates`]).
+    pub(crate) fn own_updates(&self, parent_id: String) {
+        self.transcripts.stream.own(parent_id);
+    }
+
     #[cfg(test)]
     pub(crate) async fn read_transcript(
         &self,
@@ -3577,5 +3583,598 @@ mod steer_tests {
                 .contains("unknown subagent session")
         );
         assert!(manager.sessions.lock().unwrap().contains_key(&prior.id));
+    }
+}
+
+/// A child's hook sign-in links, through the production path: a real
+/// `Subagents` (built from a runtime's own configuration), a real child-client
+/// actor (`acp_child`) driving a scripted child ACP peer, and the parent
+/// session wired as the real v1 and v2 activations wire it.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod hook_sign_in_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use agent_client_protocol::schema::v2 as wire;
+
+    const META: &str = crate::ahp::auth::HOOK_AUTH_META;
+    /// Every link the scripted child sends ends so; prompts never contain it.
+    const SECRET: &str = "/secret-link";
+
+    /// `Subagents` as a runtime builds them, launching the scripted child as
+    /// Kit's own.
+    fn manager(root: &std::path::Path, nested: bool, args: &[&str]) -> Subagents {
+        manager_as(root, nested, args, true)
+    }
+
+    /// [`manager`], the scripted child as Kit's own (`kit`) or as another
+    /// harness.
+    fn manager_as(root: &std::path::Path, nested: bool, args: &[&str], kit: bool) -> Subagents {
+        let runtime = crate::runtime::Runtime::new_with_provider_and_credentials(
+            root,
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let runtime = if nested {
+            crate::runtime::Runtime::with_depth(runtime, 1).unwrap()
+        } else {
+            runtime
+        };
+        let mut command = vec![format!(
+            "{}/fixtures/mock-acp-v2.py",
+            env!("CARGO_MANIFEST_DIR")
+        )];
+        command.extend(args.iter().map(|arg| (*arg).to_owned()));
+        // Run as Kit's own child (the `acp.kit` profile a user may set):
+        // only a Kit child's hints are relayed.
+        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+            if kit { "kit" } else { "other" }.into(),
+            crate::acp_child::AcpHarnessProfile {
+                command: "python3".into(),
+                args: command,
+                permissions: Default::default(),
+            },
+        )]))
+        .unwrap();
+        let default = if kit {
+            crate::acp_child::BUILTIN_HARNESS
+        } else {
+            "acp.other"
+        };
+        let runtime =
+            crate::runtime::Runtime::with_acp_harnesses(runtime, harnesses, default.into())
+                .unwrap();
+        Subagents::new(runtime.child_config_for_test())
+    }
+
+    /// The parent session's user, as one kind of client sees it, wired as
+    /// its activation wires it. The hint subscription is held for the
+    /// session's life, as activation holds it.
+    #[allow(dead_code)]
+    enum Parent {
+        /// A non-Kit ACP v2 client: marked notices.
+        V2(
+            crate::ahp::auth::SessionHints,
+            crate::protocols::acp::v2::RecordedUpdates,
+            tokio::sync::broadcast::Receiver<(String, Value)>,
+        ),
+        /// A non-Kit ACP v1 client that did not ask for subagent updates.
+        V1(
+            crate::ahp::auth::SessionHints,
+            tokio::sync::mpsc::UnboundedReceiver<agentkit_acp::AcpClientMessage>,
+            Vec<String>,
+        ),
+        /// No client (`kit prompt`): lines on the user's terminal.
+        Terminal(crate::ahp::auth::SessionHints, Arc<Mutex<Vec<String>>>),
+        /// Kit's own client (its TUI): `kit/hooks/auth` notifications.
+        Kit(
+            crate::ahp::auth::SessionHints,
+            Arc<Mutex<Vec<crate::protocols::acp::v2::HookAuthNotification>>>,
+            tokio::sync::broadcast::Receiver<(String, Value)>,
+        ),
+    }
+
+    impl Parent {
+        fn v2(manager: &Subagents, session: &str) -> Self {
+            let updates = manager.subscribe_updates(session.into(), false);
+            let recorded = crate::protocols::acp::v2::RecordedUpdates::default();
+            let hints = crate::protocols::acp::v2::subscribe_hook_hints(
+                None,
+                wire::SessionId::new(session.to_owned()),
+                recorded.clone(),
+                None,
+            );
+            Self::V2(hints, recorded, updates)
+        }
+
+        fn v1(manager: &Subagents, session: &str) -> Self {
+            let id = agentkit_acp::SessionId::new(session.to_owned());
+            assert!(crate::protocols::acp::own_subagents(manager, &id, false, false).is_none());
+            let (client, messages) = agentkit_acp::AcpClientHandle::channel();
+            Self::V1(
+                crate::protocols::acp::subscribe_hook_hints(None, client, id),
+                messages,
+                Vec::new(),
+            )
+        }
+
+        /// As `kit prompt` wires its session, printing to a record instead
+        /// of stderr.
+        fn terminal(manager: &Subagents, session: &str) -> Self {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let hints = crate::ahp::auth::subscribe_terminal(manager, None, session.into(), {
+                let lines = Arc::clone(&lines);
+                move |line| lines.lock().unwrap().push(line)
+            });
+            Self::Terminal(hints, lines)
+        }
+
+        fn kit(manager: &Subagents, session: &str) -> Self {
+            let updates = manager.subscribe_updates(session.into(), false);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let notify: Arc<dyn Fn(crate::protocols::acp::v2::HookAuthNotification) + Send + Sync> =
+                Arc::new({
+                    let sent = Arc::clone(&sent);
+                    move |notification| sent.lock().unwrap().push(notification)
+                });
+            let recorded = crate::protocols::acp::v2::RecordedUpdates::default();
+            let hints = crate::protocols::acp::v2::subscribe_hook_hints(
+                None,
+                wire::SessionId::new(session.to_owned()),
+                recorded,
+                Some(notify),
+            );
+            Self::Kit(hints, sent, updates)
+        }
+
+        /// Everything that reached the user for `agent` so far, in order: a
+        /// notice's text, or for Kit's client `agent: <url|reason|problem>`.
+        fn delivered(&mut self, agent: &str) -> Vec<String> {
+            match self {
+                Self::V2(_, recorded, _) => recorded
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|update| match &update.update {
+                        wire::SessionUpdate::Notice(notice)
+                            if notice
+                                .meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.contains_key(META)) =>
+                        {
+                            Some(notice.title.clone())
+                        }
+                        _ => None,
+                    })
+                    .filter(|title| title.starts_with(&format!("Agent {agent}: ")))
+                    .collect(),
+                Self::V1(_, messages, seen) => {
+                    while let Ok(message) = messages.try_recv() {
+                        if let agentkit_acp::AcpClientMessage::SessionNotification(notification) =
+                            message
+                            && let agentkit_acp::SessionUpdate::Notice(notice) = notification.update
+                            && notice
+                                .meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.contains_key(META))
+                        {
+                            seen.push(notice.title);
+                        }
+                    }
+                    seen.iter()
+                        .filter(|title| title.starts_with(&format!("Agent {agent}: ")))
+                        .cloned()
+                        .collect()
+                }
+                Self::Terminal(_, lines) => lines
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("kit: "))
+                    .filter(|line| line.starts_with(&format!("Agent {agent}: ")))
+                    .map(str::to_owned)
+                    .collect(),
+                Self::Kit(_, sent, _) => sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|notification| notification.hint.agent.as_deref() == Some(agent))
+                    .map(|notification| {
+                        let hint = &notification.hint;
+                        let what = match (&hint.url, &hint.problem, hint.reason) {
+                            (Some(url), Some(problem), _) => format!("{url} + {problem}"),
+                            (Some(url), None, _) => url.clone(),
+                            (None, Some(problem), _) => problem.clone(),
+                            (None, None, Some(reason)) => format!("{reason:?}"),
+                            (None, None, None) => "cleared".into(),
+                        };
+                        format!("{agent}: {} {what}", hint.backend)
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The subagent updates this client receives (its inspection view).
+        fn updates(&mut self) -> Vec<Value> {
+            let receiver = match self {
+                Self::V2(_, _, updates) | Self::Kit(_, _, updates) => updates,
+                Self::V1(..) | Self::Terminal(..) => return Vec::new(),
+            };
+            let mut seen = Vec::new();
+            while let Ok((_, update)) = receiver.try_recv() {
+                seen.push(update);
+            }
+            seen
+        }
+    }
+
+    fn parent(kind: &str, manager: &Subagents, session: &str) -> Parent {
+        match kind {
+            "v2" => Parent::v2(manager, session),
+            "v1" => Parent::v1(manager, session),
+            "terminal" => Parent::terminal(manager, session),
+            _ => Parent::kit(manager, session),
+        }
+    }
+
+    const KINDS: [&str; 4] = ["kit", "v2", "v1", "terminal"];
+
+    /// Waits until `count` deliveries reached the user, and returns them.
+    async fn wait_for(parent: &mut Parent, agent: &str, count: usize) -> Vec<String> {
+        for _ in 0..200 {
+            if parent.delivered(agent).len() >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Nothing more arrives.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        parent.delivered(agent)
+    }
+
+    /// The link reached nothing the model or an inspector reads.
+    async fn assert_contained(manager: &Subagents, parent: &mut Parent, values: &[&SubagentValue]) {
+        for value in values {
+            let output = serde_json::to_string(value).unwrap();
+            assert!(!output.contains(SECRET), "in a tool result: {output}");
+        }
+        let value = values.last().unwrap();
+        let page = manager
+            .read_transcript(&value.id, value.generation, 0)
+            .await
+            .unwrap();
+        let transcript = serde_json::to_string(&page.updates).unwrap();
+        assert!(
+            !transcript.contains(SECRET),
+            "in the transcript: {transcript}"
+        );
+        let updates = serde_json::to_string(&parent.updates()).unwrap();
+        assert!(!updates.contains(SECRET), "in subagent updates: {updates}");
+    }
+
+    async fn create(manager: &Subagents, prompt: &str) -> SubagentValue {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            manager.create(
+                prompt.to_owned().into(),
+                CreateOptions {
+                    name: Some("worker".into()),
+                    ..Default::default()
+                },
+                0,
+                TurnCancellation::default(),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn deliver(manager: &Subagents, id: &str, prompt: &str) -> SubagentValue {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            manager.deliver(
+                id,
+                prompt.to_owned().into(),
+                TurnCancellation::default(),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_link_in_a_later_prompt_reaches_each_kind_of_client_once() {
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &[]);
+            let mut parent = parent(kind, &manager, &format!("parent-later-{kind}"));
+            let first = create(&manager, "nothing yet").await;
+            let second =
+                deliver(&manager, &first.id, &format!("MOCK_HOOK_LINK=later-{kind}")).await;
+            let seen = wait_for(&mut parent, &first.id, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(
+                seen[0].contains(&format!("https://auth.example/later-{kind}/secret-link")),
+                "{kind}: {seen:?}"
+            );
+            assert_contained(&manager, &mut parent, &[&first, &second]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_too_long_to_pass_on_reaches_each_client_as_what_to_run() {
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &[]);
+            let mut parent = parent(kind, &manager, &format!("parent-long-{kind}"));
+            let first = create(
+                &manager,
+                &format!("MOCK_HOOK_LINK={}", "l".repeat(17 * 1024)),
+            )
+            .await;
+            let seen = wait_for(&mut parent, &first.id, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(
+                seen[0].contains("its link is too long to show here. Run `kit auth login hooks"),
+                "{kind}: {seen:?}"
+            );
+            assert!(!seen[0].contains("https://auth.example/"), "{kind}");
+            assert_contained(&manager, &mut parent, &[&first]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_before_the_first_prompt_reaches_the_user_once_registered() {
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &["--hook-notice-at-start=early"]);
+            let mut parent = parent(kind, &manager, &format!("parent-early-{kind}"));
+            let first = create(&manager, "hello").await;
+            let seen = wait_for(&mut parent, &first.id, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(
+                seen[0].contains("https://auth.example/early/secret-link"),
+                "{seen:?}"
+            );
+            assert_contained(&manager, &mut parent, &[&first]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn every_clear_while_idle_reaches_kits_client_and_signed_in_reaches_every_client() {
+        for (reason, kind) in [
+            ("signed_in", "kit"),
+            ("expired", "kit"),
+            ("logged_out", "kit"),
+            ("signed_in", "v2"),
+            ("signed_in", "v1"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &[]);
+            let mut parent = parent(kind, &manager, &format!("parent-idle-{kind}-{reason}"));
+            let first = create(
+                &manager,
+                &format!("MOCK_HOOK_AFTER=idle-{reason} MOCK_HOOK_CLEAR_AFTER={reason}"),
+            )
+            .await;
+            let seen = wait_for(&mut parent, &first.id, 2).await;
+            assert_eq!(seen.len(), 2, "{kind} {reason}: {seen:?}");
+            assert!(
+                seen[0].contains(&format!("https://auth.example/idle-{reason}/secret-link")),
+                "{seen:?}"
+            );
+            if kind == "kit" {
+                let expected = match reason {
+                    "signed_in" => "SignedIn",
+                    "expired" => "Expired",
+                    _ => "LoggedOut",
+                };
+                assert!(seen[1].ends_with(expected), "{kind} {reason}: {seen:?}");
+            } else {
+                assert!(seen[1].ends_with("is signed in."), "{kind}: {seen:?}");
+            }
+            assert_contained(&manager, &mut parent, &[&first]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_problem_beside_a_live_link_reaches_the_user() {
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &[]);
+            let mut parent = parent(kind, &manager, &format!("parent-problem-{kind}"));
+            let first = create(&manager, "MOCK_HOOK_PROBLEM=problem").await;
+            let seen = wait_for(&mut parent, &first.id, 2).await;
+            assert_eq!(seen.len(), 2, "{kind}: {seen:?}");
+            assert!(seen[1].contains("discovery_failed"), "{kind}: {seen:?}");
+            assert!(
+                seen[1].contains("https://auth.example/problem/secret-link"),
+                "{kind}: {seen:?}"
+            );
+            assert_contained(&manager, &mut parent, &[&first]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kit_child_sending_marked_notices_reaches_the_user_once() {
+        // As a v1 Kit child does: its hints are marked notices.
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager(root.path(), false, &["--hook-marked"]);
+            let mut parent = parent(kind, &manager, &format!("parent-marked-{kind}"));
+            let first = create(&manager, &format!("MOCK_HOOK_LINK=marked-{kind}")).await;
+            let seen = wait_for(&mut parent, &first.id, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(seen[0].contains(&format!("https://auth.example/marked-{kind}/secret-link")));
+            assert_contained(&manager, &mut parent, &[&first]).await;
+            manager
+                .close(&first.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_is_not_kit_relays_no_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager_as(root.path(), false, &[], false);
+        let mut parent = parent("kit", &manager, "parent-not-kit");
+        let first = create(&manager, "MOCK_HOOK_LINK=injected").await;
+        let seen = wait_for(&mut parent, &first.id, 1).await;
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_contained(&manager, &mut parent, &[&first]).await;
+        manager
+            .close(&first.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_malformed_hint_is_dropped_without_harm() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(root.path(), false, &[]);
+        let mut parent = parent("kit", &manager, "parent-malformed");
+        let first = create(&manager, "MOCK_HOOK_MALFORMED MOCK_HOOK_LINK=after-bad").await;
+        let seen = wait_for(&mut parent, &first.id, 1).await;
+        // Only the well formed one; the child's session works on.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].contains("https://auth.example/after-bad/secret-link"),
+            "{seen:?}"
+        );
+        let second = deliver(&manager, &first.id, "still here").await;
+        assert_eq!(second.output, Value::String("still here".into()));
+        assert_contained(&manager, &mut parent, &[&first, &second]).await;
+        manager
+            .close(&first.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backends_beyond_the_held_bound_are_named_once_registered() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(root.path(), false, &["--hook-backends-at-start=6"]);
+        let mut parent = parent("v2", &manager, "parent-overflow");
+        let first = create(&manager, "hello").await;
+        let seen = wait_for(&mut parent, &first.id, 5).await;
+        // The four held each come once; the two dropped at the bound are
+        // named by one line.
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert!(
+            seen.iter().any(
+                |title| title.contains("More hook backends need you to sign in")
+                    && title.contains("kit auth status hooks")
+            ),
+            "{seen:?}"
+        );
+        manager
+            .close(&first.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_late_hint_from_a_removed_agent_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("close-release");
+        let manager = manager(
+            root.path(),
+            false,
+            &[&format!("--close-release={}", release.display())],
+        );
+        let mut parent = parent("kit", &manager, "parent-removed");
+        let first = create(&manager, "MOCK_HOOK_AFTER=late").await;
+        // Removed here before the child's close settles; its late link
+        // arrives meanwhile.
+        let closing = {
+            let manager = manager.clone();
+            let id = first.id.clone();
+            tokio::spawn(async move { manager.close(&id, &TurnCancellation::default()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            parent.delivered(&first.id).is_empty(),
+            "{:?}",
+            parent.delivered(&first.id)
+        );
+        std::fs::write(&release, b"").unwrap();
+        closing.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_grandchilds_link_comes_up_once_labelled_with_both_agents() {
+        // In the nested Kit (the child, A): its own child B's link goes to
+        // A's session like any other, which a parent Kit reads as Kit's
+        // structured notification.
+        let root = tempfile::tempdir().unwrap();
+        let nested = manager(root.path(), true, &[]);
+        let mut a_session = parent("kit", &nested, "parent-nested-a");
+        let b = create(&nested, "MOCK_HOOK_LINK=nested").await;
+        let seen = wait_for(&mut a_session, &b.id, 1).await;
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_contained(&nested, &mut a_session, &[&b]).await;
+        nested
+            .close(&b.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+        // In the top Kit: A relays that hint (agent s-b), which comes up
+        // once, labelled with A then B, to each kind of client.
+        for kind in KINDS {
+            let root = tempfile::tempdir().unwrap();
+            let top = manager(root.path(), false, &[]);
+            let mut parent = parent(kind, &top, &format!("parent-top-{kind}"));
+            let a = create(&top, &format!("MOCK_HOOK_RELAYED={kind}")).await;
+            let label = format!("{}/s-b", a.id);
+            let seen = wait_for(&mut parent, &label, 1).await;
+            assert_eq!(seen.len(), 1, "{kind}: {seen:?}");
+            assert!(
+                seen[0].contains(&format!("https://auth.example/{kind}/secret-link")),
+                "{kind}: {seen:?}"
+            );
+            if kind != "kit" {
+                assert!(
+                    seen[0].starts_with(&format!("Agent {label}: Hook backend")),
+                    "{seen:?}"
+                );
+            }
+            assert_contained(&top, &mut parent, &[&a]).await;
+            top.close(&a.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        }
     }
 }

@@ -92,12 +92,14 @@ dependencies = [
 
 [[package]]
 name = "agenthooksprotocol"
-version = "0.10.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d538f4e71bc13e4bd1c48b767188a49de5401676a94b9d7561116d4f83cd95fd"
+checksum = "56984e94658cf2eaa241d92be959eb3c56d7303123c4e894c5bdb6e5999bcf0f"
 dependencies = [
  "http",
+ "httpdate",
  "jsonschema",
+ "oauth2",
  "reqwest",
  "serde",
  "serde_json",
@@ -3142,6 +3144,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "getrandom 0.4.3",
+ "http",
  "hyper",
  "hyper-util",
  "ignore",

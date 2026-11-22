@@ -64,6 +64,24 @@ struct UpdateMcpRequest {
 )]
 struct UpdateMcpResponse {}
 
+/// Kit-private notification to clients that declare `kit/hooks/auth` in
+/// their capabilities `_meta` (the bundled TUI, and a parent Kit): every
+/// change to a hook sign-in hint of the session, its own or a child
+/// agent's, with its whole lifecycle. Other clients get a marked notice.
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcNotification,
+)]
+#[serde(rename_all = "camelCase")]
+#[notification(method = "kit/hooks/auth")]
+pub(crate) struct HookAuthNotification {
+    pub session_id: wire::SessionId,
+    #[serde(flatten)]
+    pub hint: crate::ahp::auth::hint::HookHint,
+}
+
+/// The capability `_meta` key a client sets to receive [`HookAuthNotification`].
+pub(crate) const HOOK_AUTH_META: &str = crate::ahp::auth::HOOK_AUTH_META;
+
 fn client_mcp_servers(
     mcp_servers: Vec<wire::McpServer>,
 ) -> Result<Vec<agentkit_acp::McpServer>, AcpRuntimeError> {
@@ -136,6 +154,26 @@ fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
             .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
         None => agent_client_protocol::util::internal_error(detail),
     }
+}
+
+fn hook_terminal_auth_method(
+    capabilities: &wire::ClientCapabilities,
+    available: bool,
+) -> Option<wire::AuthMethod> {
+    let hooks = super::HOOK_AUTH_METHOD;
+    (available
+        && capabilities
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.terminal.as_ref())
+            .is_some())
+    .then(|| {
+        wire::AuthMethod::Terminal(
+            wire::AuthMethodTerminal::new(hooks, "Sign in to hooks")
+                .description("Sign in to the hook backends of this project that need it")
+                .args(vec!["--terminal-auth-login".into(), hooks.into()]),
+        )
+    })
 }
 
 fn terminal_auth_methods(
@@ -539,6 +577,70 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
     }
 }
 
+/// Where a session's hook sign-in hints go, its own and its child agents'
+/// alike: to a client that asked for Kit's notification (`notify`), every
+/// change as [`HookAuthNotification`]; to any other client, a marked notice
+/// per change worth a line. Subscribed once the session is activated, after
+/// the client has its response: hints replayed on subscribing name a session
+/// the client knows, and an attachment that fails never sends any.
+pub(crate) fn subscribe_hook_hints<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
+    hooks: Option<&crate::ahp::Hooks>,
+    session: wire::SessionId,
+    sink: S,
+    notify: Option<Arc<dyn Fn(HookAuthNotification) + Send + Sync>>,
+) -> crate::ahp::auth::SessionHints {
+    let id = session.to_string();
+    match notify {
+        Some(notify) => crate::ahp::auth::subscribe_session(hooks, id, move |hint| {
+            notify(HookAuthNotification {
+                session_id: session.clone(),
+                hint: hint.clone(),
+            });
+        }),
+        None => crate::ahp::auth::subscribe_session(
+            hooks,
+            id,
+            crate::ahp::auth::notices(move |hint, text| {
+                let _ = sink.update(wire::UpdateSessionNotification::new(
+                    session.clone(),
+                    wire::SessionUpdate::Notice(
+                        wire::Notice::new(wire::NoticeSeverity::Info, text).meta(hint.mark()),
+                    ),
+                ));
+            }),
+        ),
+    }
+}
+
+/// A session update sink that records what it is sent, for tests that
+/// drive a real activation.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RecordedUpdates(pub(crate) Arc<Mutex<Vec<wire::UpdateSessionNotification>>>);
+
+#[cfg(test)]
+#[async_trait]
+impl AcpSessionUpdateSink for RecordedUpdates {
+    fn update(&self, notification: wire::UpdateSessionNotification) -> Result<(), AcpRuntimeError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(notification);
+        Ok(())
+    }
+
+    async fn update_acknowledged(
+        &self,
+        notification: wire::UpdateSessionNotification,
+    ) -> Result<(), AcpRuntimeError> {
+        self.update(notification)
+    }
+
+    async fn flush(&self) -> Result<(), AcpRuntimeError> {
+        Ok(())
+    }
+}
+
 impl<S: AcpSessionUpdateSink> ResponseReplacementObserver<S> {
     fn clear_current(&self) {
         for result in self.sink.clear_current(&self.session_id) {
@@ -822,6 +924,7 @@ struct SessionSetup {
 struct Server {
     // Connection-local negotiated snapshot; only initialize writes it.
     form_elicitation: AtomicBool,
+    hook_auth_notifications: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -850,6 +953,7 @@ impl Server {
     fn new(runtime: Arc<Runtime>, registry: SessionRegistry) -> Self {
         Self {
             form_elicitation: AtomicBool::new(false),
+            hook_auth_notifications: AtomicBool::new(false),
             runtime,
             integration: Arc::new(AcpIntegration::default()),
             registry,
@@ -875,9 +979,10 @@ impl Server {
         request: wire::LoginAuthRequest,
     ) -> Result<wire::LoginAuthResponse, agent_client_protocol::Error> {
         let method_id = request.method_id.0.as_ref();
-        let detail = if terminal_auth_method_specs()
-            .iter()
-            .any(|method| method.method_id == method_id)
+        let detail = if method_id == super::HOOK_AUTH_METHOD
+            || terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == method_id)
         {
             "terminal authentication methods must be launched as a separate agent invocation"
         } else {
@@ -975,6 +1080,14 @@ impl Server {
                 .is_some_and(|value| value.form.is_some()),
             Ordering::Release,
         );
+        self.hook_auth_notifications.store(
+            request
+                .capabilities
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(HOOK_AUTH_META)),
+            Ordering::Release,
+        );
         // This handler only speaks v2. Initialization must return our supported
         // version even when the requested version is unsupported; the client
         // then disconnects if it cannot speak v2. It does not switch wire schemas.
@@ -1018,13 +1131,21 @@ impl Server {
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
         .capabilities(capabilities)
-        .auth_methods(if self.runtime.supports_logout_authentication() {
-            terminal_auth_methods(&request.capabilities, |provider| {
-                self.runtime.supports_terminal_authentication(provider)
-            })
-        } else {
-            Vec::new()
-        }))
+        .auth_methods(
+            if self.runtime.supports_logout_authentication() {
+                terminal_auth_methods(&request.capabilities, |provider| {
+                    self.runtime.supports_terminal_authentication(provider)
+                })
+            } else {
+                Vec::new()
+            }
+            .into_iter()
+            .chain(hook_terminal_auth_method(
+                &request.capabilities,
+                self.runtime.supports_hook_authentication(),
+            ))
+            .collect(),
+        ))
     }
 
     async fn new_session(
@@ -1273,6 +1394,15 @@ impl Server {
             activity.clone(),
         )
         .with_hook_messages(runtime.hooks());
+        let hook_auth_notifications =
+            self.hook_auth_notifications
+                .load(Ordering::Acquire)
+                .then(|| {
+                    let connection = connection.clone();
+                    Arc::new(move |notification: HookAuthNotification| {
+                        let _ = connection.send_notification(notification);
+                    }) as Arc<dyn Fn(HookAuthNotification) + Send + Sync>
+                });
         let context = AcpDriverContext {
             activity: activity.clone(),
             ask_user,
@@ -1355,6 +1485,13 @@ impl Server {
                 let sink = actor.sink.clone();
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
+                // Held for the session's life, from activation on.
+                let _hook_hints = subscribe_hook_hints(
+                    runtime.hooks(),
+                    session_id.clone(),
+                    sink.inner.clone(),
+                    hook_auth_notifications,
+                );
                 if let Some((used, size)) = restored_context {
                     let _ = sink.update(wire::UpdateSessionNotification::new(
                         session_id.clone(),
@@ -3834,6 +3971,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_sign_in_links_reach_the_user_not_the_transcript() {
+        let (_root, hooks) = crate::ahp::auth::test_support::hooks("test.v2-sign-in");
+        let recording = RecordingSink::default();
+        let session_id = wire::SessionId::new("v2-hook-sign-in");
+        let _subscription =
+            subscribe_hook_hints(Some(&hooks), session_id.clone(), recording.clone(), None);
+        let pending = crate::ahp::auth::test_support::hint(
+            &hooks,
+            "test.v2-sign-in",
+            "https://auth.example/authorize?state=v2",
+        );
+        // Repeated turns repeat the link; the client sees it once.
+        crate::ahp::auth::test_support::publish(pending.clone());
+        crate::ahp::auth::test_support::publish(pending.clone());
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::AuthHint {
+            url: None,
+            cleared: true,
+            signed_in: true,
+            reason: Some(crate::ahp::auth::hint::ClearReason::SignedIn),
+            ..pending
+        });
+        let updates = recording.updates.lock().unwrap();
+        let titles: Vec<_> = updates
+            .iter()
+            .map(|update| match &update.update {
+                wire::SessionUpdate::Notice(notice) => {
+                    // Tagged, so a parent Kit never hands it to its model.
+                    assert!(notice.meta.as_ref().unwrap().contains_key(HOOK_AUTH_META));
+                    notice.title.clone()
+                }
+                other => panic!("sign-in hints must be notices, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Hook backend `test.v2-sign-in` needs you to sign in. Open https://auth.example/authorize?state=v2 to approve Kit.",
+                "Hook backend `test.v2-sign-in` is signed in.",
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_sign_in_is_advertised_with_durable_storage_whatever_the_launch_hooks() {
+        // The launch workspace has no hooks: a session may attach to one
+        // that does, and the method checks that workspace when it runs.
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        for (storage, expected) in [
+            (crate::credentials::CredentialStorage::Memory, false),
+            (
+                crate::credentials::CredentialStorage::Filesystem(credentials.path().into()),
+                true,
+            ),
+        ] {
+            let runtime = Runtime::with_hooks(
+                Runtime::new_with_provider_and_credentials(
+                    root.path(),
+                    "gpt-5.4",
+                    crate::ProviderKind::OpenAiSubscription,
+                    storage,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let server = Server::new(runtime, SessionRegistry::new());
+            let response = server
+                .initialize(terminal_auth_initialize_request())
+                .unwrap();
+            let methods = response.auth_methods.iter().filter(|method| {
+                matches!(method, wire::AuthMethod::Terminal(method)
+                    if method.method_id.0.as_ref() == "hooks"
+                        && method.args == ["--terminal-auth-login", "hooks"])
+            });
+            assert_eq!(methods.count() == 1, expected);
+        }
+    }
+
+    #[tokio::test]
     async fn hook_messages_use_registered_v2_observer_message_sink() {
         let recording = RecordingSink::default();
         let sink = ResponseReplacementSink::new(recording.clone());
@@ -4811,6 +5027,121 @@ mod tests {
                     .is_some()
             );
         }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn a_child_agents_sign_in_link_reaches_the_owning_sessions_user() {
+        let recording = RecordingSink::default();
+        let session_id = wire::SessionId::new("v2-child-sign-in");
+        let link = "https://auth.example/authorize?state=child";
+        let hint = crate::ahp::auth::hint::HookHint {
+            backend: "x".into(),
+            agent: Some("scout".into()),
+            url: Some(link.into()),
+            expires_at: None,
+            cleared: false,
+            reason: None,
+            problem: None,
+        };
+        // Nobody attached yet: dropped.
+        crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
+        assert!(recording.updates.lock().unwrap().is_empty());
+        let subscription = subscribe_hook_hints(None, session_id.clone(), recording.clone(), None);
+        crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
+        // Another session's child is not this session's.
+        crate::ahp::auth::relay::relay("another-session", &hint);
+        {
+            let updates = recording.updates.lock().unwrap();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].session_id, session_id);
+            let wire::SessionUpdate::Notice(notice) = &updates[0].update else {
+                panic!("a child's link is a notice, got {:?}", updates[0].update);
+            };
+            assert_eq!(notice.severity, wire::NoticeSeverity::Info);
+            assert!(notice.title.starts_with("Agent scout: ") && notice.title.contains(link));
+            // Marked: a Kit above never hands it to its model.
+            assert!(notice.meta.as_ref().unwrap().contains_key(HOOK_AUTH_META));
+        }
+        drop(subscription);
+        crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
+        assert_eq!(recording.updates.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hook_sign_in_replay_follows_the_session_response() {
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("hooks.json"),
+            json!({"protocolVersion": "draft", "hooks": [{
+                "id": "test.replay-order",
+                "transport": {"type": "http", "url": "https://hooks.example/ahp"},
+                "subscriptions": [crate::ahp::test_support::observe(&["context.compact.before"])],
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::with_hooks(
+            Runtime::new_with_provider_credentials_and_effort(
+                root.path(),
+                "test-model",
+                crate::ProviderKind::OpenRouter,
+                credentials,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // A link is already shown when the session is created.
+        crate::ahp::auth::test_support::publish(crate::ahp::auth::test_support::hint(
+            runtime.hooks().unwrap(),
+            "test.replay-order",
+            "https://auth.example/authorize?state=replay-order",
+        ));
+        let (mut client, agent) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent).await });
+        send_wire(
+            &client,
+            "initialize",
+            1,
+            serde_json::to_value(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("replay-order-test", "0"),
+            ))
+            .unwrap(),
+        );
+        receive_wire(&mut client, "initialize response").await;
+        send_wire(
+            &client,
+            "session/new",
+            2,
+            serde_json::to_value(wire::NewSessionRequest::new(root.path().to_path_buf())).unwrap(),
+        );
+        let response = receive_wire(&mut client, "session/new response").await;
+        assert_eq!(
+            response["id"], 2,
+            "the response must come first: {response}"
+        );
+        let session_id = response["result"]["sessionId"].clone();
+        let mut replayed = false;
+        for _ in 0..10 {
+            let frame = receive_wire(&mut client, "session update").await;
+            if frame["params"]["update"]["_meta"]
+                .get(HOOK_AUTH_META)
+                .is_some()
+            {
+                assert_eq!(frame["params"]["sessionId"], session_id);
+                replayed = true;
+                break;
+            }
+        }
+        assert!(replayed, "the shown link is replayed after the response");
         server.abort();
         let _ = server.await;
     }

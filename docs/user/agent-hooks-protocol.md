@@ -49,6 +49,172 @@ hooks that you trust with those values.
 Hook backends run local processes or receive session content. Review both files
 before you run Kit in a project you do not trust.
 
+## Sign in to an OAuth hook backend
+
+Each HTTP hook backend has its own sign-in. Signing in to one backend never
+signs you in to another, and a backend that is signed in is never asked again.
+One sign-in covers a backend's event endpoint and its upload endpoints.
+
+### What happens during a session
+
+A delivery that needs a sign-in never opens a browser and never waits. It
+fails, and the subscription's `failurePolicy` decides the result: a
+`fail-closed` backend denies the operation, a `fail-open` backend lets it
+continue. The backend stays registered.
+
+When the next turn starts, Kit prepares the sign-in in the background and
+shows its link where only you see it:
+
+- The TUI status line shows a reminder, `sign in to hook <backend> needed
+  (link above)`. The full link, clickable where the terminal supports it,
+  appears once in the conversation view above.
+- Other ACP clients receive a notice with the link, and a second notice when
+  sign-in finishes.
+- A session without a client writes one line per link to stderr.
+
+Every turn shows the same link until it expires (at most 10 minutes); then
+the next turn shows a new one. As with MCP sign-in, each link has its own
+callback, `http://127.0.0.1:<port>/callback` on a port the system chooses,
+and the Kit process that showed the link listens there until the link
+expires, so you can open it at any time before then. When several Kit
+processes run, each shows its own link, and signing in through any of them
+signs in all of them: the sign-in is stored in the shared credential store,
+and the other processes clear their links when they next use the backend
+or start a turn. If you sign in twice, the newest sign-in wins. Hook
+messages and sign-in links never enter the transcript that the model reads.
+
+### Sign in from the command line
+
+```sh
+kit auth status hooks --root /path/to/project
+kit auth login hooks --root /path/to/project            # each backend that needs it
+kit auth login hooks com.example.policy --root /path/to/project
+kit auth logout hooks com.example.policy --root /path/to/project
+kit auth logout hooks com.example.policy --all-workspaces
+```
+
+`status` prints one line per backend: `authorized`, `needs-login`, `anonymous`,
+`bearer token`, or `failing (<reason>)`. `login` prints each link and waits
+until you approve it. `logout` removes the backend's tokens, pending sign-in
+and registered client, and nothing of any other backend.
+
+A sign-in link that another running Kit process showed before the logout no
+longer signs in: approving it stores nothing, and that process withdraws the
+link at its next turn start. One case remains: if a sign-in elsewhere
+completes at the very moment of the logout, its tokens can be stored briefly
+before that process removes them again. In that case a sign-in made in
+another process right after the logout can be removed with them, and you sign
+in once more.
+
+A sign-in belongs to a backend id in the hooks file that declares it, not
+to a project. A backend declared in the global `~/.agents/hooks.json` has
+one sign-in for every project that uses that declaration: signing in or
+logging out from any of them applies to all, and moving or re-cloning a
+project does not change it. Only backends declared in different files sign
+in separately, for example the same backend id in two projects'
+`.agents/hooks.json`. Moving or re-cloning a project whose own file declares
+the backend starts a new sign-in, and its old one is no longer found by
+`logout` with `--root`. `--all-workspaces` removes the backend id's sign-ins
+from every declaring file, including moved ones. ACP clients that
+support terminal authentication offer one `hooks` method whenever hooks are
+enabled and credentials are stored durably. It runs `kit auth login hooks` in
+the workspace the client chooses, and says so when no backend there needs a
+sign-in.
+
+Sign-in requires a persistent credential store (`--credential-store file` or
+`keychain`), as MCP authentication does. Memory-only storage cannot keep a
+sign-in.
+
+### Configure a backend
+
+A registration `authentication` preset fixes the resource, issuer and client:
+
+```json
+"authentication": {
+  "type": "oauth",
+  "flow": "authorization_code_pkce",
+  "resource": "https://policy.example.com/hooks",
+  "issuer": "https://login.example.com",
+  "clientId": "client-id-from-the-operator",
+  "scopes": ["hooks:invoke"]
+}
+```
+
+Without a preset, Kit learns the authorization server from the backend's
+protected resource metadata after the backend rejects an anonymous request,
+and uses it only if `oauth.issuer` names it or `oauth.trustAdvertisedIssuer`
+is `true`.
+Put further settings in an `oauth` object on the backend, beside its
+`authentication`. Other AHP harness adapters read the same object, and AHP
+receivers ignore it. All settings are optional. Alongside a preset:
+
+- `scopes` add to what a backend may ask for beyond the preset's scopes (a
+  step-up). Every sign-in asks for exactly the preset's scopes.
+- `issuer` and `clientId` must agree with the preset's `issuer` and
+  `clientId`. Kit checks a preset's values exactly, so a different value
+  makes sign-in fail rather than replace the preset's.
+- `flow` applies only to a backend without a preset; a preset's `flow`
+  always applies to it.
+- The other settings have no preset counterpart.
+
+```json
+{
+  "id": "com.example.policy",
+  "transport": { "type": "http", "url": "https://policy.example.com/hooks" },
+  "oauth": { "issuer": "https://login.example.com", "registration": true }
+}
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `issuer` | The authorization server trusted for this backend. A preset's `issuer` counts too. An `issuer` that is not an `https` URL disables OAuth for the backend until you fix it. |
+| `trustAdvertisedIssuer` | Without `issuer`, trust the authorization server the backend advertises. Default `false`: Kit refuses it. Client credentials always need `issuer`. |
+| `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
+| `scopes` | Without a preset, the scopes every sign-in asks for. With a preset, which asks for its own `scopes`, further scopes a backend may ask for. Requested scopes are never mandatory: a sign-in the authorization server grants fewer of still works. Together with the preset's they are the most Kit accepts: a backend that asks for a scope outside them is refused, not granted it. |
+| `clientId` | A client registered for Kit in advance. It always wins. Kit listens on a port the system chooses, so its registration must accept any loopback port on `http://127.0.0.1/callback` (RFC 8252 §7.3). `oauth.redirectPort` is no longer used; Kit warns when it is set. |
+| `clientSecretRef` | For client credentials: a key in `~/.kit/ahp-secrets.json`. |
+| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document that you publish. Kit uses it where the issuer supports such documents. Its `redirectUris` must include `http://127.0.0.1/callback`; the authorization server must accept any port on it (RFC 8252). |
+| `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
+| `loginLifetimeMinutes` | How long a sign-in link lasts, up to 10 (the default). |
+| `allowPrivateNetwork` | Allow the authorization server on loopback or private addresses. Default `false`. |
+
+Kit selects the client in this order: `clientId` (or the preset's), then the
+Client ID Metadata Document, then dynamic registration. If none applies,
+`status` reports `failing (credential_unavailable)`.
+
+OAuth requests go only to HTTPS endpoints. They follow no redirects, and they
+connect only to the public addresses they resolved, unless
+`allowPrivateNetwork` is set. A client secret named by `clientSecretRef` is
+sent only to a token endpoint on its configured issuer's own origin.
+
+`~/.kit/ahp-secrets.json` holds secrets that hooks.json names by reference
+(`clientSecretRef`, `initialAccessTokenRef` and a bearer `tokenRef`), as
+`{ "version": 1, "secrets": { "<ref>": "<secret>" } }`. Make it readable only
+by you (`chmod 600`); otherwise Kit ignores it. Secrets of dynamically
+registered clients go in Kit's credential store.
+
+An explicit `Authorization` header in `transport.headers` takes precedence
+over all of the above: Kit sends that header and nothing else.
+
+### Further scopes (step-up)
+
+A backend that answers `403 insufficient_scope` asks for more scopes. If
+they are within the ones Kit accepts, its next sign-in link asks for them; if
+the authorization server then grants fewer, Kit keeps the narrower sign-in
+and names the scopes the step-up required, rather than reporting the backend
+as signed in. A `401` asks only for a sign-in, whatever scopes it names; for
+client credentials, Kit also asks for the `401`'s scopes when it obtains the
+token for that request.
+
+### Backends that supply their own subscriptions
+
+A backend that supplies its subscriptions through `hooks/configuration`
+contributes none while it needs a sign-in. Its link appears at the next turn
+start, like any other. Once you sign in, through that link or elsewhere (such
+as `kit auth login hooks` in another terminal), Kit asks the backend for its
+configuration again and delivers events to it from then on, in the same
+session.
+
 ## Use server-provided subscriptions
 
 Omit a backend's `subscriptions` field to let it supply subscriptions through

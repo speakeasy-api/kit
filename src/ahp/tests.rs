@@ -3469,3 +3469,21 @@ async fn idle_background_approval_pairs_its_own_turn_on_resume_or_cancellation()
         assert_eq!(types, ["turn.start", "turn.end", "turn.start", "turn.end"]);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn declaring_file_identities_are_lossless_and_keep_utf8_paths() {
+    use std::os::unix::ffi::OsStrExt as _;
+    // A UTF-8 path keeps the identity stored sign-ins were made under.
+    assert_eq!(
+        source_identity(Path::new("/project/.agents/hooks.json")),
+        "/project/.agents/hooks.json"
+    );
+    // Two paths that differ only in bytes that are not UTF-8 look the same
+    // lossily, and never share an identity.
+    let first = Path::new(std::ffi::OsStr::from_bytes(b"/p/\xff/hooks.json"));
+    let second = Path::new(std::ffi::OsStr::from_bytes(b"/p/\xfe/hooks.json"));
+    assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+    assert_ne!(source_identity(first), source_identity(second));
+    assert!(source_identity(first).starts_with("os:"));
+}

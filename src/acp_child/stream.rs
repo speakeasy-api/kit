@@ -36,6 +36,17 @@ struct State {
     steering: HashMap<String, Steering>,
 }
 impl Stream {
+    /// Records `parent` as the session that owns these subagents, without
+    /// subscribing to their updates: their hook sign-in links are relayed to
+    /// it whatever its client's capabilities.
+    pub(crate) fn own(&self, parent: String) {
+        if let Ok(mut state) = self.state.lock()
+            && state.parent.is_none()
+        {
+            state.parent = Some(parent);
+        }
+    }
+
     pub(crate) fn subscribe(
         &self,
         parent: String,
@@ -401,7 +412,71 @@ pub(crate) struct Routes(Mutex<RoutesState>);
 struct RoutesState {
     live: HashMap<String, Route>,
     resume: Option<Resume>,
+    /// Hook sign-in hints from child sessions not yet routed to an owner, or
+    /// arriving while a registration replays: the latest per (session,
+    /// originating agent and backend), bounded.
+    held: Vec<(String, String, Hint)>,
+    /// Sessions whose held hints are being replayed: hints that arrive
+    /// meanwhile are held too, so none overtakes an older one.
+    replaying: std::collections::HashSet<String>,
+    /// Sessions that had a hint dropped at a bound before they had an
+    /// owner: once they do, it is told more backends need a sign-in.
+    overflowed: std::collections::HashSet<String>,
+    /// Sessions removed here: a late hint from one is ignored, though its
+    /// remote close may not have settled.
+    ended: std::collections::HashSet<String>,
+    /// The last hint passed on per (session, agent and backend): an identical
+    /// one right after it (the same hint in the other form, say) is dropped.
+    last: HashMap<(String, String), Hint>,
 }
+
+/// The most (session, agent and backend) pairs whose last hint is kept.
+const LAST_HINTS: usize = 256;
+
+type Hint = crate::ahp::auth::hint::HookHint;
+
+/// A replay in progress: dropping it ends the replay.
+struct Replay<'a> {
+    routes: &'a Routes,
+    remote: &'a str,
+}
+
+impl Drop for Replay<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .routes
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.replaying.remove(self.remote);
+    }
+}
+
+/// A held hint's key within its session: the agent that originated it
+/// (relayed from further down the tree) and its backend.
+fn hint_key(hint: &Hint) -> String {
+    format!("{}\n{}", hint.agent.as_deref().unwrap_or(""), hint.backend)
+}
+
+/// Whether a hint's link has expired: it is not replayed.
+fn expired(hint: &Hint) -> bool {
+    !hint.cleared
+        && hint
+            .expires_at
+            .is_some_and(|at| at <= crate::events::now_millis())
+}
+
+/// The most sessions remembered as overflowed or ended.
+const REMEMBERED_SESSIONS: usize = 256;
+
+/// The most hook sign-in hints held for one unrouted child session (a few
+/// backends); each session has its own, so none evicts another's.
+const HELD_HINTS: usize = 4;
+/// The most hook sign-in hints held for one child connection in all. When
+/// full a new hint is dropped: session ids come from the child, so one that
+/// invents them can fill this only for itself (`Routes` is per child), and
+/// a later turn shows a dropped link again.
+const HELD_TOTAL: usize = 64;
 /// Resume has no local transcript owner yet. Keep associations independently of
 /// the bounded content tail so eviction cannot orphan future descendant traffic.
 struct Resume {
@@ -501,16 +576,58 @@ impl Routes {
         }
     }
 
+    /// Registers `remote`'s owner, then hands `deliver` the hook sign-in
+    /// hints held for it, in order, outside the lock. Hints that arrive
+    /// while they are delivered queue behind them; the replay ends (and new
+    /// hints go straight to the owner) in the same critical section that
+    /// finds nothing more held, so no caller can leave it unfinished.
     pub(crate) fn register(
         &self,
         remote: &str,
         owner: &str,
         generation: u64,
         transcript: super::transcript::Transcript,
+        mut deliver: impl FnMut(&Hint),
     ) {
-        let Ok(mut state) = self.0.lock() else {
+        let (mut held, overflowed) = self.register_locked(remote, owner, generation, transcript);
+        if held.is_empty() && !overflowed {
             return;
+        }
+        // Ends the replay however this returns, a panic in `deliver` too, so
+        // the session's later hints are never held for good.
+        let _replay = Replay {
+            routes: self,
+            remote,
         };
+        if overflowed {
+            // What could not be held: the user is told where to look.
+            deliver(&crate::ahp::auth::hint::more_backends());
+        }
+        while !held.is_empty() {
+            for update in &held {
+                deliver(update);
+            }
+            let Ok(mut state) = self.0.lock() else {
+                return;
+            };
+            held = Self::take_held(&mut state, remote);
+            if held.is_empty() {
+                state.replaying.remove(remote);
+            }
+        }
+    }
+
+    fn register_locked(
+        &self,
+        remote: &str,
+        owner: &str,
+        generation: u64,
+        transcript: super::transcript::Transcript,
+    ) -> (Vec<Hint>, bool) {
+        let Ok(mut state) = self.0.lock() else {
+            return (Vec::new(), false);
+        };
+        state.ended.remove(remote);
         let routes = &mut state.live;
         if routes.len() < NODES || routes.contains_key(remote) {
             routes.insert(
@@ -536,6 +653,103 @@ impl Routes {
             }
             for ((remote, update), _) in resume.history {
                 Self::forward_registered(&mut state.live, &remote, update);
+            }
+        }
+        if !state.live.contains_key(remote) {
+            return (Vec::new(), false);
+        }
+        let held = Self::take_held(&mut state, remote);
+        // Only while there is something to replay do new hints queue behind.
+        if !held.is_empty() {
+            state.replaying.insert(remote.to_owned());
+        }
+        let overflowed = state.overflowed.remove(remote);
+        (held, overflowed)
+    }
+
+    fn take_held(state: &mut RoutesState, remote: &str) -> Vec<Hint> {
+        let mut held = Vec::new();
+        state.held.retain(|(session, _, update)| {
+            let mine = session == remote;
+            if mine && !expired(update) {
+                held.push(update.clone());
+            }
+            !mine
+        });
+        // Replayed hints count as passed on, for the duplicate check.
+        for hint in &held {
+            let key = (remote.to_owned(), hint_key(hint));
+            if state.last.len() < LAST_HINTS || state.last.contains_key(&key) {
+                state.last.insert(key, hint.clone());
+            }
+        }
+        held
+    }
+
+    /// Where a child session's hook sign-in hint goes: its owner and
+    /// transcript, for as long as the session lives (not only while a prompt
+    /// runs). A session with no owner yet keeps its latest hint per backend,
+    /// replayed by [`Self::register`]; a clear replaces the link it clears.
+    pub(crate) fn hook_hint(
+        &self,
+        remote: &str,
+        update: Hint,
+    ) -> Option<(String, super::transcript::Transcript, Hint)> {
+        let Ok(mut state) = self.0.lock() else {
+            return None;
+        };
+        // A removed session's late hint never brings its link back.
+        if state.ended.contains(remote) {
+            return None;
+        }
+        if !state.replaying.contains(remote)
+            && let Some(route) = state.live.get(remote)
+        {
+            let route = (route.owner.clone(), route.transcript.clone());
+            let key = (remote.to_owned(), hint_key(&update));
+            if state.last.get(&key) == Some(&update) {
+                return None;
+            }
+            if state.last.len() < LAST_HINTS || state.last.contains_key(&key) {
+                state.last.insert(key, update.clone());
+            }
+            return Some((route.0, route.1, update));
+        }
+        let key = hint_key(&update);
+        let state = &mut *state;
+        let held = &mut state.held;
+        if let Some(index) = held
+            .iter()
+            .position(|(session, held, _)| session == remote && *held == key)
+        {
+            // The latest goes last, after anything held before it.
+            held.remove(index);
+            held.push((remote.to_owned(), key, update));
+        } else if held.len() < HELD_TOTAL
+            && held
+                .iter()
+                .filter(|(session, _, _)| session == remote)
+                .count()
+                < HELD_HINTS
+        {
+            held.push((remote.to_owned(), key, update));
+        } else if state.overflowed.len() < REMEMBERED_SESSIONS {
+            state.overflowed.insert(remote.to_owned());
+        }
+        None
+    }
+
+    /// A child session ended: nothing is held for it any longer.
+    pub(crate) fn end_session(&self, remote: &str) {
+        if let Ok(mut state) = self.0.lock() {
+            // Its hints no longer have an owner to go to.
+            state.live.remove(remote);
+            state.last.retain(|(session, _), _| session != remote);
+            state.held.retain(|(session, _, _)| session != remote);
+            state.replaying.remove(remote);
+            state.overflowed.remove(remote);
+            if state.ended.len() < REMEMBERED_SESSIONS {
+                state.ended.insert(remote.to_owned());
             }
         }
     }
@@ -815,6 +1029,290 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    fn hook_hint(backend: &str, url: Option<&str>, cleared: bool) -> Hint {
+        Hint {
+            backend: backend.to_owned(),
+            agent: None,
+            url: url.map(str::to_owned),
+            expires_at: None,
+            cleared,
+            reason: cleared.then_some(crate::ahp::auth::hint::ClearReason::SignedIn),
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn a_hook_hint_reaches_its_owner_whenever_the_session_lives() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        // Before the first prompt: held, the latest per backend, a clear
+        // replacing the link it clears.
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", Some("https://a/1"), false))
+                .is_none()
+        );
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_none()
+        );
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("b", Some("https://b/1"), false))
+                .is_none()
+        );
+        // Another session's are its own.
+        assert!(
+            routes
+                .hook_hint("other", hook_hint("a", Some("https://a/2"), false))
+                .is_none()
+        );
+        let mut held = Vec::new();
+        routes.register(
+            "child",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |update| {
+                held.push(update.clone());
+            },
+        );
+        assert_eq!(
+            held,
+            [
+                hook_hint("a", None, true),
+                hook_hint("b", Some("https://b/1"), false)
+            ]
+        );
+        // Registered once, it stays routed between prompts: a link or clear
+        // published while idle reaches the owner.
+        let (owner, _, update) = routes
+            .hook_hint("child", hook_hint("a", Some("https://a/3"), false))
+            .unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(update, hook_hint("a", Some("https://a/3"), false));
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some()
+        );
+        // An ended session keeps nothing.
+        routes.end_session("other");
+        let mut replayed = 0;
+        routes.register(
+            "other",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |_| {
+                replayed += 1;
+            },
+        );
+        assert_eq!(replayed, 0);
+    }
+
+    #[test]
+    fn a_hint_during_replay_never_overtakes_an_older_one() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.hook_hint("child", hook_hint("a", Some("https://a/1"), false));
+        let mut delivered = Vec::new();
+        routes.register(
+            "child",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |update| {
+                delivered.push(update.clone());
+                // A clear arrives while the replay is delivered: it queues behind.
+                if delivered.len() == 1 {
+                    assert!(
+                        routes
+                            .hook_hint("child", hook_hint("a", None, true))
+                            .is_none()
+                    );
+                }
+            },
+        );
+        assert_eq!(
+            delivered,
+            [
+                hook_hint("a", Some("https://a/1"), false),
+                hook_hint("a", None, true)
+            ]
+        );
+        // The replay is over: hints go straight through.
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", Some("https://a/2"), false))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn expired_held_links_are_not_replayed_and_agents_do_not_collide() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        let mut expired = hook_hint("a", Some("https://a/old"), false);
+        expired.expires_at = Some(1);
+        routes.hook_hint("child", expired);
+        // A grandchild's link for the same backend, relayed by the child.
+        let mut relayed = hook_hint("b", Some("https://b/grandchild"), false);
+        relayed.agent = Some("s-grandchild".into());
+        routes.hook_hint("child", hook_hint("b", Some("https://b/own"), false));
+        routes.hook_hint("child", relayed.clone());
+        let mut held = Vec::new();
+        routes.register(
+            "child",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |update| {
+                held.push(update.clone());
+            },
+        );
+        assert_eq!(
+            held,
+            [hook_hint("b", Some("https://b/own"), false), relayed]
+        );
+    }
+
+    #[test]
+    fn held_hook_hints_are_bounded() {
+        let routes = Routes::default();
+        for backend in 0..HELD_HINTS + 4 {
+            routes.hook_hint(
+                "child",
+                hook_hint(&backend.to_string(), Some("https://x"), false),
+            );
+        }
+        assert_eq!(routes.0.lock().unwrap().held.len(), HELD_HINTS);
+        // Each session has its own bound.
+        routes.hook_hint("other", hook_hint("0", Some("https://x"), false));
+        assert_eq!(routes.0.lock().unwrap().held.len(), HELD_HINTS + 1);
+        // A child inventing session ids fills no more than the whole bound,
+        // and scans no longer list.
+        for session in 0..HELD_TOTAL * 4 {
+            routes.hook_hint(
+                &format!("made-up-{session}"),
+                hook_hint("0", Some("https://x"), false),
+            );
+        }
+        assert_eq!(routes.0.lock().unwrap().held.len(), HELD_TOTAL);
+    }
+
+    #[test]
+    fn a_panic_mid_replay_does_not_hold_later_hints() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.hook_hint("child", hook_hint("a", Some("https://a/1"), false));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            routes.register(
+                "child",
+                "owner",
+                1,
+                transcripts.get("owner", 1).unwrap(),
+                |_| panic!("delivery failed"),
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some(),
+            "a later hint is held after the replay panicked"
+        );
+        // So too when the panic is in delivering the overflow notice.
+        for backend in 0..HELD_HINTS + 1 {
+            routes.hook_hint(
+                "over",
+                hook_hint(&backend.to_string(), Some("https://x"), false),
+            );
+        }
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            routes.register(
+                "over",
+                "owner",
+                1,
+                transcripts.get("owner", 1).unwrap(),
+                |hint| {
+                    if hint.backend == crate::ahp::auth::hint::MORE_BACKENDS {
+                        panic!("delivery failed");
+                    }
+                },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            routes
+                .hook_hint("over", hook_hint("0", None, true))
+                .is_some(),
+            "a later hint is held after the overflow notice panicked"
+        );
+    }
+
+    #[test]
+    fn the_same_hint_in_the_other_form_is_passed_on_once() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.register(
+            "child",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |_| {},
+        );
+        let link = hook_hint("a", Some("https://a/1"), false);
+        assert!(routes.hook_hint("child", link.clone()).is_some());
+        assert!(routes.hook_hint("child", link.clone()).is_none());
+        // A change goes through, and then the earlier one again.
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some()
+        );
+        assert!(routes.hook_hint("child", link).is_some());
+    }
+
+    #[test]
+    fn a_closed_session_routes_no_late_hint_however_many_closed_before() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.register(
+            "first",
+            "owner",
+            1,
+            transcripts.get("owner", 1).unwrap(),
+            |_| {},
+        );
+        routes.end_session("first");
+        // Many more sessions close on the same connection.
+        for session in 0..REMEMBERED_SESSIONS + 8 {
+            let session = format!("other-{session}");
+            routes.register(
+                &session,
+                "owner",
+                1,
+                transcripts.get("owner", 1).unwrap(),
+                |_| {},
+            );
+            routes.end_session(&session);
+        }
+        assert!(
+            routes
+                .hook_hint("first", hook_hint("a", Some("https://late"), false))
+                .is_none()
+        );
+        assert!(!routes.0.lock().unwrap().live.contains_key("first"));
+    }
+
     #[test]
     fn nested_routes_and_directed_message_ids_are_stable_and_distinct() {
         let transcripts = super::super::transcript::Transcripts::default();
@@ -830,7 +1328,7 @@ mod tests {
                 &crate::events::SubagentRuntime::default(),
             );
             transcripts.start(child, 1);
-            routes.register(child, child, 1, transcripts.get(child, 1).unwrap());
+            routes.register(child, child, 1, transcripts.get(child, 1).unwrap(), |_| {});
         }
         rx.try_recv().unwrap();
         rx.try_recv().unwrap();
@@ -1055,7 +1553,13 @@ mod tests {
         );
         transcripts.start("child", 1);
         let routes = Routes::default();
-        routes.register("remote", "child", 1, transcripts.get("child", 1).unwrap());
+        routes.register(
+            "remote",
+            "child",
+            1,
+            transcripts.get("child", 1).unwrap(),
+            |_| {},
+        );
         rx.try_recv().unwrap();
         routes.forward("remote", json!({"sessionUpdate":"subagent_update", "sessionId":"nested", "_meta":{"kit/subagent/steer":{"generation":1,"canSteer":true}}}));
         assert_eq!(
@@ -1194,7 +1698,13 @@ mod tests {
             "remote",
             json!({"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}),
         );
-        routes.register("remote", "child", 1, transcripts.get("child", 1).unwrap());
+        routes.register(
+            "remote",
+            "child",
+            1,
+            transcripts.get("child", 1).unwrap(),
+            |_| {},
+        );
         let association = rx.try_recv().unwrap();
         assert_eq!(association.1["_meta"], json!({"two":2,"three":3}));
         let nested = association.1["sessionId"].as_str().unwrap();
@@ -1241,7 +1751,13 @@ mod tests {
             for sequence in 0..content_count {
                 routes.forward("nested", json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":sequence.to_string()}}));
             }
-            routes.register("remote", "child", 1, transcripts.get("child", 1).unwrap());
+            routes.register(
+                "remote",
+                "child",
+                1,
+                transcripts.get("child", 1).unwrap(),
+                |_| {},
+            );
             let association = rx.try_recv().unwrap();
             assert_eq!(
                 association.1["state"]["state"],
@@ -1279,7 +1795,13 @@ mod tests {
             let mut rx = transcripts.stream.subscribe("parent".into(), false);
             rx.try_recv().unwrap();
             let routes = Routes::default();
-            routes.register("remote", "child", 1, transcripts.get("child", 1).unwrap());
+            routes.register(
+                "remote",
+                "child",
+                1,
+                transcripts.get("child", 1).unwrap(),
+                |_| {},
+            );
             let mut views: HashMap<String, super::super::messages::Messages> = HashMap::new();
             let updates = [
                 (

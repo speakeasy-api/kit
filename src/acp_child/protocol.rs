@@ -67,7 +67,10 @@ pub(super) struct PermissionRequest {
     pub options: Vec<v1::PermissionOption>,
 }
 
-fn initialize_params(version: Version) -> Result<Value, Error> {
+/// `hook_hints`: the child is Kit's own, so it is asked for its hook
+/// sign-in hints as `kit/hooks/auth` notifications. Any other harness is
+/// offered nothing it does not need.
+fn initialize_params(version: Version, hook_hints: bool) -> Result<Value, Error> {
     let mut params = serde_json::to_value(
         v1::InitializeRequest::new(match version {
             Version::V1 => ProtocolVersion::V1,
@@ -87,10 +90,21 @@ fn initialize_params(version: Version) -> Result<Value, Error> {
     if version == Version::V1 {
         return Ok(params);
     }
-    let v2_params = serde_json::to_value(v2::InitializeRequest::new(
+    let mut request = v2::InitializeRequest::new(
         ProtocolVersion::V2,
         v2::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
-    ))?;
+    );
+    if hook_hints {
+        // A Kit child then sends its hook sign-in hints as structured
+        // `kit/hooks/auth` notifications, which are relayed to the user.
+        request = request.capabilities(v2::ClientCapabilities::new().meta(
+            serde_json::Map::from_iter([(
+                crate::ahp::auth::HOOK_AUTH_META.to_owned(),
+                serde_json::json!({}),
+            )]),
+        ));
+    }
+    let v2_params = serde_json::to_value(request)?;
     if let (Some(params), Value::Object(v2_params)) = (params.as_object_mut(), v2_params) {
         params.extend(v2_params);
     }
@@ -112,11 +126,12 @@ pub(super) fn requires_v1(error: &Error) -> bool {
 pub(super) async fn initialize(
     connection: &ConnectionTo<Agent>,
     offer: Version,
+    hook_hints: bool,
 ) -> Result<Initialized, Error> {
     let response = connection
         .send_request(UntypedMessage::new(
             "initialize",
-            initialize_params(offer)?,
+            initialize_params(offer, hook_hints)?,
         )?)
         .block_task()
         .await?;
@@ -367,8 +382,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn only_kits_own_child_is_asked_for_hook_sign_in_hints() {
+        let params = initialize_params(Version::V2, true).unwrap();
+        assert_eq!(
+            params["capabilities"]["_meta"][crate::ahp::auth::HOOK_AUTH_META],
+            json!({})
+        );
+        let params = initialize_params(Version::V2, false).unwrap();
+        assert_eq!(params["capabilities"], json!({}));
+    }
+
+    #[test]
     fn handshake_identifies_kit_without_advertising_services() {
-        let params = initialize_params(Version::V2).unwrap();
+        let params = initialize_params(Version::V2, false).unwrap();
         assert_eq!(params["protocolVersion"], 2);
         assert_eq!(params["clientInfo"], params["info"]);
         assert_eq!(params["info"]["name"], "kit");

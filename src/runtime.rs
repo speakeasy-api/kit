@@ -1182,7 +1182,7 @@ impl Runtime {
     pub fn with_hooks(runtime: Arc<Self>) -> Result<Arc<Self>, String> {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure agent hooks after runtime was shared".to_string())?;
-        runtime.hooks = crate::ahp::Hooks::load(&runtime.root);
+        runtime.hooks = crate::ahp::Hooks::load(&runtime.root, &runtime.credential_storage);
         runtime.hooks_enabled = true;
         Ok(Arc::new(runtime))
     }
@@ -1232,6 +1232,14 @@ impl Runtime {
 
     pub(crate) fn hooks(&self) -> Option<&crate::ahp::Hooks> {
         self.hooks.as_deref()
+    }
+
+    /// Hook sign-in stores grants, so it needs durable credential storage,
+    /// and hooks enabled. It is offered whatever the launch workspace's
+    /// hooks: a session may attach to another workspace, and the method
+    /// checks which of that workspace's backends need sign-in when it runs.
+    pub(crate) fn supports_hook_authentication(&self) -> bool {
+        self.credential_storage.is_persistent() && self.hooks_enabled
     }
 
     pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
@@ -1650,7 +1658,7 @@ impl Runtime {
             skill_package_roots: self.skill_package_roots.clone(),
             skill_directories: self.skill_directories.clone(),
             hooks: if self.hooks_enabled {
-                crate::ahp::Hooks::load(&root)
+                crate::ahp::Hooks::load(&root, &self.credential_storage)
             } else {
                 None
             },
@@ -1726,6 +1734,12 @@ impl Runtime {
     }
 
     /// Returns the depth inherited by this runtime process.
+    /// What a child spawned now starts from.
+    #[cfg(test)]
+    pub(crate) fn child_config_for_test(&self) -> crate::acp_child::ChildConfig {
+        self.subagents.child_config()
+    }
+
     pub const fn base_depth(&self) -> usize {
         self.base_depth
     }
@@ -2040,6 +2054,21 @@ impl Runtime {
                         error,
                     )
                 })?;
+            // No client is attached: the session's hook sign-in hints, its
+            // child agents' included, go to the user's terminal, unless a
+            // Kit parent keeps this stderr as a log.
+            let hook_hints = crate::ahp::auth::stderr_is_the_users().then(|| {
+                crate::ahp::auth::subscribe_terminal(
+                    &subagents,
+                    self.hooks(),
+                    session_id.clone(),
+                    |line| {
+                        // The link is shown, never logged.
+                        tracing::info!("shown a hook sign-in hint");
+                        eprintln!("{line}");
+                    },
+                )
+            });
             let trigger = if request.resume {
                 SessionStartInputTrigger::Resume
             } else {
@@ -2106,13 +2135,13 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation))
+            Ok::<_, String>((driver, pending_creation, hook_hints))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation) = {
+        let (mut driver, pending_creation, _hook_hints) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {

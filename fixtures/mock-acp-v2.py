@@ -84,6 +84,46 @@ def respond(request_id, result):
     send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
+# Whether the client asked for structured hook sign-in hints, as a parent
+# Kit asks its own Kit child; otherwise hints are marked notices, as a v1
+# Kit sends them.
+hook_structured = False
+
+
+def hook_notice(session_id, url, agent=None, reason=None, problem=None, backend="test.hook"):
+    """A Kit child's hook sign-in hint: a link, or a clear."""
+    hint = {"sessionId": session_id, "backend": backend, "cleared": url is None}
+    if url is not None:
+        hint["url"] = url
+    if url is None:
+        hint["reason"] = reason or "signed_in"
+    if agent is not None:
+        hint["agent"] = agent
+    if problem is not None:
+        hint["problem"] = problem
+    if hook_structured:
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": hint})
+        return
+    mark = {key: value for key, value in hint.items() if key != "sessionId"}
+    title = f"Hook backend `{backend}` needs you to sign in. Open {url} to approve Kit." if url else f"Hook backend `{backend}` is signed in."
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {
+        "sessionUpdate": "notice", "severity": "info", "title": title, "_meta": {"kit/hooks/auth": mark},
+    }}})
+
+
+def link(value):
+    # Never in the prompt that asks for it, so a test can tell where it went.
+    return f"https://auth.example/{value}/secret-link"
+
+
+def token(text, name):
+    prefix = name + "="
+    for word in text.split():
+        if word.startswith(prefix):
+            return word[len(prefix):]
+    return None
+
+
 def log_request(request):
     if request_log is None:
         return
@@ -281,6 +321,36 @@ def prompt(request):
                 sys.stderr.write("\x01kit-runtime\x01" + json.dumps({"event": "child_finished", "call": "call-1:compose:shell", "tool": "shell", "ok": True, "summary": "done", "millis": 2}) + "\nmock diagnostic\n")
                 sys.stderr.flush()
         text = "rich done"
+    if "MOCK_HOOK_MALFORMED" in text:
+        # Not well formed: no backend, a script link, an empty agent; and a
+        # marked notice where a structured hint belongs.
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "url": link("bad")}})
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "backend": "test.hook", "url": "javascript:alert(1)//secret-link"}})
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "backend": "test.hook", "agent": "", "url": link("bad")}})
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "backend": 7, "cleared": "yes"}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {
+            "sessionUpdate": "notice", "severity": "info", "title": "Open " + link("marked"),
+            "_meta": {"kit/hooks/auth": "not an object"}}}})
+    if token(text, "MOCK_HOOK_LINK"):
+        hook_notice(session_id, link(token(text, "MOCK_HOOK_LINK")))
+    if token(text, "MOCK_HOOK_PROBLEM"):
+        url = link(token(text, "MOCK_HOOK_PROBLEM"))
+        hook_notice(session_id, url)
+        hook_notice(session_id, url, problem="needs you to sign in, but Kit could not start it: discovery_failed.")
+    if token(text, "MOCK_HOOK_RELAYED"):
+        hook_notice(session_id, link(token(text, "MOCK_HOOK_RELAYED")), agent="s-b")
+    idle_link = token(text, "MOCK_HOOK_AFTER") and link(token(text, "MOCK_HOOK_AFTER"))
+    idle_clear = token(text, "MOCK_HOOK_CLEAR_AFTER")
+    if idle_link or idle_clear:
+        # Sent while idle, after the turn has ended.
+        def later():
+            time.sleep(0.3)
+            if idle_link:
+                hook_notice(session_id, idle_link)
+                time.sleep(0.3)
+            if idle_clear:
+                hook_notice(session_id, None, reason=idle_clear)
+        threading.Thread(target=later, daemon=True).start()
     if "MOCK_SHARED_MESSAGE_IDS" in text:
         for role, value in [("user_message", "User text"), ("agent_thought_chunk", "Thought text"), ("agent_message_chunk", "Assistant text")]:
             content = {"type": "text", "text": value}
@@ -399,6 +469,8 @@ for line in sys.stdin:
     method = request.get("method")
     log_request(request)
     if method == "initialize":
+        capabilities = request.get("params", {}).get("capabilities", {})
+        hook_structured = "kit/hooks/auth" in (capabilities.get("_meta") or {}) and "--hook-marked" not in sys.argv
         respond(request["id"], {
             "protocolVersion": int(option("--protocol-version") or "2"),
             "info": {"name": "mock-acp", "version": "2.0.0"},
@@ -433,6 +505,14 @@ for line in sys.stdin:
                     {"value": value, "name": value} for value in model_ids
                 ],
             }]
+        if option("--hook-notice-at-start"):
+            # Before the session exists for the parent: no owner is routed.
+            hook_notice(result["sessionId"], link(option("--hook-notice-at-start")))
+        if option("--hook-backends-at-start"):
+            # More backends than a parent holds, sent before the session even
+            # exists for it: none can be routed yet.
+            for n in range(int(option("--hook-backends-at-start"))):
+                hook_notice(result["sessionId"], link(f"many-{n}"), backend=f"test.hook-{n}")
         respond(request["id"], result)
         if "--crash-after-new" in sys.argv:
             threading.Thread(target=lambda: (time.sleep(0.05), os._exit(86)), daemon=True).start()
@@ -442,6 +522,8 @@ for line in sys.stdin:
                 {"name": "compact", "description": "Compact the session context"}
             ]},
         }})
+
+
     elif method == "session/list":
         cursor = request.get("params", {}).get("cursor")
         if cursor is None:

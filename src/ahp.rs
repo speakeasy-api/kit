@@ -1,4 +1,5 @@
 //! Agent Hooks Protocol integration at Kit's native lifecycle seams.
+pub(crate) mod auth;
 mod injection;
 pub(crate) mod messages;
 mod model;
@@ -67,6 +68,7 @@ pub struct Hooks {
     messages: messages::Routes,
     turn_events: turn::TurnQueues,
     root: Option<std::path::PathBuf>,
+    auth: Option<auth::HookAuth>,
 }
 
 impl Hooks {
@@ -86,20 +88,23 @@ impl Hooks {
 
     /// Loads `~/.agents/hooks.json`, then `<root>/.agents/hooks.json`. Project
     /// hooks replace global hooks with the same id. Invalid files are skipped.
-    pub(crate) fn load(root: &Path) -> Option<Arc<Self>> {
-        let mut merged: Option<Registration> = None;
-        for directory in crate::runtime::agents_directories(root).iter().rev() {
-            let path = directory.join(CONFIG_FILE);
-            match read(&path) {
-                Ok(Some(registration)) => merge(&mut merged, registration),
-                Ok(None) => {}
-                Err(error) => eprintln!("kit: ignoring {}: {error}", path.display()),
+    /// Backends that need sign-in stay registered; see [`auth`].
+    pub(crate) fn load(
+        root: &Path,
+        storage: &crate::credentials::CredentialStorage,
+    ) -> Option<Arc<Self>> {
+        let (registration, sources) = effective_registration_sources(root)?;
+        let auth = match serde_json::to_value(&registration) {
+            Ok(value) => auth::HookAuth::new(storage.clone(), &value, &sources),
+            Err(error) => {
+                eprintln!("kit: agent hooks disabled: {error}");
+                return None;
             }
-        }
-        let registration = merged?;
-        match options().and_then(|options| Self::new(registration, options)) {
+        };
+        match options().and_then(|options| Self::new(registration, auth.install(options))) {
             Ok(mut hooks) => {
                 hooks.root = Some(root.to_path_buf());
+                hooks.auth = Some(auth);
                 Some(Arc::new(hooks))
             }
             Err(error) => {
@@ -107,6 +112,14 @@ impl Hooks {
                 None
             }
         }
+    }
+
+    /// Shows hook sign-in hints for this workspace's backends to `sink`.
+    pub(crate) fn subscribe_auth_hints(
+        &self,
+        sink: impl Fn(&auth::AuthHint) + Send + Sync + 'static,
+    ) -> Option<auth::HintSubscription> {
+        self.auth.as_ref().map(|auth| auth.subscribe(sink))
     }
 
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
@@ -118,6 +131,7 @@ impl Hooks {
             messages: messages::Routes::default(),
             turn_events: turn::TurnQueues::default(),
             root: None,
+            auth: None,
         })
     }
 
@@ -381,11 +395,56 @@ fn options() -> Result<HooksOptions, String> {
         capabilities,
     );
     options.backend.inherit_environment = true;
-    // A user-configured hook is trusted to receive event bodies and choose its
-    // upload destinations, credential bindings, and header forwarding policy.
-    // Discovery does not expand Kit's host event/effect grants.
-    options.authorize_configuration = Some(Arc::new(|_, _| Ok(true)));
     Ok(options)
+}
+
+/// The global registration with project backends merged over it, and the
+/// hooks file that declares each backend.
+pub(crate) fn effective_registration_sources(
+    root: &Path,
+) -> Option<(Registration, std::collections::BTreeMap<String, String>)> {
+    let mut merged: Option<Registration> = None;
+    let mut sources = std::collections::BTreeMap::new();
+    for directory in crate::runtime::agents_directories(root).iter().rev() {
+        let path = directory.join(CONFIG_FILE);
+        match read(&path) {
+            Ok(Some(registration)) => {
+                let source =
+                    source_identity(&std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()));
+                for backend in &registration.hooks {
+                    sources.insert(backend.id.to_string(), source.clone());
+                }
+                merge(&mut merged, registration);
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("kit: ignoring {}: {error}", path.display()),
+        }
+    }
+    merged.map(|registration| (registration, sources))
+}
+
+/// The identity of a declaring hooks file in credential scopes: the path
+/// itself when it is UTF-8 (as it always was, so stored sign-ins are still
+/// found), else a lossless encoding of its native bytes. A canonical path is
+/// absolute, so the `os:` prefix never collides with a UTF-8 one, and two
+/// distinct non-UTF-8 paths never share an identity.
+fn source_identity(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_owned();
+    }
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec();
+    #[cfg(windows)]
+    let bytes: Vec<u8> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .flat_map(u16::to_be_bytes)
+        .collect();
+    #[cfg(not(any(unix, windows)))]
+    let bytes = path.to_string_lossy().into_owned().into_bytes();
+    let mut identity = String::from("os:");
+    for byte in bytes {
+        identity.push_str(&format!("{byte:02x}"));
+    }
+    identity
 }
 
 fn read(path: &Path) -> Result<Option<Registration>, String> {

@@ -69,6 +69,19 @@ pub enum Update {
     },
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
+    /// A hook backend's sign-in link for a session, or that it no longer
+    /// needs one, or why it could not be prepared.
+    HookSignIn {
+        session_id: String,
+        backend: String,
+        problem: Option<String>,
+        url: Option<String>,
+        expires_at_ms: Option<u64>,
+        cleared: bool,
+        /// A child agent's link (`a`, or `a/b` relayed by a); `None` for the
+        /// session's own.
+        agent: Option<String>,
+    },
     /// Result of listing sessions without blocking the terminal event loop.
     SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
     FileMatches {
@@ -733,6 +746,18 @@ pub enum Block {
         millis: u64,
     },
     Notice(String),
+    /// A hook backend's sign-in link, shown in full once per link. It is
+    /// for the user only and never reaches the model.
+    HookSignIn {
+        /// Which sign-in it is: the agent path it is for (`None` for the
+        /// session's own) and the backend id.
+        id: HookId,
+        /// How it is named on screen.
+        label: String,
+        url: String,
+        /// Completed, expired or replaced: shown without its link.
+        retired: bool,
+    },
     Error(String),
 }
 
@@ -873,6 +898,18 @@ pub struct App {
     pub(super) gateway_epoch: u64,
     pub(super) gateway_blocked: bool,
     pub(super) gateway_status: Option<String>,
+    /// Pending hook sign-in links, with their Unix-ms expiry. By session,
+    /// agent and backend, so another session's late updates never change
+    /// this view, and a session's links return when it does.
+    hook_sign_ins: std::collections::BTreeMap<HookKey, (String, Option<u64>)>,
+    /// Sign-in problems already shown, by session, agent and backend.
+    hook_problems: std::collections::BTreeMap<HookKey, String>,
+    /// Sessions left since they were last attached. Their cached sign-in
+    /// state is dropped on leaving and late hints for them are ignored: a
+    /// new attachment's replay is the authority.
+    hook_detached: std::collections::BTreeSet<String>,
+    /// Agents removed here: a late sign-in hint for one is ignored.
+    removed_hook_agents: std::collections::BTreeSet<String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1182,12 +1219,133 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
     }
 }
 
+/// How a hook sign-in is named on screen: its backend, and for a child
+/// agent's, the agent it is for.
+/// A hook sign-in within a session: the agent path it is for (`None` for
+/// the session's own) and the backend id. Its label is only for display:
+/// two sign-ins can share one.
+pub(super) type HookId = (Option<String>, String);
+/// A hook sign-in across sessions: the session, then its [`HookId`].
+type HookKey = (String, HookId);
+
+fn hook_label(backend: &str, agent: Option<&str>) -> String {
+    match agent {
+        Some(agent) if backend == crate::ahp::auth::hint::MORE_BACKENDS => {
+            format!("more hook backends (agent {agent})")
+        }
+        Some(agent) => format!("{backend} (agent {agent})"),
+        None => backend.to_owned(),
+    }
+}
+
+/// A problem is a clause that says what went wrong with the sign-in.
+fn hook_problem_text(label: &str, problem: &str) -> String {
+    format!("Hook backend {label} {problem}")
+}
+
+impl App {
+    /// Forgets, and retires on screen, the child sign-in links of every agent
+    /// `gone` names: links are keyed by the agent path they are for
+    /// (`a/b` for b's, relayed by a), so any agent on the path counts.
+    fn retire_subagent_hook_links(&mut self, gone: impl Fn(&str) -> bool) {
+        let for_gone = |key: &HookKey| {
+            key.1
+                .0
+                .as_deref()
+                .is_some_and(|path| path.split('/').any(&gone))
+        };
+        let retired: std::collections::BTreeSet<_> = self
+            .hook_sign_ins
+            .keys()
+            .chain(self.hook_problems.keys())
+            .filter(|key| for_gone(key))
+            .cloned()
+            .collect();
+        for key in retired {
+            if self.session_id.as_deref() == Some(key.0.as_str()) {
+                self.retire_hook_sign_ins(&key.1);
+            }
+            self.hook_sign_ins.remove(&key);
+            self.hook_problems.remove(&key);
+        }
+    }
+
+    /// Retires the current session's sign-in links whose deadline passed.
+    fn expire_hook_sign_ins(&mut self, now_unix_ms: u64) {
+        let Some(session) = self.session_id.clone() else {
+            return;
+        };
+        let expired: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|((owner, _), (_, expiry))| {
+                *owner == session && expiry.is_some_and(|at| at <= now_unix_ms)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            self.retire_hook_sign_ins(&key.1);
+            self.hook_sign_ins.remove(&key);
+        }
+    }
+
+    /// Shows sign-in `id`'s links in the current view without their link:
+    /// completed, expired or replaced.
+    fn retire_hook_sign_ins(&mut self, id: &HookId) {
+        let retiring: Vec<_> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                matches!(block, Block::HookSignIn { id: shown, retired: false, .. } if shown == id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in retiring {
+            if let Some(Block::HookSignIn { retired, .. }) = self.blocks.get_mut(index) {
+                *retired = true;
+            }
+            self.mark_block_dirty(index);
+        }
+    }
+
+    /// The status-line hint for hook backends waiting for sign-in, while
+    /// their links last. Only the user sees it; the model never does.
+    pub(super) fn hook_sign_in_status(&self) -> Option<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let session = self.session_id.as_deref()?;
+        let live: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|((owner, _), (_, expiry))| {
+                owner == session && expiry.is_none_or(|expiry| u128::from(expiry) > now)
+            })
+            .map(|((_, (agent, backend)), _)| hook_label(backend, agent.as_deref()))
+            .collect();
+        // Short: the full link is in the transcript, where it wraps.
+        match live.as_slice() {
+            [] => None,
+            [backend] => Some(format!("sign in to hook {backend} needed (link above)")),
+            [backend, rest @ ..] => Some(format!(
+                "sign in to hook {backend} and {} more needed (links above)",
+                rest.len()
+            )),
+        }
+    }
+}
+
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
             gateway_epoch: 0,
             gateway_blocked: false,
             gateway_status: None,
+            hook_sign_ins: Default::default(),
+            hook_problems: Default::default(),
+            hook_detached: Default::default(),
+            removed_hook_agents: Default::default(),
             gateway_candidate: None,
             child_focus: None,
             session_messages: HashMap::new(),
@@ -1575,6 +1733,7 @@ impl App {
 
     fn tick_at(&mut self, now_unix_ms: u64) {
         self.tick = self.tick.wrapping_add(1);
+        self.expire_hook_sign_ins(now_unix_ms);
         self.agents.retain(|_, row| {
             row.status != SubagentStatus::Removed
                 || row.outcome != Some(GenerationOutcome::Failed)
@@ -2340,6 +2499,81 @@ impl App {
             Update::OpenUserImage(_) => {}
             Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
+            Update::HookSignIn {
+                session_id,
+                backend,
+                problem,
+                url,
+                expires_at_ms,
+                cleared,
+                agent,
+            } => {
+                // From an attachment that has ended: its replacement replays.
+                if self.hook_detached.contains(&session_id) {
+                    return;
+                }
+                // A late hint for an agent already removed here.
+                if agent.as_deref().is_some_and(|path| {
+                    path.split('/')
+                        .any(|id| self.removed_hook_agents.contains(id))
+                }) {
+                    return;
+                }
+                let current = self.session_id.as_deref() == Some(session_id.as_str());
+                let label = hook_label(&backend, agent.as_deref());
+                let key: HookKey = (session_id, (agent.clone(), backend.clone()));
+                // An expired link is never shown.
+                let cleared =
+                    cleared || expires_at_ms.is_some_and(|at| at <= crate::events::now_millis());
+                let url = url.filter(|_| !cleared);
+                let problem = problem.filter(|_| !cleared);
+                match url {
+                    Some(url) => {
+                        let new = self
+                            .hook_sign_ins
+                            .get(&key)
+                            .is_none_or(|(shown, _)| *shown != url);
+                        if new && current {
+                            self.retire_hook_sign_ins(&key.1);
+                            self.push_block(Block::HookSignIn {
+                                id: key.1.clone(),
+                                label: label.clone(),
+                                url: url.clone(),
+                                retired: false,
+                            });
+                        }
+                        self.hook_sign_ins.insert(key.clone(), (url, expires_at_ms));
+                    }
+                    None => {
+                        if current {
+                            self.retire_hook_sign_ins(&key.1);
+                        }
+                        self.hook_sign_ins.remove(&key);
+                    }
+                }
+                // Shown once per distinct problem, beside any link.
+                match problem {
+                    Some(problem) => {
+                        let text = match agent.as_deref() {
+                            Some(agent) if backend == crate::ahp::auth::hint::MORE_BACKENDS => {
+                                format!(
+                                    "Agent {agent}: more hook backends need you to sign in {problem}"
+                                )
+                            }
+                            _ => hook_problem_text(&label, &problem),
+                        };
+                        if self.hook_problems.get(&key) != Some(&text) {
+                            if current {
+                                self.push_block(Block::Notice(text.clone()));
+                            }
+                            self.hook_problems.insert(key, text);
+                        }
+                    }
+                    None => {
+                        self.hook_problems.remove(&key);
+                    }
+                }
+            }
             Update::SessionCatalog(result) => {
                 self.session_catalog_pending = false;
                 match result {
@@ -2875,6 +3109,8 @@ impl App {
                             .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
                 {
                     self.agents.remove(&id);
+                    self.removed_hook_agents.insert(id.clone());
+                    self.retire_subagent_hook_links(|agent| agent == id);
                 } else {
                     if !self.agents_auto_opened && status != SubagentStatus::Removed {
                         self.agents_visible = true;
@@ -2986,6 +3222,8 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
+                self.removed_hook_agents.extend(removed.iter().cloned());
+                self.retire_subagent_hook_links(|agent| removed.contains(agent));
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
@@ -3225,6 +3463,18 @@ impl App {
         session_id: String,
         presentation: SessionPresentation,
     ) {
+        // Leaving a session ends its attachment: what it cached may clear
+        // while detached, so the next attachment rebuilds it from replay.
+        if let Some(previous) = self.session_id.clone()
+            && previous != session_id
+        {
+            self.hook_sign_ins
+                .retain(|(owner, _), _| *owner != previous);
+            self.hook_problems
+                .retain(|(owner, _), _| *owner != previous);
+            self.hook_detached.insert(previous);
+        }
+        self.hook_detached.remove(&session_id);
         self.session_presentation = presentation;
         self.elicitations.clear();
         self.model_switch = None;
@@ -3301,6 +3551,38 @@ impl App {
         self.row_code.clear();
         self.selection = None;
         self.press = None;
+        // The new session's pending sign-in links, including ones that
+        // arrived while it attached; an expired link is not shown again.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let links: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|((owner, _), (_, expiry))| {
+                self.session_id.as_deref() == Some(owner.as_str())
+                    && expiry.is_none_or(|expiry| u128::from(expiry) > now)
+            })
+            .map(|((_, id), (url, _))| (id.clone(), url.clone()))
+            .collect();
+        for (id, url) in links {
+            self.push_block(Block::HookSignIn {
+                label: hook_label(&id.1, id.0.as_deref()),
+                id,
+                url,
+                retired: false,
+            });
+        }
+        // And its unresolved sign-in problems.
+        let problems: Vec<_> = self
+            .hook_problems
+            .iter()
+            .filter(|((owner, _), _)| self.session_id.as_deref() == Some(owner.as_str()))
+            .map(|(_, text)| text.clone())
+            .collect();
+        for text in problems {
+            self.push_block(Block::Notice(text));
+        }
     }
 
     /// Folds a tool call's raw output open or shut. Completed compose calls

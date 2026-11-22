@@ -888,9 +888,14 @@ fn credential_storage_for_launch(
 }
 
 fn client_capabilities(credential_storage: &CredentialStorage) -> wire::ClientCapabilities {
-    let capabilities = wire::ClientCapabilities::new().elicitation(
-        wire::ElicitationCapabilities::new().form(wire::ElicitationFormCapabilities::new()),
-    );
+    let capabilities = wire::ClientCapabilities::new()
+        .elicitation(
+            wire::ElicitationCapabilities::new().form(wire::ElicitationFormCapabilities::new()),
+        )
+        .meta(serde_json::Map::from_iter([(
+            crate::protocols::acp::v2::HOOK_AUTH_META.into(),
+            serde_json::json!({}),
+        )]));
     if credential_storage.is_persistent() {
         capabilities.auth(
             wire::ClientAuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
@@ -998,6 +1003,23 @@ fn terminal_auth_command(
     root: &Path,
     method: &wire::AuthMethodTerminal,
 ) -> tokio::process::Command {
+    let mut invocation = invocation.clone();
+    if method.method_id.0.as_ref() == "hooks" {
+        // Hook credentials belong to the requested workspace, not the agent's
+        // original launch root. Changing only current_dir leaves --root stale.
+        let mut args = Vec::with_capacity(invocation.args.len() + 2);
+        let mut original = invocation.args.into_iter();
+        while let Some(arg) = original.next() {
+            if arg == "--root" {
+                original.next();
+            } else if !arg.to_string_lossy().starts_with("--root=") {
+                args.push(arg);
+            }
+        }
+        args.push("--root".into());
+        args.push(root.as_os_str().to_owned());
+        invocation.args = args;
+    }
     let mut command = invocation.command();
     command
         .env_remove(OPENROUTER_API_KEY_ENV)
@@ -1678,6 +1700,7 @@ async fn run_client(
         ));
         let question_origin = questions.origin.clone();
         let notifications = updates_tx.clone();
+        let hook_sign_ins = updates_tx.clone();
         let cleanup_root = root.clone();
         let transition_session = Arc::clone(&active_persisted_id);
         let notification_session = Arc::clone(&active_persisted_id);
@@ -1717,6 +1740,16 @@ async fn run_client(
                         )
                     };
                     let _ = notifications.send(queued);
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            async move |notification: crate::protocols::acp::v2::HookAuthNotification, _cx| {
+                // Kept per session: the app shows only the current session's.
+                if let Some(update) = hook_sign_in(notification) {
+                    let _ = hook_sign_ins.send(QueuedUpdate::global(update));
                 }
                 Ok(())
             },
@@ -4060,6 +4093,25 @@ fn previous_session_for_resume(
 }
 
 /// Maps one ACP session notification onto client updates.
+/// The update for a `kit/hooks/auth` notification from the agent, local
+/// or remote: its hint passes the check every hint entering a Kit process
+/// passes, or it is dropped, since the app makes its link clickable.
+fn hook_sign_in(notification: crate::protocols::acp::v2::HookAuthNotification) -> Option<Update> {
+    let Some(hint) = notification.hint.validated() else {
+        tracing::warn!("dropped a malformed hook sign-in hint from the agent");
+        return None;
+    };
+    Some(Update::HookSignIn {
+        session_id: notification.session_id.to_string(),
+        backend: hint.backend,
+        problem: hint.problem,
+        url: hint.url,
+        expires_at_ms: hint.expires_at,
+        cleared: hint.cleared,
+        agent: hint.agent,
+    })
+}
+
 fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
     let session_id = notification.session_id.to_string();
     let updates = match notification.update {
@@ -4918,6 +4970,35 @@ mod tests {
             assert!(args.windows(2).any(|args| {
                 args[0] == "--mcp-config" && args[1] == mcp_config.to_string_lossy()
             }));
+        }
+    }
+
+    #[test]
+    fn hook_terminal_auth_uses_the_requested_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        for stale_root in [
+            vec!["--root", "/old/project"],
+            vec!["--root=/old/project"],
+            vec![],
+        ] {
+            let mut base = tokio::process::Command::new("kit-agent");
+            base.arg("serve").args(stale_root);
+            let invocation = AgentInvocation::from_command(base.as_std());
+            let method = AuthMethodTerminal::new("hooks", "Sign in to hooks")
+                .args(vec!["--terminal-auth-login".into(), "hooks".into()]);
+            let command = terminal_auth_command(&invocation, root.path(), &method);
+            assert_eq!(command.as_std().get_current_dir(), Some(root.path()));
+            assert_eq!(
+                command_args(&command),
+                [
+                    "serve",
+                    "--root",
+                    root.path().to_str().unwrap(),
+                    "--terminal-auth-login",
+                    "hooks",
+                ]
+            );
+            assert_eq!(command_args(&invocation.command())[0], "serve");
         }
     }
 

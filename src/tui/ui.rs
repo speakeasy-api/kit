@@ -2008,6 +2008,56 @@ fn single_transcript_block_rows(
             ))])),
             None,
         ),
+        Block::HookSignIn {
+            label: backend,
+            retired: true,
+            ..
+        } => (
+            uncopyable(plain_lines(vec![Line::from(Span::styled(
+                format!("· Hook backend {backend}: this sign-in link is no longer valid"),
+                theme::faint(),
+            ))])),
+            None,
+        ),
+        Block::HookSignIn {
+            label: backend,
+            url,
+            ..
+        } => {
+            let link = |text: String, style| LinkedSpan {
+                span: Span::styled(text, style),
+                url: Some(url.clone()),
+                image_end: false,
+            };
+            let plain = |text: String, style| LinkedSpan {
+                span: Span::styled(text, style),
+                url: None,
+                image_end: false,
+            };
+            (
+                vec![
+                    (
+                        LinkedLine::new(vec![
+                            plain(
+                                format!("· Hook backend {backend} needs you to sign in: "),
+                                Style::default().fg(theme::warn_color()),
+                            ),
+                            link(
+                                "open the sign-in page".into(),
+                                theme::bold(theme::accent_color()),
+                            ),
+                        ]),
+                        None,
+                    ),
+                    // The whole link, wrapped and hyperlinked, to copy or click.
+                    (
+                        LinkedLine::new(vec![link(format!("  {url}"), theme::faint())]),
+                        None,
+                    ),
+                ],
+                None,
+            )
+        }
         Block::Error(text) => (
             uncopyable(plain_lines(vec![Line::from(vec![
                 Span::styled("✗ ", theme::bold(theme::error_color())),
@@ -3308,6 +3358,12 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             format!(" {status}"),
             Style::default().fg(theme::warn_color()),
         )];
+    }
+    if let Some(sign_in) = app.hook_sign_in_status() {
+        left.push(Span::styled(
+            format!(" · {sign_in}"),
+            Style::default().fg(theme::warn_color()),
+        ));
     }
     let counts = app.agent_counts();
     let active_agents = counts.starting + counts.working;
@@ -5207,6 +5263,494 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn hook_sign_in_link_stays_in_the_status_line_until_cleared() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let later = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 600_000;
+        // A realistic authorize URL is far wider than the status line.
+        let url = format!(
+            "https://login.example.com/oauth2/v1/authorize?response_type=code&client_id=kit&state={}&code_challenge={}&code_challenge_method=S256&redirect_uri=http%3A%2F%2F127.0.0.1%3A30123%2Fcallback&scope=hooks%3Ainvoke&resource=https%3A%2F%2Fpolicy.example.com%2Fhooks",
+            "s".repeat(64),
+            "c".repeat(64)
+        );
+        assert!(url.len() > 300);
+        app.start_session("current".into());
+        let hint = |url: Option<&str>, cleared| crate::tui::app::Update::HookSignIn {
+            session_id: "current".into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: url.map(str::to_owned),
+            expires_at_ms: Some(later),
+            cleared,
+            agent: None,
+        };
+        app.apply(hint(Some(&url), false));
+        app.apply(hint(Some(&url), false));
+        let screen = render(&mut app, 80, 24);
+        assert!(
+            screen.contains("sign in to hook com.example needed"),
+            "{screen}"
+        );
+        // The whole link is on screen, wrapped, once.
+        let flat: String = screen.lines().map(str::trim).collect();
+        assert!(flat.contains(&url), "{screen}");
+        assert_eq!(flat.matches("open the sign-in page").count(), 1, "{screen}");
+        app.apply(hint(None, true));
+        assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
+        // An expired link is not shown in the status line, even before it is cleared.
+        app.apply(crate::tui::app::Update::HookSignIn {
+            session_id: "current".into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: Some(url.clone()),
+            expires_at_ms: Some(1),
+            cleared: false,
+            agent: None,
+        });
+        assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
+    }
+
+    #[test]
+    fn the_agents_sign_in_hints_are_checked_before_their_link_is_shown() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("current".into());
+        // As the receiver takes them off the wire.
+        let receive = |params: serde_json::Value| {
+            let notification: crate::protocols::acp::v2::HookAuthNotification =
+                serde_json::from_value(params).unwrap();
+            crate::tui::hook_sign_in(notification)
+        };
+        for url in [
+            "http://plain.example/login",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://auth.example/\u{202e}gnp",
+        ] {
+            let hint = receive(serde_json::json!({
+                "sessionId": "current", "backend": "com.example", "url": url
+            }));
+            assert!(hint.is_none(), "{url}");
+        }
+        assert!(
+            receive(serde_json::json!({
+                "sessionId": "current", "backend": "com.example", "reason": "signed_in"
+            }))
+            .is_none(),
+            "a reason without a clear"
+        );
+        // A link too long to pass on: what to run instead, and no link.
+        let long = format!("https://auth.example/{}", "l".repeat(17 * 1024));
+        let update = receive(serde_json::json!({
+            "sessionId": "current", "backend": "com.example", "url": long
+        }))
+        .unwrap();
+        app.apply(update);
+        let screen = render(&mut app, 200, 24);
+        let flat: String = screen.lines().map(str::trim).collect();
+        assert!(
+            flat.contains("Hook backend com.example needs you to sign in; its link is too long to show here. Run `kit auth login hooks com.example` in its workspace."),
+            "{screen}"
+        );
+        assert!(!flat.contains("https://auth.example/l"), "{screen}");
+        assert!(!screen.contains("open the sign-in page"), "{screen}");
+        // A valid link is shown.
+        app.apply(
+            receive(serde_json::json!({
+                "sessionId": "current", "backend": "com.example", "url": "https://auth.example/ok"
+            }))
+            .unwrap(),
+        );
+        let flat: String = render(&mut app, 200, 24).lines().map(str::trim).collect();
+        assert!(flat.contains("https://auth.example/ok"));
+    }
+
+    #[test]
+    fn sign_ins_that_share_a_label_stay_apart() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("current".into());
+        // Agent a's backend `x`, and the session's own backend whose id
+        // reads the same on screen.
+        let hint = |agent: Option<&str>, backend: &str, url: Option<&str>| {
+            crate::tui::app::Update::HookSignIn {
+                session_id: "current".into(),
+                backend: backend.into(),
+                problem: None,
+                url: url.map(str::to_owned),
+                expires_at_ms: None,
+                cleared: url.is_none(),
+                agent: agent.map(str::to_owned),
+            }
+        };
+        app.apply(hint(Some("a"), "x", Some("https://a.example/one")));
+        app.apply(hint(None, "x (agent a)", Some("https://b.example/two")));
+        let screen = render(&mut app, 120, 24);
+        assert!(screen.contains("and 1 more needed"), "{screen}");
+        // Clearing one leaves the other's link live.
+        app.apply(hint(Some("a"), "x", None));
+        let screen = render(&mut app, 120, 24);
+        let flat: String = screen.lines().map(str::trim).collect();
+        assert!(flat.contains("https://b.example/two"), "{screen}");
+        assert!(!flat.contains("https://a.example/one"), "{screen}");
+        assert!(
+            screen.contains("sign in to hook x (agent a) needed"),
+            "{screen}"
+        );
+        assert_eq!(flat.matches("no longer valid").count(), 1, "{screen}");
+    }
+
+    #[test]
+    fn replaced_and_cleared_sign_in_links_lose_their_link() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("current".into());
+        let hint = |url: Option<&str>, cleared| crate::tui::app::Update::HookSignIn {
+            session_id: "current".into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: url.map(str::to_owned),
+            expires_at_ms: None,
+            cleared,
+            agent: None,
+        };
+        let flat = |app: &mut App| {
+            render(app, 100, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        app.apply(hint(Some("https://auth.example/old"), false));
+        app.apply(hint(Some("https://auth.example/new"), false));
+        let screen = flat(&mut app);
+        assert!(!screen.contains("auth.example/old"), "{screen}");
+        assert!(screen.contains("auth.example/new"), "{screen}");
+        assert!(screen.contains("no longer valid"), "{screen}");
+        // Completed (or expired): no clickable link remains.
+        app.apply(hint(None, true));
+        let screen = flat(&mut app);
+        assert!(!screen.contains("auth.example/new"), "{screen}");
+        assert_eq!(screen.matches("no longer valid").count(), 2, "{screen}");
+    }
+
+    #[test]
+    fn an_unresolved_sign_in_problem_returns_with_its_session() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let problem = || {
+            crate::tui::app::Update::HookSignIn {
+            session_id: "first".into(),
+            backend: "com.example".into(),
+            problem: Some(
+                "needs you to sign in, but Kit could not start it: untrusted_destination. Check oauth.issuer."
+                    .into(),
+            ),
+            url: None,
+            expires_at_ms: None,
+            cleared: false,
+            agent: None,
+        }
+        };
+        let count = |app: &mut App| {
+            render(app, 100, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+                .matches("could not start it")
+                .count()
+        };
+        app.start_session("first".into());
+        app.apply(problem());
+        assert_eq!(count(&mut app), 1);
+        app.start_session("other".into());
+        assert_eq!(count(&mut app), 0);
+        app.start_session("first".into());
+        // Shown again in the rebuilt view, and a replay does not repeat it.
+        app.apply(problem());
+        assert_eq!(count(&mut app), 1);
+    }
+
+    #[test]
+    fn a_child_agents_sign_in_link_reaches_the_user() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        app.start_session("parent".into());
+        app.apply(crate::tui::app::Update::Runtime(
+            crate::events::RuntimeEvent::SessionStarted {
+                session_id: "parent".into(),
+            },
+        ));
+        let hint = |agent: &str, url: Option<&str>, expires: Option<u64>, problem: Option<&str>| {
+            crate::tui::app::Update::HookSignIn {
+                session_id: "parent".into(),
+                backend: "com.example".into(),
+                problem: problem.map(str::to_owned),
+                url: url.map(str::to_owned),
+                expires_at_ms: expires,
+                cleared: url.is_none() && problem.is_none(),
+                agent: Some(agent.into()),
+            }
+        };
+        let flat = |app: &mut App| {
+            render(app, 120, 30)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        // The same kind of hint as the session's own, under the agent.
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child"),
+            None,
+            None,
+        ));
+        let screen = flat(&mut app);
+        assert!(screen.contains("https://auth.example/child"), "{screen}");
+        assert!(screen.contains("agent scout"), "{screen}");
+        // A problem beside the same live link is shown, once.
+        let problem = "needs you to sign in, but Kit could not start it: discovery_failed.";
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child"),
+            None,
+            Some(problem),
+        ));
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child"),
+            None,
+            Some(problem),
+        ));
+        let screen = flat(&mut app);
+        assert_eq!(screen.matches("discovery_failed").count(), 1, "{screen}");
+        assert!(screen.contains("https://auth.example/child"), "{screen}");
+        // Cleared (signed in, withdrawn or logged out): retired.
+        app.apply(hint("scout", None, None, None));
+        assert!(!flat(&mut app).contains("https://auth.example/child"));
+        // A link that expires while shown is retired at the next tick.
+        let soon = crate::events::now_millis() + 50;
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/soon"),
+            Some(soon),
+            None,
+        ));
+        assert!(flat(&mut app).contains("https://auth.example/soon"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.tick();
+        assert!(!flat(&mut app).contains("https://auth.example/soon"));
+        // A grandchild's link for the same backend sits beside the child's.
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child-again"),
+            None,
+            None,
+        ));
+        app.apply(hint(
+            "scout/pip",
+            Some("https://auth.example/grandchild"),
+            None,
+            None,
+        ));
+        let screen = flat(&mut app);
+        assert!(
+            screen.contains("https://auth.example/grandchild"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("https://auth.example/child-again"),
+            "{screen}"
+        );
+        // Removing the grandchild retires its link, and a late hint for it
+        // is ignored; the child's own link stays.
+        app.apply(crate::tui::app::Update::Runtime(
+            crate::events::RuntimeEvent::SubagentStateChanged {
+                id: "pip".into(),
+                name: "Pip".into(),
+                status: crate::events::SubagentStatus::Removed,
+                outcome: None,
+                generation: 1,
+                task: "task".into(),
+                parent_id: None,
+                parent_name: None,
+                harness: "kit".into(),
+                vendor: crate::events::HarnessVendor::Kit,
+                model: None,
+                created_at_unix_ms: 1,
+                generation_started_at_unix_ms: 1,
+                generation_finished_at_unix_ms: None,
+            },
+        ));
+        app.apply(hint(
+            "scout/pip",
+            Some("https://auth.example/late"),
+            None,
+            None,
+        ));
+        let screen = flat(&mut app);
+        assert!(
+            !screen.contains("https://auth.example/grandchild"),
+            "{screen}"
+        );
+        assert!(!screen.contains("https://auth.example/late"), "{screen}");
+        assert!(
+            screen.contains("https://auth.example/child-again"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_reattached_session_shows_only_what_its_replay_sends() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let flat = |app: &mut App| {
+            render(app, 100, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        app.start_session("first".into());
+        app.apply(crate::tui::app::Update::HookSignIn {
+            session_id: "first".into(),
+            backend: "com.example".into(),
+            problem: Some(
+                "requires scopes (hooks:admin) outside the ones Kit allows for it.".into(),
+            ),
+            url: Some("https://auth.example/consumed".into()),
+            expires_at_ms: None,
+            cleared: false,
+            agent: None,
+        });
+        assert!(flat(&mut app).contains("auth.example/consumed"));
+        // Detached, the session signs in; its clear never reaches this view.
+        app.start_session("other".into());
+        app.start_session("first".into());
+        // The new attachment replays nothing: neither the consumed link nor
+        // the resolved problem comes back.
+        let screen = flat(&mut app);
+        assert!(!screen.contains("auth.example/consumed"), "{screen}");
+        assert!(!screen.contains("hooks:admin"), "{screen}");
+    }
+
+    #[test]
+    fn hook_sign_in_links_follow_their_session() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "model".into(),
+            String::new(),
+        );
+        let hint = |session: &str, url: &str| crate::tui::app::Update::HookSignIn {
+            session_id: session.into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: Some(url.into()),
+            expires_at_ms: None,
+            cleared: false,
+            agent: None,
+        };
+        let flat = |app: &mut App| {
+            render(app, 80, 24)
+                .lines()
+                .map(str::trim)
+                .collect::<String>()
+        };
+        app.start_session("first".into());
+        app.apply(hint("first", "https://auth.example/first"));
+        // The next session's link arrives while it attaches, before it is
+        // the current session; the first session's ended attachment sends
+        // one late, which is ignored.
+        app.apply(hint("next", "https://auth.example/next"));
+        app.start_session("next".into());
+        app.apply(hint("first", "https://auth.example/first-late"));
+        let screen = flat(&mut app);
+        assert!(screen.contains("https://auth.example/next"), "{screen}");
+        assert!(
+            screen.contains("sign in to hook com.example needed"),
+            "{screen}"
+        );
+        assert!(!screen.contains("auth.example/first"), "{screen}");
+        // Replaying the same link does not duplicate it.
+        app.apply(hint("next", "https://auth.example/next"));
+        assert_eq!(flat(&mut app).matches("open the sign-in page").count(), 1);
+        // Returning to the first session shows what its new attachment
+        // replays, not the late link.
+        app.start_session("first".into());
+        assert!(!flat(&mut app).contains("first-late"));
+        app.apply(hint("first", "https://auth.example/first-again"));
+        let screen = flat(&mut app);
+        assert!(
+            screen.contains("https://auth.example/first-again"),
+            "{screen}"
+        );
+        assert!(!screen.contains("auth.example/next"), "{screen}");
+        // An expired link is not shown again when its session returns.
+        app.apply(crate::tui::app::Update::HookSignIn {
+            session_id: "next".into(),
+            backend: "com.example".into(),
+            problem: None,
+            url: Some("https://auth.example/next-expired".into()),
+            expires_at_ms: Some(1),
+            cleared: false,
+            agent: None,
+        });
+        app.start_session("next".into());
+        assert!(!flat(&mut app).contains("next-expired"));
+        app.start_session("first".into());
+        // A problem is shown once, as a notice.
+        let problem = || {
+            crate::tui::app::Update::HookSignIn {
+            session_id: "first".into(),
+            backend: "com.example".into(),
+            problem: Some(
+                "needs you to sign in, but Kit could not start it: untrusted_destination. Check oauth.issuer."
+                    .into(),
+            ),
+            url: None,
+            expires_at_ms: None,
+            cleared: false,
+            agent: None,
+        }
+        };
+        app.apply(problem());
+        app.apply(problem());
+        let screen = flat(&mut app);
+        assert_eq!(screen.matches("could not start it").count(), 1, "{screen}");
     }
 
     #[test]

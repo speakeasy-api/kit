@@ -39,6 +39,61 @@ fn typesafe_auth_environment_status_and_logout() {
     }
 }
 
+#[test]
+fn hook_auth_commands_report_and_act_per_backend() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join(".agents")).unwrap();
+    fs::write(
+        root.path().join(".agents/hooks.json"),
+        serde_json::json!({"protocolVersion": "draft", "hooks": [
+            {"id": "test.local", "transport": {"type": "stdio", "command": "true", "lifecycle": "persistent"},
+                "subscriptions": [{"events": ["session.start"], "mode": "observe", "content": {"default": "body"}}]},
+            {"id": "test.header", "transport": {"type": "http", "url": "https://hooks.example/ahp",
+                "headers": {"Authorization": "Bearer fixed"}},
+                "subscriptions": [{"events": ["session.start"], "mode": "observe", "content": {"default": "body"}}]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let kit = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .args(args)
+            .args(["--root", root.path().to_str().unwrap()])
+            .args(["--credential-store", "file", "--credential-dir"])
+            .arg(credentials.path())
+            .output()
+            .unwrap()
+    };
+    let status = kit(&["auth", "status", "hooks"]);
+    assert!(status.status.success(), "{status:?}");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("test.local: no authentication (stdio)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("test.header: authorization header from hooks.json"),
+        "{stdout}"
+    );
+    let one = kit(&["auth", "status", "hooks", "test.local"]);
+    assert!(!String::from_utf8_lossy(&one.stdout).contains("test.header"));
+    // Nothing here needs a sign-in, so login prompts for nothing.
+    let login = kit(&["auth", "login", "hooks"]);
+    assert!(login.status.success(), "{login:?}");
+    assert!(String::from_utf8_lossy(&login.stdout).contains("No hook backend needs sign-in."));
+    let logout = kit(&["auth", "logout", "hooks"]);
+    assert!(!logout.status.success());
+    assert!(String::from_utf8_lossy(&logout.stderr).contains("name the hook backend"));
+    let logout = kit(&["auth", "logout", "hooks", "test.header"]);
+    assert!(logout.status.success(), "{logout:?}");
+    assert!(String::from_utf8_lossy(&logout.stdout).contains("had no stored credentials"));
+    let other = kit(&["auth", "status", "openai", "test.local"]);
+    assert!(!other.status.success());
+}
+
 fn write_session(home: &Path, root: &Path, id: &str) -> std::path::PathBuf {
     let root = root.canonicalize().unwrap();
     let identity = blake3::hash(root.as_os_str().as_encoded_bytes());
