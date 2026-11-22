@@ -10,6 +10,7 @@
 //! fails under the subscription's failure policy and is recorded; the next
 //! turn prepares the login in the background and shows its link to the user.
 mod config;
+pub(crate) mod hint;
 mod login;
 mod network;
 mod policy;
@@ -40,6 +41,33 @@ use serde_json::Value;
 
 use crate::credentials::CredentialStorage;
 pub(crate) use login::{AuthHint, HOOK_AUTH_META, HintSubscription, notices};
+
+/// A session's hook sign-in hints, its own and its child agents', all to
+/// one sender for the session's life: the single path a hint takes to its
+/// user, whatever the client.
+pub(crate) struct SessionHints {
+    _own: Option<HintSubscription>,
+    _children: relay::ChildHintSubscription,
+}
+
+/// Sends `session`'s own hints (from `hooks`) and the hints its child
+/// agents relay to it, each through `send`, in the order they arrive.
+pub(crate) fn subscribe_session(
+    hooks: Option<&crate::ahp::Hooks>,
+    session: String,
+    send: impl Fn(&hint::HookHint) + Send + Sync + 'static,
+) -> SessionHints {
+    let send: Arc<dyn Fn(&hint::HookHint) + Send + Sync> = Arc::new(send);
+    let own = hooks.and_then(|hooks| {
+        let send = Arc::clone(&send);
+        hooks.subscribe_auth_hints(move |hint: &AuthHint| send(&hint::HookHint::from(hint)))
+    });
+    let children = relay::subscribe(session, move |hint| send(hint));
+    SessionHints {
+        _own: own,
+        _children: children,
+    }
+}
 
 /// The credential namespace of Kit's hook grants.
 const NAMESPACE: &str = "kit";
@@ -833,6 +861,14 @@ impl HookAuth {
                             );
                         }
                         login::Outcome::LoggedOut => login::registry().ended(&login),
+                        login::Outcome::Unverified => {
+                            login::registry().ended(&login);
+                            login::registry().problem(
+                                &login.scope,
+                                &login.context.backend_id,
+                                "could not finish signing in: Kit could not confirm the backend was not logged out meanwhile. Kit offers a new link at the next turn.".to_owned(),
+                            );
+                        }
                         login::Outcome::Stopped => {}
                     }
                 });
@@ -1004,6 +1040,9 @@ impl HookAuth {
             login::Outcome::NotGranted(scopes) => return Err(not_granted(&scopes)),
             login::Outcome::LoggedOut => {
                 return Err("the backend was logged out while signing in".into());
+            }
+            login::Outcome::Unverified => {
+                return Err("Kit could not confirm the sign-in; sign in again".into());
             }
             _ => return Err("the sign-in link expired or was not approved".into()),
         }
@@ -1266,6 +1305,7 @@ pub(crate) mod test_support {
             expires_at_ms: Some(u64::MAX),
             cleared: false,
             signed_in: false,
+            reason: None,
             problem: None,
         }
     }

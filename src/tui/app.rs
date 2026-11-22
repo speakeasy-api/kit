@@ -78,6 +78,9 @@ pub enum Update {
         url: Option<String>,
         expires_at_ms: Option<u64>,
         cleared: bool,
+        /// A child agent's link (`a`, or `a/b` relayed by a); `None` for the
+        /// session's own.
+        agent: Option<String>,
     },
     /// Result of listing sessions without blocking the terminal event loop.
     SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
@@ -901,8 +904,11 @@ pub struct App {
     /// state is dropped on leaving and late hints for them are ignored: a
     /// new attachment's replay is the authority.
     hook_detached: std::collections::BTreeSet<String>,
-    /// Hook sign-in links of child agents shown here, by agent and backend.
-    subagent_hook_links: std::collections::BTreeMap<(String, String), String>,
+    /// The child agent each child sign-in link or problem is for, by session
+    /// and label, so removing an agent retires them.
+    hook_agents: std::collections::BTreeMap<(String, String), String>,
+    /// Agents removed here: a late sign-in hint for one is ignored.
+    removed_hook_agents: std::collections::BTreeSet<String>,
     gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     session_messages: HashMap<String, super::wire::SessionMessage>,
@@ -1212,9 +1218,21 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
     }
 }
 
+/// How a hook sign-in is named on screen: its backend, and for a child
+/// agent's, the agent it is for.
+fn hook_label(backend: &str, agent: Option<&str>) -> String {
+    match agent {
+        Some(agent) if backend == crate::ahp::auth::hint::MORE_BACKENDS => {
+            format!("more hook backends (agent {agent})")
+        }
+        Some(agent) => format!("{backend} (agent {agent})"),
+        None => backend.to_owned(),
+    }
+}
+
 /// A problem is a clause that says what went wrong with the sign-in.
-fn hook_problem_text(backend: &str, problem: &str) -> String {
-    format!("Hook backend {backend} {problem}")
+fn hook_problem_text(label: &str, problem: &str) -> String {
+    format!("Hook backend {label} {problem}")
 }
 
 impl App {
@@ -1223,14 +1241,37 @@ impl App {
     /// (`a/b` for b's, relayed by a), so any agent on the path counts.
     fn retire_subagent_hook_links(&mut self, gone: impl Fn(&str) -> bool) {
         let retired: Vec<_> = self
-            .subagent_hook_links
-            .keys()
-            .filter(|(path, _)| path.split('/').any(&gone))
-            .cloned()
+            .hook_agents
+            .iter()
+            .filter(|(_, path)| path.split('/').any(&gone))
+            .map(|(key, _)| key.clone())
             .collect();
-        for (path, backend) in retired {
-            self.retire_hook_sign_ins(&format!("{backend} (agent {path})"));
-            self.subagent_hook_links.remove(&(path, backend));
+        for key in retired {
+            if self.session_id.as_deref() == Some(key.0.as_str()) {
+                self.retire_hook_sign_ins(&key.1);
+            }
+            self.hook_sign_ins.remove(&key);
+            self.hook_problems.remove(&key);
+            self.hook_agents.remove(&key);
+        }
+    }
+
+    /// Retires the current session's sign-in links whose deadline passed.
+    fn expire_hook_sign_ins(&mut self, now_unix_ms: u64) {
+        let Some(session) = self.session_id.clone() else {
+            return;
+        };
+        let expired: Vec<_> = self
+            .hook_sign_ins
+            .iter()
+            .filter(|((owner, _), (_, expiry))| {
+                *owner == session && expiry.is_some_and(|at| at <= now_unix_ms)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            self.retire_hook_sign_ins(&key.1);
+            self.hook_sign_ins.remove(&key);
         }
     }
 
@@ -1290,7 +1331,8 @@ impl App {
             hook_sign_ins: Default::default(),
             hook_problems: Default::default(),
             hook_detached: Default::default(),
-            subagent_hook_links: Default::default(),
+            hook_agents: Default::default(),
+            removed_hook_agents: Default::default(),
             gateway_candidate: None,
             child_focus: None,
             session_messages: HashMap::new(),
@@ -1678,6 +1720,7 @@ impl App {
 
     fn tick_at(&mut self, now_unix_ms: u64) {
         self.tick = self.tick.wrapping_add(1);
+        self.expire_hook_sign_ins(now_unix_ms);
         self.agents.retain(|_, row| {
             row.status != SubagentStatus::Removed
                 || row.outcome != Some(GenerationOutcome::Failed)
@@ -2450,13 +2493,33 @@ impl App {
                 url,
                 expires_at_ms,
                 cleared,
+                agent,
             } => {
                 // From an attachment that has ended: its replacement replays.
                 if self.hook_detached.contains(&session_id) {
                     return;
                 }
+                // A late hint for an agent already removed here.
+                if agent.as_deref().is_some_and(|path| {
+                    path.split('/')
+                        .any(|id| self.removed_hook_agents.contains(id))
+                }) {
+                    return;
+                }
                 let current = self.session_id.as_deref() == Some(session_id.as_str());
-                let key = (session_id, backend);
+                let label = hook_label(&backend, agent.as_deref());
+                let key = (session_id, label);
+                match &agent {
+                    Some(agent) => {
+                        self.hook_agents.insert(key.clone(), agent.clone());
+                    }
+                    None => {
+                        self.hook_agents.remove(&key);
+                    }
+                }
+                // An expired link is never shown.
+                let cleared =
+                    cleared || expires_at_ms.is_some_and(|at| at <= crate::events::now_millis());
                 let url = url.filter(|_| !cleared);
                 let problem = problem.filter(|_| !cleared);
                 match url {
@@ -2482,13 +2545,22 @@ impl App {
                         self.hook_sign_ins.remove(&key);
                     }
                 }
+                // Shown once per distinct problem, beside any link.
                 match problem {
                     Some(problem) => {
-                        if self.hook_problems.get(&key) != Some(&problem) {
-                            if current {
-                                self.push_block(Block::Notice(hook_problem_text(&key.1, &problem)));
+                        let text = match agent.as_deref() {
+                            Some(agent) if backend == crate::ahp::auth::hint::MORE_BACKENDS => {
+                                format!(
+                                    "Agent {agent}: more hook backends need you to sign in {problem}"
+                                )
                             }
-                            self.hook_problems.insert(key, problem);
+                            _ => hook_problem_text(&key.1, &problem),
+                        };
+                        if self.hook_problems.get(&key) != Some(&text) {
+                            if current {
+                                self.push_block(Block::Notice(text.clone()));
+                            }
+                            self.hook_problems.insert(key, text);
                         }
                     }
                     None => {
@@ -3031,6 +3103,7 @@ impl App {
                             .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
                 {
                     self.agents.remove(&id);
+                    self.removed_hook_agents.insert(id.clone());
                     self.retire_subagent_hook_links(|agent| agent == id);
                 } else {
                     if !self.agents_auto_opened && status != SubagentStatus::Removed {
@@ -3143,45 +3216,11 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
+                self.removed_hook_agents.extend(removed.iter().cloned());
                 self.retire_subagent_hook_links(|agent| removed.contains(agent));
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
-            }
-            RuntimeEvent::SubagentHookSignIn {
-                id,
-                backend,
-                url,
-                expires_at,
-                cleared,
-                text,
-            } => {
-                // An expired link is never shown; it counts as a clear.
-                let cleared = cleared || expires_at.is_some_and(|at| at <= now_unix_ms);
-                // A child's link, shown to the user under the agent's name:
-                // the child's hook waits for it.
-                let label = format!("{backend} (agent {id})");
-                let key = (id, backend);
-                match url.filter(|_| !cleared) {
-                    Some(url) => {
-                        if self.subagent_hook_links.get(&key) != Some(&url) {
-                            self.retire_hook_sign_ins(&label);
-                            self.push_block(Block::HookSignIn {
-                                backend: label,
-                                url: url.clone(),
-                                retired: false,
-                            });
-                            self.subagent_hook_links.insert(key, url);
-                        }
-                    }
-                    None => {
-                        self.retire_hook_sign_ins(&label);
-                        self.subagent_hook_links.remove(&key);
-                        if let Some(text) = text.filter(|_| !cleared) {
-                            self.push_block(Block::Notice(format!("Agent {}: {text}", key.0)));
-                        }
-                    }
-                }
             }
         }
     }
@@ -3430,8 +3469,6 @@ impl App {
             self.hook_detached.insert(previous);
         }
         self.hook_detached.remove(&session_id);
-        // A child's links belong to the view they were shown in.
-        self.subagent_hook_links.clear();
         self.session_presentation = presentation;
         self.elicitations.clear();
         self.model_switch = None;
@@ -3534,7 +3571,7 @@ impl App {
             .hook_problems
             .iter()
             .filter(|((owner, _), _)| self.session_id.as_deref() == Some(owner.as_str()))
-            .map(|((_, backend), problem)| hook_problem_text(backend, problem))
+            .map(|(_, text)| text.clone())
             .collect();
         for text in problems {
             self.push_block(Block::Notice(text));

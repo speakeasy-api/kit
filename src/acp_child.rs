@@ -441,10 +441,6 @@ pub(crate) struct ChildConfig {
     /// The parent's `tool.before` event that started this child, passed to a
     /// Kit child so its `session.start` can name it as `parentEventId`.
     pub ahp_parent_event: Option<String>,
-    /// This runtime is itself a Kit subagent (`--subagent-depth` above 0):
-    /// its stderr and runtime events go to a Kit parent, not to Kit's own
-    /// client. Unlike `parent_id`, spawning a child never changes it.
-    pub nested_runtime: bool,
 }
 
 impl ChildConfig {
@@ -518,136 +514,49 @@ pub(crate) fn subagent_usage(owner: &str, update: &Value) -> Option<crate::event
     })
 }
 
-/// A child's hook sign-in hint is for its user, never the parent's model:
-/// it is not captured, inspected or forwarded.
+/// A marked notice is for a user, never the parent's model: it is dropped,
+/// never captured, inspected or forwarded. (A Kit child sends its sign-in
+/// hints as [`HOOK_HINT_METHOD`] notifications instead.)
 fn user_only(update: &Value) -> bool {
     update["_meta"]
         .get(crate::ahp::auth::HOOK_AUTH_META)
         .is_some()
 }
 
-/// The user's copy of a child's hook sign-in hint (see [`user_only`]), as
-/// the owning agent's runtime event: the parent's UI shows it, so the user
-/// can unblock the child's hook, and nothing the model reads carries it.
-fn hook_sign_in_event(owner: &str, update: &Value) -> Option<crate::events::RuntimeEvent> {
-    let mark = update["_meta"].get(crate::ahp::auth::HOOK_AUTH_META)?;
-    Some(crate::events::RuntimeEvent::SubagentHookSignIn {
-        id: origin(owner, mark),
-        backend: mark["backend"].as_str()?.to_owned(),
-        url: mark["url"].as_str().map(str::to_owned),
-        expires_at: mark["expiresAt"].as_u64(),
-        cleared: mark["cleared"].as_bool().unwrap_or(false),
-        text: notice_text(update),
-    })
-}
+/// The notification a Kit child sends its sign-in hints as, since this
+/// client asks for it (see `protocol::initialize`).
+const HOOK_HINT_METHOD: &str = "kit/hooks/auth";
 
-/// The same hint, for the parent session's ACP client: the child's notice
-/// text and its sign-in mark only (nothing else of the child's `_meta`),
-/// relayed to that session's user only. The mark names the agent the link
-/// is for and keeps its unlabelled text, so a Kit further up labels it once.
-fn child_hint(owner: &str, update: &Value) -> Option<crate::ahp::auth::relay::ChildHint> {
-    let mut mark = update["_meta"]
-        .get(crate::ahp::auth::HOOK_AUTH_META)?
-        .clone();
-    let agent = origin(owner, &mark);
-    let text = notice_text(update)?;
-    mark["agent"] = Value::String(agent.clone());
-    mark["text"] = Value::String(text.clone());
-    Some(crate::ahp::auth::relay::ChildHint {
-        agent,
-        text,
-        meta: serde_json::Map::from_iter([(crate::ahp::auth::HOOK_AUTH_META.to_owned(), mark)]),
-    })
+/// A child's sign-in hint notification, checked field by field; anything
+/// malformed is `None`.
+fn child_hook_hint(params: &Value) -> Option<(String, crate::ahp::auth::hint::HookHint)> {
+    let session = params["sessionId"].as_str()?.to_owned();
+    let hint: crate::ahp::auth::hint::HookHint = serde_json::from_value(params.clone()).ok()?;
+    Some((session, hint.validated()?))
 }
 
 /// The agent a link is for: `owner`, or, relayed by `owner` from one of its
 /// own children, that child under it.
-fn origin(owner: &str, mark: &Value) -> String {
-    match mark["agent"].as_str() {
+fn origin(owner: &str, below: Option<&str>) -> String {
+    match below {
         Some(below) => format!("{owner}/{below}"),
         None => owner.to_owned(),
     }
 }
 
-/// The longest child notice text relayed, in bytes.
-const MAX_CHILD_NOTICE: usize = 2048;
-
-/// The child's notice text, unlabelled: what a Kit below kept in the mark,
-/// else the notice's title. Bounded, and a link that does not fit is left
-/// out rather than cut (the whole link stays in the mark).
-fn notice_text(update: &Value) -> Option<String> {
-    let mark = &update["_meta"][crate::ahp::auth::HOOK_AUTH_META];
-    let text = mark["text"].as_str().or(update["title"].as_str())?;
-    Some(bounded_notice(text, mark["url"].as_str()))
-}
-
-fn bounded_notice(text: &str, url: Option<&str>) -> String {
-    if text.len() <= MAX_CHILD_NOTICE {
-        return text.to_owned();
-    }
-    let text = match url {
-        Some(url) if text.contains(url) => text.replace(url, "(the link is too long to show)"),
-        _ => text.to_owned(),
-    };
-    let mut end = text.len().min(MAX_CHILD_NOTICE);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
-}
-
-/// Sends a child's sign-in runtime event; tests also see what was sent.
-fn emit_hook_event(event: &crate::events::RuntimeEvent) {
-    #[cfg(test)]
-    hook_event_capture::HOOK_EVENTS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .push(event.clone());
-    crate::events::emit(event);
-}
-
-#[cfg(test)]
-pub(crate) mod hook_event_capture {
-    /// Every child sign-in runtime event this process sent.
-    pub(crate) static HOOK_EVENTS: std::sync::Mutex<Vec<crate::events::RuntimeEvent>> =
-        std::sync::Mutex::new(Vec::new());
-}
-
-/// Whether this process tells Kit's own client about a child's sign-in
-/// link through a runtime event: only the top Kit of a tree, whose events
-/// that client reads. A nested Kit relays the notice to its parent session
-/// instead and emits nothing.
-fn emits_hook_events(config: &ChildConfig) -> bool {
-    !config.nested_runtime
-}
-
-/// Delivers a child session's hook sign-in hint to its user: through
-/// Kit's runtime events when this process is the top of the tree (its
-/// events go to Kit's own UI; a nested Kit's events go to its parent, which
-/// relays the notice itself), and to any other ACP client of the session
-/// that owns the agent.
+/// Relays a child session's hook sign-in hint to the user of the session
+/// that owns the agent, labelled with the agent it is for.
 fn deliver_hook_hint(
     owner: &str,
     transcript: &transcript::Transcript,
-    update: &Value,
-    nested: bool,
-    emit: &dyn Fn(&crate::events::RuntimeEvent),
+    hint: &crate::ahp::auth::hint::HookHint,
 ) {
-    if !nested && let Some(event) = hook_sign_in_event(owner, update) {
-        // An event too large for one frame would end the runtime-event
-        // transport, so it is not sent. Kit's own client then does not see
-        // this link (it registers no relay); every other client still gets
-        // the notice. Such links are far beyond any real authorization URL.
-        if crate::diagnostic_transport::fits(&event) {
-            emit(&event);
-        } else {
-            tracing::warn!(agent = %owner, "a child's hook sign-in link is too long for a runtime event");
-        }
-    }
-    if let Some(parent) = transcript.stream_parent(owner)
-        && let Some(hint) = child_hint(owner, update)
-    {
-        crate::ahp::auth::relay::relay(&parent, &hint);
+    if let Some(parent) = transcript.stream_parent(owner) {
+        let relayed = crate::ahp::auth::hint::HookHint {
+            agent: Some(origin(owner, hint.agent.as_deref())),
+            ..hint.clone()
+        };
+        crate::ahp::auth::relay::relay(&parent, &relayed);
     }
 }
 
@@ -1657,6 +1566,8 @@ async fn run(
         offer,
     } = run_config;
     let permission_policy = config.harnesses.permission_policy(&harness)?;
+    // Kit's own child is asked for its hook sign-in hints.
+    let kit_child = config.harnesses.is_kit(&harness);
     let mut command = config.harnesses.spawn(
         &harness,
         &config,
@@ -1715,8 +1626,6 @@ async fn run(
     let notification_configs = Arc::clone(&config_snapshots);
     let stream_routes = Arc::new(stream::Routes::default());
     let notification_stream_routes = Arc::clone(&stream_routes);
-    // This process's own place in the tree, not the spawned child's.
-    let nested = !emits_hook_events(&config);
     let root = config.root.clone();
     let additional_directories = config.additional_directories.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
@@ -1725,20 +1634,25 @@ async fn run(
     let connected = agent_client_protocol::Builder::new(protocol::Client)
         .on_receive_notification(
             async move |message: UntypedMessage, _cx| {
-                if message.method != "session/update" { return Ok(()); }
-                let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
-                let mut params = message.params;
-                if user_only(&params["update"]) {
-                    // To the user's UI only, never routed into child output:
-                    // whenever the child session lives, not only during a
-                    // prompt, and held until it has an owner.
-                    if let Some((owner, transcript, update)) = notification_stream_routes
-                        .hook_hint(&session_id.to_string(), params["update"].clone())
-                    {
-                        deliver_hook_hint(&owner, &transcript, &update, nested, &emit_hook_event);
+                if message.method == HOOK_HINT_METHOD {
+                    // To the user only, never into child output: whenever the
+                    // child session lives, not only during a prompt, and held
+                    // until it has an owner. Malformed hints are dropped.
+                    match child_hook_hint(&message.params) {
+                        Some((session, hint)) => {
+                            if let Some((owner, transcript, hint)) = notification_stream_routes.hook_hint(&session, hint) {
+                                deliver_hook_hint(&owner, &transcript, &hint);
+                            }
+                        }
+                        None => tracing::warn!("dropped a malformed hook sign-in hint from a child"),
                     }
                     return Ok(());
                 }
+                if message.method != "session/update" { return Ok(()); }
+                let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
+                let mut params = message.params;
+                // A marked notice is for a user: never child output.
+                if user_only(&params["update"]) { return Ok(()); }
                 protocol::normalize_config_options(&mut params["update"]);
                 let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
                 if let Some(notification) = &notification
@@ -1816,7 +1730,7 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = match protocol::initialize(&connection, offer).await {
+            let initialized = match protocol::initialize(&connection, offer, kit_child).await {
                 Ok(initialized) => initialized,
                 Err(error) => {
                     if offer == protocol::Version::V2 && protocol::requires_v1(&error) {
@@ -2203,8 +2117,8 @@ async fn run(
                             if let Some(transcript) = &prompt.transcript {
                                 // Hook sign-in hints sent before it had an owner.
                                 // Delivered in order with any that arrive meanwhile.
-                                stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone(), |update| {
-                                    deliver_hook_hint(&prompt.owner, transcript, update, nested, &emit_hook_event);
+                                stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone(), |hint| {
+                                    deliver_hook_hint(&prompt.owner, transcript, hint);
                                 });
                             }
                             if let Ok(mut routes) = routes.lock() {
@@ -2397,14 +2311,6 @@ async fn forward_stderr(
             }
             if deadline.is_some() {
                 deadline = Some(tokio::time::Instant::now() + crate::diagnostic_transport::LEASE);
-            }
-            // A child's sign-in link is for the user, never a diagnostic:
-            // the child relays it to its parent session's user itself.
-            if matches!(
-                event,
-                crate::events::RuntimeEvent::SubagentHookSignIn { .. }
-            ) {
-                continue;
             }
             if event.forward_from_child() {
                 if let crate::events::RuntimeEvent::SubagentStateChanged {
@@ -3060,7 +2966,6 @@ mod tests {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         for resume in [false, true] {
             let command = harnesses
@@ -3194,7 +3099,6 @@ mod tests {
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -3246,25 +3150,6 @@ mod tests {
             "title": format!("Hook backend `x` needs you to sign in. Open {link} to approve Kit."),
             "_meta": {"kit/hooks/auth": {"backend": "x", "url": link, "cleared": false}}});
         assert!(user_only(&notice));
-        // And a non-Kit client of the owning session gets the marked notice.
-        let relayed = child_hint("scout", &notice).unwrap();
-        assert_eq!(relayed.agent, "scout");
-        assert!(relayed.meta.contains_key(crate::ahp::auth::HOOK_AUTH_META));
-        assert!(relayed.text.contains(link));
-        // The user gets it through the parent's UI, as the owning agent's.
-        assert_eq!(
-            hook_sign_in_event("scout", &notice),
-            Some(crate::events::RuntimeEvent::SubagentHookSignIn {
-                id: "scout".into(),
-                backend: "x".into(),
-                url: Some(link.into()),
-                expires_at: None,
-                cleared: false,
-                text: Some(format!(
-                    "Hook backend `x` needs you to sign in. Open {link} to approve Kit."
-                )),
-            })
-        );
         let mut output = ChildOutput::default();
         output.record(update(notice));
         output.record(update(json!({
@@ -3617,7 +3502,6 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             };
             let result = ChildSession::start(
                 config,
@@ -3707,7 +3591,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let result = ChildSession::start(
             config,
@@ -3775,7 +3658,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
 
         let error = match ChildSession::start(
@@ -3838,7 +3720,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -3896,7 +3777,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -4034,7 +3914,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let starts = (0..64)
             .map(|_| {
@@ -4106,7 +3985,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let base = ChildSession::start(
             config,
@@ -4189,7 +4067,6 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             };
             let base = ChildSession::start(
                 config,
@@ -4357,7 +4234,6 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             };
             ChildSession::start(
                 config,
@@ -4706,7 +4582,6 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             };
             let (child, _) = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -4809,7 +4684,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let base = ChildSession::start(
             config.clone(),
@@ -5081,7 +4955,6 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         };
         let base = ChildSession::start(
             config,
@@ -5215,7 +5088,6 @@ for line in sys.stdin:
                     tree_slots: None,
                     prompt_cache_key: None,
                     ahp_parent_event: None,
-                    nested_runtime: false,
                 },
                 "acp.mock".into(),
                 None,
@@ -5360,7 +5232,6 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             };
             let base = ChildSession::start(
                 config,
@@ -5691,169 +5562,6 @@ for line in sys.stdin:
         }
     }
 
-    /// How a link from `owner` (or a descendant of it, `below`) reaches the
-    /// user from this process: the runtime events emitted and the notices
-    /// relayed to the owning parent session.
-    fn deliveries(
-        nested: bool,
-        below: Option<&str>,
-    ) -> (
-        Vec<crate::events::RuntimeEvent>,
-        Vec<crate::ahp::auth::relay::ChildHint>,
-    ) {
-        let session = format!("parent-{nested}-{below:?}");
-        let transcripts = transcript::Transcripts::default();
-        let _subscription = transcripts.stream.subscribe(session.clone(), false);
-        transcripts.stream.announce(
-            "s-child",
-            "Scout",
-            "task",
-            crate::events::SubagentStatus::Working,
-            1,
-            &crate::events::SubagentRuntime::default(),
-        );
-        transcripts.start("s-child", 1);
-        let relayed = Arc::new(Mutex::new(Vec::new()));
-        let _relay = crate::ahp::auth::relay::subscribe(session, {
-            let relayed = Arc::clone(&relayed);
-            move |hint| relayed.lock().unwrap().push(hint.clone())
-        });
-        let mut mark = json!({"backend": "x", "url": "https://auth.example/a", "cleared": false});
-        if let Some(below) = below {
-            mark["agent"] = below.into();
-        }
-        let update = json!({"sessionUpdate": "notice", "severity": "info",
-            "title": "Hook backend `x` needs you to sign in.", "_meta": {HOOK_AUTH_META_KEY: mark}});
-        let emitted = Mutex::new(Vec::new());
-        deliver_hook_hint(
-            "s-child",
-            &transcripts.get("s-child", 1).unwrap(),
-            &update,
-            nested,
-            &|event| emitted.lock().unwrap().push(event.clone()),
-        );
-        let relayed = relayed.lock().unwrap().clone();
-        (emitted.into_inner().unwrap(), relayed)
-    }
-    const HOOK_AUTH_META_KEY: &str = crate::ahp::auth::HOOK_AUTH_META;
-
-    #[test]
-    fn only_the_top_kit_emits_a_childs_sign_in_whatever_its_spawn_config_says() {
-        // The production spawn path: a child of the top Kit gets its own id
-        // as `parent_id`, which says nothing about this process's place.
-        let root = tempfile::tempdir().unwrap();
-        let top = crate::runtime::Runtime::new_with_provider_and_credentials(
-            root.path(),
-            "gpt-5.4",
-            crate::ProviderKind::OpenAiSubscription,
-            crate::credentials::CredentialStorage::Memory,
-        )
-        .unwrap();
-        let spawned = top
-            .child_config_for_test()
-            .with_parent_context("s-child".into(), "Scout".into());
-        assert!(emits_hook_events(&spawned));
-        // A Kit that is itself a subagent never emits; its parent relays.
-        let nested = crate::runtime::Runtime::with_depth(top, 1).unwrap();
-        let spawned = nested
-            .child_config_for_test()
-            .with_parent_context("s-grandchild".into(), "Pip".into());
-        assert!(!emits_hook_events(&spawned));
-    }
-
-    #[test]
-    fn a_childs_sign_in_reaches_each_kind_of_client_once() {
-        for below in [None, Some("s-grandchild")] {
-            let id = below.map_or("s-child".to_owned(), |below| format!("s-child/{below}"));
-            // The top Kit: one runtime event (Kit's own client reads it; it
-            // registers no relay) and one relayed notice (any other client's;
-            // it reads no runtime events). Both name the agent the link is for.
-            let (events, relayed) = deliveries(false, below);
-            assert_eq!(events.len(), 1, "{events:?}");
-            assert!(matches!(&events[0],
-                crate::events::RuntimeEvent::SubagentHookSignIn { id: event_id, url: Some(_), .. } if *event_id == id));
-            assert_eq!(relayed.len(), 1);
-            assert_eq!(relayed[0].agent, id);
-            assert_eq!(relayed[0].meta[HOOK_AUTH_META_KEY]["agent"], id.as_str());
-            // A nested Kit: no runtime event, only the notice to its parent.
-            let (events, relayed) = deliveries(true, below);
-            assert!(events.is_empty(), "{events:?}");
-            assert_eq!(relayed.len(), 1);
-        }
-    }
-
-    #[test]
-    fn a_link_too_long_for_a_runtime_event_is_left_to_the_notice() {
-        let transcripts = transcript::Transcripts::default();
-        transcripts.start("s-child", 1);
-        let url = format!("https://auth.example/{}", "a".repeat(20 * 1024));
-        let update = json!({"sessionUpdate": "notice", "severity": "info",
-            "title": format!("Hook backend `x` needs you to sign in. Open {url} to approve Kit."),
-            "_meta": {HOOK_AUTH_META_KEY: {"backend": "x", "url": url, "cleared": false}}});
-        let emitted = Mutex::new(0);
-        deliver_hook_hint(
-            "s-child",
-            &transcripts.get("s-child", 1).unwrap(),
-            &update,
-            false,
-            &|_| *emitted.lock().unwrap() += 1,
-        );
-        assert_eq!(*emitted.lock().unwrap(), 0);
-        // The notice text leaves the link out rather than cutting it.
-        let hint = child_hint("s-child", &update).unwrap();
-        assert!(
-            !hint.text.contains("https://auth.example/a"),
-            "{}",
-            hint.text
-        );
-        assert!(hint.text.contains("too long to show"));
-        assert_eq!(hint.meta[HOOK_AUTH_META_KEY]["url"], url.as_str());
-    }
-
-    #[tokio::test]
-    async fn a_childs_sign_in_event_never_becomes_a_diagnostic() {
-        let link = "https://auth.example/authorize?state=grandchild";
-        let event = crate::events::RuntimeEvent::SubagentHookSignIn {
-            id: "s-grandchild".into(),
-            backend: "x".into(),
-            url: Some(link.into()),
-            expires_at: None,
-            cleared: false,
-            text: Some(format!("Open {link}")),
-        };
-        let input = format!(
-            "{}{}\nan ordinary line\n",
-            crate::events::EVENT_MARKER,
-            serde_json::to_string(&event).unwrap()
-        );
-        let mut output = Vec::new();
-        forward_stderr(input.as_bytes(), "acp.kit", None, |item| output.push(item)).await;
-        for item in &output {
-            let text = match item {
-                ForwardedStderr::Diagnostic(line) | ForwardedStderr::RuntimeLine(line) => line,
-                ForwardedStderr::Cleanup(_) => continue,
-            };
-            assert!(!text.contains("state=grandchild"), "{text}");
-        }
-        assert!(output.iter().any(
-            |item| matches!(item, ForwardedStderr::Diagnostic(line) if line.contains("an ordinary line"))
-        ));
-    }
-
-    #[test]
-    fn a_relayed_child_hint_carries_only_its_mark_and_bounded_text() {
-        let update = json!({"sessionUpdate": "notice", "severity": "info",
-            "title": "é".repeat(MAX_CHILD_NOTICE),
-            "_meta": {"kit/hooks/auth": {"backend": "x", "cleared": false}, "other": {"secret": 1}}});
-        let hint = child_hint("scout", &update).unwrap();
-        assert_eq!(
-            hint.meta.keys().collect::<Vec<_>>(),
-            [crate::ahp::auth::HOOK_AUTH_META]
-        );
-        assert!(hint.text.len() <= MAX_CHILD_NOTICE);
-        assert!(hint.text.chars().all(|c| c == 'é'));
-    }
-
     mod removes_descendants_on_exit {
         use super::*;
 
@@ -5983,7 +5691,6 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
-                nested_runtime: false,
             }
         }
 

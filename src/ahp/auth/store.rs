@@ -185,6 +185,68 @@ impl Store {
         Ok(deleted)
     }
 
+    /// The token generation of every grant this backend holds, by record.
+    pub(super) async fn token_generations(
+        &self,
+        budget: OperationBudget,
+    ) -> Result<std::collections::HashMap<String, String>, HookError> {
+        let index = {
+            let _lock = self.lock(INDEX, &self.backend, budget).await?;
+            self.index().await?
+        };
+        let mut generations = std::collections::HashMap::new();
+        for (namespace, identity) in index {
+            if namespace != RECORDS {
+                continue;
+            }
+            if let Some(generation) = self.generation_of(&identity).await? {
+                generations.insert(identity, generation);
+            }
+        }
+        Ok(generations)
+    }
+
+    async fn generation_of(&self, identity: &str) -> Result<Option<String>, HookError> {
+        let entry = self.storage.entry(RECORDS, identity);
+        let bytes = blocking(move || entry.load()).await?;
+        Ok(bytes
+            .and_then(|bytes| serde_json::from_slice::<SessionRecord>(&bytes).ok())
+            .and_then(|record| record.attempt_id().map(str::to_owned)))
+    }
+
+    /// Removes the grant one code exchange wrote, and nothing else: the
+    /// record whose token generation is `ours`, or, when the exchange
+    /// returned none (an under-granted step-up still stores its grant), the
+    /// records whose generation is new since `before`. Each is checked
+    /// again under its lock before it goes, so a newer grant written
+    /// meanwhile stays. Returns how many it removed.
+    pub(super) async fn discard_exchange(
+        &self,
+        before: &std::collections::HashMap<String, String>,
+        ours: Option<&str>,
+        budget: OperationBudget,
+    ) -> Result<usize, HookError> {
+        let now = self.token_generations(budget).await?;
+        let mut removed = 0;
+        for (identity, generation) in now {
+            let written = match ours {
+                Some(ours) => generation == ours,
+                None => before.get(&identity) != Some(&generation),
+            };
+            if !written {
+                continue;
+            }
+            let _record = self.lock(RECORDS, &identity, budget).await?;
+            if self.generation_of(&identity).await?.as_deref() != Some(generation.as_str()) {
+                continue;
+            }
+            let entry = self.storage.entry(RECORDS, &identity);
+            durably(entry, |entry| entry.delete().map(|_| ())).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Every record and secret indexed for this backend.
     #[cfg(test)]
     pub(super) async fn indexed(&self) -> BTreeSet<(String, String)> {
@@ -224,6 +286,18 @@ pub(super) async fn logout_generation(
         generation.push('|');
     }
     Ok(generation)
+}
+
+/// Where `scope`'s own logout marker is kept, for file-backed storage.
+#[cfg(test)]
+pub(super) fn logout_marker_path(
+    storage: &CredentialStorage,
+    scope: &str,
+) -> Option<std::path::PathBuf> {
+    storage
+        .entry(LOGOUTS, scope)
+        .filesystem_path()
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Moves `scope`'s logout marker, or with `all_workspaces` the marker of
@@ -512,6 +586,68 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
         assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+    }
+
+    /// A grant record whose token has `generation`.
+    fn grant(version: &str, generation: &str) -> SessionRecord {
+        let mut record = serde_json::to_value(record(version)).unwrap();
+        record["token"] = serde_json::json!({
+            "access_token": "t", "refresh_token": null, "expires_at": null,
+            "scopes": [], "generation": generation,
+            "access_rejected": false, "refresh_in_flight": false
+        });
+        serde_json::from_value(record).unwrap()
+    }
+
+    #[tokio::test]
+    async fn discarding_an_exchange_removes_only_its_own_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let store = Store::new(storage, "test#discard");
+        for (name, generation) in [("old", "g-old"), ("ours", "g-ours"), ("newer", "g-newer")] {
+            let mut guard = store.acquire(key(name), budget()).await.unwrap();
+            assert!(
+                guard
+                    .compare_and_swap(None, grant("v1", generation))
+                    .await
+                    .unwrap()
+            );
+        }
+        let generations = store.token_generations(budget()).await.unwrap();
+        assert_eq!(generations.len(), 3);
+        // Our exchange's generation is known: only that record goes.
+        assert_eq!(
+            store
+                .discard_exchange(&generations, Some("g-ours"), budget())
+                .await
+                .unwrap(),
+            1
+        );
+        let left: std::collections::BTreeSet<_> = store
+            .token_generations(budget())
+            .await
+            .unwrap()
+            .into_values()
+            .collect();
+        assert_eq!(left, ["g-newer".to_owned(), "g-old".to_owned()].into());
+        // Unknown: only what is new since before the exchange goes.
+        let before = store.token_generations(budget()).await.unwrap();
+        let mut guard = store.acquire(key("stepped-up"), budget()).await.unwrap();
+        assert!(
+            guard
+                .compare_and_swap(None, grant("v1", "g-step"))
+                .await
+                .unwrap()
+        );
+        drop(guard);
+        assert_eq!(
+            store
+                .discard_exchange(&before, None, budget())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.token_generations(budget()).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

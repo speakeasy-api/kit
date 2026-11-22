@@ -390,7 +390,6 @@ fn manager_with_disconnected_session(
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
-        nested_runtime: false,
     });
     let state = Arc::new(AsyncMutex::new(State {
         name: "Scout".into(),
@@ -467,7 +466,6 @@ async fn close_does_not_block_listings_or_allow_stale_reuse() {
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
-        nested_runtime: false,
     });
     let handle = manager
         .create(
@@ -639,7 +637,6 @@ fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
-        nested_runtime: false,
     })
 }
 
@@ -1880,7 +1877,6 @@ async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
-        nested_runtime: false,
     });
     let handle = manager
         .create(
@@ -1981,7 +1977,6 @@ async fn listing_includes_named_starting_and_idle_subagents() {
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
-        nested_runtime: false,
     });
     let create_manager = manager.clone();
     let create = tokio::spawn(async move {
@@ -2135,7 +2130,6 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
-        nested_runtime: false,
     });
     let prior = manager
         .create(

@@ -415,11 +415,19 @@ struct RoutesState {
     /// Hook sign-in hints from child sessions not yet routed to an owner, or
     /// arriving while a registration replays: the latest per (session,
     /// originating agent and backend), bounded.
-    held: Vec<(String, String, Value)>,
+    held: Vec<(String, String, Hint)>,
     /// Sessions whose held hints are being replayed: hints that arrive
     /// meanwhile are held too, so none overtakes an older one.
     replaying: std::collections::HashSet<String>,
+    /// Sessions that had a hint dropped at a bound before they had an
+    /// owner: once they do, it is told more backends need a sign-in.
+    overflowed: std::collections::HashSet<String>,
+    /// Sessions removed here: a late hint from one is ignored, though its
+    /// remote close may not have settled.
+    ended: std::collections::HashSet<String>,
 }
+
+type Hint = crate::ahp::auth::hint::HookHint;
 
 /// A replay in progress: dropping it ends the replay.
 struct Replay<'a> {
@@ -440,21 +448,20 @@ impl Drop for Replay<'_> {
 
 /// A held hint's key within its session: the agent that originated it
 /// (relayed from further down the tree) and its backend.
-fn hint_key(update: &Value) -> Option<String> {
-    let mark = &update["_meta"][crate::ahp::auth::HOOK_AUTH_META];
-    let backend = mark["backend"].as_str()?;
-    Some(format!(
-        "{}\n{backend}",
-        mark["agent"].as_str().unwrap_or("")
-    ))
+fn hint_key(hint: &Hint) -> String {
+    format!("{}\n{}", hint.agent.as_deref().unwrap_or(""), hint.backend)
 }
 
 /// Whether a hint's link has expired: it is not replayed.
-fn expired(update: &Value) -> bool {
-    update["_meta"][crate::ahp::auth::HOOK_AUTH_META]["expiresAt"]
-        .as_u64()
-        .is_some_and(|at| at <= crate::events::now_millis())
+fn expired(hint: &Hint) -> bool {
+    !hint.cleared
+        && hint
+            .expires_at
+            .is_some_and(|at| at <= crate::events::now_millis())
 }
+
+/// The most sessions remembered as overflowed or ended.
+const REMEMBERED_SESSIONS: usize = 256;
 
 /// The most hook sign-in hints held for one unrouted child session (a few
 /// backends); each session has its own, so none evicts another's.
@@ -574,9 +581,13 @@ impl Routes {
         owner: &str,
         generation: u64,
         transcript: super::transcript::Transcript,
-        mut deliver: impl FnMut(&Value),
+        mut deliver: impl FnMut(&Hint),
     ) {
-        let mut held = self.register_locked(remote, owner, generation, transcript);
+        let (mut held, overflowed) = self.register_locked(remote, owner, generation, transcript);
+        if overflowed {
+            // What could not be held: the user is told where to look.
+            deliver(&crate::ahp::auth::hint::more_backends());
+        }
         if held.is_empty() {
             return;
         }
@@ -606,10 +617,11 @@ impl Routes {
         owner: &str,
         generation: u64,
         transcript: super::transcript::Transcript,
-    ) -> Vec<Value> {
+    ) -> (Vec<Hint>, bool) {
         let Ok(mut state) = self.0.lock() else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
+        state.ended.remove(remote);
         let routes = &mut state.live;
         if routes.len() < NODES || routes.contains_key(remote) {
             routes.insert(
@@ -638,17 +650,18 @@ impl Routes {
             }
         }
         if !state.live.contains_key(remote) {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let held = Self::take_held(&mut state, remote);
         // Only while there is something to replay do new hints queue behind.
         if !held.is_empty() {
             state.replaying.insert(remote.to_owned());
         }
-        held
+        let overflowed = state.overflowed.remove(remote);
+        (held, overflowed)
     }
 
-    fn take_held(state: &mut RoutesState, remote: &str) -> Vec<Value> {
+    fn take_held(state: &mut RoutesState, remote: &str) -> Vec<Hint> {
         let mut held = Vec::new();
         state.held.retain(|(session, _, update)| {
             let mine = session == remote;
@@ -667,17 +680,22 @@ impl Routes {
     pub(crate) fn hook_hint(
         &self,
         remote: &str,
-        update: Value,
-    ) -> Option<(String, super::transcript::Transcript, Value)> {
+        update: Hint,
+    ) -> Option<(String, super::transcript::Transcript, Hint)> {
         let Ok(mut state) = self.0.lock() else {
             return None;
         };
+        // A removed session's late hint never brings its link back.
+        if state.ended.contains(remote) {
+            return None;
+        }
         if !state.replaying.contains(remote)
             && let Some(route) = state.live.get(remote)
         {
             return Some((route.owner.clone(), route.transcript.clone(), update));
         }
-        let key = hint_key(&update)?;
+        let key = hint_key(&update);
+        let state = &mut *state;
         let held = &mut state.held;
         if let Some(index) = held
             .iter()
@@ -694,6 +712,8 @@ impl Routes {
                 < HELD_HINTS
         {
             held.push((remote.to_owned(), key, update));
+        } else if state.overflowed.len() < REMEMBERED_SESSIONS {
+            state.overflowed.insert(remote.to_owned());
         }
         None
     }
@@ -703,6 +723,10 @@ impl Routes {
         if let Ok(mut state) = self.0.lock() {
             state.held.retain(|(session, _, _)| session != remote);
             state.replaying.remove(remote);
+            state.overflowed.remove(remote);
+            if state.ended.len() < REMEMBERED_SESSIONS {
+                state.ended.insert(remote.to_owned());
+            }
         }
     }
     pub(crate) fn forward(&self, remote: &str, update: Value) {
@@ -981,9 +1005,16 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    fn hook_hint(backend: &str, url: Option<&str>, cleared: bool) -> Value {
-        serde_json::json!({"sessionUpdate": "notice", "severity": "info", "title": "sign in",
-            "_meta": {crate::ahp::auth::HOOK_AUTH_META: {"backend": backend, "url": url, "cleared": cleared}}})
+    fn hook_hint(backend: &str, url: Option<&str>, cleared: bool) -> Hint {
+        Hint {
+            backend: backend.to_owned(),
+            agent: None,
+            url: url.map(str::to_owned),
+            expires_at: None,
+            cleared,
+            reason: cleared.then_some(crate::ahp::auth::hint::ClearReason::SignedIn),
+            problem: None,
+        }
     }
 
     #[test]
@@ -1103,11 +1134,11 @@ mod tests {
         transcripts.start("owner", 1);
         let routes = Routes::default();
         let mut expired = hook_hint("a", Some("https://a/old"), false);
-        expired["_meta"][crate::ahp::auth::HOOK_AUTH_META]["expiresAt"] = 1.into();
+        expired.expires_at = Some(1);
         routes.hook_hint("child", expired);
         // A grandchild's link for the same backend, relayed by the child.
         let mut relayed = hook_hint("b", Some("https://b/grandchild"), false);
-        relayed["_meta"][crate::ahp::auth::HOOK_AUTH_META]["agent"] = "s-grandchild".into();
+        relayed.agent = Some("s-grandchild".into());
         routes.hook_hint("child", hook_hint("b", Some("https://b/own"), false));
         routes.hook_hint("child", relayed.clone());
         let mut held = Vec::new();

@@ -44,7 +44,7 @@ async fn sdk_v2_negotiation_and_session_dispatch() {
             .await
     });
     let client = Builder::new(Client).connect_with(client_wire, async |connection| {
-        let (version, _, _, _) = initialize(&connection, Version::V2).await?;
+        let (version, _, _, _) = initialize(&connection, Version::V2, false).await?;
         assert_eq!(version, Version::V2);
         let response = request(
             connection,
@@ -89,7 +89,7 @@ async fn sdk_v1_negotiation(offer: Version) {
             .await
     });
     let client = Builder::new(Client).connect_with(client_wire, async move |connection| {
-        let (version, _, _, _) = initialize(&connection, offer).await?;
+        let (version, _, _, _) = initialize(&connection, offer, false).await?;
         assert_eq!(version, Version::V1);
         let response = request(
             connection,

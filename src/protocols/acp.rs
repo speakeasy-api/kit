@@ -1420,42 +1420,27 @@ pub(crate) fn own_subagents(
     }
 }
 
-/// A child agent's hook sign-in notices, for this session's user: marked
-/// Info notices labelled with the agent, never transcript, child output or
-/// inspection. Registered with the session's own hints, after activation.
-pub(crate) fn relay_child_hook_hints(
-    client: AcpClientHandle,
-    session: agentkit_acp::SessionId,
-) -> crate::ahp::auth::relay::ChildHintSubscription {
-    crate::ahp::auth::relay::subscribe(session.to_string(), move |hint| {
-        let _ = client.notify_session(SessionNotification::new(
-            session.clone(),
-            SessionUpdate::Notice(
-                Notice::new(
-                    NoticeSeverity::Info,
-                    format!("Agent {}: {}", hint.agent, hint.text),
-                )
-                .meta(hint.meta.clone()),
-            ),
-        ));
-    })
-}
-
-/// Hook sign-in links are for the user only, never the transcript: one
-/// marked notice per link. Subscribed once the session is activated, after
-/// the client has its response: the hints replayed on subscribing name a
+/// Where a v1 session's hook sign-in hints go, its own and its child
+/// agents' alike: a marked notice per change worth a line, never transcript,
+/// child output or inspection. Subscribed once the session is activated,
+/// after the client has its response: hints replayed on subscribing name a
 /// session the client knows, and an attachment that fails never sends any.
-fn subscribe_hook_auth(
+pub(crate) fn subscribe_hook_hints(
     hooks: Option<&crate::ahp::Hooks>,
     client: AcpClientHandle,
     session: agentkit_acp::SessionId,
-) -> Option<crate::ahp::auth::HintSubscription> {
-    hooks?.subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
-        let _ = client.notify_session(SessionNotification::new(
-            session.clone(),
-            SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text).meta(hint.meta())),
-        ));
-    }))
+) -> crate::ahp::auth::SessionHints {
+    let id = session.to_string();
+    crate::ahp::auth::subscribe_session(
+        hooks,
+        id,
+        crate::ahp::auth::notices(move |hint, text| {
+            let _ = client.notify_session(SessionNotification::new(
+                session.clone(),
+                SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text).meta(hint.mark())),
+            ));
+        }),
+    )
 }
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
@@ -2109,10 +2094,8 @@ impl Server {
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
                 // Held for the session's life, from activation on.
-                let _child_hints =
-                    relay_child_hook_hints(hook_auth_client.clone(), session_id.clone());
-                let _hook_auth =
-                    subscribe_hook_auth(runtime.hooks(), hook_auth_client, session_id.clone());
+                let _hook_hints =
+                    subscribe_hook_hints(runtime.hooks(), hook_auth_client, session_id.clone());
                 // Clients discard non-transcript updates during replay, so these
                 // follow the response rather than joining the replay stream.
                 if let Some((used, size)) = restored_context {
@@ -6485,43 +6468,6 @@ pub(super) mod tests {
         );
         server.abort();
         let _ = server.await;
-    }
-
-    #[test]
-    fn a_child_agents_sign_in_link_reaches_the_owning_legacy_session() {
-        let session_id = agentkit_acp::SessionId::new("v1-child-sign-in");
-        let (client, mut messages) = AcpClientHandle::channel();
-        let _relay = relay_child_hook_hints(client, session_id.clone());
-        crate::ahp::auth::relay::relay(
-            &session_id.to_string(),
-            &crate::ahp::auth::relay::ChildHint {
-                agent: "scout".into(),
-                text: "Hook backend `x` needs you to sign in.".into(),
-                meta: serde_json::Map::from_iter([(
-                    crate::ahp::auth::HOOK_AUTH_META.to_owned(),
-                    json!({"backend": "x", "cleared": false}),
-                )]),
-            },
-        );
-        let AcpClientMessage::SessionNotification(notification) = messages.try_recv().unwrap()
-        else {
-            panic!("expected a session notification");
-        };
-        assert_eq!(notification.session_id, session_id);
-        let SessionUpdate::Notice(notice) = notification.update else {
-            panic!("a child's link is a notice");
-        };
-        assert_eq!(notice.severity, NoticeSeverity::Info);
-        assert_eq!(
-            notice.title,
-            "Agent scout: Hook backend `x` needs you to sign in."
-        );
-        assert!(
-            notice
-                .meta
-                .unwrap()
-                .contains_key(crate::ahp::auth::HOOK_AUTH_META)
-        );
     }
 
     #[tokio::test]

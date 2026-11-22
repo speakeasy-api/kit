@@ -77,20 +77,6 @@ pub enum RuntimeEvent {
     },
     /// Every observable strict descendant of an ancestor should be removed.
     SubagentDescendantsRemoved { ancestor_id: String },
-    /// A child's hook sign-in hint, for the user only: never the parent's
-    /// model, child output or inspection.
-    SubagentHookSignIn {
-        id: String,
-        backend: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        url: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expires_at: Option<u64>,
-        cleared: bool,
-        /// The child's notice text.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-    },
 }
 
 /// Partial activity updates preserve omitted fields from earlier notifications.

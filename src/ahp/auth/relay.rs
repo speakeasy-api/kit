@@ -1,4 +1,4 @@
-//! A child agent's hook sign-in notices, relayed to the user of the parent
+//! A child agent's hook sign-in hints, relayed to the user of the parent
 //! session that owns the agent. The child's hook waits for its user to sign
 //! in, so the parent delivers the link the way it delivers its own: to that
 //! session's user only, never into child output, inspection or a model.
@@ -7,15 +7,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 
-/// One relayed notice: the child agent, the child's notice text and its
-/// sign-in `_meta` (kept, so a Kit above the parent drops it from its model
-/// too).
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ChildHint {
-    pub(crate) agent: String,
-    pub(crate) text: String,
-    pub(crate) meta: serde_json::Map<String, serde_json::Value>,
-}
+/// A child's hint, its `agent` the path from the owning session.
+pub(crate) use super::hint::HookHint as ChildHint;
 
 type Sink = dyn Fn(&ChildHint) + Send + Sync;
 

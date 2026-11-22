@@ -65,8 +65,9 @@ struct UpdateMcpRequest {
 struct UpdateMcpResponse {}
 
 /// Kit-private notification to clients that declare `kit/hooks/auth` in
-/// their capabilities `_meta` (the bundled TUI): a hook backend's sign-in
-/// link for a status line, or that it cleared. Other clients get a notice.
+/// their capabilities `_meta` (the bundled TUI, and a parent Kit): every
+/// change to a hook sign-in hint of the session, its own or a child
+/// agent's, with its whole lifecycle. Other clients get a marked notice.
 #[derive(
     Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcNotification,
 )]
@@ -74,15 +75,8 @@ struct UpdateMcpResponse {}
 #[notification(method = "kit/hooks/auth")]
 pub(crate) struct HookAuthNotification {
     pub session_id: wire::SessionId,
-    pub backend: String,
-    pub url: Option<String>,
-    /// Unix milliseconds.
-    pub expires_at: Option<u64>,
-    pub cleared: bool,
-    /// What went wrong with the backend's sign-in, with what to check: a
-    /// clause that follows "Hook backend <id> ".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub problem: Option<String>,
+    #[serde(flatten)]
+    pub hint: crate::ahp::auth::hint::HookHint,
 }
 
 /// The capability `_meta` key a client sets to receive [`HookAuthNotification`].
@@ -583,15 +577,39 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
     }
 }
 
-/// At a session's activation: relays its child agents' sign-in links to its
-/// user, unless the client is Kit's own (`kit_client`: it asked for Kit's
-/// hook notifications), which shows them from runtime events instead.
-pub(crate) fn activate_child_relay<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
+/// Where a session's hook sign-in hints go, its own and its child agents'
+/// alike: to a client that asked for Kit's notification (`notify`), every
+/// change as [`HookAuthNotification`]; to any other client, a marked notice
+/// per change worth a line. Subscribed once the session is activated, after
+/// the client has its response: hints replayed on subscribing name a session
+/// the client knows, and an attachment that fails never sends any.
+pub(crate) fn subscribe_hook_hints<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
+    hooks: Option<&crate::ahp::Hooks>,
     session: wire::SessionId,
     sink: S,
-    kit_client: bool,
-) -> Option<crate::ahp::auth::relay::ChildHintSubscription> {
-    (!kit_client).then(|| relay_child_hook_hints(session, sink))
+    notify: Option<Arc<dyn Fn(HookAuthNotification) + Send + Sync>>,
+) -> crate::ahp::auth::SessionHints {
+    let id = session.to_string();
+    match notify {
+        Some(notify) => crate::ahp::auth::subscribe_session(hooks, id, move |hint| {
+            notify(HookAuthNotification {
+                session_id: session.clone(),
+                hint: hint.clone(),
+            });
+        }),
+        None => crate::ahp::auth::subscribe_session(
+            hooks,
+            id,
+            crate::ahp::auth::notices(move |hint, text| {
+                let _ = sink.update(wire::UpdateSessionNotification::new(
+                    session.clone(),
+                    wire::SessionUpdate::Notice(
+                        wire::Notice::new(wire::NoticeSeverity::Info, text).meta(hint.mark()),
+                    ),
+                ));
+            }),
+        ),
+    }
 }
 
 /// A session update sink that records what it is sent, for tests that
@@ -620,62 +638,6 @@ impl AcpSessionUpdateSink for RecordedUpdates {
 
     async fn flush(&self) -> Result<(), AcpRuntimeError> {
         Ok(())
-    }
-}
-
-/// A child agent's hook sign-in notices, for this session's user: marked
-/// Info notices labelled with the agent, never transcript, child output or
-/// inspection. Registered with the session's own hints, after activation.
-fn relay_child_hook_hints<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
-    session: wire::SessionId,
-    sink: S,
-) -> crate::ahp::auth::relay::ChildHintSubscription {
-    crate::ahp::auth::relay::subscribe(session.to_string(), move |hint| {
-        let _ = sink.update(wire::UpdateSessionNotification::new(
-            session.clone(),
-            wire::SessionUpdate::Notice(
-                wire::Notice::new(
-                    wire::NoticeSeverity::Info,
-                    format!("Agent {}: {}", hint.agent, hint.text),
-                )
-                .meta(hint.meta.clone()),
-            ),
-        ));
-    })
-}
-
-/// Hook sign-in links go to the user only, never the transcript: to a
-/// client's status line through [`HookAuthNotification`] when it asked for
-/// them, else as one notice per link. Subscribed once the session is
-/// activated, after the client has its response: the hints replayed on
-/// subscribing name a session the client knows, and an attachment that
-/// fails never sends any.
-fn subscribe_hook_auth<S: AcpSessionUpdateSink + Clone + Send + Sync + 'static>(
-    hooks: Option<&crate::ahp::Hooks>,
-    session: wire::SessionId,
-    sink: S,
-    notifications: Option<V2ConnectionTo<Client>>,
-) -> Option<crate::ahp::auth::HintSubscription> {
-    let hooks = hooks?;
-    match notifications {
-        Some(connection) => hooks.subscribe_auth_hints(move |hint| {
-            let _ = connection.send_notification(HookAuthNotification {
-                session_id: session.clone(),
-                backend: hint.backend.clone(),
-                url: hint.url.clone(),
-                expires_at: hint.expires_at_ms,
-                cleared: hint.cleared,
-                problem: hint.problem.clone(),
-            });
-        }),
-        None => hooks.subscribe_auth_hints(crate::ahp::auth::notices(move |hint, text| {
-            let _ = sink.update(wire::UpdateSessionNotification::new(
-                session.clone(),
-                wire::SessionUpdate::Notice(
-                    wire::Notice::new(wire::NoticeSeverity::Info, text).meta(hint.meta()),
-                ),
-            ));
-        })),
     }
 }
 
@@ -1432,10 +1394,15 @@ impl Server {
             activity.clone(),
         )
         .with_hook_messages(runtime.hooks());
-        let hook_auth_notifications = self
-            .hook_auth_notifications
-            .load(Ordering::Acquire)
-            .then(|| connection.clone());
+        let hook_auth_notifications =
+            self.hook_auth_notifications
+                .load(Ordering::Acquire)
+                .then(|| {
+                    let connection = connection.clone();
+                    Arc::new(move |notification: HookAuthNotification| {
+                        let _ = connection.send_notification(notification);
+                    }) as Arc<dyn Fn(HookAuthNotification) + Send + Sync>
+                });
         let context = AcpDriverContext {
             activity: activity.clone(),
             ask_user,
@@ -1518,15 +1485,8 @@ impl Server {
                 let sink = actor.sink.clone();
                 let runtime = Arc::clone(&actor.runtime);
                 let session_id = actor.session_id.clone();
-                // Held for the session's life, from activation on. A client
-                // that takes Kit's hook notifications is Kit, which shows a
-                // child's links from its runtime events instead.
-                let _child_hints = activate_child_relay(
-                    session_id.clone(),
-                    sink.inner.clone(),
-                    hook_auth_notifications.is_some(),
-                );
-                let _hook_auth = subscribe_hook_auth(
+                // Held for the session's life, from activation on.
+                let _hook_hints = subscribe_hook_hints(
                     runtime.hooks(),
                     session_id.clone(),
                     sink.inner.clone(),
@@ -4016,7 +3976,7 @@ mod tests {
         let recording = RecordingSink::default();
         let session_id = wire::SessionId::new("v2-hook-sign-in");
         let _subscription =
-            subscribe_hook_auth(Some(&hooks), session_id.clone(), recording.clone(), None);
+            subscribe_hook_hints(Some(&hooks), session_id.clone(), recording.clone(), None);
         let pending = crate::ahp::auth::test_support::hint(
             &hooks,
             "test.v2-sign-in",
@@ -4029,6 +3989,7 @@ mod tests {
             url: None,
             cleared: true,
             signed_in: true,
+            reason: Some(crate::ahp::auth::hint::ClearReason::SignedIn),
             ..pending
         });
         let updates = recording.updates.lock().unwrap();
@@ -5075,18 +5036,19 @@ mod tests {
         let recording = RecordingSink::default();
         let session_id = wire::SessionId::new("v2-child-sign-in");
         let link = "https://auth.example/authorize?state=child";
-        let hint = crate::ahp::auth::relay::ChildHint {
-            agent: "scout".into(),
-            text: format!("Hook backend `x` needs you to sign in. Open {link} to approve Kit."),
-            meta: serde_json::Map::from_iter([(
-                HOOK_AUTH_META.to_owned(),
-                json!({"backend": "x", "url": link, "cleared": false}),
-            )]),
+        let hint = crate::ahp::auth::hint::HookHint {
+            backend: "x".into(),
+            agent: Some("scout".into()),
+            url: Some(link.into()),
+            expires_at: None,
+            cleared: false,
+            reason: None,
+            problem: None,
         };
         // Nobody attached yet: dropped.
         crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
         assert!(recording.updates.lock().unwrap().is_empty());
-        let subscription = relay_child_hook_hints(session_id.clone(), recording.clone());
+        let subscription = subscribe_hook_hints(None, session_id.clone(), recording.clone(), None);
         crate::ahp::auth::relay::relay(&session_id.to_string(), &hint);
         // Another session's child is not this session's.
         crate::ahp::auth::relay::relay("another-session", &hint);

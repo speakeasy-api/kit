@@ -892,7 +892,6 @@ impl Runtime {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: false,
         });
         Ok(Arc::new(Self {
             ask_user_enabled: true,
@@ -1035,10 +1034,6 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
         runtime.base_depth = depth;
-        // Its children's sign-in links then go up through its own parent.
-        let mut config = runtime.subagents.child_config();
-        config.nested_runtime = depth > 0;
-        runtime.subagents = Subagents::new(config);
         Ok(Arc::new(runtime))
     }
 
@@ -1575,7 +1570,6 @@ impl Runtime {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
-            nested_runtime: previous.nested_runtime,
         });
         Ok(Arc::new(runtime))
     }

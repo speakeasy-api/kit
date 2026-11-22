@@ -30,6 +30,8 @@ pub(crate) struct AuthHint {
     pub cleared: bool,
     /// Cleared because sign-in finished, rather than because the link expired.
     pub signed_in: bool,
+    /// Why it cleared.
+    pub reason: Option<super::hint::ClearReason>,
     /// What went wrong with the backend's sign-in, as a clause after
     /// "Hook backend `<id>` ", with what to check: sanitized, never a
     /// provider message.
@@ -42,43 +44,23 @@ pub(crate) struct AuthHint {
 pub(crate) const HOOK_AUTH_META: &str = "kit/hooks/auth";
 
 impl AuthHint {
-    /// `_meta` for a notice carrying this hint.
-    pub(crate) fn meta(&self) -> serde_json::Map<String, serde_json::Value> {
-        serde_json::Map::from_iter([(
-            HOOK_AUTH_META.to_owned(),
-            serde_json::Value::Object(serde_json::Map::from_iter([
-                ("backend".into(), self.backend.clone().into()),
-                ("url".into(), self.url.clone().into()),
-                ("expiresAt".into(), self.expires_at_ms.into()),
-                ("cleared".into(), self.cleared.into()),
-            ])),
-        )])
-    }
-
-    /// Plain text for a client without Kit's status line: once for a new
-    /// link and once when sign-in finishes. An expired link says nothing;
-    /// the next turn shows its replacement.
+    /// Plain text for a client without Kit's status line (see
+    /// [`super::hint::HookHint::notice_text`]).
     pub(crate) fn notice(&self) -> Option<String> {
-        match (&self.url, &self.problem) {
-            // A problem is a clause that says what went wrong.
-            (Some(url), Some(problem)) if !self.cleared => {
-                return Some(format!(
-                    "Hook backend `{}` needs you to sign in. Open {url} to approve Kit. Also, the backend {problem}",
-                    self.backend
-                ));
-            }
-            (None, Some(problem)) if !self.cleared => {
-                return Some(format!("Hook backend `{}` {problem}", self.backend));
-            }
-            _ => {}
-        }
-        match (&self.url, self.signed_in) {
-            (Some(url), _) if !self.cleared => Some(format!(
-                "Hook backend `{}` needs you to sign in. Open {url} to approve Kit.",
-                self.backend
-            )),
-            (_, true) => Some(format!("Hook backend `{}` is signed in.", self.backend)),
-            _ => None,
+        super::hint::HookHint::from(self).notice_text()
+    }
+}
+
+impl From<&AuthHint> for super::hint::HookHint {
+    fn from(hint: &AuthHint) -> Self {
+        Self {
+            backend: hint.backend.clone(),
+            agent: None,
+            url: hint.url.clone(),
+            expires_at: hint.expires_at_ms,
+            cleared: hint.cleared,
+            reason: hint.reason,
+            problem: hint.problem.clone(),
         }
     }
 }
@@ -186,6 +168,7 @@ impl Login {
             expires_at_ms: Some(unix_ms(self.expires_at)),
             cleared: false,
             signed_in: false,
+            reason: None,
             problem: None,
         }
     }
@@ -241,14 +224,15 @@ pub(crate) struct HintSubscription {
     _sink: Arc<Sink>,
 }
 
-fn cleared(scope: &str, backend: &str, signed_in: bool) -> AuthHint {
+fn cleared(scope: &str, backend: &str, reason: super::hint::ClearReason) -> AuthHint {
     AuthHint {
         scope: scope.to_owned(),
         backend: backend.to_owned(),
         url: None,
         expires_at_ms: None,
         cleared: true,
-        signed_in,
+        signed_in: reason == super::hint::ClearReason::SignedIn,
+        reason: Some(reason),
         problem: None,
     }
 }
@@ -420,7 +404,8 @@ impl Registry {
                 problem: Some(problem),
                 ..link.unwrap_or_else(|| AuthHint {
                     cleared: false,
-                    ..cleared(scope, backend, false)
+                    reason: None,
+                    ..cleared(scope, backend, super::hint::ClearReason::Withdrawn)
                 })
             };
             stage(&mut state, hint)
@@ -444,7 +429,8 @@ impl Registry {
                 problem: Some(problem),
                 ..link.unwrap_or_else(|| AuthHint {
                     cleared: false,
-                    ..cleared(scope, backend, false)
+                    reason: None,
+                    ..cleared(scope, backend, super::hint::ClearReason::Withdrawn)
                 })
             };
             stage_transient(&mut state, hint)
@@ -538,8 +524,14 @@ impl Registry {
             if next.is_none() {
                 state.pending.remove(scope);
             }
-            let signed_in = matches!(how, Settle::Granted(_)) && !state.needs.contains_key(scope);
-            let hint = next.unwrap_or_else(|| cleared(scope, &context.backend_id, signed_in));
+            let reason = match how {
+                Settle::Granted(_) if !state.needs.contains_key(scope) => {
+                    super::hint::ClearReason::SignedIn
+                }
+                Settle::Granted(_) => super::hint::ClearReason::Withdrawn,
+                Settle::Ended => super::hint::ClearReason::Expired,
+            };
+            let hint = next.unwrap_or_else(|| cleared(scope, &context.backend_id, reason));
             (stopped, stage(&mut state, hint))
         };
         for stop in stopped {
@@ -588,7 +580,8 @@ impl Registry {
             if next.is_none() {
                 state.pending.remove(scope);
             }
-            let hint = next.unwrap_or_else(|| cleared(scope, backend, false));
+            let hint = next
+                .unwrap_or_else(|| cleared(scope, backend, super::hint::ClearReason::LoggedOut));
             (stopped, stage(&mut state, hint))
         };
         for stop in stopped {
@@ -603,7 +596,13 @@ impl Registry {
             let mut state = self.lock();
             state.needs.remove(scope);
             let stopped = state.pending.remove(scope).unwrap_or_default();
-            (stopped, stage(&mut state, cleared(scope, backend, false)))
+            (
+                stopped,
+                stage(
+                    &mut state,
+                    cleared(scope, backend, super::hint::ClearReason::LoggedOut),
+                ),
+            )
         };
         for login in stopped {
             login.stop.notify_one();
@@ -822,6 +821,9 @@ pub(super) enum Outcome {
     /// The backend was logged out (in any Kit process) after the login was
     /// prepared: it stores no grant.
     LoggedOut,
+    /// Whether a logout happened during the exchange could not be told: the
+    /// sign-in is refused and its grant removed; the user signs in again.
+    Unverified,
 }
 
 /// Receives `login`'s callback on its own `listener` and completes the
@@ -905,6 +907,12 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             deadline,
             ..login.context.clone()
         };
+        let store = super::store::Store::new(login.generation.storage.clone(), &login.scope);
+        // What the exchange did not write, so only its own write is undone.
+        let before = store
+            .token_generations(OperationBudget::until(deadline))
+            .await
+            .ok();
         let completed = login
             .oauth
             .complete(context, callback, OperationBudget::until(deadline))
@@ -914,23 +922,32 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
         // here. Checked whatever `complete` returned: an under-granted step-up
         // stores its grant and still fails access_denied. Removing is
         // idempotent, so a failed exchange that stored nothing costs nothing.
-        let logged_out = match login.generation.current(&login.scope).await {
-            Ok(current) => !current,
-            Err(_) => {
-                // The grant is stored by now; a logout that follows removes it.
-                tracing::warn!(backend = %login.context.backend_id, "the logout marker could not be read after a hook sign-in");
-                false
-            }
-        };
-        if logged_out {
+        // Only a verified generation accepts the grant: a logout meanwhile,
+        // or a marker that cannot be read, undoes this exchange's write
+        // (and only that) and never reports a sign-in.
+        let verified = login.generation.current(&login.scope).await;
+        if !matches!(verified, Ok(true)) {
             let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
-            if let Err(error) =
-                super::store::Store::new(login.generation.storage.clone(), &login.scope)
-                    .forget(budget)
-                    .await
-            {
+            let ours = completed
+                .as_ref()
+                .ok()
+                .map(|credential| credential.attempt_id.clone());
+            let discarded = match (&before, ours.as_deref()) {
+                (_, Some(ours)) => {
+                    store
+                        .discard_exchange(&before.clone().unwrap_or_default(), Some(ours), budget)
+                        .await
+                }
+                (Some(before), None) => store.discard_exchange(before, None, budget).await,
+                // Nothing to tell this exchange's write from another's.
+                (None, None) => Ok(0),
+            };
+            if let Err(error) = discarded {
                 let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
-                tracing::warn!(backend = %login.context.backend_id, code, "a hook sign-in completed during a logout could not be removed");
+                tracing::warn!(backend = %login.context.backend_id, code, "a hook sign-in that could not be accepted could not be removed");
+            }
+            if verified.is_err() {
+                tracing::warn!(backend = %login.context.backend_id, "a hook sign-in was refused: the logout marker could not be read");
             }
             if completed
                 .as_ref()
@@ -942,7 +959,11 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
                     .await;
             }
             respond(&mut stream, false).await;
-            return Outcome::LoggedOut;
+            return if verified.is_err() {
+                Outcome::Unverified
+            } else {
+                Outcome::LoggedOut
+            };
         }
         respond(&mut stream, completed.is_ok()).await;
         let error = match completed {
@@ -1061,36 +1082,44 @@ async fn respond(stream: &mut tokio::net::TcpStream, success: bool) {
 /// Adapts `notify` to a client without Kit's status line: one notice per new
 /// link, and one when a backend whose link it showed finishes signing in.
 pub(crate) fn notices(
-    notify: impl Fn(&AuthHint, String) + Send + Sync + 'static,
-) -> impl Fn(&AuthHint) + Send + Sync + 'static {
+    notify: impl Fn(&super::hint::HookHint, String) + Send + Sync + 'static,
+) -> impl Fn(&super::hint::HookHint) + Send + Sync + 'static {
     let shown: Mutex<HashSet<String>> = Mutex::default();
-    move |hint: &AuthHint| {
+    move |hint: &super::hint::HookHint| {
         let text = {
             let mut shown = shown.lock().unwrap_or_else(|poison| poison.into_inner());
+            // One line per link and per problem, for each agent's backend.
+            let owner = format!(
+                "{}\n{}\n",
+                hint.agent.as_deref().unwrap_or(""),
+                hint.backend
+            );
             match (&hint.url, &hint.problem) {
                 (Some(url), problem) if !hint.cleared => {
                     let key = match problem {
-                        Some(problem) => format!("{}\n{url}\n{problem}", hint.backend),
-                        None => format!("{}\n{url}", hint.backend),
+                        Some(problem) => format!("{owner}{url}\n{problem}"),
+                        None => format!("{owner}{url}"),
                     };
                     if !shown.insert(key) {
                         return;
                     }
                 }
                 (None, Some(problem)) if !hint.cleared => {
-                    if !shown.insert(format!("{}\nproblem\n{problem}", hint.backend)) {
+                    if !shown.insert(format!("{owner}problem\n{problem}")) {
                         return;
                     }
                 }
                 _ => {
                     let before = shown.len();
-                    shown.retain(|key| !key.starts_with(&format!("{}\n", hint.backend)));
-                    if before == shown.len() || !hint.signed_in {
+                    shown.retain(|key| !key.starts_with(&owner));
+                    if before == shown.len()
+                        || hint.reason != Some(super::hint::ClearReason::SignedIn)
+                    {
                         return;
                     }
                 }
             }
-            hint.notice()
+            hint.notice_text()
         };
         if let Some(text) = text {
             notify(hint, text);
@@ -1135,9 +1164,14 @@ mod tests {
             expires_at_ms: None,
             cleared: false,
             signed_in: false,
+            reason: None,
             problem: None,
         };
-        let done = cleared("test#test.order", "test.order", true);
+        let done = cleared(
+            "test#test.order",
+            "test.order",
+            super::super::hint::ClearReason::SignedIn,
+        );
         // The later state (signed in) arrives first; the older link that
         // was staged before it must not replace it.
         sink(2, true, &done);
@@ -1164,9 +1198,14 @@ mod tests {
             expires_at_ms: None,
             cleared: false,
             signed_in: false,
+            reason: None,
             problem: Some("requires scopes (x) outside the ones Kit allows for it.".into()),
         };
-        let done = cleared(scope, "test.diagnostic-order", true);
+        let done = cleared(
+            scope,
+            "test.diagnostic-order",
+            super::super::hint::ClearReason::SignedIn,
+        );
         // A diagnostic staged after the clear (number 5) is delivered first:
         // the clear still arrives.
         sink(
@@ -1194,6 +1233,7 @@ mod tests {
             expires_at_ms: None,
             cleared: false,
             signed_in: false,
+            reason: None,
             problem: None,
         };
         let first = hint("https://auth.example/a");
@@ -1222,6 +1262,7 @@ mod tests {
             expires_at_ms: None,
             cleared: false,
             signed_in: false,
+            reason: None,
             problem: None,
         };
         assert!(headless_line(&mut printed, &link).is_some());

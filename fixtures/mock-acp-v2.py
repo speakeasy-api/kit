@@ -84,21 +84,18 @@ def respond(request_id, result):
     send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
-def hook_notice(session_id, url, agent=None):
-    """A Kit child's hook sign-in notice: a link, or (url None) signed in."""
-    mark = {"backend": "test.hook", "url": url, "cleared": url is None}
-    text = (f"Hook backend `test.hook` needs you to sign in. Open {url} to approve Kit."
-            if url else "Hook backend `test.hook` is signed in.")
-    title = text
+def hook_notice(session_id, url, agent=None, reason=None, problem=None, backend="test.hook"):
+    """A Kit child's structured hook sign-in hint: a link, or a clear."""
+    hint = {"sessionId": session_id, "backend": backend, "cleared": url is None}
+    if url is not None:
+        hint["url"] = url
+    if url is None:
+        hint["reason"] = reason or "signed_in"
     if agent is not None:
-        # As a nested Kit relays its own child's notice.
-        mark["agent"] = agent
-        mark["text"] = text
-        title = f"Agent {agent}: {text}"
-    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {
-        "sessionUpdate": "notice", "severity": "info", "title": title,
-        "_meta": {"kit/hooks/auth": mark},
-    }}})
+        hint["agent"] = agent
+    if problem is not None:
+        hint["problem"] = problem
+    send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": hint})
 
 
 def link(value):
@@ -311,12 +308,26 @@ def prompt(request):
                 sys.stderr.write("\x01kit-runtime\x01" + json.dumps({"event": "child_finished", "call": "call-1:compose:shell", "tool": "shell", "ok": True, "summary": "done", "millis": 2}) + "\nmock diagnostic\n")
                 sys.stderr.flush()
         text = "rich done"
+    if "MOCK_HOOK_MALFORMED" in text:
+        # Not well formed: no backend, a script link, an empty agent; and a
+        # marked notice where a structured hint belongs.
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "url": link("bad")}})
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "backend": "test.hook", "url": "javascript:alert(1)//secret-link"}})
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "backend": "test.hook", "agent": "", "url": link("bad")}})
+        send({"jsonrpc": "2.0", "method": "kit/hooks/auth", "params": {"sessionId": session_id, "backend": 7, "cleared": "yes"}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {
+            "sessionUpdate": "notice", "severity": "info", "title": "Open " + link("marked"),
+            "_meta": {"kit/hooks/auth": "not an object"}}}})
     if token(text, "MOCK_HOOK_LINK"):
         hook_notice(session_id, link(token(text, "MOCK_HOOK_LINK")))
+    if token(text, "MOCK_HOOK_PROBLEM"):
+        url = link(token(text, "MOCK_HOOK_PROBLEM"))
+        hook_notice(session_id, url)
+        hook_notice(session_id, url, problem="needs you to sign in, but Kit could not start it: discovery_failed.")
     if token(text, "MOCK_HOOK_RELAYED"):
         hook_notice(session_id, link(token(text, "MOCK_HOOK_RELAYED")), agent="s-b")
     idle_link = token(text, "MOCK_HOOK_AFTER") and link(token(text, "MOCK_HOOK_AFTER"))
-    idle_clear = "MOCK_HOOK_CLEAR_AFTER" in text
+    idle_clear = token(text, "MOCK_HOOK_CLEAR_AFTER")
     if idle_link or idle_clear:
         # Sent while idle, after the turn has ended.
         def later():
@@ -325,7 +336,7 @@ def prompt(request):
                 hook_notice(session_id, idle_link)
                 time.sleep(0.3)
             if idle_clear:
-                hook_notice(session_id, None)
+                hook_notice(session_id, None, reason=idle_clear)
         threading.Thread(target=later, daemon=True).start()
     if "MOCK_SHARED_MESSAGE_IDS" in text:
         for role, value in [("user_message", "User text"), ("agent_thought_chunk", "Thought text"), ("agent_message_chunk", "Assistant text")]:
@@ -491,6 +502,10 @@ for line in sys.stdin:
         if option("--hook-notice-at-start"):
             # Before any prompt: no owner is routed yet.
             hook_notice(result["sessionId"], link(option("--hook-notice-at-start")))
+        if option("--hook-backends-at-start"):
+            # More backends than a parent holds before the first prompt.
+            for n in range(int(option("--hook-backends-at-start"))):
+                hook_notice(result["sessionId"], link(f"many-{n}"), backend=f"test.hook-{n}")
     elif method == "session/list":
         cursor = request.get("params", {}).get("cursor")
         if cursor is None:

@@ -631,18 +631,20 @@ fn notices_show_each_link_once_and_completion_once() {
         expires_at_ms: Some(1),
         cleared: false,
         signed_in: false,
+        reason: None,
         problem: None,
     };
-    sink(&pending);
-    sink(&pending);
+    sink(&hint::HookHint::from(&pending));
+    sink(&hint::HookHint::from(&pending));
     let cleared = AuthHint {
         url: None,
         cleared: true,
         signed_in: true,
+        reason: Some(hint::ClearReason::SignedIn),
         ..pending.clone()
     };
-    sink(&cleared);
-    sink(&cleared);
+    sink(&hint::HookHint::from(&cleared));
+    sink(&hint::HookHint::from(&cleared));
     assert_eq!(
         *shown.lock().unwrap(),
         [
@@ -1585,6 +1587,49 @@ async fn a_step_up_not_granted_is_not_asked_for_again_every_turn() {
 }
 
 #[tokio::test]
+async fn a_sign_in_whose_logout_state_cannot_be_read_is_refused() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.unverified";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, target.clone()).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    issuer.delay_ms.store(1500, Ordering::SeqCst);
+    let code = issue_code(&url);
+    let (callback_port, state) = (port(&url), query(&url, "state"));
+    let callback = tokio::spawn(async move { call_back_with(callback_port, &state, &code).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while issuer.received.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exchange starts");
+    // While the exchange runs, the logout marker becomes unreadable.
+    let marker = store::logout_marker_path(&auth.0.storage, &scope).unwrap();
+    let _ = std::fs::remove_file(&marker);
+    std::fs::create_dir_all(&marker).unwrap();
+    // The grant is not accepted: the callback is refused, the exchange's
+    // grant removed, and the user told, never that it signed in.
+    assert!(!callback.await.unwrap());
+    std::fs::remove_dir(&marker).unwrap();
+    assert!(credential(&auth, target).await.is_err());
+    let problem = loop {
+        let hint = next_hint(&mut hints).await;
+        assert!(!hint.signed_in, "{hint:?}");
+        if let Some(problem) = hint.problem {
+            break problem;
+        }
+    };
+    assert!(problem.contains("could not finish signing in"), "{problem}");
+}
+
+#[tokio::test]
 async fn a_logout_during_an_under_granted_step_up_leaves_no_grant() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
@@ -1913,6 +1958,7 @@ fn a_replayed_link_reaches_a_new_subscriber_before_its_completion() {
         expires_at_ms: None,
         cleared: false,
         signed_in: false,
+        reason: None,
         problem: None,
     };
     login::registry().publish(link.clone());
@@ -1932,6 +1978,7 @@ fn a_replayed_link_reaches_a_new_subscriber_before_its_completion() {
                         expires_at_ms: None,
                         cleared: true,
                         signed_in: true,
+                        reason: Some(hint::ClearReason::SignedIn),
                         problem: None,
                     });
                 }));

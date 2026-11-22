@@ -5289,6 +5289,7 @@ mod tests {
             url: url.map(str::to_owned),
             expires_at_ms: Some(later),
             cleared,
+            agent: None,
         };
         app.apply(hint(Some(&url), false));
         app.apply(hint(Some(&url), false));
@@ -5311,6 +5312,7 @@ mod tests {
             url: Some(url.clone()),
             expires_at_ms: Some(1),
             cleared: false,
+            agent: None,
         });
         assert!(!render(&mut app, 80, 24).contains("sign in to hook"));
     }
@@ -5331,6 +5333,7 @@ mod tests {
             url: url.map(str::to_owned),
             expires_at_ms: None,
             cleared,
+            agent: None,
         };
         let flat = |app: &mut App| {
             render(app, 100, 24)
@@ -5370,6 +5373,7 @@ mod tests {
             url: None,
             expires_at_ms: None,
             cleared: false,
+            agent: None,
         }
         };
         let count = |app: &mut App| {
@@ -5405,62 +5409,89 @@ mod tests {
                 session_id: "parent".into(),
             },
         ));
-        let event = |url: Option<&str>, cleared: bool| {
-            crate::tui::app::Update::Runtime(crate::events::RuntimeEvent::SubagentHookSignIn {
-                id: "scout".into(),
+        let hint = |agent: &str, url: Option<&str>, expires: Option<u64>, problem: Option<&str>| {
+            crate::tui::app::Update::HookSignIn {
+                session_id: "parent".into(),
                 backend: "com.example".into(),
+                problem: problem.map(str::to_owned),
                 url: url.map(str::to_owned),
-                expires_at: None,
-                cleared,
-                text: None,
-            })
+                expires_at_ms: expires,
+                cleared: url.is_none() && problem.is_none(),
+                agent: Some(agent.into()),
+            }
         };
         let flat = |app: &mut App| {
-            render(app, 120, 24)
+            render(app, 120, 30)
                 .lines()
                 .map(str::trim)
                 .collect::<String>()
         };
-        app.apply(event(Some("https://auth.example/child"), false));
+        // The same kind of hint as the session's own, under the agent.
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child"),
+            None,
+            None,
+        ));
         let screen = flat(&mut app);
         assert!(screen.contains("https://auth.example/child"), "{screen}");
         assert!(screen.contains("agent scout"), "{screen}");
-        // Signed in: the link is retired.
-        app.apply(event(None, true));
-        assert!(!flat(&mut app).contains("https://auth.example/child"));
-        // A new session's view starts without a child's links: the same
-        // link, sent again, is shown again.
-        app.apply(event(Some("https://auth.example/child"), false));
-        app.start_session("next".into());
-        app.apply(crate::tui::app::Update::Runtime(
-            crate::events::RuntimeEvent::SessionStarted {
-                session_id: "next".into(),
-            },
+        // A problem beside the same live link is shown, once.
+        let problem = "needs you to sign in, but Kit could not start it: discovery_failed.";
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child"),
+            None,
+            Some(problem),
         ));
-        app.apply(event(Some("https://auth.example/child"), false));
-        assert!(flat(&mut app).contains("https://auth.example/child"));
-        let other = |id: &str, url: &str, expires_at: Option<u64>| {
-            crate::tui::app::Update::Runtime(crate::events::RuntimeEvent::SubagentHookSignIn {
-                id: id.into(),
-                backend: "com.example".into(),
-                url: Some(url.into()),
-                expires_at,
-                cleared: false,
-                text: None,
-            })
-        };
-        // An expired link is never shown.
-        app.apply(other("scout", "https://auth.example/expired", Some(1)));
-        assert!(!flat(&mut app).contains("auth.example/expired"));
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child"),
+            None,
+            Some(problem),
+        ));
+        let screen = flat(&mut app);
+        assert_eq!(screen.matches("discovery_failed").count(), 1, "{screen}");
+        assert!(screen.contains("https://auth.example/child"), "{screen}");
+        // Cleared (signed in, withdrawn or logged out): retired.
+        app.apply(hint("scout", None, None, None));
+        assert!(!flat(&mut app).contains("https://auth.example/child"));
+        // A link that expires while shown is retired at the next tick.
+        let soon = crate::events::now_millis() + 50;
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/soon"),
+            Some(soon),
+            None,
+        ));
+        assert!(flat(&mut app).contains("https://auth.example/soon"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.tick();
+        assert!(!flat(&mut app).contains("https://auth.example/soon"));
         // A grandchild's link for the same backend sits beside the child's.
-        app.apply(other("scout/pip", "https://auth.example/grandchild", None));
+        app.apply(hint(
+            "scout",
+            Some("https://auth.example/child-again"),
+            None,
+            None,
+        ));
+        app.apply(hint(
+            "scout/pip",
+            Some("https://auth.example/grandchild"),
+            None,
+            None,
+        ));
         let screen = flat(&mut app);
         assert!(
             screen.contains("https://auth.example/grandchild"),
             "{screen}"
         );
-        assert!(screen.contains("agent scout/pip"), "{screen}");
-        // Removing the grandchild retires its link, keyed under the child.
+        assert!(
+            screen.contains("https://auth.example/child-again"),
+            "{screen}"
+        );
+        // Removing the grandchild retires its link, and a late hint for it
+        // is ignored; the child's own link stays.
         app.apply(crate::tui::app::Update::Runtime(
             crate::events::RuntimeEvent::SubagentStateChanged {
                 id: "pip".into(),
@@ -5479,7 +5510,22 @@ mod tests {
                 generation_finished_at_unix_ms: None,
             },
         ));
-        assert!(!flat(&mut app).contains("https://auth.example/grandchild"));
+        app.apply(hint(
+            "scout/pip",
+            Some("https://auth.example/late"),
+            None,
+            None,
+        ));
+        let screen = flat(&mut app);
+        assert!(
+            !screen.contains("https://auth.example/grandchild"),
+            "{screen}"
+        );
+        assert!(!screen.contains("https://auth.example/late"), "{screen}");
+        assert!(
+            screen.contains("https://auth.example/child-again"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -5506,6 +5552,7 @@ mod tests {
             url: Some("https://auth.example/consumed".into()),
             expires_at_ms: None,
             cleared: false,
+            agent: None,
         });
         assert!(flat(&mut app).contains("auth.example/consumed"));
         // Detached, the session signs in; its clear never reaches this view.
@@ -5533,6 +5580,7 @@ mod tests {
             url: Some(url.into()),
             expires_at_ms: None,
             cleared: false,
+            agent: None,
         };
         let flat = |app: &mut App| {
             render(app, 80, 24)
@@ -5577,6 +5625,7 @@ mod tests {
             url: Some("https://auth.example/next-expired".into()),
             expires_at_ms: Some(1),
             cleared: false,
+            agent: None,
         });
         app.start_session("next".into());
         assert!(!flat(&mut app).contains("next-expired"));
@@ -5593,6 +5642,7 @@ mod tests {
             url: None,
             expires_at_ms: None,
             cleared: false,
+            agent: None,
         }
         };
         app.apply(problem());
