@@ -226,7 +226,12 @@ impl Connection {
             if matching.next().is_some() {
                 return Err(Failure::conflict("ambiguous cancellation request id"));
             }
-            control.send(message, Arc::clone(charge)).await?;
+            // A late withdrawal cannot affect a replaced or exited resident.
+            // Let the normal flush settle only this session's pending calls.
+            match control.send(message, Arc::clone(charge)).await {
+                Ok(_) | Err(Failure(_, _, "controller_replaced" | "unavailable")) => {}
+                Err(error) => return Err(error),
+            }
             return Ok(None);
         }
         if method == "session/list" {
@@ -979,6 +984,150 @@ mod tests {
             message["params"].clone(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_withdrawal_does_not_disconnect_another_session() {
+        assert_late_withdrawal_is_session_local(false, "controller_replaced").await;
+    }
+
+    #[tokio::test]
+    async fn resident_exit_during_withdrawal_does_not_disconnect_another_session() {
+        assert_late_withdrawal_is_session_local(true, "unavailable").await;
+    }
+
+    async fn assert_late_withdrawal_is_session_local(exited: bool, reason: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let (mut channel, mut peer) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        send(
+            &peer,
+            json!({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}),
+        )
+        .await
+        .unwrap();
+        let charge = Arc::new(channel.rx.next().await.unwrap());
+        let mut connection = Connection::new(gateway);
+        connection
+            .request(
+                json!({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}),
+                &channel,
+                &charge,
+            )
+            .await
+            .unwrap();
+
+        let [mut replaced, mut active] = ["replaced", "active"].map(|session| {
+            let (sender, receiver) = mpsc::channel::<Envelope>(2);
+            let (_stopped, stopped) = watch::channel(());
+            connection.controls.insert(
+                session.into(),
+                Control {
+                    session: session.into(),
+                    attachment: format!("{session}-attachment"),
+                    entry: Entry {
+                        root: PathBuf::new(),
+                        sender,
+                        stopped,
+                    },
+                    cursor: 0,
+                    closed: false,
+                    pending: HashMap::from([(json!(session).to_string(), json!(session))]),
+                },
+            );
+            receiver
+        });
+        // Queue the late notification before the adapter can poll either actor.
+        send(
+            &peer,
+            json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"replaced"}}),
+        )
+        .await
+        .unwrap();
+
+        let replaced_actor = async move {
+            if exited {
+                return;
+            }
+            let withdrawal = replaced.recv().await.unwrap();
+            assert!(
+                matches!(&withdrawal.request, Request::Send { attachment, message, .. }
+                if attachment == "replaced-attachment" && message["method"] == "$/cancel_request")
+            );
+            withdrawal
+                .reply
+                .send(Err(Failure(
+                    StatusCode::CONFLICT,
+                    "replaced".into(),
+                    "controller_replaced",
+                )))
+                .unwrap();
+            let poll = replaced.recv().await.unwrap();
+            assert!(matches!(poll.request, Request::Poll { .. }));
+            poll.reply
+                .send(Err(Failure(
+                    StatusCode::CONFLICT,
+                    "replaced".into(),
+                    "controller_replaced",
+                )))
+                .unwrap();
+        };
+        let active_actor = async {
+            while let Some(envelope) = active.recv().await {
+                match envelope.request {
+                    Request::Poll { cursor, .. } => {
+                        let events = if cursor == 0 {
+                            json!([{"cursor":1,"message":{"jsonrpc":"2.0","id":"active","result":{}}}])
+                        } else {
+                            json!([])
+                        };
+                        let _ = envelope.reply.send(Ok(json!({"events": events})));
+                    }
+                    Request::Detach { .. } => break,
+                    _ => panic!("unexpected operation for the active session"),
+                }
+            }
+        };
+        let client = async {
+            let mut responses = HashMap::new();
+            for _ in 0..3 {
+                let frame = peer
+                    .rx
+                    .next()
+                    .await
+                    .expect("connection closed before pending calls settled");
+                let TransportFrame::Single(message) = frame.decode() else {
+                    panic!("expected single message")
+                };
+                let message = serde_json::to_value(message).unwrap();
+                if message["method"] == "session/update" {
+                    assert_eq!(message["params"]["sessionId"], "replaced");
+                } else {
+                    responses.insert(message["id"].as_str().unwrap().to_owned(), message);
+                }
+            }
+            assert_eq!(responses["replaced"]["error"]["data"]["reason"], reason);
+            assert_eq!(responses["active"]["result"], json!({}));
+            drop(peer);
+        };
+        let (result, (), (), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                connection.run(channel),
+                replaced_actor,
+                active_actor,
+                client
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

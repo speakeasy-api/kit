@@ -130,6 +130,99 @@ final class PromptDeliveryTests: XCTestCase {
     }
 
     @MainActor
+    func testLargeAudioEchoMatchesLocalFileInBothOrders() async throws {
+        for updateFirst in [false, true] {
+            let directory = temporaryDirectory()
+            let controller = makeController(directory: directory, updateFirst: updateFirst)
+            controller.start()
+            try await waitUntil { controller.isReady }
+
+            let url = directory.appendingPathComponent("recording.wav")
+            // 1 MiB of 8-bit mono PCM, well above the Desktop inline preview cap.
+            let pcmBytes = 1024 * 1024
+            var audio = Data("RIFF".utf8)
+            audio.append(contentsOf: [36, 0, 16, 0])
+            audio.append(contentsOf: "WAVEfmt ".utf8)
+            audio.append(contentsOf: [16, 0, 0, 0, 1, 0, 1, 0, 64, 31, 0, 0, 64, 31, 0, 0, 1, 0, 8, 0])
+            audio.append(contentsOf: "data".utf8)
+            audio.append(contentsOf: [0, 0, 16, 0])
+            audio.append(Data(repeating: 128, count: pcmBytes))
+            try audio.write(to: url)
+            let attachment = Attachment(url: url, kind: .audio, mimeType: "audio/wav", size: Int64(audio.count))
+
+            for action in ["match", "replace", "remove"] {
+                controller.draft = "audio: \(action)"
+                controller.attachments = [attachment]
+                controller.send()
+                try await waitUntil { controller.acceptsInput }
+                let entry = try XCTUnwrap(controller.entries.last(where: { $0.role == .user }))
+                let media = try XCTUnwrap(entry.presentation?.userMessage?.media)
+                if action == "remove" {
+                    XCTAssertTrue(media.isEmpty, "updateFirst=\(updateFirst)")
+                } else {
+                    XCTAssertEqual(media.count, 1, "updateFirst=\(updateFirst)")
+                    XCTAssertEqual(media.first?.url, action == "match" ? url : nil, "updateFirst=\(updateFirst)")
+                    XCTAssertEqual(media.first?.name, action == "match" ? "recording.wav" : nil)
+                    XCTAssertNil(media.first?.data, "Echoed payload is above the inline limit")
+                    if action == "match" {
+                        let resolved = TranscriptMedia(mimeType: attachment.mimeType, url: media.first?.url)
+                        XCTAssertEqual(try resolved.boundedData(), audio)
+                    }
+                }
+            }
+            XCTAssertEqual(controller.entries.filter { $0.role == .user }.count, 3)
+            await close(controller)
+        }
+    }
+
+    @MainActor
+    func testRejectedPromptKeepsNewerDraftWhenAttachmentsCannotMerge() async throws {
+        let directory = temporaryDirectory()
+        let controller = makeController(directory: directory)
+        controller.start()
+        try await waitUntil { controller.isReady }
+
+        let submitted = ["first.png", "second.png"].map { directory.appendingPathComponent($0) }
+        for url in submitted {
+            try Data().write(to: url)
+            let file = try FileHandle(forWritingTo: url)
+            try file.truncate(atOffset: UInt64(ConversationController.maximumAttachmentBytes))
+            try file.close()
+        }
+        controller.draft = "held rejection"
+        controller.addAttachments(submitted)
+        controller.send()
+        try await waitUntil { FileManager.default.fileExists(atPath: directory.appendingPathComponent("reject-held").path) }
+
+        let newer = directory.appendingPathComponent("newer.png")
+        try Data([1]).write(to: newer)
+        controller.draft = "newer draft"
+        controller.addAttachments([newer])
+        try Data().write(to: directory.appendingPathComponent("reject-now"))
+        try await waitUntil { controller.acceptsInput && !controller.savedDrafts.isEmpty }
+        XCTAssertEqual(controller.draft, "newer draft")
+        XCTAssertEqual(controller.attachments.map(\.url), [newer])
+
+        let rejected = try XCTUnwrap(controller.savedDrafts.first)
+        XCTAssertEqual(rejected.text, "held rejection")
+        XCTAssertEqual(rejected.attachments.map(\.url), submitted)
+        controller.restoreSavedDraft(id: rejected.id)
+        XCTAssertEqual(controller.draft, "held rejection")
+        XCTAssertEqual(controller.attachments.map(\.url), submitted)
+
+        let savedNewer = try XCTUnwrap(controller.savedDrafts.first)
+        XCTAssertEqual(savedNewer.text, "newer draft")
+        XCTAssertEqual(savedNewer.attachments.map(\.url), [newer])
+        controller.attachments = []
+        controller.draft = ""
+        controller.restoreSavedDraft(id: savedNewer.id)
+        XCTAssertEqual(controller.draft, "newer draft")
+        XCTAssertEqual(controller.attachments.map(\.url), [newer])
+        XCTAssertTrue(controller.savedDrafts.isEmpty)
+        await close(controller)
+    }
+
+    @MainActor
     func testRejectedSteerRestoresDraftWithoutSettlingForegroundTurn() async throws {
         let controller = try await startRunningController(directory: temporaryDirectory())
         controller.draft = "reject steer"
@@ -165,7 +258,7 @@ final class PromptDeliveryTests: XCTestCase {
     }
 
     private static let agent = #"""
-    import json, pathlib, queue, sys, threading
+    import base64, json, pathlib, queue, sys, threading
 
     directory = pathlib.Path(sys.argv[1])
     update_first = sys.argv[2] == "update-first"
@@ -175,6 +268,7 @@ final class PromptDeliveryTests: XCTestCase {
     inserted = {}
     withdrawn = {}
     was_idle = False
+    rejection = None
 
     def read():
         for line in sys.stdin:
@@ -197,6 +291,9 @@ final class PromptDeliveryTests: XCTestCase {
 
     threading.Thread(target=read, daemon=True).start()
     while True:
+        if rejection is not None and (directory / "reject-now").exists():
+            error(rejection, -32602, "prompt rejected")
+            rejection = None
         if not was_idle and (directory / "idle").exists():
             was_idle = True
             update("state_update", state="idle", stopReason="end_turn")
@@ -230,7 +327,7 @@ final class PromptDeliveryTests: XCTestCase {
         method, id, params = req["method"], req.get("id"), req.get("params", {})
         if method == "initialize":
             respond(id, {"protocolVersion": 2, "info": {"name": "test", "version": "0"},
-                         "capabilities": {"session": {"prompt": {"image": {}, "delivery": {"steer": {}}}}}})
+                         "capabilities": {"session": {"prompt": {"image": {}, "audio": {}, "delivery": {"steer": {}}}}}})
         elif method == "session/new":
             respond(id, {"sessionId": "session"})
         elif method == "session/prompt":
@@ -240,6 +337,23 @@ final class PromptDeliveryTests: XCTestCase {
                     error(id, -32602, "steer rejected")
                 else:
                     held[id] = blocks
+            elif blocks[0]["text"] == "held rejection":
+                rejection = id
+                (directory / "reject-held").touch()
+            elif blocks[0]["text"].startswith("audio: "):
+                action = blocks[0]["text"][len("audio: "):]
+                if action == "remove":
+                    blocks = blocks[:1]
+                elif action == "replace":
+                    # Same MIME and preview bytes, but not the same audio.
+                    decoded = base64.b64decode(blocks[1]["data"])
+                    blocks[1]["data"] = base64.b64encode(decoded[:-1] + b"\x00").decode()
+                if update_first:
+                    report(id, blocks)
+                respond(id, {"messageId": str(id)})
+                if not update_first:
+                    report(id, blocks)
+                update("state_update", state="idle", stopReason="end_turn")
             elif blocks[0]["text"] == "MOCK_SHARED_MESSAGE_IDS":
                 report(id, [{"type": "text", "text": "User text"}])
                 update("agent_thought_chunk", messageId=str(id), content={"type": "text", "text": "Thought text"})

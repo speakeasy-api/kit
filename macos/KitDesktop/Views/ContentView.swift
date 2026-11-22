@@ -624,6 +624,19 @@ private struct ConversationView: View {
     private var composer: some View {
         VStack(spacing: 0) {
             if !controller.pendingSteers.isEmpty { pendingSteersBar }
+            ForEach(controller.savedDrafts) { item in
+                HStack(spacing: 8) {
+                    Text("Saved draft").brandMicroLabel().foregroundStyle(.secondary)
+                    Text(item.summary).lineLimit(1)
+                    Spacer()
+                    Button("Recover") { controller.restoreSavedDraft(id: item.id) }
+                        .help("Restore this draft or swap it with the current draft if both do not fit")
+                }
+                .font(.caption)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(Brand.paper, in: RoundedRectangle(cornerRadius: Brand.Radius.small))
+                .frame(maxWidth: 790)
+            }
             if !commandSuggestions.isEmpty { commandBar }
             VStack(spacing: 10) {
                 attachmentBar

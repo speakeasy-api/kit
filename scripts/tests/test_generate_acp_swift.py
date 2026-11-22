@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Regression tests for the ACP Swift generator's schema contract."""
 import copy
+import hashlib
 import importlib.util
 import json
 import pathlib
 import unittest
+from unittest.mock import patch
 
 GENERATOR_PATH = pathlib.Path(__file__).resolve().parents[1] / "generate-acp-swift.py"
 SPEC = importlib.util.spec_from_file_location("generate_acp_swift", GENERATOR_PATH)
@@ -25,6 +27,19 @@ class SchemaContractTests(unittest.TestCase):
 
     def test_pinned_schema_matches_emitted_subset(self):
         GENERATOR.validate_schema(self.schema)
+
+    def test_header_tracks_schema_pin_and_bytes(self):
+        revision = "0123456789abcdef" * 2 + "01234567"
+        pin = f"[`agentkit-acp-schema` 1.0.0 source commit](https://github.com/danielkov/agent-client-protocol/tree/{revision})."
+        with patch.object(GENERATOR, "SCHEMA_PIN") as source:
+            source.read_text.return_value = pin
+            header = GENERATOR.render().splitlines()[:3]
+            source.read_text.return_value = pin.replace(revision, revision[:7])
+            with self.assertRaisesRegex(SystemExit, "expected one full ACP schema source revision"):
+                GENERATOR.render()
+        self.assertEqual(header[1], f"// Source: ACP v2 unstable schema, agent-client-protocol rev {revision}")
+        digest = hashlib.sha256(GENERATOR.SCHEMA.read_bytes()).hexdigest()
+        self.assertEqual(header[2], f"// Schema SHA-256: {digest}")
 
     def test_emitted_field_change_is_rejected(self):
         self.assert_rejected(

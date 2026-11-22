@@ -96,13 +96,9 @@ The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has
 
 ## Message a subagent in any state
 
-`prompt({ subagent, prompt })` delivers a message however the subagent's current state allows, and returns the subagent's value once the turn that handled the message ends:
+`prompt({ subagent, prompt })` starts a new turn and returns that turn's value. If the subagent is still starting, being forked, or working on another turn, the prompt waits. Use `output_schema` to constrain the value returned by the new turn.
 
-- An idle subagent, including one whose last turn failed, starts a new turn.
-- A working subagent receives the message within its current turn when its harness supports ACP v2 `steer` injection. The call then returns that turn's value.
-- A working subagent without steering support, or one that is still starting or being forked, receives the message in a new turn after its current work ends.
-
-An `output_schema` applies to a new turn only, so a prompt with one always waits for the current turn to end. While the originating `compose` is backgrounded, `subagents({})` lists the IDs and statuses of working children:
+While the originating `compose` is backgrounded, `subagents({})` lists the IDs and statuses of working children:
 
 ```text
 return prompt({
@@ -111,7 +107,7 @@ return prompt({
 })
 ```
 
-The prompt accepts text or ACP content blocks. Unknown and retired IDs fail. Cancelling the call stops waiting, but does not revoke a message already injected into a working turn.
+The prompt accepts text or ACP content blocks. Unknown and retired IDs fail. Cancelling the call stops waiting. It does not undo a prompt the subagent has already received.
 
 ## Inspect display names
 

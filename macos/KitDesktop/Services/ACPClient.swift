@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -17,6 +18,16 @@ struct ACPSessionInfo: Equatable {
     let title: String?
     let updatedAt: Date?
     var isSubagent = false
+}
+
+struct PromptAudioAttachment {
+    let file: Attachment
+    let fingerprint: SHA256.Digest
+}
+
+struct PromptReceipt {
+    let messageId: String
+    let audio: [PromptAudioAttachment]
 }
 
 final class ACPClient {
@@ -94,26 +105,28 @@ final class ACPClient {
 
     func prompt(
         text: String, attachments: [Attachment], delivery: ACPPromptDelivery? = nil,
-        onSent: ((Int) -> Void)? = nil, completion: @escaping (Result<ACPPromptResponse, Error>) -> Void
+        onSent: ((Int) -> Void)? = nil, completion: @escaping (Result<PromptReceipt, Error>) -> Void
     ) {
         queue.async {
-            let handleResponse: (Result<Dictionary, Error>) -> Void = { result in
-                completion(result.flatMap { payload in
-                    do { return .success(try Self.decode(ACPPromptResponse.self, from: payload)) }
-                    catch { return .failure(ACPClientError.protocolError("Malformed session/prompt response: " + error.localizedDescription)) }
-                })
-            }
             guard let sessionID = self.sessionID else {
-                self.complete(handleResponse, with: .failure(ACPClientError.protocolError("ACP session is not ready")))
+                DispatchQueue.main.async { completion(.failure(ACPClientError.protocolError("ACP session is not ready"))) }
                 return
             }
             do {
-                let request = ACPPromptRequest(
-                    sessionId: sessionID, prompt: try self.promptBlocks(text: text, attachments: attachments), delivery: delivery
-                )
+                let (blocks, audio) = try self.promptBlocks(text: text, attachments: attachments)
+                let request = ACPPromptRequest(sessionId: sessionID, prompt: blocks, delivery: delivery)
                 self.requestLocked(method: "session/prompt", params: try Self.dictionary(request),
-                                   timeout: self.promptTimeout, onSent: onSent, completion: handleResponse)
-            } catch { self.complete(handleResponse, with: .failure(error)) }
+                                   timeout: self.promptTimeout, onSent: onSent) { result in
+                    completion(result.flatMap { payload in
+                        do {
+                            let response = try Self.decode(ACPPromptResponse.self, from: payload)
+                            return .success(PromptReceipt(messageId: response.messageId, audio: audio))
+                        } catch {
+                            return .failure(ACPClientError.protocolError("Malformed session/prompt response: " + error.localizedDescription))
+                        }
+                    })
+                }
+            } catch { DispatchQueue.main.async { completion(.failure(error)) } }
         }
     }
 
@@ -692,10 +705,11 @@ final class ACPClient {
         DispatchQueue.main.async { completion(result) }
     }
 
-    private func promptBlocks(text: String, attachments: [Attachment]) throws -> [JSONValue] {
+    private func promptBlocks(text: String, attachments: [Attachment]) throws -> ([JSONValue], [PromptAudioAttachment]) {
         guard attachments.count <= 8 else { throw ACPClientError.attachment("At most 8 attachments can be pending") }
         var total: Int64 = 0
         var blocks: [JSONValue] = [.object(["type": .string("text"), "text": .string(text)])]
+        var audio: [PromptAudioAttachment] = []
         for attachment in attachments {
             let supported = switch attachment.kind {
             case .image: promptCapabilities?.image != nil
@@ -708,14 +722,19 @@ final class ACPClient {
             guard data.count <= 10 * 1024 * 1024 else { throw ACPClientError.attachment("\(attachment.url.lastPathComponent) exceeds the 10 MiB limit") }
             total += Int64(data.count)
             guard total <= 20 * 1024 * 1024 else { throw ACPClientError.attachment("Attachments exceed the 20 MiB total limit") }
+            let base64 = data.base64EncodedString()
             var block: [String: JSONValue] = [
-                "type": .string(attachment.kind.rawValue), "data": .string(data.base64EncodedString()),
+                "type": .string(attachment.kind.rawValue), "data": .string(base64),
                 "mimeType": .string(attachment.mimeType),
             ]
-            if attachment.kind == .image { block["uri"] = .string(attachment.url.absoluteString) }
+            if attachment.kind == .image {
+                block["uri"] = .string(attachment.url.absoluteString)
+            } else {
+                audio.append(PromptAudioAttachment(file: attachment, fingerprint: DesktopContentBlock.audioFingerprint(base64)))
+            }
             blocks.append(.object(block))
         }
-        return blocks
+        return (blocks, audio)
     }
 
     private static func dictionary<T: Encodable>(_ value: T) throws -> Dictionary {

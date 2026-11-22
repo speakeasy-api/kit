@@ -31,7 +31,7 @@ struct TranscriptMedia: Equatable {
         switch block {
         case .image(let data, let mime, let uri):
             return TranscriptMedia(mimeType: mime ?? "image/*", base64: data, url: uri.flatMap(URL.init(string:)))
-        case .audio(let data, let mime):
+        case .audio(let data, let mime, _):
             return TranscriptMedia(mimeType: mime ?? "audio/*", base64: data)
         case .resourceLink(let uri, let name, let mime):
             guard let mime = mime ?? inferredMIME(uri),

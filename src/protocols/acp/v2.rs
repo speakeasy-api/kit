@@ -33,7 +33,7 @@ use futures_util::{
     future::{Either, select},
 };
 use serde_json::{Map, Value};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
 use crate::{
@@ -689,7 +689,7 @@ struct SessionHandle {
     integration: AcpSessionHandle,
     busy: Arc<AtomicBool>,
     background_jobs: BackgroundJobs,
-    structured_completion: bool,
+    background_stop: Option<Arc<Notify>>,
     tasks: TaskManagerHandle,
 }
 
@@ -1306,7 +1306,9 @@ impl Server {
             .map_err(|error| AcpRuntimeError::Loop(format!("skill catalog error: {error}")))?;
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
-        let structured_completion = driver.structured_completion;
+        let background_stop = driver
+            .structured_completion
+            .then(|| Arc::new(Notify::new()));
         let (tx, rx) = mpsc::channel(8);
         let busy = Arc::new(AtomicBool::new(false));
         let voice_state = crate::runtime::voice_state::VoiceState::default();
@@ -1330,7 +1332,7 @@ impl Server {
             driver: driver.driver,
             tasks: driver.tasks,
             background_jobs: background_jobs.clone(),
-            structured_completion,
+            background_stop: background_stop.clone(),
             skill_catalog,
             adapter: driver.adapter,
             catalog,
@@ -1349,6 +1351,7 @@ impl Server {
         let subagent_updates = driver
             .subagents
             .subscribe_updates(session_id.to_string(), replay_history);
+        let initial_cancellation = handle.cancellation_handle().checkpoint();
         let actor_task = tokio::spawn(async move {
             let _guard = guard;
             if activated.await.is_ok() {
@@ -1371,7 +1374,7 @@ impl Server {
                     ));
                 }
                 let actor = std::pin::pin!(super::subagents::with_updates(
-                    session_actor(actor),
+                    session_actor(actor, initial_cancellation),
                     Some(subagent_updates),
                     |session_id, update| {
                         if let Some(update) = super::subagents::v2_update(update) {
@@ -1455,7 +1458,7 @@ impl Server {
                     integration: handle,
                     busy,
                     background_jobs,
-                    structured_completion,
+                    background_stop,
                     tasks,
                 },
             },
@@ -1609,16 +1612,21 @@ impl Server {
                 (
                     session.integration.clone(),
                     session.background_jobs.clone(),
-                    session.structured_completion,
+                    session.background_stop.clone(),
                 )
             });
-        if let Some((handle, background_jobs, structured_completion)) = session {
-            // Cancel already registered jobs synchronously. The actor drains
-            // their task-manager settlement before starting another turn.
-            if structured_completion {
+        if let Some((handle, background_jobs, background_stop)) = session {
+            // Signal jobs synchronously; the actor escalates for this
+            // interruption before admitting another structured turn.
+            if background_stop.is_some() {
                 background_jobs.cancel_all();
             }
             handle.interrupt();
+            if let Some(stop) = background_stop {
+                // One outstanding permit covers repeated Stops: the actor
+                // reads the latest cancellation generation before escalating.
+                stop.notify_one();
+            }
         }
         Ok(())
     }
@@ -1841,7 +1849,7 @@ struct SessionActor<S: ModelSession> {
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
     background_jobs: BackgroundJobs,
-    structured_completion: bool,
+    background_stop: Option<Arc<Notify>>,
     skill_catalog: skill_catalog::SkillCatalogMonitor,
     adapter: SelectableAdapter,
     catalog: Vec<crate::provider::ModelGroup>,
@@ -1849,7 +1857,10 @@ struct SessionActor<S: ModelSession> {
     mcp_events: crate::tools::mcp::McpSubscription,
 }
 
-async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
+async fn session_actor<S: ModelSession + Send + 'static>(
+    actor: SessionActor<S>,
+    mut admitted_generation: TurnCancellation,
+) {
     let SessionActor {
         prompt_keys,
         subagents,
@@ -1865,7 +1876,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         mut driver,
         tasks,
         background_jobs,
-        structured_completion,
+        background_stop,
         mut skill_catalog,
         adapter,
         mut catalog,
@@ -1875,30 +1886,57 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     let mut binding = Some(binding);
     let mut model_switch = model_switch::Guard::default();
     let pending = handle.pending_prompts();
+    let structured_completion = background_stop.is_some();
     loop {
         // Administrative commands (notably close) take precedence over another
         // turn. Prompt admission itself is synchronous in the receive handler.
+        let mcp = async {
+            match mcp_events.recv().await {
+                Some(event) => event,
+                None => std::future::pending().await,
+            }
+        };
+        let stop = async {
+            match &background_stop {
+                Some(stop) => stop.notified().await,
+                None => std::future::pending().await,
+            }
+        };
         let event = {
             let command = std::pin::pin!(commands.recv());
+            let stop = std::pin::pin!(stop);
             let prompt = std::pin::pin!(pending.ready());
-            let mcp = std::pin::pin!(async {
-                match mcp_events.recv().await {
-                    Some(event) => event,
-                    None => std::future::pending().await,
-                }
-            });
+            let mcp = std::pin::pin!(mcp);
             let task = std::pin::pin!(tasks.next_event());
             let work = select(prompt, select(mcp, task));
-            match select(command, work).await {
+            match select(command, select(stop, work)).await {
                 Either::Left((command, _)) => Some(Either::Left(command)),
-                Either::Right((Either::Left(((), _)), _)) => None,
-                Either::Right((Either::Right((work, _)), _)) => Some(Either::Right(match work {
-                    Either::Left((event, _)) => Either::Left(event),
-                    Either::Right((event, _)) => Either::Right(event),
-                })),
+                Either::Right((Either::Left(((), _)), _)) => {
+                    admitted_generation = handle.cancellation_handle().checkpoint();
+                    super::cancel_background_jobs(&tasks, &background_jobs).await;
+                    continue;
+                }
+                Either::Right((Either::Right((Either::Left(((), _)), _)), _)) => None,
+                Either::Right((Either::Right((Either::Right((work, _)), _)), _)) => {
+                    Some(Either::Right(match work {
+                        Either::Left((event, _)) => Either::Left(event),
+                        Either::Right((event, _)) => Either::Right(event),
+                    }))
+                }
+            }
+        };
+        // A Stop racing event selection must also fence prompt preparation
+        // and autonomous work. Advance the admitted generation only when selecting
+        // escalation above; otherwise the actor can start work ahead of Stop.
+        let turn_checkpoint = || {
+            if structured_completion {
+                admitted_generation.clone()
+            } else {
+                handle.cancellation_handle().checkpoint()
             }
         };
         let Some(event) = event else {
+            let cancellation = turn_checkpoint();
             busy.store(true, Ordering::Release);
             let result = prepare_prompt(
                 TurnContext {
@@ -1918,6 +1956,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     structured_completion,
                 },
                 &mut driver,
+                cancellation,
             )
             .await;
             busy.store(false, Ordering::Release);
@@ -2119,7 +2158,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             },
             Either::Right(Either::Left(event)) => {
                 let result = async {
-                    let cancellation = handle.cancellation_handle().checkpoint();
+                    let cancellation = turn_checkpoint();
                     match driver.commit_input(
                         vec![Item::notification(event.message)],
                         cancellation.clone(),
@@ -2179,7 +2218,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                                 background_jobs: &background_jobs,
                                 structured_completion,
                             }),
-                            handle.cancellation_handle().checkpoint(),
+                            turn_checkpoint(),
                         )
                         .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
                         .await
@@ -2231,6 +2270,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     context: TurnContext<'_, impl AcpSessionUpdateSink>,
     mut preparation: PromptPreparation<'_>,
     driver: &mut LoopDriver<S>,
+    cancellation: TurnCancellation,
 ) -> Result<(), AcpRuntimeError> {
     let TurnContext {
         session_id,
@@ -2239,7 +2279,6 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         sink,
         activity,
     } = context;
-    let cancellation = handle.cancellation_handle().checkpoint();
     let structured = preparation
         .structured_completion
         .then_some((preparation.tasks, preparation.background_jobs));
@@ -3630,10 +3669,7 @@ mod tests {
     };
     use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager};
     use agentkit_tools_core::{ToolAnnotations, ToolName, ToolRegistry, ToolSpec};
-    use tokio::{
-        sync::Notify,
-        time::{Duration, timeout},
-    };
+    use tokio::time::{Duration, timeout};
 
     use super::*;
     use crate::protocols::acp::tests::{BlockingTool, ScriptAdapter};
@@ -5294,6 +5330,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_stop_aborts_detached_work_and_preserves_queued_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let state = Arc::new(Server::new(Arc::clone(&runtime), SessionRegistry::new()));
+        let (mut client, agent) = agent_client_protocol::Channel::duplex();
+        agent_client_protocol::Agent
+            .v2()
+            .on_receive_request(
+                async |_: wire::InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        wire::InitializeResponse::new(
+                            wire::ProtocolVersion::V2,
+                            wire::Implementation::new("structured-stop-test", "0"),
+                        )
+                        .capabilities(wire::AgentCapabilities::new().session(
+                            wire::SessionCapabilities::new().prompt(
+                                wire::PromptCapabilities::new().delivery(
+                                    wire::PromptDeliveryCapabilities::new(true, true),
+                                ),
+                            ),
+                        )),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async |_: wire::NewSessionRequest, responder, _cx| {
+                    responder.respond(wire::NewSessionResponse::new(wire::SessionId::new("structured-stop")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let state = Arc::clone(&state);
+                    async move |request: wire::PromptRequest, responder, cx| {
+                        let Either::Right(wait) =
+                            state.enqueue_prompt(request, responder.cancellation())?
+                        else {
+                            panic!("first prompt must wait for insertion");
+                        };
+                        cx.spawn(async move { responder.respond_with_result(wait.wait().await) })?;
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, async move |connection| {
+                let id = wire::SessionId::new("structured-stop");
+                let sink = ResponseReplacementSink::new(ConnectionSink(connection));
+                let activity = native_activity(id.clone(), sink.clone());
+                let handle = state
+                    .integration
+                    .bind_session(AcpSessionBinding::new(
+                        id.clone(),
+                        SessionId::new(id.to_string()),
+                        sink.clone(),
+                    ))
+                    .unwrap();
+                let mcp = runtime.mcp_for_test().clone();
+                let (jobs, tasks) = super::super::tests::start_non_cooperative_background("detached")
+                    .await;
+                let (driver, _) = test_driver(TestOutcome::Content, "structured-stop").await;
+                let (commands, rx) = mpsc::channel(1);
+                let busy = Arc::new(AtomicBool::new(false));
+                let prompt_keys = Arc::new(identity::PromptKeys::default());
+                let background_stop = Arc::new(Notify::new());
+                let voice_state = crate::runtime::voice_state::VoiceState::default();
+                let voice_monitor = voice_state.monitor(&[]);
+                state.sessions.lock().unwrap().insert(
+                    id.clone(),
+                    SessionHandle {
+                        prompt_keys: prompt_keys.clone(),
+                        cwd: runtime.root().to_path_buf(),
+                        mcp: mcp.clone(),
+                        activity: activity.clone(),
+                        subagents: None,
+                        voice_state,
+                        token: 1,
+                        commands,
+                        integration: handle.clone(),
+                        busy: busy.clone(),
+                        background_jobs: jobs.clone(),
+                        background_stop: Some(background_stop.clone()),
+                        tasks: tasks.clone(),
+                    },
+                );
+                let actor = tokio::spawn(session_actor(
+                    SessionActor {
+                        prompt_keys,
+                        subagents: None,
+                        voice_monitor,
+                        session_id: id.clone(),
+                        runtime,
+                        integration: Arc::clone(&state.integration),
+                        handle: handle.clone(),
+                        busy: busy.clone(),
+                        binding: BindingGuard {
+                            integration: Arc::clone(&state.integration),
+                            session_id: id.clone(),
+                        },
+                        sink,
+                        activity,
+                        driver,
+                        tasks: tasks.clone(),
+                        background_jobs: jobs,
+                        background_stop: Some(background_stop),
+                        skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+                        adapter: SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4")
+                            .unwrap(),
+                        catalog: Vec::new(),
+                        commands: rx,
+                        mcp_events: mcp.subscribe(id.to_string()).unwrap(),
+                    },
+                    handle.cancellation_handle().checkpoint(),
+                ));
+                send_wire(
+                    &client,
+                    "initialize",
+                    1,
+                    serde_json::to_value(terminal_auth_initialize_request()).unwrap(),
+                );
+                let initialized = receive_wire(&mut client, "initialize").await;
+                assert!(initialized.get("result").is_some(), "{initialized}");
+                send_wire(&client, "session/new", 2, json!({"cwd": root.path()}));
+                let opened = receive_wire(&mut client, "session/new").await;
+                assert!(opened.get("result").is_some(), "{opened}");
+                send_wire(
+                    &client,
+                    "session/prompt",
+                    3,
+                    json!({"sessionId": id, "delivery": "queue", "prompt": [{"type": "text", "text": "next"}]}),
+                );
+                use futures_util::StreamExt as _;
+                timeout(Duration::from_secs(3), async {
+                    tokio::select! {
+                        frame = client.rx.next() => panic!("prompt responded before Stop: {frame:?}"),
+                        () = async {
+                            while !busy.load(Ordering::Acquire) {
+                                tokio::task::yield_now().await;
+                            }
+                        } => {}
+                    }
+                })
+                .await
+                .expect("queued prompt did not enter preparation");
+                assert_eq!(tasks.list_running().await.len(), 1);
+
+                state.cancel(wire::CancelSessionNotification::new(id)).unwrap();
+
+                timeout(Duration::from_secs(3), async {
+                    let mut running = false;
+                    let mut inserted = false;
+                    while !(running && inserted) {
+                        let agent_client_protocol::TransportFrame::Single(message) =
+                            client.rx.next().await.unwrap()
+                        else {
+                            panic!("expected single message");
+                        };
+                        let frame = serde_json::to_value(message).unwrap();
+                        if frame["id"] == 3 {
+                            assert!(frame["result"]["messageId"].is_string(), "{frame}");
+                            inserted = true;
+                        }
+                        if frame["method"] == "session/update" {
+                            let update: wire::UpdateSessionNotification =
+                                serde_json::from_value(frame["params"].clone()).unwrap();
+                            running |= matches!(
+                                update.update,
+                                wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                            );
+                        }
+                    }
+                })
+                .await
+                .expect("Stop did not release the queued prompt");
+                assert!(tasks.list_running().await.is_empty());
+                actor.abort();
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn structured_prompt_waits_for_background_synthesis_and_consumes_completion() {
         let turns = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(AtomicBool::new(false));
@@ -6323,7 +6543,7 @@ mod tests {
                 integration,
                 busy: busy.clone(),
                 background_jobs: jobs.clone(),
-                structured_completion: false,
+                background_stop: None,
                 tasks: AsyncTaskManager::new().handle(),
             },
         );
@@ -6403,7 +6623,7 @@ mod tests {
                 integration,
                 busy: busy.clone(),
                 background_jobs: BackgroundJobs::default(),
-                structured_completion: false,
+                background_stop: None,
                 tasks: AsyncTaskManager::new().handle(),
             },
         );
@@ -6475,7 +6695,7 @@ mod tests {
                 integration,
                 busy: Arc::new(AtomicBool::new(false)),
                 background_jobs: BackgroundJobs::default(),
-                structured_completion: false,
+                background_stop: None,
                 tasks: AsyncTaskManager::new().handle(),
             },
         );
@@ -6631,7 +6851,7 @@ mod tests {
                     integration,
                     busy: Arc::new(AtomicBool::new(false)),
                     background_jobs: BackgroundJobs::default(),
-                    structured_completion: false,
+                    background_stop: None,
                     tasks: AsyncTaskManager::new().handle(),
                 },
             },
@@ -6905,7 +7125,7 @@ mod tests {
                         token,
                         commands,
                         background_jobs,
-                        structured_completion: false,
+                        background_stop: None,
                         tasks,
                     },
                 );
@@ -7065,7 +7285,7 @@ mod tests {
                         integration,
                         busy: Arc::new(AtomicBool::new(false)),
                         background_jobs: BackgroundJobs::default(),
-                        structured_completion: false,
+                        background_stop: None,
                         tasks: AsyncTaskManager::new().handle(),
                     },
                 },

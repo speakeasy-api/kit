@@ -6652,7 +6652,7 @@ pub(super) mod tests {
         )
     }
 
-    async fn start_non_cooperative_background(
+    pub(super) async fn start_non_cooperative_background(
         call_id: &str,
     ) -> (BackgroundJobs, TaskManagerHandle) {
         let jobs = BackgroundJobs::default();
