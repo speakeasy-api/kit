@@ -401,7 +401,13 @@ pub(crate) struct Routes(Mutex<RoutesState>);
 struct RoutesState {
     live: HashMap<String, Route>,
     resume: Option<Resume>,
+    /// Hook sign-in hints from child sessions not yet routed to an owner:
+    /// the latest per (session, backend), bounded, until registration.
+    held: Vec<(String, String, Value)>,
 }
+
+/// The most hook sign-in hints held for unrouted child sessions.
+const HELD_HINTS: usize = 16;
 /// Resume has no local transcript owner yet. Keep associations independently of
 /// the bounded content tail so eviction cannot orphan future descendant traffic.
 struct Resume {
@@ -501,15 +507,17 @@ impl Routes {
         }
     }
 
+    /// Registers `remote`'s owner. Returns the hook sign-in hints held for
+    /// it before it had one, to deliver now.
     pub(crate) fn register(
         &self,
         remote: &str,
         owner: &str,
         generation: u64,
         transcript: super::transcript::Transcript,
-    ) {
+    ) -> Vec<Value> {
         let Ok(mut state) = self.0.lock() else {
-            return;
+            return Vec::new();
         };
         let routes = &mut state.live;
         if routes.len() < NODES || routes.contains_key(remote) {
@@ -537,6 +545,55 @@ impl Routes {
             for ((remote, update), _) in resume.history {
                 Self::forward_registered(&mut state.live, &remote, update);
             }
+        }
+        if !state.live.contains_key(remote) {
+            return Vec::new();
+        }
+        let mut held = Vec::new();
+        state.held.retain(|(session, _, update)| {
+            let mine = session == remote;
+            if mine {
+                held.push(update.clone());
+            }
+            !mine
+        });
+        held
+    }
+
+    /// Where a child session's hook sign-in hint goes: its owner and
+    /// transcript, for as long as the session lives (not only while a prompt
+    /// runs). A session with no owner yet keeps its latest hint per backend,
+    /// replayed by [`Self::register`]; a clear replaces the link it clears.
+    pub(crate) fn hook_hint(
+        &self,
+        remote: &str,
+        update: Value,
+    ) -> Option<(String, super::transcript::Transcript, Value)> {
+        let Ok(mut state) = self.0.lock() else {
+            return None;
+        };
+        if let Some(route) = state.live.get(remote) {
+            return Some((route.owner.clone(), route.transcript.clone(), update));
+        }
+        let backend = update["_meta"][crate::ahp::auth::HOOK_AUTH_META]["backend"]
+            .as_str()?
+            .to_owned();
+        let held = &mut state.held;
+        if let Some(existing) = held
+            .iter_mut()
+            .find(|(session, held, _)| session == remote && *held == backend)
+        {
+            existing.2 = update;
+        } else if held.len() < HELD_HINTS {
+            held.push((remote.to_owned(), backend, update));
+        }
+        None
+    }
+
+    /// A child session ended: nothing is held for it any longer.
+    pub(crate) fn end_session(&self, remote: &str) {
+        if let Ok(mut state) = self.0.lock() {
+            state.held.retain(|(session, _, _)| session != remote);
         }
     }
     pub(crate) fn forward(&self, remote: &str, update: Value) {
@@ -813,6 +870,80 @@ mod tests {
             );
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    fn hook_hint(backend: &str, url: Option<&str>, cleared: bool) -> Value {
+        serde_json::json!({"sessionUpdate": "notice", "severity": "info", "title": "sign in",
+            "_meta": {crate::ahp::auth::HOOK_AUTH_META: {"backend": backend, "url": url, "cleared": cleared}}})
+    }
+
+    #[test]
+    fn a_hook_hint_reaches_its_owner_whenever_the_session_lives() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        // Before the first prompt: held, the latest per backend, a clear
+        // replacing the link it clears.
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", Some("https://a/1"), false))
+                .is_none()
+        );
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_none()
+        );
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("b", Some("https://b/1"), false))
+                .is_none()
+        );
+        // Another session's are its own.
+        assert!(
+            routes
+                .hook_hint("other", hook_hint("a", Some("https://a/2"), false))
+                .is_none()
+        );
+        let held = routes.register("child", "owner", 1, transcripts.get("owner", 1).unwrap());
+        assert_eq!(
+            held,
+            [
+                hook_hint("a", None, true),
+                hook_hint("b", Some("https://b/1"), false)
+            ]
+        );
+        // Registered once, it stays routed between prompts: a link or clear
+        // published while idle reaches the owner.
+        let (owner, _, update) = routes
+            .hook_hint("child", hook_hint("a", Some("https://a/3"), false))
+            .unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(update, hook_hint("a", Some("https://a/3"), false));
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some()
+        );
+        // An ended session keeps nothing.
+        routes.end_session("other");
+        assert!(
+            routes
+                .register("other", "owner", 1, transcripts.get("owner", 1).unwrap())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn held_hook_hints_are_bounded() {
+        let routes = Routes::default();
+        for backend in 0..HELD_HINTS + 4 {
+            routes.hook_hint(
+                "child",
+                hook_hint(&backend.to_string(), Some("https://x"), false),
+            );
+        }
+        assert_eq!(routes.0.lock().unwrap().held.len(), HELD_HINTS);
     }
 
     #[test]

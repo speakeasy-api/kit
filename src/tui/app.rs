@@ -3015,6 +3015,8 @@ impl App {
                             .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
                 {
                     self.agents.remove(&id);
+                    self.subagent_hook_links
+                        .retain(|(agent, _), _| *agent != id);
                 } else {
                     if !self.agents_auto_opened && status != SubagentStatus::Removed {
                         self.agents_visible = true;
@@ -3126,6 +3128,8 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
+                self.subagent_hook_links
+                    .retain(|(agent, _), _| !removed.contains(agent));
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
@@ -3410,6 +3414,8 @@ impl App {
             self.hook_detached.insert(previous);
         }
         self.hook_detached.remove(&session_id);
+        // A child's links belong to the view they were shown in.
+        self.subagent_hook_links.clear();
         self.session_presentation = presentation;
         self.elicitations.clear();
         self.model_switch = None;

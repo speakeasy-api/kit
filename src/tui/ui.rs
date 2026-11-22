@@ -5428,6 +5428,17 @@ mod tests {
         // Signed in: the link is retired.
         app.apply(event(None, true));
         assert!(!flat(&mut app).contains("https://auth.example/child"));
+        // A new session's view starts without a child's links: the same
+        // link, sent again, is shown again.
+        app.apply(event(Some("https://auth.example/child"), false));
+        app.start_session("next".into());
+        app.apply(crate::tui::app::Update::Runtime(
+            crate::events::RuntimeEvent::SessionStarted {
+                session_id: "next".into(),
+            },
+        ));
+        app.apply(event(Some("https://auth.example/child"), false));
+        assert!(flat(&mut app).contains("https://auth.example/child"));
     }
 
     #[test]

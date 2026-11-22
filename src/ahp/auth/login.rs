@@ -647,7 +647,7 @@ fn stage(state: &mut State, hint: AuthHint) -> Option<Delivery> {
         .filter(|(scopes, _)| scopes.contains(&hint.scope))
         .filter_map(|(_, sink)| sink.upgrade())
         .collect();
-    let line = if sinks.is_empty() {
+    let line = if sinks.is_empty() && !stderr_is_logged() {
         headless_line(&mut state.printed, &hint)
     } else {
         None
@@ -674,7 +674,7 @@ fn stage_transient(state: &mut State, hint: AuthHint) -> Delivery {
         .filter(|(scopes, _)| scopes.contains(&hint.scope))
         .filter_map(|(_, sink)| sink.upgrade())
         .collect();
-    let line = if sinks.is_empty() {
+    let line = if sinks.is_empty() && !stderr_is_logged() {
         headless_line(&mut state.printed, &hint)
     } else {
         None
@@ -733,6 +733,14 @@ fn ordered(inner: Arc<dyn Fn(&AuthHint) + Send + Sync>) -> (Arc<Sink>, Arc<Shown
         }
     });
     (sink, shown)
+}
+
+/// Whether this process's stderr is read by a Kit parent (the TUI, or a Kit
+/// above a nested one), which keeps it as a diagnostic log. A sign-in link
+/// printed there would be logged; that parent shows links through its own
+/// channels instead.
+fn stderr_is_logged() -> bool {
+    crate::events::enabled()
 }
 
 /// The stderr line for a session nobody is attached to: once per link.
