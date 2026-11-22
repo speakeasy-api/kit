@@ -88,27 +88,9 @@ impl AuthHint {
 #[derive(Clone)]
 pub(super) struct Need {
     pub(super) context: AuthContext,
-    /// Its step-up scopes (see [`step_up`]); empty for a plain sign-in.
+    /// The scopes the SDK reported as required: a 403's step-up scopes, or
+    /// none for a plain sign-in.
     pub(super) required: Vec<String>,
-}
-
-/// The scopes `required` asks for beyond `context`'s target's own. A plain
-/// sign-in always obtains the target's own scopes (the SDK reports them as
-/// required on every `interaction_required`), so only these make a step-up.
-/// Every need and login keeps only these, and every comparison uses them.
-pub(super) fn step_up(context: &AuthContext, required: &[String]) -> Vec<String> {
-    let own = context
-        .target()
-        .map(|target| target.scopes().to_vec())
-        .unwrap_or_default();
-    let mut extra: Vec<String> = required
-        .iter()
-        .filter(|scope| !own.contains(scope))
-        .cloned()
-        .collect();
-    extra.sort();
-    extra.dedup();
-    extra
 }
 
 /// Whether `granted` step-up scopes include every one in `required`.
@@ -129,8 +111,9 @@ pub(super) struct Login {
     pub(super) context: AuthContext,
     pub(super) pending: PendingLogin,
     pub(super) state: String,
-    /// Its step-up scopes (see [`step_up`]): completing it meets a need
-    /// for no more than these.
+    /// The scopes it was prepared to require: completing it (which the SDK
+    /// lets succeed only with a grant that has them) meets a need for no
+    /// more than these.
     pub(super) required: Vec<String>,
     pub(super) url: String,
     pub(super) expires_at: SystemTime,
@@ -151,7 +134,7 @@ impl Login {
             oauth,
             context: context.clone(),
             state: query(pending.authorization_url(), "state").unwrap_or_default(),
-            required: step_up(context, required),
+            required: required.to_vec(),
             url: pending.authorization_url().to_string(),
             expires_at: pending.expires_at(),
             pending,
@@ -284,7 +267,7 @@ impl Registry {
         let needs = state.needs.entry(scope.to_owned()).or_default();
         let need = Need {
             context: context.clone(),
-            required: step_up(context, required),
+            required: required.to_vec(),
         };
         match needs.iter_mut().find(|n| same_target(&n.context, context)) {
             Some(existing) => *existing = need,
@@ -302,8 +285,7 @@ impl Registry {
     /// `context`'s target was prepared with `required` scopes: a need for
     /// no more is met.
     pub(super) fn prepared(&self, scope: &str, context: &AuthContext, required: &[String]) {
-        let granted = step_up(context, required);
-        self.settle(scope, context, Settle::Granted(&granted), None);
+        self.settle(scope, context, Settle::Granted(required), None);
     }
 
     pub(super) fn needs(&self, scope: &str) -> Vec<Need> {
@@ -640,9 +622,9 @@ pub(super) enum Outcome {
     Completed,
     /// The link expired, or the user denied consent.
     Ended,
-    /// The issuer granted fewer than the target's own scopes: the login
-    /// ended, and signing in again the same way would fail the same way.
-    NotGranted,
+    /// The issuer granted fewer than the step-up scopes the login required
+    /// (named): the SDK saved the grant and ended the login.
+    NotGranted(Vec<String>),
     /// The login is no longer wanted, as when another process signed in.
     Stopped,
 }
@@ -709,22 +691,26 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             deadline,
             ..login.context.clone()
         };
-        // The user denied consent: the callback carries an error, not a code.
-        let denied = query(&callback, "error").is_some();
         let completed = login
             .oauth
             .complete(context, callback, OperationBudget::until(deadline))
             .await;
         respond(&mut stream, completed.is_ok()).await;
-        // A callback with the login's state ends it either way: the SDK
-        // claims the login before it exchanges the code, so after a denial
-        // or a failed exchange its link no longer works.
-        return match completed {
-            Ok(_) => Outcome::Completed,
-            Err(error) if !denied && error.auth_code() == Some(AuthErrorCode::AccessDenied) => {
-                Outcome::NotGranted
-            }
-            Err(_) => Outcome::Ended,
+        let error = match completed {
+            Ok(_) => return Outcome::Completed,
+            Err(error) => error,
+        };
+        // The SDK says whether the login is still pending: after an invalid
+        // callback, say, its link still works and Kit keeps listening.
+        if error.login_ended() == Some(false) {
+            continue;
+        }
+        return if error.auth_code() == Some(AuthErrorCode::AccessDenied)
+            && !error.required_scopes().is_empty()
+        {
+            Outcome::NotGranted(error.required_scopes().to_vec())
+        } else {
+            Outcome::Ended
         };
     }
 }

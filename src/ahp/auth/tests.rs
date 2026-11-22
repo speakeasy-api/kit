@@ -1107,10 +1107,10 @@ async fn a_plain_need_of_a_scoped_binding_clears_once_signed_in_elsewhere() {
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let target = context(&auth, id);
     let scope = auth.0.backends[id].scope.clone();
-    // The SDK reports the binding's own scopes as required on a plain
-    // "not signed in"; that is not a step-up.
+    // A preset's scopes are requested, never required: a plain "not signed
+    // in" requires nothing, so it is not a step-up.
     let error = credential(&auth, target.clone()).await.unwrap_err();
-    assert_eq!(error.required_scopes(), ["hooks:invoke"]);
+    assert!(error.required_scopes().is_empty(), "{error:?}");
     assert!(login::registry().needs(&scope)[0].required.is_empty());
     auth.turn_started();
     assert!(next_hint(&mut hints).await.url.is_some());
@@ -1138,11 +1138,7 @@ async fn a_login_completed_for_less_than_the_need_is_replaced_next_turn() {
     auth.turn_started();
     let first = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
     // While that plain link is live, an operation needs `hooks:admin` too.
-    login::registry().needs_login(
-        &scope,
-        &target,
-        &["hooks:invoke".into(), "hooks:admin".into()],
-    );
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
     // The user approves the first link, granting only the binding's scope.
     let code = issue_code_granting(&first, "hooks:invoke");
     assert!(call_back_with(port(&first), &query(&first, "state"), &code).await);
@@ -1178,11 +1174,7 @@ async fn a_live_link_for_less_than_the_need_is_replaced_next_turn() {
     let _ = credential(&auth, target.clone()).await;
     auth.turn_started();
     let first = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
-    login::registry().needs_login(
-        &scope,
-        &target,
-        &["hooks:invoke".into(), "hooks:admin".into()],
-    );
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
     // The plain link would not meet the step-up: the next turn replaces it.
     auth.prepare_backend(&auth.0.backends[id].clone()).await;
     let next = hints.try_recv().expect("a new link");
@@ -1243,16 +1235,12 @@ async fn a_step_up_granted_elsewhere_clears_its_link_next_turn() {
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
     let target = context(&auth, id);
     let scope = auth.0.backends[id].scope.clone();
-    login::registry().needs_login(
-        &scope,
-        &target,
-        &["hooks:invoke".into(), "hooks:admin".into()],
-    );
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
     auth.turn_started();
     let shown = next_hint(&mut hints).await;
     assert!(shown.url.is_some());
-    // Another process signs in, and its grant includes `hooks:admin`.
-    let (url, complete) = elsewhere(&other, id).await;
+    // Another process steps up too, and its grant includes `hooks:admin`.
+    let (url, complete) = elsewhere_requiring(&other, id, &["hooks:admin"]).await;
     complete(issue_code(&url)).await;
     auth.prepare_backend(&auth.0.backends[id].clone()).await;
     let cleared = hints.try_recv().expect("the link is withdrawn");
@@ -1262,29 +1250,76 @@ async fn a_step_up_granted_elsewhere_clears_its_link_next_turn() {
 }
 
 #[tokio::test]
-async fn a_sign_in_granted_too_few_scopes_says_so() {
+async fn a_step_up_granted_too_few_scopes_says_so() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
     let id = "test.too-few";
     let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
     let (tx, mut hints) = mpsc::unbounded_channel();
     let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
-    let _ = credential(&auth, context(&auth, id)).await;
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    // A 403 asked for `hooks:admin`: the step-up link is shown.
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
     auth.turn_started();
     let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
-    // The issuer grants `hooks:admin` but not the binding's `hooks:invoke`.
-    let code = issue_code_granting(&url, "hooks:admin");
+    // The issuer grants only the preset's `hooks:invoke`.
+    let code = issue_code_granting(&url, "hooks:invoke");
     assert!(!call_back_with(port(&url), &query(&url, "state"), &code).await);
+    // The link is withdrawn and the user told why, never "signed in".
+    let mut seen = Vec::new();
     let problem = loop {
         let hint = next_hint(&mut hints).await;
+        seen.push(hint.clone());
         if let Some(problem) = hint.problem {
             break problem;
         }
     };
+    assert!(seen.iter().all(|hint| !hint.signed_in), "{seen:?}");
     assert!(
-        problem.contains("did not grant") && problem.contains("hooks:invoke"),
+        problem.contains("did not grant") && problem.contains("hooks:admin"),
         "{problem}"
     );
+    assert!(states(&scope).is_empty());
+    assert!(login::registry().has_needs(&scope));
+    // The SDK kept the narrower grant.
+    assert!(credential(&auth, target).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_invalid_callback_keeps_the_link_live() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.stray-callback";
+    let auth = hook_auth(&storage, vec![issuer.backend(id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let scope = auth.0.backends[id].scope.clone();
+    let _ = credential(&auth, context(&auth, id)).await;
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // A callback with the login's state but a duplicated `code`: the SDK
+    // refuses it and reports the login still pending.
+    let mut stream = TcpStream::connect(("127.0.0.1", port(&url))).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /callback?code=a&code=b&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                query(&url, "state")
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 400"));
+    // Kit keeps listening, the link stays, and it still signs in.
+    assert_eq!(states(&scope), [query(&url, "state")]);
+    assert!(hints.try_recv().is_err());
+    assert!(approve(&url).await);
+    let cleared = next_hint(&mut hints).await;
+    assert!(cleared.cleared && cleared.signed_in, "{cleared:?}");
 }
 
 #[tokio::test]
@@ -1330,11 +1365,7 @@ async fn a_step_up_link_stays(id: &str, then: BaseCredential) {
     let target = context(&auth, id);
     let scope = auth.0.backends[id].scope.clone();
     // A 403 asked for `hooks:admin`: the step-up link is shown.
-    login::registry().needs_login(
-        &scope,
-        &target,
-        &["hooks:invoke".into(), "hooks:admin".into()],
-    );
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
     auth.turn_started();
     let shown = next_hint(&mut hints).await;
     let url = url::Url::parse(shown.url.as_deref().unwrap()).unwrap();
@@ -1382,21 +1413,26 @@ async fn a_late_base_preparation_keeps_the_step_up_link() {
 }
 
 #[tokio::test]
-async fn scope_settings_add_to_the_presets_scopes() {
+async fn scope_settings_widen_what_a_preset_backend_may_step_up_to() {
     let issuer = Issuer::start().await;
     let storage = tempfile::tempdir().unwrap();
-    let mut backend = issuer.backend("test.scopes");
-    backend["authentication"]["scopes"] = json!(["hooks:invoke"]);
-    backend["oauth"]["scopes"] = json!(["hooks:upload"]);
-    let auth = hook_auth(&storage, vec![backend]);
-    let target = context(&auth, "test.scopes");
+    let id = "test.scopes";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let target = context(&auth, id);
+    // A sign-in asks for exactly the preset's scopes.
     let url = auth.prepare(&target, &[]).await.unwrap().unwrap();
+    assert_eq!(query(&url, "scope"), "hooks:invoke");
+    assert!(approve(&url).await);
+    assert!(credential(&auth, target.clone()).await.unwrap().is_some());
+    // `oauth.scopes` allow a step-up to `hooks:admin`, which asks for both.
+    let url = auth
+        .prepare(&target, &["hooks:admin".into()])
+        .await
+        .unwrap()
+        .unwrap();
     let mut requested: Vec<_> = query(&url, "scope").split(' ').map(str::to_owned).collect();
     requested.sort();
-    assert_eq!(requested, ["hooks:invoke", "hooks:upload"]);
-    // And the grant satisfies the preset's requirement.
-    assert!(approve(&url).await);
-    assert!(credential(&auth, target).await.unwrap().is_some());
+    assert_eq!(requested, ["hooks:admin", "hooks:invoke"]);
 }
 
 #[tokio::test]
@@ -1445,10 +1481,10 @@ async fn status_for_one_backend_checks_only_that_backend() {
         0,
         "another backend's issuer was contacted"
     );
-    // The named backend itself was checked.
-    let checked = first.hits.load(Ordering::SeqCst);
-    assert!(checked > 0, "the named backend was not checked");
+    // Not signed in needs no authorization-server request to tell.
+    assert_eq!(lines[0].1, "needs-login");
     // A typo is refused before any credential check.
+    let checked = first.hits.load(Ordering::SeqCst);
     assert!(auth.status(Some("test.typo")).await.is_err());
     assert_eq!(first.hits.load(Ordering::SeqCst), checked);
     assert_eq!(second.hits.load(Ordering::SeqCst), 0);
@@ -1669,13 +1705,27 @@ async fn elsewhere(
     url::Url,
     impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
 ) {
+    elsewhere_requiring(auth, id, &[]).await
+}
+
+/// [`elsewhere`], for a sign-in that requires `required` scopes.
+async fn elsewhere_requiring(
+    auth: &HookAuth,
+    id: &str,
+    required: &[&str],
+) -> (
+    url::Url,
+    impl FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
     let target = context(auth, id);
     let manager = auth.manager(&target).unwrap();
     let redirect = "http://127.0.0.1:9/callback";
     let Preparation::InteractionRequired(pending) = manager
         .prepare_with(
             with_deadline(&target),
-            PrepareOptions::new().redirect_uri(redirect),
+            PrepareOptions::new()
+                .redirect_uri(redirect)
+                .required(required.iter().map(|scope| (*scope).to_owned()).collect()),
             budget(),
         )
         .await

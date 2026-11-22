@@ -133,7 +133,8 @@ Put further settings in an `oauth` object on the backend, beside its
 `authentication`. Other AHP harness adapters read the same object, and AHP
 receivers ignore it. All settings are optional. Alongside a preset:
 
-- `scopes` add to the preset's scopes.
+- `scopes` add to what a backend may ask for beyond the preset's scopes (a
+  step-up). Every sign-in asks for exactly the preset's scopes.
 - `issuer` and `clientId` must agree with the preset's `issuer` and
   `clientId`. Kit checks a preset's values exactly, so a different value
   makes sign-in fail rather than replace the preset's.
@@ -154,7 +155,7 @@ receivers ignore it. All settings are optional. Alongside a preset:
 | `issuer` | The authorization server trusted for this backend. A preset's `issuer` counts too. An `issuer` that is not an `https` URL disables OAuth for the backend until you fix it. |
 | `trustAdvertisedIssuer` | Without `issuer`, trust the authorization server the backend advertises. Default `false`: Kit refuses it. Client credentials always need `issuer`. |
 | `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
-| `scopes` | Scopes to request in addition to the preset's, which every operation requires. They are also the most Kit accepts: a backend that asks for a scope outside them is refused, not granted it. |
+| `scopes` | Without a preset, the scopes every sign-in asks for. With a preset, which asks for its own `scopes`, further scopes a backend may ask for. Requested scopes are never mandatory: a sign-in the authorization server grants fewer of still works. Together with the preset's they are the most Kit accepts: a backend that asks for a scope outside them is refused, not granted it. |
 | `clientId` | A client registered for Kit in advance. It always wins. Kit listens on a port the system chooses, so its registration must accept any loopback port on `http://127.0.0.1/callback` (RFC 8252 §7.3). `oauth.redirectPort` is no longer used; Kit warns when it is set. |
 | `clientSecretRef` | For client credentials: a key in `~/.kit/ahp-secrets.json`. |
 | `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document that you publish. Kit uses it where the issuer supports such documents. Its `redirectUris` must include `http://127.0.0.1/callback`; the authorization server must accept any port on it (RFC 8252). |
@@ -179,6 +180,14 @@ registered clients go in Kit's credential store.
 
 An explicit `Authorization` header in `transport.headers` takes precedence
 over all of the above: Kit sends that header and nothing else.
+
+### Further scopes (step-up)
+
+A backend that answers `403 insufficient_scope` asks for more scopes. If
+they are within the ones Kit accepts, its next sign-in link asks for them; if
+the authorization server then grants fewer, Kit keeps the narrower sign-in
+and says which scopes it did not grant, rather than reporting the backend as
+signed in. A `401` asks only for a sign-in, whatever scopes it names.
 
 ### Backends that supply their own subscriptions
 

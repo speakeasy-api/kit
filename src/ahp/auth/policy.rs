@@ -73,11 +73,13 @@ impl OAuthPolicy for Policy {
         Ok(())
     }
 
+    /// The SDK adds the operation's required scopes to every acquisition
+    /// itself, so the selection is always the target's requested scopes.
     fn select(
         &self,
         target: &AuthTarget,
         resource: &ResourceMetadata,
-        challenge_scopes: &[String],
+        _required: &[String],
     ) -> Result<TrustDecision, HookError> {
         if self.settings.invalid_issuer {
             return Err(denied());
@@ -106,13 +108,7 @@ impl OAuthPolicy for Policy {
                 .cloned(),
         }
         .ok_or_else(denied)?;
-        let mut scopes = self.requested(target);
-        for scope in challenge_scopes {
-            if !scopes.contains(scope) {
-                scopes.push(scope.clone());
-            }
-        }
-        Ok(TrustDecision::new(issuer, scopes))
+        Ok(TrustDecision::new(issuer, self.requested(target)))
     }
 }
 
@@ -133,16 +129,28 @@ impl Policy {
         flow == Some(agenthooksprotocol::auth::OAuthFlow::ClientCredentials)
     }
 
-    /// The preset's scopes and those the backend's settings add: the preset's
-    /// are requirements the SDK enforces on every operation, so settings can
-    /// widen the request but never drop them.
+    /// The scopes every sign-in asks for, none of them mandatory: a
+    /// preset's `scopes` when it has them (the SDK requires a preset's to be
+    /// exactly the request), otherwise the backend's `oauth.scopes`.
     pub(super) fn requested(&self, target: &AuthTarget) -> Vec<String> {
-        let mut scopes = target.scopes().to_vec();
-        for scope in self.settings.scopes.iter().flatten() {
-            if !scopes.contains(scope) {
-                scopes.push(scope.clone());
-            }
-        }
-        scopes
+        let scopes = match target.preset_scopes() {
+            Some(preset) => preset.to_vec(),
+            None => self.settings.scopes.clone().unwrap_or_default(),
+        };
+        normalized(scopes)
     }
+
+    /// The most Kit accepts for the target: its request and the backend's
+    /// `oauth.scopes`. A step-up a backend asks for must lie within these.
+    pub(super) fn ceiling(&self, target: &AuthTarget) -> Vec<String> {
+        let mut scopes = self.requested(target);
+        scopes.extend(self.settings.scopes.iter().flatten().cloned());
+        normalized(scopes)
+    }
+}
+
+fn normalized(mut scopes: Vec<String>) -> Vec<String> {
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }

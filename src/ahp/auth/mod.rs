@@ -332,11 +332,11 @@ impl HookAuth {
         let policy = policy::Policy {
             settings: settings.clone(),
         };
-        // The target's own scopes set the manager's request and ceiling, so
-        // targets with different scopes (an event and an upload binding,
-        // say) never share one. They still share the backend's grant.
-        let mut scopes = policy.requested(&target);
-        scopes.sort();
+        // The target's own scopes set the manager's request, so targets
+        // with different scopes (an event and an upload binding, say) never
+        // share one. They still share the backend's grant.
+        let scopes = policy.requested(&target);
+        let ceiling = policy.ceiling(&target);
         let key = (
             backend.scope.clone(),
             pkce,
@@ -390,7 +390,7 @@ impl HookAuth {
         config = config
             .grant_partition(&backend.scope)
             .login_lifetime(settings.login_lifetime)
-            .scopes(scopes.clone(), scopes)
+            .scopes(scopes, ceiling)
             .client_secret_storage(Arc::new(secrets::Secrets(store.clone())));
         if !pkce && client.is_some() {
             let reference = settings
@@ -446,16 +446,31 @@ impl HookAuth {
         {
             return;
         }
-        if let Some(backend) = self.0.backends.get(&context.backend_id) {
-            login::registry().problem(
-                &backend.scope,
-                &backend.id,
-                format!(
-                    "access_denied. The backend requires scopes ({}) outside the ones Kit allows for it. Review oauth.scopes in hooks.json.",
-                    error.required_scopes().join(" ")
-                ),
-            );
-        }
+        let Some(backend) = self.0.backends.get(&context.backend_id) else {
+            return;
+        };
+        let required = error.required_scopes();
+        let allowed = context.target().is_ok_and(|target| {
+            let ceiling = policy::Policy {
+                settings: backend.settings.clone(),
+            }
+            .ceiling(&target);
+            required.iter().all(|scope| ceiling.contains(scope))
+        });
+        let message = if allowed {
+            // Within what Kit accepts, yet refused: the authorization server
+            // did not grant them, or the backend refuses a token that has them.
+            format!(
+                "access_denied. The authorization server did not grant the scopes the backend requires ({}), or the backend refuses them.",
+                required.join(" ")
+            )
+        } else {
+            format!(
+                "access_denied. The backend requires scopes ({}) outside the ones Kit allows for it. Review oauth.scopes in hooks.json.",
+                required.join(" ")
+            )
+        };
+        login::registry().problem(&backend.scope, &backend.id, message);
     }
 
     /// The ids of backends whose sign-in hints a session of these hooks shows.
@@ -733,12 +748,12 @@ impl HookAuth {
                         }
                         login::Outcome::Ended => login::registry().ended(&login),
                         // Said once, beside where the next link appears.
-                        login::Outcome::NotGranted => {
+                        login::Outcome::NotGranted(scopes) => {
                             login::registry().ended(&login);
                             login::registry().problem(
                                 &login.scope,
                                 &login.context.backend_id,
-                                not_granted(&login.context),
+                                not_granted(&scopes),
                             );
                         }
                         login::Outcome::Stopped => {}
@@ -900,7 +915,7 @@ impl HookAuth {
             login::Login::new(&backend.scope, Arc::clone(&manager), &context, &[], pending);
         match login::serve(&listener, &candidate).await {
             login::Outcome::Completed => {}
-            login::Outcome::NotGranted => return Err(not_granted(&context)),
+            login::Outcome::NotGranted(scopes) => return Err(not_granted(&scopes)),
             _ => return Err("the sign-in link expired or was not approved".into()),
         }
         login::registry().usable(&backend.scope, &context);
@@ -941,14 +956,11 @@ fn guidance(error: &HookError) -> String {
     }
 }
 
-/// The issuer granted a sign-in fewer than the target's own scopes.
-fn not_granted(context: &AuthContext) -> String {
-    let scopes = context
-        .target()
-        .map(|target| target.scopes().join(" "))
-        .unwrap_or_default();
+/// The issuer granted a sign-in fewer than the scopes it required.
+fn not_granted(scopes: &[String]) -> String {
     format!(
-        "access_denied. The authorization server did not grant the scopes Kit needs ({scopes}). Check which scopes it allows Kit."
+        "access_denied. The authorization server did not grant the scopes Kit needs ({}). Check which scopes it allows Kit.",
+        scopes.join(" ")
     )
 }
 
@@ -1022,22 +1034,16 @@ impl AuthProvider for Provider {
     ) -> LocalFuture<'_, Result<(), HookError>> {
         Box::pin(async move {
             let observed = context.clone();
-            // Only a 403 (insufficient_scope) asks for more scopes. A 401
-            // asks to sign in, whatever scopes the SDK attaches to it.
-            let step_up = challenge.status == 403;
             let result = match self.0.manager(&context) {
                 Ok(manager) => manager.challenge(context, challenge).await,
                 Err(error) => Err(error),
             };
             if let Err(error) = &result {
                 if needs_login(error) {
+                    // The SDK's required scopes: a 403's step-up, never a
+                    // 401's hint.
                     if let Some(scope) = self.0.scope(&observed) {
-                        let required = if step_up {
-                            error.required_scopes()
-                        } else {
-                            &[]
-                        };
-                        login::registry().needs_login(scope, &observed, required);
+                        login::registry().needs_login(scope, &observed, error.required_scopes());
                     }
                 } else {
                     self.0.explain_ceiling(&observed, error);
