@@ -539,7 +539,10 @@ impl HookAuth {
 
     /// At a turn boundary: for each backend that needs a login, prepare it
     /// in the background and show its link. Never blocks the turn and never
-    /// touches a backend that has a usable grant.
+    /// touches a backend that has a usable grant. Per OAuth backend each turn
+    /// costs two credential-entry reads for the logout marker (its scope's
+    /// and its backend id's), plus a credential lookup where a need or a
+    /// skipped configuration calls for one.
     pub(crate) fn turn_started(&self) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -572,7 +575,8 @@ impl HookAuth {
 
     async fn prepare_backend(&self, backend: &Backend) {
         // A logout in another Kit process withdraws this process's links
-        // from before it, and what it knew the backend needed.
+        // from before it, and what it knew the backend needed. Two
+        // credential-entry reads: the scope's marker and the backend id's.
         if let Ok(generation) = store::logout_generation(&self.0.storage, &backend.scope).await
             && login::registry().superseded(&backend.scope, &generation)
         {
@@ -695,8 +699,10 @@ impl HookAuth {
     /// step-up's `required` scopes; if so the need is met and its link
     /// withdrawn. Looked up through a manager that requires them: a token
     /// that has them is returned, one without them is `interaction_required`.
-    /// Neither sends an authorization-server request or registers a client,
-    /// so this is cheap at every turn.
+    /// Neither sends an authorization-server request or registers a client:
+    /// at each turn a live step-up costs one credential lookup in the store
+    /// (a token refresh if the token expired), besides the turn's two
+    /// logout-marker reads.
     async fn check_step_up(&self, backend: &Backend, context: &AuthContext, required: &[String]) {
         let result = match self.manager_requiring(context, required) {
             Ok(manager) => manager.credential(with_deadline(context)).await,
@@ -814,6 +820,11 @@ impl HookAuth {
                         login::Outcome::Ended => login::registry().ended(&login),
                         // Said once, beside where the next link appears.
                         login::Outcome::NotGranted(scopes) => {
+                            login::registry().withdraw_step_up(
+                                &login.scope,
+                                &login.context,
+                                &scopes,
+                            );
                             login::registry().ended(&login);
                             login::registry().problem(
                                 &login.scope,

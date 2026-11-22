@@ -142,12 +142,16 @@ impl Generation {
         })
     }
 
-    /// Whether no logout happened since. An unreadable marker does not
-    /// block a sign-in: the grant it would store is then as current as any.
-    pub(super) async fn current(&self, scope: &str) -> bool {
+    /// Whether no logout happened since. An unreadable marker is an error:
+    /// the caller decides whether that refuses (before a grant is stored)
+    /// or is tolerated (after).
+    pub(super) async fn current(
+        &self,
+        scope: &str,
+    ) -> Result<bool, agenthooksprotocol::client::HookError> {
         super::store::logout_generation(&self.storage, scope)
             .await
-            .map_or(true, |now| now == self.at)
+            .map(|now| now == self.at)
     }
 }
 
@@ -543,6 +547,20 @@ impl Registry {
         deliver(delivery);
     }
 
+    /// The authorization server would not grant `scopes` to `context`'s
+    /// target: its need stops asking for them, so later links ask only for
+    /// what can be granted. A fresh 403 asks again.
+    pub(super) fn withdraw_step_up(&self, scope: &str, context: &AuthContext, scopes: &[String]) {
+        if let Some(needs) = self.lock().needs.get_mut(scope) {
+            for need in needs
+                .iter_mut()
+                .filter(|need| same_target(&need.context, context))
+            {
+                need.required.retain(|required| !scopes.contains(required));
+            }
+        }
+    }
+
     /// Whether this process shows a link for `scope` prepared before its
     /// current logout generation: a logout elsewhere superseded it.
     pub(super) fn superseded(&self, scope: &str, generation: &str) -> bool {
@@ -807,15 +825,24 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             respond(&mut stream, false).await;
             continue;
         }
-        // A link shown before a logout never signs in.
-        if !login.generation.current(&login.scope).await {
-            respond(&mut stream, false).await;
-            let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
-            let _ = login
-                .oauth
-                .cancel_login(login.pending.clone(), budget)
-                .await;
-            return Outcome::LoggedOut;
+        // A link shown before a logout never signs in. An unreadable marker
+        // refuses this callback; the link still works, so the user can retry.
+        match login.generation.current(&login.scope).await {
+            Ok(true) => {}
+            Ok(false) => {
+                respond(&mut stream, false).await;
+                let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
+                let _ = login
+                    .oauth
+                    .cancel_login(login.pending.clone(), budget)
+                    .await;
+                return Outcome::LoggedOut;
+            }
+            Err(_) => {
+                tracing::warn!(backend = %login.context.backend_id, "hook sign-in refused: the logout marker could not be read");
+                respond(&mut stream, false).await;
+                continue;
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = AuthContext {
@@ -827,12 +854,37 @@ pub(super) async fn serve(listener: &TcpListener, login: &Login) -> Outcome {
             .complete(context, callback, OperationBudget::until(deadline))
             .await;
         // A logout during the exchange: its marker was moved before it
-        // removed anything, so the grant just stored is removed again here.
-        if completed.is_ok() && !login.generation.current(&login.scope).await {
+        // removed anything, so whatever the exchange stored is removed again
+        // here. Checked whatever `complete` returned: an under-granted step-up
+        // stores its grant and still fails access_denied. Removing is
+        // idempotent, so a failed exchange that stored nothing costs nothing.
+        let logged_out = match login.generation.current(&login.scope).await {
+            Ok(current) => !current,
+            Err(_) => {
+                // The grant is stored by now; a logout that follows removes it.
+                tracing::warn!(backend = %login.context.backend_id, "the logout marker could not be read after a hook sign-in");
+                false
+            }
+        };
+        if logged_out {
             let budget = OperationBudget::until(Instant::now() + Duration::from_secs(30));
-            let _ = super::store::Store::new(login.generation.storage.clone(), &login.scope)
-                .forget(budget)
-                .await;
+            if let Err(error) =
+                super::store::Store::new(login.generation.storage.clone(), &login.scope)
+                    .forget(budget)
+                    .await
+            {
+                let code = error.auth_code().map_or("failed", AuthErrorCode::as_str);
+                tracing::warn!(backend = %login.context.backend_id, code, "a hook sign-in completed during a logout could not be removed");
+            }
+            if completed
+                .as_ref()
+                .is_err_and(|error| error.login_ended() == Some(false))
+            {
+                let _ = login
+                    .oauth
+                    .cancel_login(login.pending.clone(), budget)
+                    .await;
+            }
             respond(&mut stream, false).await;
             return Outcome::LoggedOut;
         }

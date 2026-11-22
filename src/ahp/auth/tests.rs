@@ -1512,8 +1512,81 @@ async fn a_step_up_granted_too_few_scopes_says_so() {
     );
     assert!(states(&scope).is_empty());
     assert!(login::registry().has_needs(&scope));
+    // The scopes it would not grant are no longer asked for.
+    assert!(login::registry().needs(&scope)[0].required.is_empty());
     // The SDK kept the narrower grant.
     assert!(credential(&auth, target).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_step_up_not_granted_is_not_asked_for_again_every_turn() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.not-granted-loop";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    let code = issue_code_granting(&url, "hooks:invoke");
+    assert!(!call_back_with(port(&url), &query(&url, "state"), &code).await);
+    while next_hint(&mut hints).await.problem.is_none() {}
+    // The next turns offer no new link: the narrower grant meets the need
+    // that is left, until a backend asks for `hooks:admin` again.
+    for _ in 0..2 {
+        auth.prepare_backend(&auth.0.backends[id].clone()).await;
+    }
+    while let Ok(hint) = hints.try_recv() {
+        assert!(hint.url.is_none(), "a new link: {hint:?}");
+    }
+    assert!(states(&scope).is_empty());
+    assert!(!login::registry().has_needs(&scope));
+}
+
+#[tokio::test]
+async fn a_logout_during_an_under_granted_step_up_leaves_no_grant() {
+    let issuer = Issuer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let id = "test.logout-under-granted";
+    let auth = hook_auth(&storage, vec![step_up_backend(&issuer, id)]);
+    let (tx, mut hints) = mpsc::unbounded_channel();
+    let _subscription = auth.subscribe(move |hint| tx.send(hint.clone()).unwrap());
+    let target = context(&auth, id);
+    let scope = auth.0.backends[id].scope.clone();
+    login::registry().needs_login(&scope, &target, &["hooks:admin".into()]);
+    auth.turn_started();
+    let url = url::Url::parse(&next_hint(&mut hints).await.url.unwrap()).unwrap();
+    // The exchange is slow; the user logs out (in another process) while it
+    // runs, and the issuer grants only `hooks:invoke`.
+    issuer.delay_ms.store(1500, Ordering::SeqCst);
+    let code = issue_code_granting(&url, "hooks:invoke");
+    let (callback_port, state) = (port(&url), query(&url, "state"));
+    let callback = tokio::spawn(async move { call_back_with(callback_port, &state, &code).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while issuer.received.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exchange starts");
+    // That logout already removed what was stored: only its marker moves
+    // now, and the exchange still stores its (narrower) grant.
+    logout_elsewhere(&auth, id, false).await;
+    assert!(!callback.await.unwrap());
+    // The grant the exchange stored is gone, and the user is not told the
+    // step-up was refused: the backend was logged out.
+    assert!(credential(&auth, target).await.is_err());
+    let cleared = loop {
+        let hint = next_hint(&mut hints).await;
+        assert!(hint.problem.is_none(), "{hint:?}");
+        if hint.cleared {
+            break hint;
+        }
+    };
+    assert!(!cleared.signed_in, "{cleared:?}");
 }
 
 #[tokio::test]
