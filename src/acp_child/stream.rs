@@ -421,6 +421,23 @@ struct RoutesState {
     replaying: std::collections::HashSet<String>,
 }
 
+/// A replay in progress: dropping it ends the replay.
+struct Replay<'a> {
+    routes: &'a Routes,
+    remote: &'a str,
+}
+
+impl Drop for Replay<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .routes
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.replaying.remove(self.remote);
+    }
+}
+
 /// A held hint's key within its session: the agent that originated it
 /// (relayed from further down the tree) and its backend.
 fn hint_key(update: &Value) -> Option<String> {
@@ -442,6 +459,11 @@ fn expired(update: &Value) -> bool {
 /// The most hook sign-in hints held for one unrouted child session (a few
 /// backends); each session has its own, so none evicts another's.
 const HELD_HINTS: usize = 4;
+/// The most hook sign-in hints held for one child connection in all. When
+/// full a new hint is dropped: session ids come from the child, so one that
+/// invents them can fill this only for itself (`Routes` is per child), and
+/// a later turn shows a dropped link again.
+const HELD_TOTAL: usize = 64;
 /// Resume has no local transcript owner yet. Keep associations independently of
 /// the bounded content tail so eviction cannot orphan future descendant traffic.
 struct Resume {
@@ -555,6 +577,15 @@ impl Routes {
         mut deliver: impl FnMut(&Value),
     ) {
         let mut held = self.register_locked(remote, owner, generation, transcript);
+        if held.is_empty() {
+            return;
+        }
+        // Ends the replay however this returns, a panic in `deliver` too, so
+        // the session's later hints are never held for good.
+        let _replay = Replay {
+            routes: self,
+            remote,
+        };
         while !held.is_empty() {
             for update in &held {
                 deliver(update);
@@ -655,11 +686,12 @@ impl Routes {
             // The latest goes last, after anything held before it.
             held.remove(index);
             held.push((remote.to_owned(), key, update));
-        } else if held
-            .iter()
-            .filter(|(session, _, _)| session == remote)
-            .count()
-            < HELD_HINTS
+        } else if held.len() < HELD_TOTAL
+            && held
+                .iter()
+                .filter(|(session, _, _)| session == remote)
+                .count()
+                < HELD_HINTS
         {
             held.push((remote.to_owned(), key, update));
         }
@@ -1107,6 +1139,39 @@ mod tests {
         // Each session has its own bound.
         routes.hook_hint("other", hook_hint("0", Some("https://x"), false));
         assert_eq!(routes.0.lock().unwrap().held.len(), HELD_HINTS + 1);
+        // A child inventing session ids fills no more than the whole bound,
+        // and scans no longer list.
+        for session in 0..HELD_TOTAL * 4 {
+            routes.hook_hint(
+                &format!("made-up-{session}"),
+                hook_hint("0", Some("https://x"), false),
+            );
+        }
+        assert_eq!(routes.0.lock().unwrap().held.len(), HELD_TOTAL);
+    }
+
+    #[test]
+    fn a_panic_mid_replay_does_not_hold_later_hints() {
+        let transcripts = super::super::transcript::Transcripts::default();
+        transcripts.start("owner", 1);
+        let routes = Routes::default();
+        routes.hook_hint("child", hook_hint("a", Some("https://a/1"), false));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            routes.register(
+                "child",
+                "owner",
+                1,
+                transcripts.get("owner", 1).unwrap(),
+                |_| panic!("delivery failed"),
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            routes
+                .hook_hint("child", hook_hint("a", None, true))
+                .is_some(),
+            "a later hint is held after the replay panicked"
+        );
     }
 
     #[test]
