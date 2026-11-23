@@ -519,12 +519,14 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Foreground {
     Waiting,
+    Unknown,
     Running,
     Idle(Option<v2::StopReason>),
 }
 impl Foreground {
     pub(super) fn advance(&mut self, next: Self) -> bool {
-        if matches!(self, Self::Idle(_))
+        if next == Self::Unknown
+            || matches!(self, Self::Idle(_))
             || (*self == Self::Waiting && matches!(next, Self::Idle(_)))
         {
             return false;
@@ -604,7 +606,12 @@ pub(super) fn foreground(params: &Value) -> Result<Option<Foreground>, Error> {
         v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
             Some(Foreground::Idle(idle.stop_reason))
         }
-        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => Some(Foreground::Running),
+        // Capture only distinguishes active work from idle, including when
+        // the workflow is blocked waiting for user action.
+        v2::SessionUpdate::StateUpdate(
+            v2::StateUpdate::Running(_) | v2::StateUpdate::RequiresAction(_),
+        ) => Some(Foreground::Running),
+        v2::SessionUpdate::StateUpdate(_) => Some(Foreground::Unknown),
         _ => None,
     })
 }

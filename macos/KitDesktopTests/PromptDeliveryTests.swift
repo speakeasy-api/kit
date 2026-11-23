@@ -237,6 +237,34 @@ final class PromptDeliveryTests: XCTestCase {
     }
 
     @MainActor
+    func testIndependentPlaybackCachesShareTheLastSlot() async throws {
+        let directory = temporaryDirectory()
+        let seedCache = TranscriptMediaCache(playbackDirectory: directory)
+        for slot in 1...31 {
+            let url = await seedCache.openURL(TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: slot * 2)))
+            XCTAssertNotNil(url)
+        }
+
+        let contenders = (32...39).map { TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: $0 * 2)) }
+        let admitted = await withTaskGroup(of: URL?.self, returning: [URL].self) { group in
+            for media in contenders {
+                group.addTask {
+                    // Independent cache actors must coordinate through the directory, not actor isolation.
+                    await TranscriptMediaCache(playbackDirectory: directory).openURL(media)
+                }
+            }
+            var urls: [URL] = []
+            for await url in group {
+                if let url { urls.append(url) }
+            }
+            return urls
+        }
+
+        XCTAssertEqual(admitted.count, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 32)
+    }
+
+    @MainActor
     func testLargeAudioEchoMatchesLocalFileInBothOrders() async throws {
         for updateFirst in [false, true] {
             let directory = temporaryDirectory()

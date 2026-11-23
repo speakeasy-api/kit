@@ -27,10 +27,10 @@ impl Capture {
         }
     }
 
-    pub(super) fn state(&mut self, state: Foreground) -> Option<Foreground> {
+    pub(super) fn state(&mut self, state: Foreground, repeated_idle: bool) -> Option<Foreground> {
         match self {
             Self::Legacy(turn) => turn.state(state),
-            Self::Correlated(correlation) => correlation.state(state),
+            Self::Correlated(correlation) => correlation.state(state, repeated_idle),
         }
     }
 
@@ -52,6 +52,18 @@ impl Capture {
             Self::Legacy(turn) => record(&mut turn.output),
             Self::Correlated(correlation) => correlation.record_output(record),
         }
+    }
+
+    pub(super) fn record_message(
+        &mut self,
+        update: agent_client_protocol::v2::schema::SessionUpdate,
+    ) {
+        if let Self::Correlated(correlation) = self
+            && (correlation.matched || !correlation.current.echoes.is_empty())
+        {
+            correlation.current.answer_observed = true;
+        }
+        self.record_output(|output| output.record_message(update));
     }
 
     pub(super) fn take_result(&mut self) -> Result<ChildOutput, ChildError> {
@@ -110,6 +122,7 @@ struct Candidate {
     echoes: BTreeSet<String>,
     echo_bytes: usize,
     turn: Turn,
+    answer_observed: bool,
     output_overflow: bool,
 }
 
@@ -184,7 +197,13 @@ impl Correlation {
         }
     }
 
-    fn state(&mut self, state: Foreground) -> Option<Foreground> {
+    fn state(&mut self, state: Foreground, repeated_idle: bool) -> Option<Foreground> {
+        // An echo only establishes insertion. For children that omit an active
+        // snapshot, require an agent message after the echo before accepting an
+        // otherwise repeated Idle as the answer's boundary.
+        if repeated_idle && !self.current.answer_observed {
+            return None;
+        }
         let idle = if self.current.turn.foreground == Foreground::Waiting
             && matches!(state, Foreground::Idle(_))
         {

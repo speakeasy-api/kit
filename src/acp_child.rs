@@ -1,7 +1,7 @@
 //! Generic parent-owned ACP subprocesses used for nested agents.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -745,12 +745,13 @@ impl Route {
     fn record_state(
         &self,
         state: protocol::Foreground,
+        repeated_idle: bool,
     ) -> Result<(), agent_client_protocol::Error> {
         let idle = self
             .capture
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?
-            .state(state);
+            .state(state, repeated_idle);
         if let Some(idle) = idle {
             self.idle.send_replace(idle);
         }
@@ -787,14 +788,38 @@ impl Route {
     }
 }
 
-/// Complete child-advertised snapshots, including notifications between prompts.
-/// Writers replace one session atomically; no lock is held across protocol calls,
-/// output callbacks, or awaits. Poison isolates the connection rather than
-/// silently publishing an unknown configuration. Snapshot values have no custom Drop.
+/// Child-advertised snapshots, including notifications between prompts.
+/// No lock is held across protocol calls, output callbacks, or awaits. Poison
+/// isolates the connection rather than silently guessing the state of a session.
 #[derive(Default)]
-struct ConfigSnapshots(Mutex<HashMap<SessionId, Vec<SessionConfigOption>>>);
+struct SessionSnapshots(Mutex<SnapshotState>);
 
-impl ConfigSnapshots {
+#[derive(Default)]
+struct SnapshotState {
+    configs: HashMap<SessionId, Vec<SessionConfigOption>>,
+    idle_sessions: HashSet<SessionId>,
+}
+
+impl SessionSnapshots {
+    /// Only explicit snapshots establish that a later Idle is a repetition.
+    /// Some children omit the first active snapshot; preserve that first Idle.
+    fn repeated_idle(
+        &self,
+        id: &SessionId,
+        state: &protocol::Foreground,
+    ) -> agent_client_protocol::Result<bool> {
+        let mut snapshots = self
+            .0
+            .lock()
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+        if matches!(state, protocol::Foreground::Idle(_)) {
+            Ok(!snapshots.idle_sessions.insert(id.clone()))
+        } else {
+            snapshots.idle_sessions.remove(id);
+            Ok(false)
+        }
+    }
+
     fn set(
         &self,
         id: SessionId,
@@ -804,6 +829,7 @@ impl ConfigSnapshots {
             .0
             .lock()
             .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .configs
             .insert(id, options);
         drop(old);
         Ok(())
@@ -824,20 +850,22 @@ impl ConfigSnapshots {
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
         // A notification for the new ID can precede the fork response. Never
         // overwrite child-reported state with an inferred parent fallback.
-        if !snapshots.contains_key(&id)
-            && let Some(inherited) = snapshots.get(source).cloned()
+        if !snapshots.configs.contains_key(&id)
+            && let Some(inherited) = snapshots.configs.get(source).cloned()
         {
-            snapshots.insert(id, inherited);
+            snapshots.configs.insert(id, inherited);
         }
         Ok(())
     }
 
     fn remove(&self, id: &SessionId) -> agent_client_protocol::Result<()> {
-        let old = self
+        let mut snapshots = self
             .0
             .lock()
-            .map_err(|_| agent_client_protocol::Error::internal_error())?
-            .remove(id);
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+        snapshots.idle_sessions.remove(id);
+        let old = snapshots.configs.remove(id);
+        drop(snapshots);
         drop(old);
         Ok(())
     }
@@ -850,6 +878,7 @@ impl ConfigSnapshots {
             .0
             .lock()
             .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .configs
             .get(id)
             .cloned())
     }
@@ -1600,8 +1629,8 @@ async fn run(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(HashMap::<SessionId, Route>::new()));
     let notification_routes = Arc::clone(&routes);
-    let config_snapshots = Arc::new(ConfigSnapshots::default());
-    let notification_configs = Arc::clone(&config_snapshots);
+    let session_snapshots = Arc::new(SessionSnapshots::default());
+    let notification_snapshots = Arc::clone(&session_snapshots);
     let stream_routes = Arc::new(stream::Routes::default());
     let notification_stream_routes = Arc::clone(&stream_routes);
     let root = config.root.clone();
@@ -1619,9 +1648,15 @@ async fn run(
                 let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
                 if let Some(notification) = &notification
                     && let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
-                    notification_configs.set(notification.session_id.clone(), update.config_options.clone())?;
+                    notification_snapshots.set(notification.session_id.clone(), update.config_options.clone())?;
                 }
                 notification_stream_routes.forward(&session_id.to_string(), params["update"].clone());
+                let state = protocol::foreground(&params)?;
+                let repeated_idle = if let Some(state) = &state {
+                    notification_snapshots.repeated_idle(&session_id, state)?
+                } else {
+                    false
+                };
                 let route = notification_routes
                     .lock()
                     .ok()
@@ -1629,12 +1664,11 @@ async fn run(
                 let Some(route) = route else {
                     return Ok(());
                 };
-                if let Some(state) = protocol::foreground(&params)? {
-                    route.record_inspection(params["update"].clone());
-                    route.record_state(state)?;
+                route.record_inspection(params["update"].clone());
+                if let Some(state) = state {
+                    route.record_state(state, repeated_idle)?;
                     return Ok(());
                 }
-                route.record_inspection(params["update"].clone());
                 if matches!(params["update"]["sessionUpdate"].as_str(), Some("user_message" | "user_message_chunk")) {
                     if let Some(id) = params["update"]["messageId"].as_str() {
                         route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
@@ -1642,7 +1676,7 @@ async fn run(
                     return Ok(());
                 }
                 if let Some(update) = messages::parse(&params["update"])? {
-                    route.record_output(|output| output.record_message(update))?;
+                    route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_message(update);
                     return Ok(());
                 }
                 // Capture rich tool values without round-tripping through the v1
@@ -1757,7 +1791,7 @@ async fn run(
             let mut replay = replay_capture.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.take_output();
             replay.finish_messages();
             if let Some(options) = session.config_options.clone() {
-                config_snapshots.set(session.session_id.clone(), options)?;
+                session_snapshots.set(session.session_id.clone(), options)?;
             }
             if let Some(model) = model {
                 let selectable = session.config_options.as_deref().unwrap_or_default().iter().any(|option| {
@@ -1768,7 +1802,7 @@ async fn run(
                     return std::future::pending().await;
                 }
                 match protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).await {
-                    Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
+                    Ok(response) => session_snapshots.set(session.session_id.clone(), response.config_options)?,
                     Err(error) => {
                         let error = child_request_error(error, &auth_methods);
                         let _ = ready.send(Err(format!("ACP harness {harness:?} rejected model selection {model:?}: {error}")));
@@ -1778,7 +1812,7 @@ async fn run(
             }
             if let Some(policy) = config.harnesses.model_policies.get(&harness) {
                 for (key, value) in &policy.config_options {
-                    let options = config_snapshots.get(&session.session_id)?.unwrap_or_default();
+                    let options = session_snapshots.get(&session.session_id)?.unwrap_or_default();
                     let (id, value) = match configured_option(&options, key, value) {
                         Ok(option) => option,
                         Err(error) => {
@@ -1787,7 +1821,7 @@ async fn run(
                         }
                     };
                     match protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(session.session_id.clone(), id, value)).await {
-                        Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
+                        Ok(response) => session_snapshots.set(session.session_id.clone(), response.config_options)?,
                         Err(error) => {
                             let error = child_request_error(error, &auth_methods);
                         let _ = ready.send(Err(format!("ACP harness {harness:?} rejected config option {key:?}: {error}")));
@@ -1876,7 +1910,7 @@ async fn run(
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
                         let additional_directories = additional_directories.clone();
-                        let config_snapshots = Arc::clone(&config_snapshots);
+                        let session_snapshots = Arc::clone(&session_snapshots);
                         tasks.spawn(async move {
                             let serial = fork.serial;
                             let source_id = fork.session_id.clone();
@@ -1909,7 +1943,7 @@ async fn run(
                                 Either::Left((result, _)) => match result {
                                     Ok(response) => {
                                         let session_id = response.session_id;
-                                        let configured = config_snapshots.fork(session_id.clone(), &source_id, response.config_options);
+                                        let configured = session_snapshots.fork(session_id.clone(), &source_id, response.config_options);
                                         if let Err(error) = configured {
                                             let _ = fork.reply.send(Err(ChildError::Failed(error.to_string())));
                                             return;
@@ -1928,7 +1962,7 @@ async fn run(
                                             )
                                             .await
                                             {
-                                                Ok(Ok(response)) => config_snapshots.set(session_id.clone(), response.config_options)
+                                                Ok(Ok(response)) => session_snapshots.set(session_id.clone(), response.config_options)
                                                     .map(|()| session_id.clone()).map_err(|error| ChildError::Failed(error.to_string())),
                                                 Ok(Err(error)) => Err(ChildError::Failed(format!(
                                                     "ACP harness rejected model selection {model:?} for forked session: {}", child_request_error(error, &auth_methods)
@@ -1946,7 +1980,7 @@ async fn run(
                                                 {
                                                     sessions.retain(|id| id != &session_id);
                                                     drop(sessions);
-                                                    let _ = config_snapshots.remove(&session_id);
+                                                    let _ = session_snapshots.remove(&session_id);
                                                 }
                                             }
                                             selected
@@ -1962,7 +1996,7 @@ async fn run(
                                     let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
-                                    let cleanup_configs = Arc::clone(&config_snapshots);
+                                    let cleanup_snapshots = Arc::clone(&session_snapshots);
                                     tokio::spawn(async move {
                                         // The remote fork still owns source-session
                                         // serialization until its response and cleanup.
@@ -1979,7 +2013,7 @@ async fn run(
                                             .await
                                             .is_ok_and(|result| result.is_ok());
                                         if closed {
-                                            let _ = cleanup_configs.remove(&session_id);
+                                            let _ = cleanup_snapshots.remove(&session_id);
                                         }
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
@@ -1995,7 +2029,7 @@ async fn run(
                                     let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
-                                    let cleanup_configs = Arc::clone(&config_snapshots);
+                                    let cleanup_snapshots = Arc::clone(&session_snapshots);
                                     tokio::spawn(async move {
                                         // The remote fork still owns source-session
                                         // serialization until its response and cleanup.
@@ -2012,7 +2046,7 @@ async fn run(
                                             .await
                                             .is_ok_and(|result| result.is_ok());
                                         if closed {
-                                            let _ = cleanup_configs.remove(&session_id);
+                                            let _ = cleanup_snapshots.remove(&session_id);
                                         }
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
@@ -2031,7 +2065,7 @@ async fn run(
                     }
                     Request::Close(close) => {
                         let auth_methods = auth_methods.clone();
-                        let config_snapshots = Arc::clone(&config_snapshots);
+                        let session_snapshots = Arc::clone(&session_snapshots);
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         tasks.spawn(async move {
@@ -2064,7 +2098,7 @@ async fn run(
                                 sessions.retain(|id| id != &close.session_id);
                             }
                             let result = result.map(|deletion| {
-                                let cleanup = config_snapshots.remove(&close.session_id)
+                                let cleanup = session_snapshots.remove(&close.session_id)
                                     .err().map(|error| ChildError::Failed(error.to_string()));
                                 deletion.or(cleanup)
                             });
@@ -2077,7 +2111,7 @@ async fn run(
                         let connection = connection.clone();
                         let routes = Arc::clone(&routes);
                         let fatal = fatal_tx.clone();
-                        let config_snapshots = Arc::clone(&config_snapshots);
+                        let session_snapshots = Arc::clone(&session_snapshots);
                         tasks.spawn(async move {
                             let _serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
@@ -2146,7 +2180,7 @@ async fn run(
                                         .map_err(|error| ChildError::Failed(error.to_string()))?
                                         .take_result()?;
                                     output.finish_messages();
-                                    if let Some(options) = config_snapshots.get(&session_id)
+                                    if let Some(options) = session_snapshots.get(&session_id)
                                         .map_err(|error| ChildError::Failed(error.to_string()))?
                                     {
                                         output.config_snapshot(options);
@@ -4314,14 +4348,57 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn correlated_prompt_settles_after_echo_without_running() {
-        for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+    async fn correlated_prompt_settles_after_echo_without_route_running() {
+        for initial_foreground in [None, Some("idle"), Some("running"), Some("requires_action")] {
+            for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+                let mut args = vec![
+                    "--omit-prompt-running".into(),
+                    format!("--prompt-receipt-order={receipt_order}"),
+                ];
+                if let Some(state) = initial_foreground {
+                    args.push(format!("--initial-foreground={state}"));
+                }
+                let root = tempfile::tempdir().unwrap();
+                let child = steering_test_support::start(&root, args).await;
+                std::fs::write(root.path().join("release"), b"release").unwrap();
+                for answer in ["ordinary reply", "next reply"] {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        child.prompt(
+                            child.session_id(),
+                            answer.into(),
+                            TurnCancellation::default(),
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("timed out with {initial_foreground:?}, receipt {receipt_order}")
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        result.text, answer,
+                        "{initial_foreground:?}, receipt {receipt_order}"
+                    );
+                }
+                child.close().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_does_not_settle_on_repeated_idle_after_echo() {
+        for (receipt_order, active_state) in [
+            ("before-echo", "running"),
+            ("after-echo", "unknown"),
+            ("after-idle", "requires_action"),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let child = steering_test_support::start(
                 &root,
                 vec![
-                    "--omit-prompt-running".into(),
-                    format!("--rollover-receipt-order={receipt_order}"),
+                    "--initial-foreground=idle".into(),
+                    format!("--repeat-idle-before={active_state}"),
+                    format!("--prompt-receipt-order={receipt_order}"),
                 ],
             )
             .await;
@@ -4329,7 +4406,7 @@ for line in sys.stdin:
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 child.prompt(
-                    "s-test".into(),
+                    child.session_id(),
                     "ordinary reply".into(),
                     TurnCancellation::default(),
                 ),
@@ -5468,7 +5545,7 @@ for line in sys.stdin:
 
     #[test]
     fn config_snapshots_replace_isolate_sessions_and_reject_poison() {
-        let snapshots = ConfigSnapshots::default();
+        let snapshots = SessionSnapshots::default();
         let first = SessionId::new("first");
         let second = SessionId::new("second");
         snapshots
@@ -5502,6 +5579,11 @@ for line in sys.stdin:
         assert!(snapshots.get(&second).is_err());
         assert!(snapshots.set(second.clone(), vec![]).is_err());
         assert!(snapshots.remove(&second).is_err());
+        assert!(
+            snapshots
+                .repeated_idle(&second, &protocol::Foreground::Idle(None))
+                .is_err()
+        );
     }
 
     #[test]

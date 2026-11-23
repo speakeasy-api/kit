@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import Darwin
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -148,32 +149,35 @@ actor TranscriptMediaCache {
               type.conforms(to: .image) || type.conforms(to: .audio),
               let ext = type.preferredFilenameExtension else { return nil }
         guard let directory = playbackDirectory else { return nil }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         let files = FileManager.default
         do {
             try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            guard Self.isPlaybackDirectory(directory) else { return nil }
-            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            let url = directory.appendingPathComponent("Kit-media-\(digest)").appendingPathExtension(ext)
-            if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-                guard values.isRegularFile == true, values.isSymbolicLink == false else { return nil }
-                // External players can edit files. Only reuse a file that still holds the snapshot.
-                let cached = TranscriptMedia(mimeType: media.mimeType, url: url)
-                if (try? cached.boundedData()) == data {
-                    try files.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
-                    return url
+            return try Self.withPlaybackDirectoryLock(in: directory) {
+                let url = directory.appendingPathComponent("Kit-media-\(digest)").appendingPathExtension(ext)
+                if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
+                    guard values.isRegularFile == true, values.isSymbolicLink == false else { return nil }
+                    // External players can edit files. Only reuse a file that still holds the snapshot.
+                    let cached = TranscriptMedia(mimeType: media.mimeType, url: url)
+                    if (try? cached.boundedData()) == data {
+                        try files.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+                        return url
+                    }
+                } else {
+                    // Never evict a recent snapshot to make room for a new one.
+                    guard try pruneExpiredPlaybackFiles(in: directory) < playbackCapacity else { return nil }
                 }
-            } else {
-                // Never evict a recent snapshot to make room for a new one.
-                guard try pruneExpiredPlaybackFiles(in: directory) < playbackCapacity else { return nil }
+                try data.write(to: url, options: .atomic)
+                return url
             }
-            try data.write(to: url, options: .atomic)
-            return url
         } catch { return nil }
     }
 
     func prunePlaybackFiles() {
-        guard let directory = playbackDirectory, Self.isPlaybackDirectory(directory) else { return }
-        _ = try? pruneExpiredPlaybackFiles(in: directory)
+        guard let directory = playbackDirectory else { return }
+        _ = try? Self.withPlaybackDirectoryLock(in: directory) {
+            try pruneExpiredPlaybackFiles(in: directory)
+        }
     }
 
     private func pruneExpiredPlaybackFiles(in directory: URL) throws -> Int {
@@ -199,9 +203,17 @@ actor TranscriptMediaCache {
             .range(of: #"\AKit-media-[0-9a-f]{64}\z"#, options: .regularExpression) != nil
     }
 
-    private static func isPlaybackDirectory(_ directory: URL) -> Bool {
-        guard let values = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return false }
-        return values.isDirectory == true && values.isSymbolicLink == false
+    private static func withPlaybackDirectoryLock<T>(in directory: URL, _ body: () throws -> T) throws -> T {
+        // Lock the directory itself: Kit never removes it, and closing the descriptor releases
+        // the lock on every exit (including process termination) without a separate lock file.
+        let fd = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = Darwin.close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            let error = errno
+            guard error == EINTR else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(error)) }
+        }
+        return try body()
     }
 }
 

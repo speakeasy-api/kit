@@ -38,6 +38,9 @@ prompt_release = option("--prompt-release")
 prompt_release_text = option("--prompt-release-text")
 steer_ack_release = option("--steer-ack-release")
 rollover_receipt_order = option("--rollover-receipt-order")
+prompt_receipt_order = rollover_receipt_order or option("--prompt-receipt-order")
+initial_foreground = option("--initial-foreground")
+repeat_idle_before = option("--repeat-idle-before")
 close_release = option("--close-release")
 close_release_session = option("--close-release-session")
 fail_close_session = option("--fail-close-session")
@@ -155,12 +158,11 @@ def prompt(request):
     if rollover_receipt_order:
         rollover_turn(session_id, "rollover-before", params["prompt"],
                       started=rollover_receipt_order != "after-echo")
-    delayed_receipt = rollover_receipt_order == "after-idle" or text in (
-        "MOCK_CAPTURE_IMAGE_ECHOES", "MOCK_CAPTURE_ANSWER_OVERFLOW",
-    )
-    if rollover_receipt_order != "after-echo" and not delayed_receipt:
+    output_overflow_case = text in ("MOCK_CAPTURE_IMAGE_ECHOES", "MOCK_CAPTURE_ANSWER_OVERFLOW")
+    delayed_receipt = prompt_receipt_order == "after-idle" or output_overflow_case
+    if prompt_receipt_order != "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
-    if "--omit-prompt-running" not in sys.argv:
+    if "--omit-prompt-running" not in sys.argv and not repeat_idle_before:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
     if text == "MOCK_CAPTURE_TRUNCATED_TERMINAL":
         for _ in range(5):
@@ -178,7 +180,10 @@ def prompt(request):
     if supports_steer and text != "MOCK_CAPTURE_IMAGE_ECHOES":
         session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
                                     "content": params["prompt"]})
-    if rollover_receipt_order == "after-echo" and not delayed_receipt:
+    if repeat_idle_before:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before})
+    if prompt_receipt_order == "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
     if text == "MOCK_CAPTURE_IMAGE_ECHOES":
         for _ in range(5):
@@ -350,7 +355,8 @@ def prompt(request):
     })
     send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn", "usage": {"totalTokens": 12, "inputTokens": 7, "outputTokens": 5}}}})
     if delayed_receipt:
-        rollover_turn(session_id, "rollover-after", params["prompt"])
+        if rollover_receipt_order or output_overflow_case:
+            rollover_turn(session_id, "rollover-after", params["prompt"])
         respond(request["id"], {"messageId": message_id})
     if "--exit-after-prompt" in sys.argv:
         time.sleep(0.05)
@@ -454,6 +460,11 @@ for line in sys.stdin:
                     {"value": value, "name": value} for value in model_ids
                 ],
             }]
+        if initial_foreground:
+            update = {"sessionUpdate": "state_update", "state": initial_foreground}
+            if initial_foreground == "idle":
+                update["stopReason"] = "refusal"
+            session_update(session_id, update)
         respond(request["id"], result)
         if "--crash-after-new" in sys.argv:
             threading.Thread(target=lambda: (time.sleep(0.05), os._exit(86)), daemon=True).start()
