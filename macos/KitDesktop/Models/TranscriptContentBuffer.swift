@@ -51,7 +51,7 @@ enum TranscriptContentBuffer {
         switch block {
         case .text(let value): return value.utf8.count
         case .image(let data, let mime, let uri): return bytes(data, mime, uri)
-        case .audio(let data, let mime): return bytes(data, mime)
+        case .audio(let data, let mime, _): return bytes(data, mime)
         case .resourceLink(let uri, let name, let mime): return bytes(uri, name, mime)
         case .resource(let uri, let mime, let text, let blob): return bytes(uri, mime, text, blob)
         case .unknown(let type): return type.utf8.count

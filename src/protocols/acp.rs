@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::schema::v1::UsageUpdate;
-use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
+use agent_client_protocol::v1::schema::UsageUpdate;
+use agent_client_protocol::{Client, ConnectTo, Handled, v1::ConnectionTo};
 use agenthooksprotocol::SessionEndInputOutcome;
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
@@ -255,9 +255,9 @@ fn transcript_replay(
             replay.push(SessionNotification::new(
                 session_id.clone(),
                 SessionUpdate::CompactionUpdate(
-                    agent_client_protocol::schema::v1::CompactionUpdate::new(
+                    agent_client_protocol::v1::schema::CompactionUpdate::new(
                         format!("{session_id}-replay-{index}-compaction"),
-                        agent_client_protocol::schema::v1::CompactionStatus::Completed,
+                        agent_client_protocol::v1::schema::CompactionStatus::Completed,
                     )
                     .summary(summary),
                 ),
@@ -577,7 +577,7 @@ fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     match authentication_method_id(&detail) {
         Some(method_id) => agent_client_protocol::Error::auth_required()
             .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
-        None => agent_client_protocol::util::internal_error(detail),
+        None => agent_client_protocol::Error::internal_error().data(detail),
     }
 }
 
@@ -3253,7 +3253,7 @@ fn component(
         .build()?;
     let state = Arc::new(Server::new(runtime, integration, registry));
     Ok(agent_client_protocol::Agent
-        .builder()
+        .v1()
         .name("kit")
         .on_receive_request(
             {
@@ -3492,11 +3492,12 @@ fn component(
                 async move |request: FileSearchRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        responder.respond_with_result(
-                            state.search_files(request).await.map_err(|error| {
-                                agent_client_protocol::util::internal_error(error)
-                            }),
-                        )
+                        responder.respond_with_result(state.search_files(request).await.map_err(
+                            |error| {
+                                agent_client_protocol::Error::internal_error()
+                                    .data(error.to_string())
+                            },
+                        ))
                     })?;
                     Ok(())
                 }
@@ -3661,22 +3662,20 @@ pub(crate) mod test_support {
         assert!(!page.updates.is_empty());
         let (agent_transport, client_transport) = agent_client_protocol::Channel::duplex();
         let (received, mut notifications) = mpsc::unbounded_channel();
-        let client = agent_client_protocol::Client
-            .builder()
-            .on_receive_notification(
-                async move |update: SessionNotification, _cx| {
-                    received.send(update).unwrap();
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_notification!(),
-            );
+        let client = agent_client_protocol::Client.v1().on_receive_notification(
+            async move |update: SessionNotification, _cx| {
+                received.send(update).unwrap();
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        );
         let client_task = tokio::spawn(client.connect_to(client_transport));
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .connect_with(agent_transport, async move |connection| {
                 connection.send_notification(SessionNotification::new(
                     "parent",
-                    SessionUpdate::SubagentUpdate(agent_client_protocol::schema::v1::SubagentUpdate::new(child.clone())),
+                    SessionUpdate::SubagentUpdate(agent_client_protocol::v1::schema::SubagentUpdate::new(child.clone())),
                 ))?;
                 for update in page.updates {
                     if let Some(update) = subagents::v1_update(update) {
@@ -3833,7 +3832,7 @@ pub(super) mod tests {
         let failure = AcpIntegration::builder().build().err().unwrap();
         let expected = sdk_error(AcpRuntimeError::MissingField("name"));
         let actual = HttpConnection(Err(failure))
-            .connect_to(agent_client_protocol::Client.builder())
+            .connect_to(agent_client_protocol::Client.v1())
             .await
             .unwrap_err();
         assert_eq!(actual, expected);
@@ -3846,7 +3845,7 @@ pub(super) mod tests {
         let content_events = events.clone();
         let client = tokio::spawn(async move {
             agent_client_protocol::Client
-                .builder()
+                .v1()
                 .on_receive_notification(
                     async move |state: TurnStateNotification, _cx| {
                         events
@@ -3870,7 +3869,7 @@ pub(super) mod tests {
                 .await
         });
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .connect_with(agent_transport, async move |connection| {
                 let id = agentkit_acp::SessionId::new("ordered");
                 let lifecycle_connection = connection.clone();
@@ -4126,7 +4125,7 @@ pub(super) mod tests {
         let error = sdk_error(AcpRuntimeError::Loop(
             "speakeasy_auth_required: run `kit auth login speakeasy`".into(),
         ));
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::AUTH_REQUIRED);
 
         let root = tempfile::tempdir().unwrap();
         let server = Server::new(
@@ -4142,7 +4141,7 @@ pub(super) mod tests {
             let error = server
                 .authenticate(AuthenticateRequest::new(method_id))
                 .unwrap_err();
-            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
             assert_eq!(error.data.unwrap()["methodId"], method_id);
         }
     }
@@ -4979,13 +4978,13 @@ pub(super) mod tests {
         let (client_transport, agent_transport) = Channel::duplex();
         let serving = tokio::spawn(async move {
             agent_client_protocol::Client
-                .builder()
+                .v1()
                 .connect_to(client_transport)
                 .await
         });
         let workspace = root.path().to_path_buf();
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .connect_with(agent_transport, async move |connection| {
                 let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
                 for invalid_cwd in [true, false] {
@@ -5048,7 +5047,7 @@ pub(super) mod tests {
         let router = component(runtime.clone(), registry.clone()).unwrap();
         let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
         let workspace = root.path().to_path_buf();
-        let client = agent_client_protocol::Client.builder().connect_with(
+        let client = agent_client_protocol::Client.v1().connect_with(
             client_transport,
             async move |connection| {
                 connection
@@ -5141,7 +5140,7 @@ pub(super) mod tests {
             let router = component(runtime.clone(), registry.clone()).unwrap();
             let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
             let workspace = root.path().to_path_buf();
-            let client = agent_client_protocol::Client.builder().connect_with(
+            let client = agent_client_protocol::Client.v1().connect_with(
                 client_transport,
                 async move |connection| {
                     connection
@@ -5966,7 +5965,7 @@ pub(super) mod tests {
         assert_eq!(supported.len(), 1);
         assert!(
             matches!(&supported[0].update, SessionUpdate::CompactionUpdate(update)
-            if update.status == agent_client_protocol::schema::v1::CompactionStatus::Completed)
+            if update.status == agent_client_protocol::v1::schema::CompactionStatus::Completed)
         );
         let replay =
             transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, false);
@@ -6653,7 +6652,7 @@ pub(super) mod tests {
         )
     }
 
-    async fn start_non_cooperative_background(
+    pub(super) async fn start_non_cooperative_background(
         call_id: &str,
     ) -> (BackgroundJobs, TaskManagerHandle) {
         let jobs = BackgroundJobs::default();
@@ -6751,7 +6750,7 @@ pub(super) mod tests {
             .await
             .expect("poison must return an error without waiting for the actor")
             .unwrap_err();
-            assert_eq!(error.code, agent_client_protocol::ErrorCode::InternalError);
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::INTERNAL_ERROR);
             assert_eq!(
                 error.data,
                 Some(serde_json::json!(AcpRuntimeError::ClientClosed.to_string()))
@@ -7729,7 +7728,7 @@ pub(super) mod tests {
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
         let workspace = root.path().to_path_buf();
         agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
                     let _ = updates_tx.send(notification.update);
@@ -7802,7 +7801,7 @@ pub(super) mod tests {
         let cleanup_session_id = session_id.clone();
 
         agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
                     let _ = updates_tx.send(notification.update);
@@ -7953,7 +7952,7 @@ pub(super) mod tests {
         let (proceed, proceed_rx) = oneshot::channel();
         let client = tokio::spawn(async move {
             agent_client_protocol::Client
-                .builder()
+                .v1()
                 .connect_with(client_transport, async move |connection| {
                     connection
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -8058,7 +8057,7 @@ pub(super) mod tests {
         let requested_active_id = active_id.clone();
 
         agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |_notification: SessionNotification, _cx| Ok(()),
                 agent_client_protocol::on_receive_notification!(),
@@ -8200,7 +8199,7 @@ pub(super) mod tests {
         assert!(session_pagination::Cursor::parse("offset:nope").is_err());
         assert_eq!(
             list_sessions_error(ListSessionsError::InvalidCursor).code,
-            agent_client_protocol::ErrorCode::InvalidParams
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
         );
     }
 
@@ -8316,7 +8315,7 @@ pub(super) mod tests {
         let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
         let server = tokio::spawn(serve_transport(runtime.clone(), agent_transport));
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |_notification: SessionNotification, _cx| Ok(()),
                 agent_client_protocol::on_receive_notification!(),
@@ -8475,7 +8474,7 @@ pub(super) mod tests {
         let (client_transport, agent_transport) = Channel::duplex();
         let server = tokio::spawn(serve_transport(runtime, agent_transport));
         agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |_notification: SessionNotification, _cx| Ok(()),
                 agent_client_protocol::on_receive_notification!(),
@@ -8598,7 +8597,7 @@ pub(super) mod tests {
         let (client_transport, agent_transport) = Channel::duplex();
         let server = tokio::spawn(serve_transport(runtime, agent_transport));
         agent_client_protocol::Client
-            .builder()
+            .v1()
             .connect_with(client_transport, async move |connection| {
                 let initialized = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -8690,7 +8689,7 @@ pub(super) mod tests {
         let server = tokio::spawn(serve_transport(runtime, agent_transport));
 
         agent_client_protocol::Client
-            .builder()
+            .v1()
             .connect_with(client_transport, async move |connection| {
                 let initialized = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V2))
@@ -8717,7 +8716,7 @@ pub(super) mod tests {
                     .block_task()
                     .await
                     .expect_err("malformed list cursor must fail");
-                assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+                assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 
                 connection
                     .send_request(ForkSessionRequest::new(
@@ -8801,7 +8800,7 @@ pub(super) mod tests {
                         params.as_object_mut().unwrap().remove("clientCapabilities");
                     }
                     client.tx.unbounded_send(agent_client_protocol::TransportFrame::Single(
-                        agent_client_protocol::RawJsonRpcMessage::request("initialize".into(), params, 1.into()).unwrap(),
+                        agent_client_protocol::RawJsonRpcMessage::request("initialize".into(), params, 1_i64).unwrap(),
                     )).unwrap();
                     let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.rx.next()).await.unwrap().unwrap();
                     let agent_client_protocol::TransportFrame::Single(response) = response else { panic!("expected single response") };

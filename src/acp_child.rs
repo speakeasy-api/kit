@@ -1,7 +1,7 @@
 //! Generic parent-owned ACP subprocesses used for nested agents.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -14,6 +14,7 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, UntypedMessage};
 
+mod capture;
 mod messages;
 #[cfg(test)]
 mod negotiation_tests;
@@ -48,6 +49,7 @@ use prompt::ChildPrompt;
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
+const UNVERIFIED_IDLE_SETTLE: Duration = CANCEL_SETTLE;
 const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
@@ -486,6 +488,7 @@ impl ChildConfig {
 pub(crate) enum ChildError {
     Cancelled,
     Failed(String),
+    DeliveryUnknown(String),
     TerminalCancelled,
     TerminalFailed(String),
 }
@@ -493,7 +496,7 @@ impl std::fmt::Display for ChildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled | Self::TerminalCancelled => f.write_str("nested agent cancelled"),
-            Self::Failed(e) | Self::TerminalFailed(e) => f.write_str(e),
+            Self::Failed(e) | Self::DeliveryUnknown(e) | Self::TerminalFailed(e) => f.write_str(e),
         }
     }
 }
@@ -504,7 +507,7 @@ pub(crate) fn subagent_usage(owner: &str, update: &Value) -> Option<crate::event
     if owner.is_empty() || update["sessionUpdate"] != "usage_update" {
         return None;
     }
-    let usage: agent_client_protocol::schema::v2::UsageUpdate =
+    let usage: agent_client_protocol::v2::schema::UsageUpdate =
         serde_json::from_value(update.clone()).ok()?;
     Some(crate::events::RuntimeEvent::SubagentUsage {
         id: owner.to_owned(),
@@ -563,9 +566,23 @@ fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActi
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum SessionPromptState {
+    #[default]
+    Ready,
+    // An unverified boundary cannot safely separate future output from this turn.
+    Unsettled,
+}
+
+fn ambiguous_prompt_error() -> ChildError {
+    ChildError::TerminalFailed(
+        "nested agent reported Idle without a verifiable completion for this prompt".into(),
+    )
+}
+
 struct Prompt {
     // The worker, not the waiting caller, owns serialization until settlement.
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: tokio::sync::OwnedMutexGuard<SessionPromptState>,
     session_id: SessionId,
     /// The subagent id that owns this turn, so usage events name the roster row.
     owner: String,
@@ -576,7 +593,7 @@ struct Prompt {
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
 }
 struct Fork {
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: tokio::sync::OwnedMutexGuard<SessionPromptState>,
     session_id: SessionId,
     model: Option<String>,
     parent: Option<(String, String)>,
@@ -726,17 +743,47 @@ impl InspectionSegments {
     }
 }
 
-/// Where one in-flight prompt's session updates land.
+/// Where one in-flight prompt's session updates land. The notification callback
+/// records echoes, output, and foreground transitions in wire order; the prompt
+/// task records the receipt and takes the result. The capture lock is never held
+/// while notifying the waiter or acquiring the session routes lock.
 #[derive(Clone)]
 struct Route {
     transcript: Option<Transcript>,
     inspection_segments: Arc<Mutex<InspectionSegments>>,
     owner: String,
     generation: u64,
-    output: Arc<Mutex<ChildOutput>>,
-    idle: watch::Sender<protocol::Foreground>,
+    capture: Arc<Mutex<capture::Capture>>,
+    boundary_changed: watch::Sender<()>,
 }
 impl Route {
+    fn record_state(
+        &self,
+        state: protocol::Foreground,
+        repeated_idle: bool,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let changed = self
+            .capture
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+            .state(state, repeated_idle);
+        if changed {
+            self.boundary_changed.send_replace(());
+        }
+        Ok(())
+    }
+
+    fn record_output(
+        &self,
+        record: impl FnOnce(&mut ChildOutput),
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.capture
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+            .record_output(record);
+        Ok(())
+    }
+
     fn record_inspection(&self, mut update: Value) {
         let Some(transcript) = &self.transcript else {
             return;
@@ -756,14 +803,75 @@ impl Route {
     }
 }
 
-/// Complete child-advertised snapshots, including notifications between prompts.
-/// Writers replace one session atomically; no lock is held across protocol calls,
-/// output callbacks, or awaits. Poison isolates the connection rather than
-/// silently publishing an unknown configuration. Snapshot values have no custom Drop.
-#[derive(Default)]
-struct ConfigSnapshots(Mutex<HashMap<SessionId, Vec<SessionConfigOption>>>);
+fn prompt_boundary(capture: &Mutex<capture::Capture>) -> Result<capture::Boundary, ChildError> {
+    Ok(capture
+        .lock()
+        .map_err(|error| ChildError::Failed(error.to_string()))?
+        .boundary())
+}
 
-impl ConfigSnapshots {
+async fn wait_for_prompt_boundary(
+    capture: &Mutex<capture::Capture>,
+    mut updates: watch::Receiver<()>,
+) -> Result<Option<agent_client_protocol::v2::schema::StopReason>, ChildError> {
+    loop {
+        // Mark the watch seen before reading capture: a notification after the
+        // read must wake us, and one before it is reflected in capture.
+        updates.borrow_and_update();
+        match prompt_boundary(capture)? {
+            capture::Boundary::Settled(reason) => return Ok(reason),
+            capture::Boundary::Waiting => {}
+            capture::Boundary::UnverifiedIdle(observed) => {
+                let deadline = observed + UNVERIFIED_IDLE_SETTLE;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ambiguous_prompt_error());
+                }
+                if let Ok(result) = tokio::time::timeout_at(deadline, updates.changed()).await {
+                    result.map_err(|error| ChildError::Failed(error.to_string()))?;
+                }
+                // Recheck capture even at expiry: terminal evidence can race the timer.
+                continue;
+            }
+        }
+        updates
+            .changed()
+            .await
+            .map_err(|error| ChildError::Failed(error.to_string()))?;
+    }
+}
+
+/// Child-advertised snapshots, including notifications between prompts.
+/// No lock is held across protocol calls, output callbacks, or awaits. Poison
+/// isolates the connection rather than silently guessing the state of a session.
+#[derive(Default)]
+struct SessionSnapshots(Mutex<SnapshotState>);
+
+#[derive(Default)]
+struct SnapshotState {
+    configs: HashMap<SessionId, Vec<SessionConfigOption>>,
+    idle_sessions: HashSet<SessionId>,
+}
+
+impl SessionSnapshots {
+    /// Only explicit snapshots establish that a later Idle is a repetition.
+    /// Some children omit the first active snapshot; preserve that first Idle.
+    fn repeated_idle(
+        &self,
+        id: &SessionId,
+        state: &protocol::Foreground,
+    ) -> agent_client_protocol::Result<bool> {
+        let mut snapshots = self
+            .0
+            .lock()
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+        if matches!(state, protocol::Foreground::Idle(_)) {
+            Ok(!snapshots.idle_sessions.insert(id.clone()))
+        } else {
+            snapshots.idle_sessions.remove(id);
+            Ok(false)
+        }
+    }
+
     fn set(
         &self,
         id: SessionId,
@@ -773,6 +881,7 @@ impl ConfigSnapshots {
             .0
             .lock()
             .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .configs
             .insert(id, options);
         drop(old);
         Ok(())
@@ -793,20 +902,22 @@ impl ConfigSnapshots {
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
         // A notification for the new ID can precede the fork response. Never
         // overwrite child-reported state with an inferred parent fallback.
-        if !snapshots.contains_key(&id)
-            && let Some(inherited) = snapshots.get(source).cloned()
+        if !snapshots.configs.contains_key(&id)
+            && let Some(inherited) = snapshots.configs.get(source).cloned()
         {
-            snapshots.insert(id, inherited);
+            snapshots.configs.insert(id, inherited);
         }
         Ok(())
     }
 
     fn remove(&self, id: &SessionId) -> agent_client_protocol::Result<()> {
-        let old = self
+        let mut snapshots = self
             .0
             .lock()
-            .map_err(|_| agent_client_protocol::Error::internal_error())?
-            .remove(id);
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+        snapshots.idle_sessions.remove(id);
+        let old = snapshots.configs.remove(id);
+        drop(snapshots);
         drop(old);
         Ok(())
     }
@@ -819,6 +930,7 @@ impl ConfigSnapshots {
             .0
             .lock()
             .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .configs
             .get(id)
             .cloned())
     }
@@ -876,6 +988,10 @@ pub(crate) struct ChildOutput {
 }
 
 impl ChildOutput {
+    fn retained_bytes(&self) -> usize {
+        self.text.len() + self.update_bytes + self.messages.retained_bytes()
+    }
+
     fn finish_messages(&mut self) {
         self.text.push_str(&self.messages.finish());
     }
@@ -916,8 +1032,8 @@ impl ChildOutput {
         self.updates.push(value);
     }
 
-    fn record_message(&mut self, update: agent_client_protocol::schema::v2::SessionUpdate) {
-        use agent_client_protocol::schema::{MaybeUndefined, v2};
+    fn record_message(&mut self, update: agent_client_protocol::v2::schema::SessionUpdate) {
+        use agent_client_protocol::{schema::MaybeUndefined, v2::schema as v2};
         match &update {
             v2::SessionUpdate::AgentMessage(message) => {
                 if !matches!(message.content, MaybeUndefined::Undefined) {
@@ -960,9 +1076,9 @@ impl ChildOutput {
     fn capture_message_block(
         &mut self,
         id: &str,
-        block: &agent_client_protocol::schema::v2::ContentBlock,
+        block: &agent_client_protocol::v2::schema::ContentBlock,
     ) {
-        use agent_client_protocol::schema::v2;
+        use agent_client_protocol::v2::schema as v2;
         if matches!(block, v2::ContentBlock::Text(_)) {
             return;
         }
@@ -1090,7 +1206,7 @@ pub(crate) struct ChildSession {
     tx: mpsc::Sender<Request>,
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
-    serial: Arc<tokio::sync::Mutex<()>>,
+    serial: Arc<tokio::sync::Mutex<SessionPromptState>>,
     closed: watch::Receiver<bool>,
     descendant_parent: Option<String>,
 }
@@ -1213,7 +1329,7 @@ impl ChildSession {
                         tx: actor_tx,
                         session_id: ready.session_id,
                         capabilities: ready.capabilities,
-                        serial: Arc::new(tokio::sync::Mutex::new(())),
+                        serial: Arc::default(),
                         closed: closed_rx,
                         descendant_parent: ready.descendant_parent,
                     },
@@ -1308,6 +1424,9 @@ impl ChildSession {
             Either::Left((serial, _)) => serial,
             Either::Right(((), _)) => return Err(ChildError::Cancelled),
         };
+        if *serial == SessionPromptState::Unsettled {
+            return Err(ambiguous_prompt_error());
+        }
         if !self.supports_native_fork() {
             return Err(ChildError::Failed(
                 "ACP harness does not support session/fork".into(),
@@ -1342,7 +1461,7 @@ impl ChildSession {
             tx: self.tx.clone(),
             session_id,
             capabilities: self.capabilities.clone(),
-            serial: Arc::new(tokio::sync::Mutex::new(())),
+            serial: Arc::default(),
             closed: self.closed.clone(),
             descendant_parent,
         })
@@ -1395,6 +1514,9 @@ impl ChildSession {
             Either::Left((serial, _)) => serial,
             Either::Right(((), _)) => return Err(ChildError::Cancelled),
         };
+        if *serial == SessionPromptState::Unsettled {
+            return Err(ambiguous_prompt_error());
+        }
         let (reply, response) = oneshot::channel();
         let request = Request::Prompt(Prompt {
             serial,
@@ -1450,9 +1572,9 @@ fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
 /// contain secrets. Only bounded, control-free method identifiers are included.
 fn child_auth_required(
     error: &agent_client_protocol::Error,
-    methods: &[agent_client_protocol::schema::v1::AuthMethod],
+    methods: &[agent_client_protocol::v1::schema::AuthMethod],
 ) -> Option<String> {
-    if error.code != agent_client_protocol::ErrorCode::AuthRequired {
+    if error.code != agent_client_protocol::ErrorCode::AUTH_REQUIRED {
         return None;
     }
     let mut ids = BTreeSet::new();
@@ -1490,7 +1612,7 @@ fn child_auth_required(
 
 fn child_request_error(
     error: agent_client_protocol::Error,
-    methods: &[agent_client_protocol::schema::v1::AuthMethod],
+    methods: &[agent_client_protocol::v1::schema::AuthMethod],
 ) -> String {
     child_auth_required(&error, methods).unwrap_or_else(|| error.to_string())
 }
@@ -1565,8 +1687,8 @@ async fn run(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(HashMap::<SessionId, Route>::new()));
     let notification_routes = Arc::clone(&routes);
-    let config_snapshots = Arc::new(ConfigSnapshots::default());
-    let notification_configs = Arc::clone(&config_snapshots);
+    let session_snapshots = Arc::new(SessionSnapshots::default());
+    let notification_snapshots = Arc::clone(&session_snapshots);
     let stream_routes = Arc::new(stream::Routes::default());
     let notification_stream_routes = Arc::clone(&stream_routes);
     let root = config.root.clone();
@@ -1584,9 +1706,15 @@ async fn run(
                 let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
                 if let Some(notification) = &notification
                     && let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
-                    notification_configs.set(notification.session_id.clone(), update.config_options.clone())?;
+                    notification_snapshots.set(notification.session_id.clone(), update.config_options.clone())?;
                 }
                 notification_stream_routes.forward(&session_id.to_string(), params["update"].clone());
+                let state = protocol::foreground(&params)?;
+                let repeated_idle = if let Some(state) = &state {
+                    notification_snapshots.repeated_idle(&session_id, state)?
+                } else {
+                    false
+                };
                 let route = notification_routes
                     .lock()
                     .ok()
@@ -1594,15 +1722,33 @@ async fn run(
                 let Some(route) = route else {
                     return Ok(());
                 };
-                if let Some(state) = protocol::foreground(&params)? {
-                    route.record_inspection(params["update"].clone());
-                    // Startup/replayed idle cannot settle a newly submitted turn.
-                    route.idle.send_if_modified(|current| current.advance(state));
+                route.record_inspection(params["update"].clone());
+                if let Some(state) = state {
+                    route.record_state(state, repeated_idle)?;
                     return Ok(());
                 }
-                route.record_inspection(params["update"].clone());
+                if matches!(params["update"]["sessionUpdate"].as_str(), Some("user_message" | "user_message_chunk")) {
+                    if let Some(id) = params["update"]["messageId"].as_str() {
+                        let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
+                        if changed {
+                            route.boundary_changed.send_replace(());
+                        }
+                    }
+                    return Ok(());
+                }
+                // Use the native schema: the v1 projection allows thought
+                // chunks without a message ID and omits whole v2 thoughts.
+                if capture::thought_has_progress(&params["update"]) {
+                    let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_thought();
+                    if changed {
+                        route.boundary_changed.send_replace(());
+                    }
+                }
                 if let Some(update) = messages::parse(&params["update"])? {
-                    if let Ok(mut output) = route.output.lock() { output.record_message(update); }
+                    let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_message(update);
+                    if changed {
+                        route.boundary_changed.send_replace(());
+                    }
                     return Ok(());
                 }
                 // Capture rich tool values without round-tripping through the v1
@@ -1614,9 +1760,7 @@ async fn run(
                         | "terminal_update" | "terminal_output_chunk"));
                 if tool_update {
                     let value = params["update"].clone();
-                    if let Ok(mut output) = route.output.lock() {
-                        output.record_tool_value(value);
-                    }
+                    route.record_output(|output| output.record_tool_value(value))?;
                 }
                 // Reuse normalized configuration identifiers for captured output.
                 let Some(notification) = notification else { return Ok(()); };
@@ -1628,8 +1772,8 @@ async fn run(
                 if let Some(usage) = subagent_usage(&route.owner, &params["update"]) {
                     crate::events::emit(&usage);
                 }
-                if !tool_update && let Ok(mut output) = route.output.lock() {
-                    output.record(notification.update);
+                if !tool_update {
+                    route.record_output(|output| output.record(notification.update))?;
                 }
                 Ok(())
             },
@@ -1687,7 +1831,7 @@ async fn run(
             // Startup privately owns this route. Notifications are its only output
             // writers; response completion removes the route before publishing replay.
             // Failure/cancellation drops the entire startup connection and its route.
-            let replay_output = Arc::new(Mutex::new(ChildOutput::default()));
+            let replay_capture = Arc::new(Mutex::new(capture::Capture::new(false)));
             let session_result = if let Some((id, true)) = &persisted
                 && !config.harnesses.is_kit(&harness)
             {
@@ -1696,9 +1840,9 @@ async fn run(
                     return std::future::pending().await;
                 }
                 let id = SessionId::new(id.clone());
-                let (idle, _) = watch::channel(protocol::Foreground::Waiting);
+                let (boundary_changed, _) = watch::channel(());
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
-                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, output: Arc::clone(&replay_output), idle });
+                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, capture: Arc::clone(&replay_capture), boundary_changed });
                 stream_routes.begin_resume(id.to_string());
                 let result = protocol::resume(&connection, version, id.clone(), root.clone(), additional_directories.clone()).await;
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
@@ -1716,10 +1860,10 @@ async fn run(
                     return Err(error);
                 }
             };
-            let mut replay = replay_output.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.clone();
+            let mut replay = replay_capture.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.take_output();
             replay.finish_messages();
             if let Some(options) = session.config_options.clone() {
-                config_snapshots.set(session.session_id.clone(), options)?;
+                session_snapshots.set(session.session_id.clone(), options)?;
             }
             if let Some(model) = model {
                 let selectable = session.config_options.as_deref().unwrap_or_default().iter().any(|option| {
@@ -1730,7 +1874,7 @@ async fn run(
                     return std::future::pending().await;
                 }
                 match protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).await {
-                    Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
+                    Ok(response) => session_snapshots.set(session.session_id.clone(), response.config_options)?,
                     Err(error) => {
                         let error = child_request_error(error, &auth_methods);
                         let _ = ready.send(Err(format!("ACP harness {harness:?} rejected model selection {model:?}: {error}")));
@@ -1740,7 +1884,7 @@ async fn run(
             }
             if let Some(policy) = config.harnesses.model_policies.get(&harness) {
                 for (key, value) in &policy.config_options {
-                    let options = config_snapshots.get(&session.session_id)?.unwrap_or_default();
+                    let options = session_snapshots.get(&session.session_id)?.unwrap_or_default();
                     let (id, value) = match configured_option(&options, key, value) {
                         Ok(option) => option,
                         Err(error) => {
@@ -1749,7 +1893,7 @@ async fn run(
                         }
                     };
                     match protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(session.session_id.clone(), id, value)).await {
-                        Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
+                        Ok(response) => session_snapshots.set(session.session_id.clone(), response.config_options)?,
                         Err(error) => {
                             let error = child_request_error(error, &auth_methods);
                         let _ = ready.send(Err(format!("ACP harness {harness:?} rejected config option {key:?}: {error}")));
@@ -1784,7 +1928,7 @@ async fn run(
                 match request {
                     Request::Steer(steer) => {
                         // Routes are installed/removed only by prompt tasks. Read under
-                        // their lock, then release it before any protocol I/O. Injection
+                        // their lock, then release it before any protocol I/O. Steering
                         // never owns or changes the foreground output, gate, or idle state.
                         let (request, submitted) = {
                             let routes = match routes.lock() {
@@ -1796,7 +1940,7 @@ async fn run(
                             };
                             let route = routes.get(&steer.session_id);
                             let rejection = if !supports_steer {
-                                Some("ACP harness does not advertise v2 steer injection")
+                                Some("ACP harness does not advertise v2 prompt steering")
                             } else if route.is_none() {
                                 Some("subagent has no active prompt to steer")
                             } else if route.is_some_and(|route| steer.generation.is_some_and(|generation| generation != route.generation)) {
@@ -1816,8 +1960,13 @@ async fn run(
                         tasks.spawn(async move {
                             let result = match request {
                                 Ok(request) => match tokio::time::timeout(CANCEL_SETTLE, request).await {
-                                    Ok(result) => result.map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods))),
-                                    Err(_) => Err(ChildError::Failed("steer acknowledgement timed out; delivery is unknown".into())),
+                                    Ok(result) => result.map_err(|error| {
+                                        let unknown = agent_client_protocol::is_connection_terminated(&error)
+                                            || agent_client_protocol::is_incoming_transport_closed(&error);
+                                        let detail = child_request_error(error, &auth_methods);
+                                        if unknown { ChildError::DeliveryUnknown(detail) } else { ChildError::Failed(detail) }
+                                    }),
+                                    Err(_) => Err(ChildError::DeliveryUnknown("steer insertion response timed out; delivery is unknown".into())),
                                 },
                                 Err(error) => Err(ChildError::Failed(child_request_error(error, &auth_methods))),
                             };
@@ -1833,7 +1982,7 @@ async fn run(
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
                         let additional_directories = additional_directories.clone();
-                        let config_snapshots = Arc::clone(&config_snapshots);
+                        let session_snapshots = Arc::clone(&session_snapshots);
                         tasks.spawn(async move {
                             let serial = fork.serial;
                             let source_id = fork.session_id.clone();
@@ -1866,7 +2015,7 @@ async fn run(
                                 Either::Left((result, _)) => match result {
                                     Ok(response) => {
                                         let session_id = response.session_id;
-                                        let configured = config_snapshots.fork(session_id.clone(), &source_id, response.config_options);
+                                        let configured = session_snapshots.fork(session_id.clone(), &source_id, response.config_options);
                                         if let Err(error) = configured {
                                             let _ = fork.reply.send(Err(ChildError::Failed(error.to_string())));
                                             return;
@@ -1885,7 +2034,7 @@ async fn run(
                                             )
                                             .await
                                             {
-                                                Ok(Ok(response)) => config_snapshots.set(session_id.clone(), response.config_options)
+                                                Ok(Ok(response)) => session_snapshots.set(session_id.clone(), response.config_options)
                                                     .map(|()| session_id.clone()).map_err(|error| ChildError::Failed(error.to_string())),
                                                 Ok(Err(error)) => Err(ChildError::Failed(format!(
                                                     "ACP harness rejected model selection {model:?} for forked session: {}", child_request_error(error, &auth_methods)
@@ -1903,7 +2052,7 @@ async fn run(
                                                 {
                                                     sessions.retain(|id| id != &session_id);
                                                     drop(sessions);
-                                                    let _ = config_snapshots.remove(&session_id);
+                                                    let _ = session_snapshots.remove(&session_id);
                                                 }
                                             }
                                             selected
@@ -1919,7 +2068,7 @@ async fn run(
                                     let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
-                                    let cleanup_configs = Arc::clone(&config_snapshots);
+                                    let cleanup_snapshots = Arc::clone(&session_snapshots);
                                     tokio::spawn(async move {
                                         // The remote fork still owns source-session
                                         // serialization until its response and cleanup.
@@ -1936,7 +2085,7 @@ async fn run(
                                             .await
                                             .is_ok_and(|result| result.is_ok());
                                         if closed {
-                                            let _ = cleanup_configs.remove(&session_id);
+                                            let _ = cleanup_snapshots.remove(&session_id);
                                         }
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
@@ -1952,7 +2101,7 @@ async fn run(
                                     let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
-                                    let cleanup_configs = Arc::clone(&config_snapshots);
+                                    let cleanup_snapshots = Arc::clone(&session_snapshots);
                                     tokio::spawn(async move {
                                         // The remote fork still owns source-session
                                         // serialization until its response and cleanup.
@@ -1969,7 +2118,7 @@ async fn run(
                                             .await
                                             .is_ok_and(|result| result.is_ok());
                                         if closed {
-                                            let _ = cleanup_configs.remove(&session_id);
+                                            let _ = cleanup_snapshots.remove(&session_id);
                                         }
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
@@ -1988,7 +2137,7 @@ async fn run(
                     }
                     Request::Close(close) => {
                         let auth_methods = auth_methods.clone();
-                        let config_snapshots = Arc::clone(&config_snapshots);
+                        let session_snapshots = Arc::clone(&session_snapshots);
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         tasks.spawn(async move {
@@ -2021,7 +2170,7 @@ async fn run(
                                 sessions.retain(|id| id != &close.session_id);
                             }
                             let result = result.map(|deletion| {
-                                let cleanup = config_snapshots.remove(&close.session_id)
+                                let cleanup = session_snapshots.remove(&close.session_id)
                                     .err().map(|error| ChildError::Failed(error.to_string()));
                                 deletion.or(cleanup)
                             });
@@ -2034,17 +2183,17 @@ async fn run(
                         let connection = connection.clone();
                         let routes = Arc::clone(&routes);
                         let fatal = fatal_tx.clone();
-                        let config_snapshots = Arc::clone(&config_snapshots);
+                        let session_snapshots = Arc::clone(&session_snapshots);
                         tasks.spawn(async move {
-                            let _serial = prompt.serial;
+                            let mut serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
-                            let output = Arc::new(Mutex::new(ChildOutput::default()));
-                            let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
+                            let capture = Arc::new(Mutex::new(capture::Capture::new(supports_steer)));
+                            let (boundary_changed, boundary_updates) = watch::channel(());
                             if let Some(transcript) = &prompt.transcript {
                                 stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone());
                             }
                             if let Ok(mut routes) = routes.lock() {
-                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, output: Arc::clone(&output), idle: idle_tx });
+                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, capture: Arc::clone(&capture), boundary_changed });
                             }
                             if !prompt.owner.is_empty() {
                                 crate::events::emit(&crate::events::RuntimeEvent::SubagentCapabilities {
@@ -2056,14 +2205,20 @@ async fn run(
                                 }
                             }
                             let request = async {
-                                let response = protocol::prompt(&connection, version, session_id.clone(), prompt.content).await?;
-                                if version == protocol::Version::V2 {
-                                    let state = idle_rx.wait_for(|state| matches!(state, protocol::Foreground::Idle(_))).await.map_err(agent_client_protocol::Error::into_internal_error)?.clone();
-                                    if let protocol::Foreground::Idle(reason) = state {
-                                        return protocol::completion(reason);
-                                    }
+                                let request_error = |error| ChildError::Failed(child_request_error(error, &auth_methods));
+                                let receipt = match protocol::prompt(&connection, version, session_id.clone(), prompt.content).await.map_err(request_error)? {
+                                    protocol::PromptAcceptance::V1(response) => return Ok(*response),
+                                    protocol::PromptAcceptance::V2(receipt) => receipt,
+                                };
+                                let receipt = capture.lock().map_err(agent_client_protocol::Error::into_internal_error).map_err(request_error)?.receipt(receipt);
+                                if matches!(receipt, capture::Receipt::EchoOverflow) {
+                                    // An omitted echo ID could own the receipt. Keep the
+                                    // serial guard until the actor invalidates the connection.
+                                    let _ = fatal.send(());
+                                    return std::future::pending().await;
                                 }
-                                Ok::<_, agent_client_protocol::Error>(response)
+                                let reason = wait_for_prompt_boundary(&capture, boundary_updates).await?;
+                                protocol::completion(reason).map_err(request_error)
                             };
                             tokio::pin!(request);
                             // Response-first matches the original biased race.
@@ -2072,11 +2227,16 @@ async fn run(
                                 &mut request,
                                 std::pin::pin!(prompt.cancellation.cancelled()),
                             ).await {
-                                Either::Left((result, _)) => (result.map_err(|error| child_request_error(error, &auth_methods)), false),
+                                Either::Left((result, _)) => (result, false),
                                 Either::Right(((), _)) => {
                                     let _ = protocol::cancel(&connection, version, session_id.clone());
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
-                                        Ok(result) => (result.map_err(|error| child_request_error(error, &auth_methods)), true),
+                                        Ok(result) => (result, true),
+                                        // Cancellation may expire before the Idle grace window.
+                                        // An observed but unverified Idle still only quarantines this session.
+                                        Err(_) if matches!(prompt_boundary(&capture), Ok(capture::Boundary::UnverifiedIdle(_))) => {
+                                            (Err(ambiguous_prompt_error()), true)
+                                        }
                                         Err(_) => {
                                             let _ = prompt.reply.send(Err(ChildError::TerminalCancelled));
                                             let _ = fatal.send(());
@@ -2086,18 +2246,24 @@ async fn run(
                                 }
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
-                            let mut output = output.lock().map(|output| output.clone()).unwrap_or_default();
-                            output.finish_messages();
-                            match config_snapshots.get(&session_id) {
-                                Ok(Some(options)) => output.config_snapshot(options),
-                                Ok(None) => {},
-                                Err(error) => {
-                                    let _ = prompt.reply.send(Err(ChildError::Failed(error.to_string())));
-                                    return;
-                                }
-                            }
-                            let outcome = if cancelled { Err(ChildError::Cancelled) } else {
-                                response.map_err(ChildError::Failed).and_then(|response| prompt_outcome(response, output))
+                            let outcome = if let Err(error @ ChildError::TerminalFailed(_)) = response {
+                                // Quarantine this session before releasing its gate. A sibling
+                                // has its own gate and can continue using the connection.
+                                *serial = SessionPromptState::Unsettled;
+                                Err(error)
+                            } else if cancelled { Err(ChildError::Cancelled) } else {
+                                response.and_then(|response| {
+                                    let mut output = capture.lock()
+                                        .map_err(|error| ChildError::Failed(error.to_string()))?
+                                        .take_result()?;
+                                    output.finish_messages();
+                                    if let Some(options) = session_snapshots.get(&session_id)
+                                        .map_err(|error| ChildError::Failed(error.to_string()))?
+                                    {
+                                        output.config_snapshot(options);
+                                    }
+                                    prompt_outcome(response, output)
+                                })
                             };
                             let _ = prompt.reply.send(outcome);
                         });
@@ -2327,7 +2493,7 @@ mod test_support {
                     tx,
                     session_id: "test".into(),
                     capabilities: agentkit_acp::AgentCapabilities::default(),
-                    serial: Arc::new(tokio::sync::Mutex::new(())),
+                    serial: Arc::default(),
                     closed: watch::channel(false).1,
                     descendant_parent: None,
                 },
@@ -2342,7 +2508,7 @@ mod test_support {
                 tx,
                 session_id: "test".into(),
                 capabilities: agentkit_acp::AgentCapabilities::default(),
-                serial: Arc::new(tokio::sync::Mutex::new(())),
+                serial: Arc::default(),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
             }
@@ -2492,7 +2658,7 @@ mod tests {
                 tx,
                 session_id: "test".into(),
                 capabilities,
-                serial: Arc::new(tokio::sync::Mutex::new(())),
+                serial: Arc::default(),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
             },
@@ -4146,7 +4312,7 @@ for line in sys.stdin:
             .await
             .unwrap()
         }
-        pub(super) async fn wait_request(root: &tempfile::TempDir, method: &str) {
+        pub(super) async fn wait_prompt(root: &tempfile::TempDir, delivery: Option<&str>) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let log =
@@ -4154,7 +4320,10 @@ for line in sys.stdin:
                     if log
                         .lines()
                         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                        .any(|request| request["method"] == method)
+                        .any(|request| {
+                            request["method"] == "session/prompt"
+                                && request["delivery"].as_str() == delivery
+                        })
                     {
                         break;
                     }
@@ -4185,7 +4354,7 @@ for line in sys.stdin:
             let event = inspection_event("child", 9, update).unwrap();
             let update = event;
             assert!(
-                serde_json::from_value::<agent_client_protocol::schema::v2::SessionUpdate>(
+                serde_json::from_value::<agent_client_protocol::v2::schema::SessionUpdate>(
                     update.clone()
                 )
                 .is_ok()
@@ -4214,7 +4383,7 @@ for line in sys.stdin:
             let event = inspection_event("child", 3, update.clone()).unwrap();
             let normalized = event;
             assert!(
-                serde_json::from_value::<agent_client_protocol::schema::v2::SessionUpdate>(
+                serde_json::from_value::<agent_client_protocol::v2::schema::SessionUpdate>(
                     normalized
                 )
                 .is_ok()
@@ -4228,6 +4397,512 @@ for line in sys.stdin:
         .unwrap();
         let update = event;
         assert_eq!(update["rawOutput"].as_str().unwrap().len(), 65536);
+    }
+
+    #[tokio::test]
+    async fn ordinary_prompt_returns_its_own_turn_after_a_rollover_steer() {
+        for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![format!("--rollover-receipt-order={receipt_order}")],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt(
+                    "s-test".into(),
+                    "ordinary reply".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out with receipt {receipt_order}"))
+            .unwrap_or_else(|error| panic!("failed with receipt {receipt_order}: {error}"));
+            assert_eq!(output.text, "ordinary reply", "receipt {receipt_order}");
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_settles_after_echo_without_route_running() {
+        for initial_foreground in [None, Some("idle"), Some("running"), Some("requires_action")] {
+            for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+                let mut args = vec![
+                    "--omit-prompt-running".into(),
+                    format!("--prompt-receipt-order={receipt_order}"),
+                ];
+                if let Some(state) = initial_foreground {
+                    args.push(format!("--initial-foreground={state}"));
+                }
+                let root = tempfile::tempdir().unwrap();
+                let child = steering_test_support::start(&root, args).await;
+                std::fs::write(root.path().join("release"), b"release").unwrap();
+                for answer in ["ordinary reply", "next reply"] {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        child.prompt(
+                            child.session_id(),
+                            answer.into(),
+                            TurnCancellation::default(),
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("timed out with {initial_foreground:?}, receipt {receipt_order}")
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        result.text, answer,
+                        "{initial_foreground:?}, receipt {receipt_order}"
+                    );
+                }
+                child.close().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_does_not_settle_on_repeated_idle_after_echo() {
+        for (receipt_order, active_state) in [
+            ("before-echo", "running"),
+            ("after-echo", "unknown"),
+            ("after-idle", "requires_action"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    "--initial-foreground=idle".into(),
+                    format!("--repeat-idle-before={active_state}"),
+                    format!("--prompt-receipt-order={receipt_order}"),
+                ],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt(
+                    child.session_id(),
+                    "ordinary reply".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out with receipt {receipt_order}"))
+            .unwrap_or_else(|error| panic!("failed with receipt {receipt_order}: {error}"));
+            assert_eq!(result.text, "ordinary reply", "receipt {receipt_order}");
+            child.close().await.unwrap();
+        }
+    }
+
+    async fn assert_answerless_idle_keeps_siblings_alive(receipt_order: &str, cancel: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(
+            &root,
+            vec![format!("--prompt-receipt-order={receipt_order}")],
+        )
+        .await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let sibling = child
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
+        let prompt = |text: &'static str| {
+            child.prompt(child.session_id(), text.into(), TurnCancellation::default())
+        };
+        assert_eq!(prompt("first answer").await.unwrap().text, "first answer");
+
+        let controller = agentkit_core::CancellationController::new();
+        let result = async {
+            let choice = child.prompt(
+                child.session_id(),
+                "MOCK_ANSWERLESS_IDLE".into(),
+                controller.handle().checkpoint(),
+            );
+            let interrupt = async {
+                if cancel {
+                    // Observe the second submission, not the earlier healthy turn.
+                    let log = root.path().join("requests");
+                    while !std::fs::read_to_string(&log)
+                        .unwrap_or_default()
+                        .contains("MOCK_ANSWERLESS_IDLE")
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    controller.interrupt();
+                }
+            };
+            tokio::join!(choice, interrupt).0
+        };
+        let error = tokio::time::timeout(Duration::from_secs(10), result)
+            .await
+            .expect("ambiguous completion must be bounded")
+            .unwrap_err();
+        assert!(matches!(error, ChildError::TerminalFailed(message)
+            if message.contains("without a verifiable completion")));
+        assert!(matches!(
+            prompt("unsafe to submit again").await,
+            Err(ChildError::TerminalFailed(_))
+        ));
+        assert!(!child.is_closed());
+        if cancel {
+            let log = std::fs::read_to_string(root.path().join("requests")).unwrap();
+            assert!(log.lines().any(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["method"] == "session/cancel" && request["sessionId"] == child.session_id()
+            }));
+        }
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            sibling.prompt(
+                sibling.session_id(),
+                "sibling answer".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.text, "sibling answer");
+        child.close().await.unwrap();
+        sibling.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_bounds_answerless_idle() {
+        assert_answerless_idle_keeps_siblings_alive("before-echo", false).await;
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_bounds_answerless_idle_during_cancellation() {
+        assert_answerless_idle_keeps_siblings_alive("after-idle", true).await;
+    }
+
+    #[tokio::test]
+    async fn missing_echo_quarantines_only_its_session_even_when_cancelled() {
+        async fn check(receipt_order: &str, cancel: bool) {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![format!("--prompt-receipt-order={receipt_order}")],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let sibling = child
+                .fork(None, None, &TurnCancellation::default())
+                .await
+                .unwrap();
+            let controller = agentkit_core::CancellationController::new();
+            let request = child.prompt(
+                child.session_id(),
+                "MOCK_MISSING_ECHO".into(),
+                controller.handle().checkpoint(),
+            );
+            let interrupt = async {
+                if cancel {
+                    let idle = root.path().join("requests.uncorrelated-idle");
+                    while !idle.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    controller.interrupt();
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(request, interrupt).0
+            })
+            .await
+            .expect("an uncorrelated Idle must bound settlement");
+            assert!(matches!(result, Err(ChildError::TerminalFailed(_))));
+            assert!(matches!(
+                child
+                    .prompt(
+                        child.session_id(),
+                        "unsafe retry".into(),
+                        TurnCancellation::default()
+                    )
+                    .await,
+                Err(ChildError::TerminalFailed(_))
+            ));
+            if cancel {
+                let log = std::fs::read_to_string(root.path().join("requests")).unwrap();
+                assert!(log.lines().any(|line| {
+                    let request: Value = serde_json::from_str(line).unwrap();
+                    request["method"] == "session/cancel"
+                        && request["sessionId"] == child.session_id()
+                }));
+            }
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                sibling.prompt(
+                    sibling.session_id(),
+                    "healthy sibling".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output.text, "healthy sibling");
+            child.close().await.unwrap();
+        }
+        tokio::join!(check("before-echo", false), check("after-idle", true));
+    }
+
+    #[tokio::test]
+    async fn late_echo_can_recover_but_cannot_claim_the_preceding_idle_or_output() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            child.prompt(
+                child.session_id(),
+                "MOCK_LATE_ECHO".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.text, "matched answer");
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_ignores_stale_idle_when_foreground_activates_before_echo() {
+        async fn check(receipt_order: &str, active_state: &str) {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    format!("--prompt-receipt-order={receipt_order}"),
+                    format!("--repeat-idle-before={active_state}"),
+                ],
+            )
+            .await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                child.prompt(
+                    child.session_id(),
+                    "MOCK_ACTIVE_BEFORE_ECHO".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.text, "late echo after activation");
+            child.close().await.unwrap();
+        }
+        tokio::join!(
+            check("before-echo", "running"),
+            check("after-echo", "requires_action"),
+        );
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_rearms_unmatched_idle_without_deferral_by_unrelated_turns() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.prompt(
+                child.session_id(),
+                "MOCK_UNRELATED_ROLLOVERS".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .expect("unrelated foreground rollovers must not extend the unmatched Idle deadline")
+        .unwrap_err();
+        assert!(matches!(error, ChildError::TerminalFailed(_)));
+        assert!(!child.is_closed());
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_keeps_reasoning_after_stale_idle_without_running() {
+        async fn check(prompt: &str) {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    "--initial-foreground=idle".into(),
+                    "--repeat-idle-before=none".into(),
+                ],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                child.prompt(
+                    child.session_id(),
+                    prompt.into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.text, "streaming");
+            child.close().await.unwrap();
+        }
+        tokio::join!(
+            check("MOCK_LONG_THOUGHT_NO_RUNNING"),
+            check("MOCK_LONG_WHOLE_THOUGHT_NO_RUNNING"),
+        );
+    }
+
+    #[tokio::test]
+    async fn thoughts_without_usable_content_do_not_clear_the_idle_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let child =
+            steering_test_support::start(&root, vec!["--initial-foreground=idle".into()]).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.prompt(
+                child.session_id(),
+                "MOCK_MALFORMED_THOUGHTS".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .expect("malformed thoughts must not extend the Idle deadline")
+        .unwrap_err();
+        assert!(matches!(error, ChildError::TerminalFailed(_)));
+        assert!(!child.is_closed());
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_ignores_answer_patches_without_content_after_stale_idle() {
+        for prompt in [
+            "MOCK_ANSWER_PATCH_OMITTED",
+            "MOCK_ANSWER_PATCH_NULL",
+            "MOCK_ANSWER_PATCH_EMPTY",
+            "MOCK_ANSWER_PATCH_EMPTY_TEXT",
+            "MOCK_ANSWER_PATCH_EMPTY_CHUNK",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    "--initial-foreground=idle".into(),
+                    "--repeat-idle-before=none".into(),
+                ],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                child.prompt(
+                    child.session_id(),
+                    prompt.into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out with {prompt}"))
+            .unwrap_or_else(|error| panic!("failed with {prompt}: {error}"));
+            assert_eq!(result.text, "real answer", "{prompt}");
+            child.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_returns_answer_after_discarding_oversized_rich_output() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.prompt(
+                "s-test".into(),
+                "MOCK_CAPTURE_TRUNCATED_TERMINAL".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.text, "terminal output truncated");
+        assert!(result.updates_truncated);
+        assert!(
+            result
+                .updates
+                .iter()
+                .all(|update| update["sessionUpdate"] != "terminal_output_chunk")
+        );
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_captures_answer_before_echo_without_rollover_output() {
+        for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![format!("--rollover-receipt-order={receipt_order}")],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt(
+                    "s-test".into(),
+                    "MOCK_CAPTURE_PRE_ECHO".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.text, "before after", "receipt {receipt_order}");
+            child.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_output_overflow_does_not_disconnect_shared_child() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        let sibling = child
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let result = child
+                .prompt(
+                    "s-test".into(),
+                    "MOCK_CAPTURE_IMAGE_ECHOES".into(),
+                    TurnCancellation::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.text, "images echoed");
+            let error = child
+                .prompt(
+                    "s-test".into(),
+                    "MOCK_CAPTURE_ANSWER_OVERFLOW".into(),
+                    TurnCancellation::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ChildError::Failed(message) if message.contains("provisional output limit")));
+            for (session, reply) in [(&sibling, "sibling reply"), (&child, "next reply")] {
+                let result = session
+                    .prompt("s-test".into(), reply.into(), TurnCancellation::default())
+                    .await
+                    .unwrap();
+                assert_eq!(result.text, reply);
+            }
+            sibling.close().await.unwrap();
+            child.close().await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4247,7 +4922,7 @@ for line in sys.stdin:
                 )
                 .await
         });
-        steering_test_support::wait_request(&root, "session/prompt").await;
+        steering_test_support::wait_prompt(&root, None).await;
         assert!(
             base.steer_generation("stale instruction".into(), Some(6))
                 .await
@@ -4258,9 +4933,9 @@ for line in sys.stdin:
                 .await
                 .is_err()
         );
-        assert!(base.steer("MOCK_REJECT_INJECT".into()).await.is_err());
+        assert!(base.steer("MOCK_REJECT_STEER".into()).await.is_err());
         let auth_error = base
-            .steer("MOCK_AUTH_INJECT".into())
+            .steer("MOCK_AUTH_STEER".into())
             .await
             .unwrap_err()
             .to_string();
@@ -4285,7 +4960,7 @@ for line in sys.stdin:
             .steer_generation("change direction".into(), Some(7))
             .await
             .unwrap();
-        assert_eq!(receipt["messageId"], "injected-1");
+        assert_eq!(receipt["messageId"], "steered-1");
         assert!(
             !turn.is_finished(),
             "acceptance must not finish the original prompt"
@@ -4321,17 +4996,18 @@ for line in sys.stdin:
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let injections: Vec<_> = requests
-            .iter()
-            .filter(|r| r["method"] == "session/inject")
-            .collect();
-        assert_eq!(injections.len(), 3);
-        assert!(injections.iter().all(|r| r["mode"] == "steer"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "session/prompt" && r["delivery"] == "steer")
+                .count(),
+            3
+        );
         assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
         assert_eq!(
             requests
                 .iter()
-                .filter(|r| r["method"] == "session/prompt")
+                .filter(|r| r["method"] == "session/prompt" && r["delivery"].is_null())
                 .count(),
             2
         );
@@ -4345,7 +5021,7 @@ for line in sys.stdin:
             let base = steering_test_support::start(
                 &root,
                 vec![format!(
-                    "--inject-ack-release={}",
+                    "--steer-ack-release={}",
                     root.path().join("ack").display()
                 )],
             )
@@ -4360,10 +5036,10 @@ for line in sys.stdin:
                     )
                     .await
             });
-            steering_test_support::wait_request(&root, "session/prompt").await;
+            steering_test_support::wait_prompt(&root, None).await;
             let child = base.clone();
             let steer = tokio::spawn(async move { child.steer("redirect".into()).await });
-            steering_test_support::wait_request(&root, "session/inject").await;
+            steering_test_support::wait_prompt(&root, Some("steer")).await;
             if drop_caller {
                 steer.abort();
                 assert!(steer.await.unwrap_err().is_cancelled());
@@ -4373,11 +5049,14 @@ for line in sys.stdin:
                     .unwrap()
                     .unwrap()
                     .unwrap_err();
-                assert!(error.to_string().contains("delivery is unknown"), "{error}");
+                assert!(
+                    matches!(error, ChildError::DeliveryUnknown(ref detail) if detail.contains("delivery is unknown")),
+                    "{error}"
+                );
             }
             assert!(!turn.is_finished());
             assert!(base.serial.try_lock().is_err());
-            // The original turn can settle while its injection acknowledgement is held.
+            // The original turn can settle while its steering acknowledgement is held.
             std::fs::write(root.path().join("release"), b"release").unwrap();
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(5), turn)
@@ -4406,11 +5085,14 @@ for line in sys.stdin:
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
-            assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
+            assert!(!requests.iter().any(|r| matches!(
+                r["method"].as_str(),
+                Some("session/cancel" | "$/cancel_request")
+            )));
             assert_eq!(
                 requests
                     .iter()
-                    .filter(|r| r["method"] == "session/prompt")
+                    .filter(|r| r["method"] == "session/prompt" && r["delivery"].is_null())
                     .count(),
                 2
             );
@@ -5254,7 +5936,7 @@ for line in sys.stdin:
 
     #[test]
     fn config_snapshots_replace_isolate_sessions_and_reject_poison() {
-        let snapshots = ConfigSnapshots::default();
+        let snapshots = SessionSnapshots::default();
         let first = SessionId::new("first");
         let second = SessionId::new("second");
         snapshots
@@ -5288,6 +5970,11 @@ for line in sys.stdin:
         assert!(snapshots.get(&second).is_err());
         assert!(snapshots.set(second.clone(), vec![]).is_err());
         assert!(snapshots.remove(&second).is_err());
+        assert!(
+            snapshots
+                .repeated_idle(&second, &protocol::Foreground::Idle(None))
+                .is_err()
+        );
     }
 
     #[test]

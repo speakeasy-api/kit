@@ -212,18 +212,18 @@ impl Transcript {
         generation: u64,
         content: &[super::ContentBlock],
     ) {
-        use agent_client_protocol::schema::v1::{SessionMessage, SessionUpdate};
+        use agent_client_protocol::v1::schema::{SessionMessage, SessionUpdate};
         let mut message = SessionMessage::new(format!(
             "kit-delegation-{generation}-{}",
             crate::session::new_id()
         ))
-        .recipient_session_id(agent_client_protocol::schema::v1::SessionId::from(
+        .recipient_session_id(agent_client_protocol::v1::schema::SessionId::from(
             owner.to_owned(),
         ))
         .content(content.to_vec());
         if let Some(parent) = self.stream.as_ref().and_then(|stream| stream.parent(owner)) {
             message = message
-                .sender_session_id(agent_client_protocol::schema::v1::SessionId::from(parent));
+                .sender_session_id(agent_client_protocol::v1::schema::SessionId::from(parent));
         }
         if let Ok(update) = serde_json::to_value(SessionUpdate::SessionMessage(message)) {
             self.directed(owner, update.clone());
@@ -687,8 +687,8 @@ mod tests {
             inspection_segments: Arc::default(),
             owner: "child".into(),
             generation: 1,
-            output: Arc::default(),
-            idle: tokio::sync::watch::channel(super::super::protocol::Foreground::Waiting).0,
+            capture: Arc::new(Mutex::new(super::super::capture::Capture::new(false))),
+            boundary_changed: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -738,17 +738,25 @@ mod tests {
         assert!(transcript.read(0).await.is_err());
         // The execution accumulator and completion signal remain usable.
         route
-            .output
-            .lock()
-            .unwrap()
-            .text
-            .push_str("execution continues");
-        assert_eq!(route.output.lock().unwrap().text, "execution continues");
-        let mut completion = route.idle.subscribe();
+            .record_output(|output| output.text.push_str("execution continues"))
+            .unwrap();
+        assert_eq!(
+            route.capture.lock().unwrap().take_output().text,
+            "execution continues"
+        );
+        let completion = route.boundary_changed.subscribe();
         route
-            .idle
-            .send_replace(super::super::protocol::Foreground::Idle(None));
-        completion.changed().await.unwrap();
+            .record_state(super::super::protocol::Foreground::Running, false)
+            .unwrap();
+        route
+            .record_state(super::super::protocol::Foreground::Idle(None), false)
+            .unwrap();
+        assert_eq!(
+            super::super::wait_for_prompt_boundary(&route.capture, completion)
+                .await
+                .unwrap(),
+            None
+        );
 
         let other = Transcript::start();
         let _ = std::panic::catch_unwind(|| {

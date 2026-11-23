@@ -166,7 +166,9 @@ fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
 fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
     match error {
         ChildError::TerminalCancelled | ChildError::TerminalFailed(_) => true,
-        ChildError::Cancelled | ChildError::Failed(_) => child.is_closed(),
+        ChildError::Cancelled | ChildError::Failed(_) | ChildError::DeliveryUnknown(_) => {
+            child.is_closed()
+        }
     }
 }
 
@@ -259,22 +261,7 @@ struct State {
     startup_reservation: Weak<Reservation>,
     /// Prompt cache key the child process runs under; `None` uses its own id.
     cache_key: Option<String>,
-    /// Recent finished generations, newest last, for callers waiting on one.
-    finished: std::collections::VecDeque<FinishedTurn>,
 }
-
-/// What one generation produced, kept for callers that injected a message into
-/// it: later generations replace the session's current output and outcome.
-struct FinishedTurn {
-    generation: u64,
-    started_at_ms: u64,
-    finished_at_ms: u64,
-    outcome: GenerationOutcome,
-    output: Value,
-    updates: Option<SubagentUpdates>,
-}
-
-const FINISHED_TURNS: usize = 8;
 
 /// Whether another caller is using, starting or forking the session, or has
 /// advanced it past `prior`.
@@ -292,27 +279,6 @@ struct Admitted {
     child: ChildSession,
     name: String,
     generation: u64,
-}
-
-impl State {
-    fn record_finished(&mut self) {
-        let Some(outcome) = self.outcome else {
-            return;
-        };
-        self.finished.push_back(FinishedTurn {
-            generation: self.generation,
-            started_at_ms: self.generation_started_at_unix_ms,
-            finished_at_ms: self
-                .generation_finished_at_unix_ms
-                .unwrap_or_else(events::now_millis),
-            outcome,
-            output: self.output.clone(),
-            updates: self.updates.clone(),
-        });
-        while self.finished.len() > FINISHED_TURNS {
-            self.finished.pop_front();
-        }
-    }
 }
 
 impl State {
@@ -679,7 +645,6 @@ impl Subagents {
                 startup_reservation: Weak::new(),
                 permit: Some(permit),
                 cache_key: cache_key.clone(),
-                finished: Default::default(),
             },
         )?;
         let prompt = match (kit, inherit.is_some()) {
@@ -785,7 +750,6 @@ impl Subagents {
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
-        locked.record_finished();
         if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Idle) {
             drop(locked);
             return Err(self
@@ -854,8 +818,7 @@ impl Subagents {
         child.steer_generation(prompt, Some(generation)).await
     }
 
-    /// Delivers `prompt` by whichever method the subagent's state allows and
-    /// returns its value once the turn that handled the prompt has ended.
+    /// Delivers `prompt` in a new turn and returns that turn's value.
     async fn deliver(
         &self,
         id: &str,
@@ -868,15 +831,13 @@ impl Subagents {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let (status, forking, generation, handle_generation, child) = {
+            let (status, forking, handle_generation) = {
                 let locked = state.lock().await;
                 self.check_active(&locked)?;
                 (
                     locked.status,
                     locked.forking.is_some(),
-                    locked.generation,
                     locked.handle_generation,
-                    locked.child.clone(),
                 )
             };
             if status == SubagentStatus::Idle && !forking {
@@ -896,70 +857,9 @@ impl Subagents {
                 }
                 continue;
             }
-            // An injected message has no turn of its own to carry an output contract.
-            if status == SubagentStatus::Working
-                && !forking
-                && contract.is_none()
-                && let Some(child) = child
-            {
-                match child
-                    .steer_generation(prompt.clone(), Some(generation))
-                    .await
-                {
-                    Ok(_) => {
-                        return self.turn_value(id, &state, generation, &cancellation).await;
-                    }
-                    Err(error) if child_error_is_terminal(&error, &child) => return Err(error),
-                    Err(_) => {}
-                }
-            }
+            // A steer can roll into a new child turn and only acknowledges
+            // insertion. Wait to own an ordinary turn with its own output route.
             wait_or_cancel(changed, &cancellation).await?;
-        }
-    }
-
-    /// Waits for `generation` to end and returns what it produced.
-    async fn turn_value(
-        &self,
-        id: &str,
-        state: &Arc<AsyncMutex<State>>,
-        generation: u64,
-        cancellation: &TurnCancellation,
-    ) -> Result<SubagentValue, ChildError> {
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            {
-                let locked = state.lock().await;
-                if let Some(turn) = locked
-                    .finished
-                    .iter()
-                    .find(|turn| turn.generation == generation)
-                {
-                    return match turn.outcome {
-                        GenerationOutcome::Success => Ok(SubagentValue {
-                            id: id.to_owned(),
-                            name: Some(locked.name.clone()),
-                            output: turn.output.clone(),
-                            generation,
-                            updates: turn.updates.clone(),
-                        }),
-                        GenerationOutcome::Failed => Err(failed_turn(
-                            id,
-                            &locked.name,
-                            (turn.started_at_ms, turn.finished_at_ms),
-                            ChildError::Failed("the turn that received this prompt failed".into()),
-                        )),
-                    };
-                }
-                self.check_active(&locked)?;
-                if locked.generation != generation {
-                    return Err(ChildError::Failed(format!(
-                        "subagent {id:?} finished generation {generation} without a recorded result"
-                    )));
-                }
-            }
-            wait_or_cancel(changed, cancellation).await?;
         }
     }
 
@@ -1083,7 +983,6 @@ impl Subagents {
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 locked.output.clone_from(&output);
                 locked.updates.clone_from(&updates);
-                locked.record_finished();
                 if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Idle) {
                     drop(locked);
                     return Err(self
@@ -1112,7 +1011,6 @@ impl Subagents {
                     locked.status = SubagentStatus::Idle;
                     locked.outcome = Some(GenerationOutcome::Failed);
                     locked.generation_finished_at_unix_ms = Some(window.1);
-                    locked.record_finished();
                     // A failed call returns no replacement handle, so preserve the
                     // accepted handle generation for a retry while keeping lifecycle
                     // generations monotonic.
@@ -1229,7 +1127,6 @@ impl Subagents {
                 locked.status = SubagentStatus::Idle;
                 locked.outcome = Some(GenerationOutcome::Success);
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                locked.record_finished();
                 let event = locked.runtime_event(success.value.id.clone());
                 drop(locked);
                 if success.acknowledge.send(()).is_err() {
@@ -1308,7 +1205,6 @@ impl Subagents {
                 startup_reservation: Arc::downgrade(&permit.reservation),
                 permit: None,
                 cache_key: cache_key.clone(),
-                finished: Default::default(),
             },
         )?;
         let branch_name = state.lock().await.name.clone();
@@ -1628,7 +1524,6 @@ impl Subagents {
                 if locked.outcome.is_none() {
                     locked.outcome = Some(GenerationOutcome::Failed);
                     locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                    locked.record_finished();
                 }
                 locked.status = SubagentStatus::Removed;
                 locked.forking = None;
@@ -1966,7 +1861,6 @@ impl Subagents {
         locked.outcome = Some(GenerationOutcome::Failed);
         let window = (locked.generation_started_at_unix_ms, events::now_millis());
         locked.generation_finished_at_unix_ms = Some(window.1);
-        locked.record_finished();
         let _ = self.persist_state(&locked, session::ChildLifecycle::Idle);
         let name = locked.name.clone();
         let event = locked.runtime_event(id.to_string());
@@ -2572,7 +2466,7 @@ impl PromptTool {
             manager,
             spec: ToolSpec::new(
                 ToolName::new("prompt"),
-                "Send a message to an existing subagent and return its value once the turn that handled the message ends. It works in any state: an idle subagent, including one whose last turn failed, starts a new turn; a working one receives the message within its current turn when it supports that, otherwise in a new turn after the current one ends.",
+                "Send a message to an existing subagent in a new turn and return its value. If the subagent is already working, wait for its current turn to end before starting the new one.",
                 continuation_schema(),
             )
             .with_output_schema(value_schema())
@@ -2741,9 +2635,9 @@ fn result(
 ) -> Result<ToolResult, ToolError> {
     let value = value.map_err(|error| match error {
         ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
-        ChildError::Failed(error) | ChildError::TerminalFailed(error) => {
-            ToolError::ExecutionFailed(error)
-        }
+        ChildError::Failed(error)
+        | ChildError::DeliveryUnknown(error)
+        | ChildError::TerminalFailed(error) => ToolError::ExecutionFailed(error),
     })?;
     let serialized = serde_json::to_value(&value).map_err(|error| {
         ToolError::ExecutionFailed(format!("failed to serialize subagent value: {error}"))
@@ -3005,7 +2899,6 @@ mod steer_tests {
             startup_reservation: Weak::new(),
             permit: Some(manager.acquire_permit().unwrap()),
             cache_key: None,
-            finished: Default::default(),
         }));
         manager.sessions.lock().unwrap().insert(
             "source".into(),
@@ -3123,34 +3016,14 @@ mod steer_tests {
                 )
             };
             let capacity = manager.capacity.available_permits();
-            let delivery = {
-                let manager = manager.clone();
-                let id = id.clone();
-                tokio::spawn(async move {
-                    manager
-                        .deliver(
-                            &id,
-                            "original turn".into(),
-                            TurnCancellation::default(),
-                            None,
-                        )
-                        .await
-                })
-            };
-            loop {
-                let log = std::fs::read_to_string(&request_log).unwrap_or_default();
-                if log
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .any(|request| request["method"] == "session/inject")
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            let receipt = manager
+                .steer_generation(id, Some(before.0), "original turn".into())
+                .await
+                .unwrap();
+            assert_eq!(receipt["messageId"], "steered-1");
             assert!(
-                !turn.is_finished() && !delivery.is_finished(),
-                "an injected prompt must not finish the gated turn"
+                !turn.is_finished(),
+                "a steer receipt is not turn completion"
             );
             {
                 let locked = state.lock().await;
@@ -3177,9 +3050,6 @@ mod steer_tests {
             assert_eq!(completed.id, *id);
             assert_eq!(completed.output, json!("original turn"));
             assert_eq!(completed.generation, before.0);
-            let delivered = delivery.await.unwrap().unwrap();
-            assert_eq!(delivered.generation, completed.generation);
-            assert_eq!(delivered.output, completed.output);
             {
                 let locked = state.lock().await;
                 assert_eq!(locked.status, SubagentStatus::Idle);
@@ -3226,7 +3096,7 @@ mod steer_tests {
             assert!(
                 history
                     .iter()
-                    .any(|update| update["messageId"] == "injected-1"
+                    .any(|update| update["messageId"] == "steered-1"
                         && update["content"][0]["text"] == "original turn")
             );
             crate::protocols::acp::test_support::assert_transcript_route(
@@ -3311,12 +3181,13 @@ mod steer_tests {
     }
 
     #[tokio::test]
-    async fn prompt_to_a_working_subagent_without_steering_runs_after_its_turn() {
+    async fn result_bearing_prompt_waits_for_its_own_turn_even_with_steering() {
         use std::time::Duration;
 
         tokio::time::timeout(Duration::from_secs(10), async {
             let root = tempfile::tempdir().unwrap();
             let release = root.path().join("release");
+            let steer_ack = root.path().join("steer-ack");
             let request_log = root.path().join("requests");
             let mut config = manager_with_disconnected_session(root.path())
                 .0
@@ -3329,7 +3200,9 @@ mod steer_tests {
                         command: "python3".into(),
                         args: vec![
                             format!("{}/fixtures/mock-acp-v2.py", env!("CARGO_MANIFEST_DIR")),
+                            "--steer".into(),
                             format!("--prompt-release={}", release.display()),
+                            format!("--steer-ack-release={}", steer_ack.display()),
                             format!("--request-log={}", request_log.display()),
                         ],
                         permissions: Default::default(),
@@ -3360,22 +3233,45 @@ mod steer_tests {
             let id = manager.list(&TurnCancellation::default()).await.unwrap()[0]
                 .id
                 .clone();
-            let delivery = {
-                let manager = manager.clone();
-                let id = id.clone();
-                tokio::spawn(async move {
-                    manager
-                        .deliver(&id, "second".into(), TurnCancellation::default(), None)
-                        .await
-                })
-            };
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(!delivery.is_finished());
+            let cancellation = TurnCancellation::default();
+            let delivery = manager.deliver(&id, "second".into(), cancellation, None);
+            tokio::pin!(delivery);
+            assert!(futures_util::poll!(&mut delivery).is_pending());
+            // A rejected explicit steer is a round-trip barrier: any steer sent
+            // by the preceding poll reached the mock while the first turn was active.
+            assert!(
+                manager
+                    .steer_generation(&id, None, "MOCK_REJECT_STEER".into())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                std::fs::read_to_string(&request_log)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|request| request["method"] == "session/prompt"
+                        && request["text"] == "MOCK_REJECT_STEER"
+                        && request["delivery"] == "steer")
+            );
             std::fs::write(&release, b"release").unwrap();
             assert_eq!(turn.await.unwrap().unwrap().output, json!("first"));
-            let delivered = delivery.await.unwrap().unwrap();
+            // An incorrectly submitted steer would now acknowledge insertion only
+            // after the first generation has finished.
+            std::fs::write(&steer_ack, b"release").unwrap();
+            let delivered = delivery.await.unwrap();
             assert_eq!(delivered.output, json!("second"));
             assert_eq!(delivered.generation, 2);
+            let second_requests: Vec<Value> = std::fs::read_to_string(&request_log)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|request| {
+                    request["method"] == "session/prompt" && request["text"] == "second"
+                })
+                .collect();
+            assert_eq!(second_requests.len(), 1);
+            assert!(second_requests[0].get("delivery").is_none());
             manager
                 .close(&id, &TurnCancellation::default())
                 .await
@@ -3383,42 +3279,6 @@ mod steer_tests {
         })
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn injected_callers_get_their_own_generations_result() {
-        let (manager, state, prior) = manager_with_disconnected_session(Path::new("."));
-        {
-            let mut locked = state.lock().await;
-            locked.generation = 1;
-            locked.outcome = Some(GenerationOutcome::Failed);
-            locked.output = json!("stale");
-            locked.record_finished();
-            locked.generation = 2;
-            locked.outcome = Some(GenerationOutcome::Success);
-            locked.output = json!("second");
-            locked.record_finished();
-            locked.generation = 3;
-            locked.status = SubagentStatus::Working;
-            locked.outcome = None;
-            locked.output = json!("third in progress");
-        }
-        let cancellation = TurnCancellation::default();
-        let failed = manager
-            .turn_value(&prior.id, &state, 1, &cancellation)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            failed.contains("the turn that received this prompt failed"),
-            "{failed}"
-        );
-        let second = manager
-            .turn_value(&prior.id, &state, 2, &cancellation)
-            .await
-            .unwrap();
-        assert_eq!(second.output, json!("second"));
-        assert_eq!(second.generation, 2);
     }
 
     #[tokio::test]

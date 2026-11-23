@@ -15,7 +15,7 @@ use std::ffi::OsStr;
 use std::process::{Command, Stdio};
 
 use agent_client_protocol::schema::MaybeUndefined;
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol::v2::schema::{
     AuthMethodTerminal, StateUpdate, StopReason, ToolCallStatus, ToolKind,
 };
 use crossterm::event::{
@@ -62,10 +62,10 @@ pub enum Update {
         generation: u64,
         result: Result<(), String>,
     },
-    /// Ordered ACP prompt receipt, before the accepted turn's user message.
+    /// ACP receipt identifying the inserted user message.
     VoicePromptAccepted {
         id: String,
-        result: Result<(), String>,
+        result: Result<String, String>,
     },
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
@@ -81,16 +81,10 @@ pub enum Update {
         display_name: Option<String>,
         result: Result<Option<String>, String>,
     },
-    /// A steer was accepted but has not been delivered into the transcript yet.
-    SteerAccepted {
-        id: String,
-        text: String,
-        editable: bool,
-    },
-    SteerMutationFinished {
-        id: String,
-        token: u64,
-        result: Result<(), SteerMutationError>,
+    /// The request settled; only session updates supply transcript content and placement.
+    PromptSettled {
+        id: super::wire::RequestId,
+        result: Result<super::wire::MessageId, agent_client_protocol::Error>,
     },
     /// A user message delivered or replayed by the agent.
     UserMessage {
@@ -156,12 +150,12 @@ pub enum Update {
         commands: Vec<SlashCommand>,
     },
     /// Full session configuration snapshot.
-    ConfigOptions(Vec<agent_client_protocol::schema::v2::SessionConfigOption>),
+    ConfigOptions(Vec<agent_client_protocol::v2::schema::SessionConfigOption>),
     /// Context window accounting.
     Usage {
         used: u64,
         size: u64,
-        cost: MaybeUndefined<agent_client_protocol::schema::v2::Cost>,
+        cost: MaybeUndefined<agent_client_protocol::v2::schema::Cost>,
     },
     /// The authoritative ACP v2 foreground lifecycle, preserved from the wire.
     State(StateUpdate),
@@ -173,7 +167,7 @@ pub enum Update {
     ProcessExited(String),
 }
 
-fn valid_cost(cost: &agent_client_protocol::schema::v2::Cost) -> bool {
+fn valid_cost(cost: &agent_client_protocol::v2::schema::Cost) -> bool {
     cost.amount.is_finite()
         && cost.amount >= 0.0
         && cost.currency.len() == 3
@@ -419,32 +413,25 @@ pub struct SubmittedPrompt {
     pub attachments: Vec<Attachment>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PendingSteer {
-    pub id: String,
-    pub text: String,
-    /// False if the accepted injection included any non-text content blocks.
-    pub editable: bool,
+pub(super) struct PendingPrompt {
+    pub id: super::wire::RequestId,
+    pub prompt: SubmittedPrompt,
+    pub delivery: Option<super::wire::PromptDelivery>,
+    pub status: PendingPromptStatus,
 }
 
-#[derive(Debug)]
-pub struct SteerMutationError {
-    pub message: String,
-    pub unavailable: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingPromptStatus {
+    Waiting,
+    Cancelling,
+    Draft,
+    OutcomeUnknown,
 }
 
-struct SteerMutation {
-    token: u64,
-    edit_token: Option<u64>,
-    text: Option<String>,
-}
-
-struct SteerEdit {
-    id: String,
-    token: u64,
-    draft: Editor,
-    attachments: Vec<Attachment>,
-    next_attachment: usize,
+impl PendingPromptStatus {
+    fn is_draft(self) -> bool {
+        matches!(self, Self::Draft | Self::OutcomeUnknown)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -456,10 +443,6 @@ pub(super) enum ClipboardRoute {
     Blocked(u64),
     Composer(u64),
     Rename(u64),
-    Steer {
-        id: String,
-        token: u64,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,14 +471,10 @@ pub enum Action {
     ReadClipboard(ClipboardRoute, ClipboardMode),
     Submit {
         prompt: SubmittedPrompt,
-        inject: bool,
+        delivery: Option<super::wire::PromptDelivery>,
     },
-    ReplaceSteer {
-        id: String,
-        text: String,
-    },
-    RevokeSteer {
-        id: String,
+    CancelPrompt {
+        id: super::wire::RequestId,
     },
     New {
         prompt: Option<String>,
@@ -786,7 +765,7 @@ pub struct AgentRow {
     pub generation_started_at_unix_ms: u64,
     pub generation_finished_at_unix_ms: Option<u64>,
     pub usage: Option<ContextUsage>,
-    pub cost: Option<agent_client_protocol::schema::v2::Cost>,
+    pub cost: Option<agent_client_protocol::v2::schema::Cost>,
     pub activity: AgentActivity,
 }
 
@@ -941,22 +920,18 @@ pub struct App {
     pub(super) pending_clipboard: Vec<String>,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
-    /// When the user last started something new, as opposed to steering.
+    /// When the most recent user message entered the conversation.
     prompt_started: Option<Instant>,
     prompt_seen: bool,
     /// Scoped event clock: outer None is live, inner None is unknown replay timing.
     observation_time: Option<Option<Instant>>,
     pub can_steer: bool,
-    pub can_replace_steer: bool,
-    pub(super) selected_steer: Option<String>,
+    pub can_queue: bool,
+    pub(super) selected_prompt: Option<super::wire::RequestId>,
     pub(super) queue_focused: bool,
     /// Asynchronous selector closure must not redirect stale destructive keys.
     pub(super) queue_handoff: bool,
-    steer_edit: Option<SteerEdit>,
-    retired_steers: HashSet<String>,
-    steer_mutations: HashMap<String, SteerMutation>,
-    next_steer_token: u64,
-    pub(super) pending_steers: VecDeque<PendingSteer>,
+    pub(super) pending_prompts: VecDeque<PendingPrompt>,
     message_blocks: HashMap<String, usize>,
     /// The previous assistant stream ended; the next text starts a new block.
     agent_stream_sealed: bool,
@@ -964,7 +939,7 @@ pub struct App {
     latest_agent_source: String,
     pub compacting: bool,
     pub usage: Option<ContextUsage>,
-    pub cost: Option<agent_client_protocol::schema::v2::Cost>,
+    pub cost: Option<agent_client_protocol::v2::schema::Cost>,
     pub logs: Vec<String>,
     pub show_logs: bool,
     /// Shared child storage outlives individual sessions.
@@ -975,7 +950,7 @@ pub struct App {
     agents_auto_opened: bool,
     agents: HashMap<String, AgentRow>,
     /// Latest cumulative report per child session, retained after roster removal.
-    agent_costs: HashMap<String, agent_client_protocol::schema::v2::Cost>,
+    agent_costs: HashMap<String, agent_client_protocol::v2::schema::Cost>,
     agent_versions: HashMap<String, (u64, u8)>,
     /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
     cleaned_agent_ids: HashSet<String>,
@@ -1255,15 +1230,11 @@ impl App {
             prompt_seen: false,
             observation_time: None,
             can_steer: false,
-            can_replace_steer: false,
-            selected_steer: None,
+            can_queue: false,
+            selected_prompt: None,
             queue_focused: false,
             queue_handoff: false,
-            steer_edit: None,
-            retired_steers: HashSet::new(),
-            steer_mutations: HashMap::new(),
-            next_steer_token: 0,
-            pending_steers: VecDeque::new(),
+            pending_prompts: VecDeque::new(),
             message_blocks: HashMap::new(),
             agent_stream_sealed: false,
             latest_agent_source: String::new(),
@@ -1314,8 +1285,14 @@ impl App {
         self.phase != Phase::Idle
     }
 
+    pub(super) fn has_unsettled_prompts(&self) -> bool {
+        self.pending_prompts
+            .iter()
+            .any(|pending| !pending.status.is_draft())
+    }
+
     fn command_completion_prefix(&self) -> Option<&str> {
-        if self.editing_steer() || self.queue_focused {
+        if self.queue_focused {
             return None;
         }
         command::completion_prefix(self.editor.text(), self.editor.cursor())
@@ -2149,9 +2126,6 @@ impl App {
     }
 
     fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
-        self.retired_steers
-            .extend(self.pending_steers.drain(..).map(|pending| pending.id));
-        self.close_queue_after_update();
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
@@ -2416,38 +2390,15 @@ impl App {
                     self.sync_command_completion();
                 }
             }
-            Update::SteerMutationFinished { id, token, result } => {
-                self.finish_steer_mutation(&id, token, result);
-            }
-            Update::SteerAccepted { id, text, editable } => {
-                if self.message_blocks.contains_key(&id) || self.retired_steers.contains(&id) {
-                    return;
-                }
-                if let Some(pending) = self
-                    .pending_steers
-                    .iter_mut()
-                    .find(|pending| pending.id == id)
-                {
-                    pending.text = text;
-                    pending.editable = editable;
-                } else {
-                    if self.queue_focused && self.selected_steer.is_none() {
-                        self.selected_steer = Some(id.clone());
-                    }
-                    self.pending_steers
-                        .push_back(PendingSteer { id, text, editable });
-                }
-            }
+            Update::PromptSettled { id, result } => self.finish_prompt(&id, result),
             Update::UserMessage {
                 id,
                 text,
                 images,
                 append,
             } => {
-                let steer = self.pending_steers.iter().any(|pending| pending.id == id);
                 let new_message = !self.message_blocks.contains_key(&id);
-                self.remove_pending_steer(&id);
-                if new_message && !steer {
+                if new_message {
                     self.prompt_seen = true;
                     self.prompt_started = at;
                 }
@@ -2704,6 +2655,7 @@ impl App {
                 _ => {}
             },
             Update::ProcessExited(error) => {
+                self.mark_pending_outcome_unknown();
                 self.elicitations.clear();
                 // Confirmed process exit can retire known roster rows. A mere
                 // diagnostic gap cannot claim those terminal outcomes.
@@ -3228,12 +3180,9 @@ impl App {
         self.session_presentation = presentation;
         self.elicitations.clear();
         self.model_switch = None;
-        self.cancel_steer_edit();
-        self.selected_steer = None;
+        self.selected_prompt = None;
         self.queue_focused = false;
         self.queue_handoff = false;
-        self.retired_steers.clear();
-        self.steer_mutations.clear();
         self.session_catalog_pending = false;
         self.session_id = Some(session_id);
         self.file_picker = None;
@@ -3265,7 +3214,7 @@ impl App {
         self.prompt_started = None;
         self.prompt_seen = false;
         self.message_blocks.clear();
-        self.pending_steers.clear();
+        self.pending_prompts.clear();
         self.compacting = false;
         self.usage = None;
         self.show_logs = false;
@@ -3398,10 +3347,6 @@ impl App {
     }
 
     pub(super) fn attach_attachment(&mut self, mut attachment: Attachment) {
-        if self.editing_steer() {
-            self.toast("pending-message edits are text-only");
-            return;
-        }
         self.queue_handoff = false;
         self.file_picker = None;
         self.prune_attachments();
@@ -3441,17 +3386,18 @@ impl App {
         self.submitted_attachment = 0;
     }
 
-    pub fn accept_attachments(&mut self, accepted: &[Attachment]) {
-        if let Some(number) = accepted.iter().filter_map(attachment_number).max() {
+    fn reserve_attachment_numbers(&mut self, attachments: &[Attachment]) {
+        if let Some(number) = attachments.iter().filter_map(attachment_number).max() {
             self.submitted_attachment = self.submitted_attachment.max(number);
         }
+    }
+
+    fn retain_attachment_files(&mut self, accepted: &[Attachment]) {
         self.retained_attachment_files.extend(
             accepted
                 .iter()
                 .filter_map(|attachment| attachment.temporary.clone()),
         );
-        self.attachments.clear();
-        self.next_attachment = self.submitted_attachment;
     }
 
     pub fn restore_attachments(&mut self, attachments: Vec<Attachment>) {
@@ -3558,20 +3504,15 @@ impl App {
 
     pub(super) fn cancel_clipboard_placeholders(&mut self) {
         for placeholder in self.pending_clipboard.drain(..) {
-            // A route change may have saved the composer while editing a steer.
-            for editor in std::iter::once(&mut self.editor)
-                .chain(self.steer_edit.as_mut().map(|edit| &mut edit.draft))
-            {
-                while let Some(start) = editor.text().find(&placeholder) {
-                    let end = start + placeholder.len();
-                    let cursor = editor.cursor();
-                    editor.replace_range(start..end, "");
-                    editor.set_cursor(if cursor >= end {
-                        cursor - placeholder.len()
-                    } else {
-                        cursor.min(start)
-                    });
-                }
+            while let Some(start) = self.editor.text().find(&placeholder) {
+                let end = start + placeholder.len();
+                let cursor = self.editor.cursor();
+                self.editor.replace_range(start..end, "");
+                self.editor.set_cursor(if cursor >= end {
+                    cursor - placeholder.len()
+                } else {
+                    cursor.min(start)
+                });
             }
         }
     }
@@ -3599,11 +3540,6 @@ impl App {
             ClipboardRoute::Blocked(self.clipboard_route_epoch)
         } else if self.session_rename_active() {
             ClipboardRoute::Rename(self.clipboard_route_epoch)
-        } else if let Some(edit) = &self.steer_edit {
-            ClipboardRoute::Steer {
-                id: edit.id.clone(),
-                token: edit.token,
-            }
         } else {
             ClipboardRoute::Composer(self.clipboard_route_epoch)
         }
@@ -4175,213 +4111,154 @@ impl App {
         Action::None
     }
 
-    pub fn editing_steer(&self) -> bool {
-        self.steer_edit.is_some()
-    }
-
-    fn cancel_steer_edit(&mut self) {
-        if let Some(edit) = self.steer_edit.take() {
-            self.editor = edit.draft;
-            self.attachments = edit.attachments;
-            self.next_attachment = edit.next_attachment;
-            self.file_picker = None;
-            self.sync_command_completion();
+    fn mark_pending_outcome_unknown(&mut self) {
+        for pending in &mut self.pending_prompts {
+            if !pending.status.is_draft() {
+                pending.status = PendingPromptStatus::OutcomeUnknown;
+            }
         }
     }
 
     fn close_queue_after_update(&mut self) {
         self.queue_handoff |= self.queue_focused;
         self.queue_focused = false;
-        self.selected_steer = None;
+        self.selected_prompt = None;
     }
 
-    fn remove_pending_steer(&mut self, id: &str) {
-        self.retired_steers.insert(id.to_owned());
-        let index = self
-            .pending_steers
-            .iter()
-            .position(|pending| pending.id == id);
-        self.pending_steers.retain(|pending| pending.id != id);
-        if self.pending_steers.is_empty() {
+    fn remove_pending_prompt(&mut self, index: usize) -> Option<PendingPrompt> {
+        let pending = self.pending_prompts.remove(index)?;
+        if self.pending_prompts.is_empty() {
             self.close_queue_after_update();
-        } else if self.selected_steer.as_deref() == Some(id) {
-            self.selected_steer = index.and_then(|index| {
-                self.pending_steers
-                    .get(index.min(self.pending_steers.len().saturating_sub(1)))
-                    .map(|pending| pending.id.clone())
-            });
+        } else if self.selected_prompt.as_ref() == Some(&pending.id) {
+            self.selected_prompt = Some(
+                self.pending_prompts[index.min(self.pending_prompts.len() - 1)]
+                    .id
+                    .clone(),
+            );
         }
+        Some(pending)
     }
 
-    pub fn begin_steer_mutation(&mut self, id: &str, text: Option<String>) -> Option<u64> {
-        if self.steer_mutations.contains_key(id) {
-            self.toast("a change to this pending message is still in progress");
-            return None;
-        }
-        if !self.pending_steers.iter().any(|pending| pending.id == id) {
-            self.toast("message is no longer pending");
-            return None;
-        }
-        if text.is_some()
-            && self
-                .pending_steers
-                .iter()
-                .any(|pending| pending.id == id && !pending.editable)
-        {
-            self.toast("pending messages with media cannot be edited; removal is still available");
-            return None;
-        }
-        self.next_steer_token += 1;
-        let token = self.next_steer_token;
-        let edit_token = self
-            .steer_edit
-            .as_ref()
-            .filter(|edit| edit.id == id)
-            .map(|edit| edit.token);
-        self.steer_mutations.insert(
-            id.to_owned(),
-            SteerMutation {
-                token,
-                edit_token,
-                text,
-            },
-        );
-        self.toast(if self.steer_mutations[id].text.is_some() {
-            "saving pending message…"
-        } else {
-            "removing pending message…"
-        });
-        Some(token)
-    }
-
-    fn finish_steer_mutation(
+    pub(super) fn start_prompt(
         &mut self,
-        id: &str,
-        token: u64,
-        result: Result<(), SteerMutationError>,
+        id: super::wire::RequestId,
+        prompt: SubmittedPrompt,
+        delivery: Option<super::wire::PromptDelivery>,
     ) {
-        let std::collections::hash_map::Entry::Occupied(entry) =
-            self.steer_mutations.entry(id.to_owned())
+        // The composer can accept new attachments before this request settles.
+        // Do not reuse a number still visible in a pending or accepted prompt.
+        self.reserve_attachment_numbers(&prompt.attachments);
+        self.attachments.clear();
+        self.next_attachment = self.submitted_attachment;
+        self.pending_prompts.push_back(PendingPrompt {
+            id,
+            prompt,
+            delivery,
+            status: PendingPromptStatus::Waiting,
+        });
+    }
+
+    pub(super) fn prompt_cancel_sent(&mut self, id: &super::wire::RequestId) {
+        if let Some(pending) = self
+            .pending_prompts
+            .iter_mut()
+            .find(|pending| &pending.id == id)
+            && pending.status == PendingPromptStatus::Waiting
+        {
+            pending.status = PendingPromptStatus::Cancelling;
+        }
+    }
+
+    fn finish_prompt(
+        &mut self,
+        id: &super::wire::RequestId,
+        result: Result<super::wire::MessageId, agent_client_protocol::Error>,
+    ) {
+        let Some(index) = self
+            .pending_prompts
+            .iter()
+            .position(|pending| &pending.id == id && !pending.status.is_draft())
         else {
             return;
         };
-        if entry.get().token != token {
-            return;
-        }
-        let mutation = entry.remove();
         match result {
-            Ok(()) => {
-                if let Some(text) = mutation.text {
-                    // Delivery may have won the race: update only an existing entry.
-                    if let Some(pending) = self
-                        .pending_steers
-                        .iter_mut()
-                        .find(|pending| pending.id == id)
-                    {
-                        pending.text = text.clone();
-                    }
-                    // Esc/reopen can create another edit for the same ID while this
-                    // request waits. Neither that edit nor newly typed text belongs
-                    // to this completion.
-                    if self
-                        .steer_edit
-                        .as_ref()
-                        .is_some_and(|edit| Some(edit.token) == mutation.edit_token)
-                    {
-                        if self.editor.text() == text {
-                            self.cancel_steer_edit();
-                        } else {
-                            self.toast("earlier revision saved; current edit is still unsaved");
-                        }
-                    }
-                } else {
-                    self.steer_revoked(id);
+            Ok(_) => {
+                // Also correct if the user_message update has already arrived.
+                if let Some(pending) = self.remove_pending_prompt(index) {
+                    self.retain_attachment_files(&pending.prompt.attachments);
                 }
             }
-            Err(error) => self.steer_mutation_failed(id, error.message, error.unavailable),
+            Err(error)
+                if self.pending_prompts[index].status == PendingPromptStatus::Cancelling
+                    && error.code == super::wire::ErrorCode::RequestCancelled =>
+            {
+                self.remove_pending_prompt(index);
+            }
+            Err(error) => {
+                self.pending_prompts[index].status =
+                    if super::recovery::prompt_outcome_unknown(&error) {
+                        PendingPromptStatus::OutcomeUnknown
+                    } else {
+                        PendingPromptStatus::Draft
+                    };
+                self.note(super::recovery::submission_error(&error));
+            }
         }
     }
 
-    pub fn steer_revoked(&mut self, id: &str) {
-        self.remove_pending_steer(id);
-    }
-
-    pub fn steer_mutation_failed(&mut self, id: &str, error: String, unavailable: bool) {
-        if unavailable {
-            self.remove_pending_steer(id);
-            self.toast(if self.editing_steer() {
-                "message is no longer pending; copy your edit or Esc to restore draft"
-            } else {
-                "message is no longer pending; it cannot be removed"
-            });
-            return;
-        }
-        // Keep the replacement composer and its parked draft intact for retry/copy/Esc.
-        self.toast(error);
-    }
-
-    fn handle_steer_selection(&mut self, key: KeyEvent) -> Action {
-        if matches!(key.code, KeyCode::Esc | KeyCode::F(2)) {
-            self.selected_steer = None;
+    fn handle_prompt_selection(&mut self, key: KeyEvent) -> Action {
+        if key.code == KeyCode::Esc || key.code == KeyCode::F(2) {
             self.queue_focused = false;
+            self.selected_prompt = None;
             return Action::None;
         }
         let Some(index) = self
-            .pending_steers
+            .pending_prompts
             .iter()
-            .position(|pending| Some(&pending.id) == self.selected_steer.as_ref())
+            .position(|pending| Some(&pending.id) == self.selected_prompt.as_ref())
         else {
-            self.close_queue_after_update();
             return Action::None;
         };
+        let pending = &self.pending_prompts[index];
         match key.code {
             KeyCode::Up | KeyCode::Down => {
                 let next = if key.code == KeyCode::Up {
                     index.saturating_sub(1)
                 } else {
-                    (index + 1).min(self.pending_steers.len() - 1)
+                    (index + 1).min(self.pending_prompts.len() - 1)
                 };
-                self.selected_steer = Some(self.pending_steers[next].id.clone());
+                self.selected_prompt = Some(self.pending_prompts[next].id.clone());
             }
-            KeyCode::Backspace | KeyCode::Delete => {
-                if self
-                    .steer_mutations
-                    .contains_key(&self.pending_steers[index].id)
-                {
-                    self.toast("a change to this pending message is still in progress");
-                    return Action::None;
-                }
-                return Action::RevokeSteer {
-                    id: self.pending_steers[index].id.clone(),
-                };
+            KeyCode::Backspace | KeyCode::Delete if pending.status.is_draft() => {
+                self.remove_pending_prompt(index);
             }
-            KeyCode::Enter => {
-                if !self.can_replace_steer {
-                    self.toast("this agent does not support editing pending messages");
-                    return Action::None;
-                }
-                let pending = &self.pending_steers[index];
-                if !pending.editable {
-                    self.toast(
-                        "pending messages with media cannot be edited; removal is still available",
-                    );
-                    return Action::None;
-                }
-                let mut editor = Editor::default();
-                editor.insert_str(&pending.text);
-                self.next_steer_token += 1;
-                self.steer_edit = Some(SteerEdit {
+            KeyCode::Backspace | KeyCode::Delete
+                if pending.status == PendingPromptStatus::Waiting =>
+            {
+                return Action::CancelPrompt {
                     id: pending.id.clone(),
-                    token: self.next_steer_token,
-                    draft: std::mem::replace(&mut self.editor, editor),
-                    attachments: std::mem::take(&mut self.attachments),
-                    next_attachment: self.next_attachment,
-                });
-                self.next_attachment = 0;
-                self.selected_steer = None;
+                };
+            }
+            KeyCode::Enter if pending.status.is_draft() => {
+                if !self.editor.is_empty() {
+                    self.toast("clear or send the current draft before recalling another");
+                    return Action::None;
+                }
+                let Some(pending) = self.remove_pending_prompt(index) else {
+                    return Action::None;
+                };
+                let prompt = pending.prompt;
+                if pending.status == PendingPromptStatus::OutcomeUnknown {
+                    self.toast(
+                        "previous acceptance unknown; review the transcript before resubmitting",
+                    );
+                }
                 self.queue_focused = false;
-                self.file_picker = None;
-                self.last_key = None;
+                self.selected_prompt = None;
+                self.queue_handoff = false;
+                self.editor.insert_str(&prompt.text);
+                self.restore_attachments(prompt.attachments);
+                self.sync_command_completion();
             }
             _ => {}
         }
@@ -4548,7 +4425,7 @@ impl App {
             _ => false,
         };
         if self.queue_focused && !global_key {
-            return self.handle_steer_selection(key);
+            return self.handle_prompt_selection(key);
         }
         if self.queue_handoff && !global_key {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -4585,19 +4462,15 @@ impl App {
                 self.toast = None;
             }
         }
-        if key.code == KeyCode::F(2) && !self.editing_steer() {
-            let Some(pending) = self.pending_steers.front() else {
+        if key.code == KeyCode::F(2) {
+            let Some(pending) = self.pending_prompts.front() else {
                 self.toast("no pending messages");
                 return Action::None;
             };
-            self.selected_steer = Some(pending.id.clone());
+            self.selected_prompt = Some(pending.id.clone());
             self.queue_focused = true;
             self.queue_handoff = false;
             self.file_picker = None;
-            return Action::None;
-        }
-        if key.code == KeyCode::Esc && self.editing_steer() {
-            self.cancel_steer_edit();
             return Action::None;
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
@@ -4724,31 +4597,6 @@ impl App {
                 if self.editor.is_empty() {
                     return Action::None;
                 }
-                if let Some(edit) = &self.steer_edit {
-                    if self.steer_mutations.contains_key(&edit.id) {
-                        self.toast("a change to this pending message is still in progress");
-                        return Action::None;
-                    }
-                    if !self
-                        .pending_steers
-                        .iter()
-                        .any(|pending| pending.id == edit.id)
-                    {
-                        self.toast(
-                            "message is no longer pending; copy your edit or Esc to restore draft",
-                        );
-                        return Action::None;
-                    }
-                    if !self.can_replace_steer {
-                        self.toast("this agent does not support editing pending messages");
-                        return Action::None;
-                    }
-                    return Action::ReplaceSteer {
-                        id: edit.id.clone(),
-                        text: self.editor.text().to_owned(),
-                    };
-                }
-
                 if let Parsed::Usage { provider } =
                     parse(self.editor.text(), !self.auth_methods.is_empty())
                 {
@@ -4768,8 +4616,7 @@ impl App {
                     }
                     return Action::Voice(control);
                 }
-                let inject = self.working();
-                if inject {
+                let delivery = if self.working() {
                     if self.phase != Phase::Working {
                         self.toast("the agent is waiting for required input");
                         return Action::None;
@@ -4788,11 +4635,17 @@ impl App {
                         self.toast("commands are available only while idle");
                         return Action::None;
                     }
-                    if !self.can_steer {
-                        self.toast("this agent does not support active steering");
+                    if self.can_steer {
+                        Some(super::wire::PromptDelivery::Steer)
+                    } else if self.can_queue {
+                        Some(super::wire::PromptDelivery::Queue)
+                    } else {
+                        self.toast("this agent does not support steering or queueing");
                         return Action::None;
                     }
-                }
+                } else {
+                    None
+                };
                 let input = self.editor.submit();
                 // Pending clipboard reads belong to the submitted draft, not
                 // the empty composer that replaces it (including commands).
@@ -4909,7 +4762,7 @@ impl App {
                                 .cloned()
                                 .collect(),
                         },
-                        inject,
+                        delivery,
                     },
                 };
             }
@@ -4983,7 +4836,7 @@ impl App {
                         .next_back()
                         .is_some_and(char::is_whitespace);
                 self.editor.insert_char('@');
-                if eligible && !self.editing_steer() {
+                if eligible {
                     return self.start_file_picker(at..at + 1);
                 }
             }
@@ -5497,7 +5350,7 @@ fn open_url(_url: &str) {}
     clippy::disallowed_macros
 )]
 mod test_support {
-    use agent_client_protocol::schema::v2::RunningStateUpdate;
+    use agent_client_protocol::v2::schema::RunningStateUpdate;
 
     use super::*;
 
@@ -5558,7 +5411,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use agent_client_protocol::schema::v2::{
+    use agent_client_protocol::v2::schema::{
         AuthMethodTerminal, IdleStateUpdate, RequiresActionStateUpdate, RunningStateUpdate,
         StateUpdate, StopReason, ToolCallStatus, ToolKind,
     };
@@ -5569,7 +5422,7 @@ mod tests {
     use super::{
         Action, AgentPart, App, Attachment, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
         MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, MessageRole, Phase,
-        SessionPresentation, Update, UserImage, replace_image_uri_on_line,
+        SessionPresentation, SubmittedPrompt, Update, UserImage, replace_image_uri_on_line,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -6237,7 +6090,7 @@ mod tests {
         assert!(first.exists(), "overflow opens must not evict stable links");
         // Real translation + worker + app + mouse routing for two distinct
         // overflow images on one line, including reverse image-block order.
-        use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+        use agent_client_protocol::v2::schema::{ContentBlock, ImageContent, TextContent};
         let mut opened_uris = Vec::new();
         for append in [false, true] {
             let id = format!("inline-{append}");
@@ -6750,11 +6603,11 @@ mod tests {
             ),
             (StopReason::Refusal, "turn refused"),
             (
-                StopReason::Error(agent_client_protocol::schema::v2::ErrorStopReason::new()),
+                StopReason::Error(agent_client_protocol::v2::schema::ErrorStopReason::new()),
                 "turn failed",
             ),
             (
-                StopReason::Other(agent_client_protocol::schema::v2::OtherStopReason::new(
+                StopReason::Other(agent_client_protocol::v2::schema::OtherStopReason::new(
                     "custom",
                     Default::default(),
                 )),
@@ -7565,6 +7418,18 @@ mod tests {
         }
     }
 
+    fn accept_prompt_attachments(app: &mut App, attachments: &[super::Attachment]) {
+        app.start_prompt(
+            request_id("attachment"),
+            super::SubmittedPrompt {
+                text: app.editor.text().into(),
+                attachments: attachments.to_vec(),
+            },
+            None,
+        );
+        settle_prompt(app, "attachment");
+    }
+
     #[test]
     fn accepted_clipboard_image_file_lives_until_the_session_is_cleared() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -7576,7 +7441,7 @@ mod tests {
         ));
 
         let accepted = app.attachments.clone();
-        app.accept_attachments(&accepted);
+        accept_prompt_attachments(&mut app, &accepted);
         assert!(path_buf.exists());
         drop(accepted);
 
@@ -7596,7 +7461,7 @@ mod tests {
             );
         }
         let accepted = vec![app.attachments[0].clone()];
-        app.accept_attachments(&accepted);
+        accept_prompt_attachments(&mut app, &accepted);
         app.editor.clear();
         app.attach(
             PathBuf::from("/tmp/reused.png"),
@@ -7618,7 +7483,7 @@ mod tests {
             3,
         );
         let accepted = app.attachments.clone();
-        app.accept_attachments(&accepted);
+        accept_prompt_attachments(&mut app, &accepted);
         app.editor.clear();
         app.attach(
             PathBuf::from("/tmp/second.png"),
@@ -7749,7 +7614,7 @@ mod tests {
             3,
         );
         let accepted = app.attachments.clone();
-        app.accept_attachments(&accepted);
+        accept_prompt_attachments(&mut app, &accepted);
         app.editor.clear();
         for name in ["two.png", "three.png"] {
             app.attach(
@@ -7780,7 +7645,7 @@ mod tests {
             3,
         );
         let accepted = app.attachments.clone();
-        app.accept_attachments(&accepted);
+        accept_prompt_attachments(&mut app, &accepted);
         app.editor.clear();
         app.attach(
             PathBuf::from("/tmp/two.png"),
@@ -8227,73 +8092,100 @@ mod tests {
         assert_eq!(prompt.text, "/newer keep this");
     }
 
+    fn request_id(id: &str) -> super::super::wire::RequestId {
+        id.to_owned().into()
+    }
+
+    fn settle_prompt(app: &mut App, id: &str) {
+        app.apply(Update::PromptSettled {
+            id: request_id(id),
+            result: Ok(id.to_owned().into()),
+        });
+    }
+
     #[test]
-    fn active_plain_text_is_submitted_as_steering_when_advertised() {
-        let mut app = app();
-        app.can_steer = true;
-        app.apply(Update::State(StateUpdate::Running(
-            RunningStateUpdate::new(),
-        )));
-        app.paste("change direction");
-        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+    fn active_submissions_use_advertised_delivery() {
+        use super::super::wire::PromptDelivery;
+        for (steer, queue, expected) in [
+            (true, true, PromptDelivery::Steer),
+            (false, true, PromptDelivery::Queue),
+        ] {
+            let mut app = app();
+            app.can_steer = steer;
+            app.can_queue = queue;
+            app.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            app.paste("change direction");
+            let Action::Submit { prompt, delivery } = app.handle_key(press(KeyCode::Enter)) else {
+                panic!("expected delivery-aware submission");
+            };
+            assert_eq!(delivery, Some(expected));
+            assert_eq!(prompt.text, "change direction");
+        }
+    }
 
-        let Action::Submit { prompt, inject } = app.handle_key(press(KeyCode::Enter)) else {
-            panic!("expected steering submission");
-        };
-        assert!(inject);
-        assert_eq!(prompt.text, "change direction");
-        assert!(
-            !app.blocks
-                .iter()
-                .any(|block| matches!(block, Block::User(_)))
-        );
-
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "injected-1".into(),
-            text: prompt.text,
-        });
-        assert_eq!(app.pending_steers.len(), 1);
-        assert!(
-            !app.blocks
-                .iter()
-                .any(|block| matches!(block, Block::User(_)))
-        );
-
-        app.apply(Update::UserMessage {
-            id: "injected-1".into(),
-            text: "change direction".into(),
-            images: Vec::new(),
-            append: false,
-        });
-        assert!(app.pending_steers.is_empty());
-        assert!(
-            matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "change direction")
-        );
-        assert!(app.working());
+    #[test]
+    fn response_and_user_update_reconcile_in_either_order() {
+        for response_first in [true, false] {
+            let mut app = queued_app();
+            // A cancellation can be overtaken by insertion. Only the prompt
+            // response settles the targeted request, even with identical text.
+            app.pending_prompts[1].prompt.text = "pending a".into();
+            app.prompt_cancel_sent(&request_id("a"));
+            if response_first {
+                app.apply(Update::PromptSettled {
+                    id: request_id("a"),
+                    result: Ok("agent-owned-id".into()),
+                });
+                assert_eq!(app.pending_prompts.len(), 2);
+                assert!(
+                    !app.blocks
+                        .iter()
+                        .any(|block| matches!(block, Block::User(_)))
+                );
+            }
+            app.apply(Update::UserMessage {
+                id: "agent-owned-id".into(),
+                text: "pending a".into(),
+                images: vec![],
+                append: false,
+            });
+            if !response_first {
+                assert_eq!(app.pending_prompts.len(), 3);
+                app.apply(Update::PromptSettled {
+                    id: request_id("a"),
+                    result: Ok("agent-owned-id".into()),
+                });
+            }
+            assert_eq!(app.pending_prompts.len(), 2);
+            assert_eq!(
+                app.blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::User(_)))
+                    .count(),
+                1
+            );
+        }
     }
 
     fn queued_app() -> App {
         let mut app = app();
         app.can_steer = true;
-        app.can_replace_steer = true;
         app.apply(Update::State(StateUpdate::Running(
             RunningStateUpdate::new(),
         )));
         for id in ["a", "b", "c"] {
-            app.apply(Update::SteerAccepted {
-                editable: true,
-                id: id.into(),
-                text: format!("pending {id}"),
-            });
+            app.start_prompt(
+                request_id(id),
+                SubmittedPrompt {
+                    text: format!("pending {id}"),
+                    attachments: vec![],
+                },
+                Some(super::super::wire::PromptDelivery::Steer),
+            );
         }
         app
-    }
-
-    fn begin_steer_edit(app: &mut App) {
-        app.handle_key(press(KeyCode::F(2)));
-        app.handle_key(press(KeyCode::Enter));
-        assert!(app.editing_steer());
     }
 
     #[test]
@@ -8305,7 +8197,7 @@ mod tests {
             app.handle_key(press(KeyCode::F(2)));
             if drained {
                 for id in ["a", "b", "c"] {
-                    app.steer_revoked(id);
+                    settle_prompt(&mut app, id);
                 }
             }
             // Without background work Ctrl+K is an editor key, so suppress it.
@@ -8345,337 +8237,40 @@ mod tests {
     }
 
     #[test]
-    fn queued_selector_navigation_and_revoke_preserve_order_and_draft() {
-        let mut app = queued_app();
-        app.paste("draft");
-        app.handle_key(press(KeyCode::F(2)));
-        app.handle_key(press(KeyCode::Up));
-        assert_eq!(app.selected_steer.as_deref(), Some("a"));
-        app.handle_key(press(KeyCode::Down));
-        let Action::RevokeSteer { id } = app.handle_key(press(KeyCode::Delete)) else {
-            panic!("expected revoke");
-        };
-        assert_eq!(id, "b");
-        assert_eq!(
-            app.pending_steers.len(),
-            3,
-            "wait for server acknowledgment"
-        );
-        app.steer_mutation_failed(&id, "temporary failure".into(), false);
-        assert_eq!(app.pending_steers.len(), 3);
-        assert_eq!(app.selected_steer.as_deref(), Some("b"));
-        app.steer_revoked(&id);
-        assert_eq!(
-            app.pending_steers
-                .iter()
-                .map(|p| p.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "c"]
-        );
-        assert_eq!(app.selected_steer.as_deref(), Some("c"));
-        app.handle_key(press(KeyCode::Down));
-        assert_eq!(app.selected_steer.as_deref(), Some("c"));
-        app.handle_key(press(KeyCode::Esc));
-        assert!(app.selected_steer.is_none());
-        assert!(app.working(), "Esc in selector must not cancel the turn");
-        assert_eq!(app.editor.text(), "draft");
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id,
-            text: "late acceptance".into(),
-        });
-        assert_eq!(app.pending_steers.len(), 2, "revoked IDs stay retired");
-    }
-
-    #[test]
-    fn queued_edit_cancel_restores_draft_cursor_and_attachments() {
-        let mut app = queued_app();
-        app.paste("draft");
-        app.attach(
-            PathBuf::from("image.png"),
-            "image/png",
-            AttachmentKind::Image,
-            3,
-        );
-        app.editor.move_left();
-        let draft = app.editor.text().to_owned();
-        let cursor = app.editor.cursor();
-        let attachments = app.attachments.clone();
-        let sequence = app.next_attachment;
-        begin_steer_edit(&mut app);
-        assert_eq!(app.editor.text(), "pending a");
-        assert!(app.attachments.is_empty());
-        app.paste(" revised");
-        app.attach(
-            PathBuf::from("other.png"),
-            "image/png",
-            AttachmentKind::Image,
-            4,
-        );
-        assert!(app.attachments.is_empty(), "replacement is text-only");
-        app.handle_key(press(KeyCode::Esc));
-        assert!(!app.editing_steer());
-        assert_eq!(app.editor.text(), draft);
-        assert_eq!(app.editor.cursor(), cursor);
-        assert_eq!(app.attachments, attachments);
-        assert_eq!(app.next_attachment, sequence);
-        assert_eq!(app.pending_steers[0].text, "pending a");
-        assert!(app.working());
-    }
-
-    #[test]
-    fn queued_edit_save_keeps_id_order_and_restores_draft() {
-        let mut app = queued_app();
-        app.paste("next draft");
-        app.handle_key(press(KeyCode::F(2)));
-        app.handle_key(press(KeyCode::Down));
-        app.handle_key(press(KeyCode::Enter));
-        app.paste(" revised");
-        let Action::ReplaceSteer { id, text } = app.handle_key(press(KeyCode::Enter)) else {
-            panic!("expected replacement");
-        };
-        assert_eq!(id, "b");
-        assert_eq!(text, "pending b revised");
-        assert_eq!(app.pending_steers[1].text, "pending b");
-        assert_eq!(app.editor.text(), text, "keep edit until acknowledged");
-        let token = app.begin_steer_mutation(&id, Some(text)).unwrap();
-        app.apply(Update::SteerMutationFinished {
-            id: id.clone(),
-            token,
-            result: Ok(()),
-        });
-        assert_eq!(
-            app.pending_steers
-                .iter()
-                .map(|p| p.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b", "c"]
-        );
-        assert_eq!(app.pending_steers[1].text, "pending b revised");
-        assert_eq!(app.editor.text(), "next draft");
-        assert!(!app.editing_steer());
-    }
-
-    #[test]
-    fn queued_edit_failure_keeps_both_drafts_and_allows_retry() {
-        let mut app = queued_app();
-        app.paste("original draft");
-        begin_steer_edit(&mut app);
-        app.paste(" revision");
-        app.steer_mutation_failed("a", "temporary failure".into(), false);
-        assert_eq!(app.editor.text(), "pending a revision");
-        assert!(app.editing_steer());
-        assert_eq!(app.pending_steers[0].text, "pending a");
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::ReplaceSteer { .. }
-        ));
-        app.handle_key(press(KeyCode::Esc));
-        assert_eq!(app.editor.text(), "original draft");
-    }
-
-    #[test]
-    fn queued_edit_delivery_races_never_resurrect_messages() {
-        for unavailable_error in [false, true] {
-            let mut app = queued_app();
-            app.paste("original draft");
-            begin_steer_edit(&mut app);
-            app.paste(" revision");
-            let token = app
-                .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
-                .unwrap();
-            if unavailable_error {
-                app.steer_mutation_failed("a", "unknown message".into(), true);
-            } else {
-                app.apply(Update::UserMessage {
-                    id: "a".into(),
-                    text: "pending a".into(),
-                    images: Vec::new(),
-                    append: false,
-                });
-            }
-            assert_eq!(app.editor.text(), "pending a revision");
-            assert!(matches!(
-                app.handle_key(press(KeyCode::Enter)),
-                Action::None
-            ));
-            assert!(!app.pending_steers.iter().any(|pending| pending.id == "a"));
-            app.apply(Update::SteerMutationFinished {
-                id: "a".into(),
-                token,
-                result: Ok(()),
-            });
-            app.apply(Update::SteerAccepted {
-                editable: true,
-                id: "a".into(),
-                text: "late acceptance".into(),
-            });
-            assert!(!app.pending_steers.iter().any(|pending| pending.id == "a"));
-            assert_eq!(app.editor.text(), "original draft");
-        }
-    }
-
-    #[test]
-    fn queued_delivery_reselects_neighbor_and_session_switch_clears_edit() {
-        let mut app = queued_app();
-        app.paste("draft");
-        app.handle_key(press(KeyCode::F(2)));
-        app.apply(Update::UserMessage {
-            id: "a".into(),
-            text: "pending a".into(),
-            images: Vec::new(),
-            append: false,
-        });
-        assert_eq!(app.selected_steer.as_deref(), Some("b"));
-        app.handle_key(press(KeyCode::Enter));
-        app.start_session("other-session".into());
-        assert!(!app.editing_steer());
-        assert!(app.selected_steer.is_none());
-        assert!(app.pending_steers.is_empty());
-        assert!(app.retired_steers.is_empty());
-        assert_eq!(app.editor.text(), "draft");
-    }
-
-    #[test]
-    fn queued_edit_capability_is_required_but_revoke_is_always_available() {
-        let mut app = queued_app();
-        app.can_replace_steer = false;
-        app.paste("draft");
-        app.handle_key(press(KeyCode::F(2)));
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        assert!(!app.editing_steer());
-        assert_eq!(app.editor.text(), "draft");
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Delete)),
-            Action::RevokeSteer { .. }
-        ));
-        app.can_replace_steer = true;
-        app.handle_key(press(KeyCode::Enter));
-        app.can_replace_steer = false;
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        assert_eq!(app.editor.text(), "pending a");
-        app.handle_key(press(KeyCode::Esc));
-        assert_eq!(app.editor.text(), "draft");
-    }
-
-    #[test]
     fn empty_queue_does_not_capture_composer_focus() {
         let mut app = app();
         app.paste("draft");
         app.handle_key(press(KeyCode::F(2)));
         assert!(!app.queue_focused);
         assert!(!app.queue_handoff);
-        assert!(app.selected_steer.is_none());
+        assert!(app.selected_prompt.is_none());
         assert_eq!(app.toast_text(), Some("no pending messages"));
         app.handle_key(press(KeyCode::Char('!')));
         assert_eq!(app.editor.text(), "draft!");
     }
 
     #[test]
-    fn draining_the_queue_returns_keyboard_focus_to_the_composer() {
-        for outcome in ["delivery", "removal", "unavailable", "turn_end"] {
-            let mut app = queued_app();
-            app.paste("draft");
-            app.handle_key(press(KeyCode::F(2)));
-            if outcome == "turn_end" {
-                app.apply(Update::State(StateUpdate::Idle(
-                    IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
-                )));
-            } else {
-                for id in ["a", "b", "c"] {
-                    match outcome {
-                        "delivery" => app.apply(Update::UserMessage {
-                            id: id.into(),
-                            text: id.into(),
-                            images: Vec::new(),
-                            append: false,
-                        }),
-                        "removal" => app.steer_revoked(id),
-                        "unavailable" => app.steer_mutation_failed(id, "gone".into(), true),
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            assert!(app.pending_steers.is_empty(), "{outcome}");
-            assert!(!app.queue_focused, "{outcome}");
-            assert!(app.selected_steer.is_none(), "{outcome}");
+    fn pending_requests_survive_idle_and_queue_handoff_guards_the_draft() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert_eq!(app.pending_prompts.len(), 3);
+        assert!(app.queue_focused);
+        for id in ["a", "b", "c"] {
+            settle_prompt(&mut app, id);
+        }
+        assert!(!app.queue_focused);
+        assert!(app.queue_handoff);
+        for key in [KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete] {
+            assert!(matches!(app.handle_key(press(key)), Action::None));
             assert_eq!(app.editor.text(), "draft");
-            app.handle_key(press(KeyCode::Char('!')));
-            assert_eq!(app.editor.text(), "draft!", "{outcome}");
         }
-    }
-
-    #[test]
-    fn automatic_queue_closure_guards_stale_destructive_keys_until_acknowledged() {
-        for outcome in ["delivery", "removal", "unavailable", "turn_end"] {
-            for key in [KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete] {
-                let mut app = queued_app();
-                app.paste("draft");
-                app.attach(
-                    PathBuf::from("image.png"),
-                    "image/png",
-                    AttachmentKind::Image,
-                    3,
-                );
-                app.editor.move_left();
-                let draft = app.editor.text().to_owned();
-                let attachments = app.attachments.clone();
-                app.handle_key(press(KeyCode::F(2)));
-                if outcome == "turn_end" {
-                    app.apply(Update::State(StateUpdate::Idle(
-                        IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
-                    )));
-                } else {
-                    for id in ["a", "b", "c"] {
-                        match outcome {
-                            "delivery" => app.apply(Update::UserMessage {
-                                id: id.into(),
-                                text: id.into(),
-                                images: Vec::new(),
-                                append: false,
-                            }),
-                            "removal" => {
-                                let token = app.begin_steer_mutation(id, None).unwrap();
-                                app.apply(Update::SteerMutationFinished {
-                                    id: id.into(),
-                                    token,
-                                    result: Ok(()),
-                                });
-                            }
-                            "unavailable" => app.steer_mutation_failed(id, "gone".into(), true),
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-                assert!(!app.queue_focused);
-                assert!(app.queue_handoff);
-                for _ in 0..3 {
-                    assert!(matches!(app.handle_key(press(key)), Action::None));
-                    assert_eq!(app.editor.text(), draft, "{outcome} {key:?}");
-                    assert_eq!(app.attachments, attachments);
-                    assert!(app.queue_handoff);
-                }
-                assert!(app.toast_text().unwrap().contains("queue closed"));
-                // Esc acknowledges composer focus rather than cancelling the turn.
-                assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
-                assert!(!app.queue_handoff);
-                assert!(app.phase != Phase::Cancelling);
-                let action = app.handle_key(press(key));
-                if key == KeyCode::Enter {
-                    assert!(
-                        matches!(action, Action::Submit { prompt, .. } if prompt.text == draft && prompt.attachments == attachments)
-                    );
-                } else {
-                    assert_ne!(app.editor.text(), draft);
-                }
-            }
-        }
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.queue_handoff);
+        assert_eq!(app.editor.text(), "draft");
     }
 
     #[test]
@@ -8685,7 +8280,7 @@ mod tests {
             app.paste("draft");
             app.handle_key(press(KeyCode::F(2)));
             for id in ["a", "b", "c"] {
-                app.steer_revoked(id);
+                settle_prompt(&mut app, id);
             }
             assert!(app.queue_handoff);
             match interaction {
@@ -8724,7 +8319,7 @@ mod tests {
         assert!(!app.queue_handoff);
         app.handle_key(press(KeyCode::F(2)));
         for id in ["a", "b", "c"] {
-            app.steer_revoked(id);
+            settle_prompt(&mut app, id);
         }
         assert!(app.queue_handoff);
         app.start_session("other-session".into());
@@ -8733,55 +8328,28 @@ mod tests {
     }
 
     #[test]
-    fn backspace_and_forward_delete_remove_only_after_acknowledgement() {
+    fn backspace_and_delete_cancel_only_the_selected_request() {
+        use super::super::wire;
         for key in [KeyCode::Backspace, KeyCode::Delete] {
             let mut app = queued_app();
             app.paste("draft");
             app.handle_key(press(KeyCode::F(2)));
-            for (index, expected) in ["a", "b", "c"].into_iter().enumerate() {
-                let Action::RevokeSteer { id } = app.handle_key(press(key)) else {
-                    panic!("expected removal from {key:?}");
-                };
-                assert_eq!(id, expected);
-                let token = app.begin_steer_mutation(&id, None).unwrap();
-                assert_eq!(app.pending_steers.len(), 3 - index);
-                assert!(app.queue_focused);
-                assert!(matches!(app.handle_key(press(key)), Action::None));
-                assert_eq!(app.editor.text(), "draft");
-                app.apply(Update::SteerMutationFinished {
-                    id,
-                    token,
-                    result: Ok(()),
-                });
-                assert_eq!(app.pending_steers.len(), 2 - index);
-                assert_eq!(app.queue_focused, index < 2);
-            }
-            assert!(app.selected_steer.is_none());
+            app.handle_key(press(KeyCode::Down));
+            let Action::CancelPrompt { id } = app.handle_key(press(key)) else {
+                panic!("expected request cancellation");
+            };
+            assert_eq!(id, request_id("b"));
+            app.prompt_cancel_sent(&id);
+            assert_eq!(app.pending_prompts.len(), 3);
+            assert!(matches!(app.handle_key(press(key)), Action::None));
+            app.apply(Update::PromptSettled {
+                id,
+                result: Err(wire::Error::request_cancelled().into()),
+            });
+            assert_eq!(app.pending_prompts.len(), 2);
+            assert_eq!(app.selected_prompt, Some(request_id("c")));
             assert_eq!(app.editor.text(), "draft");
-            app.handle_key(press(KeyCode::Char('!')));
-            assert_eq!(app.editor.text(), "draft!");
         }
-    }
-
-    #[test]
-    fn queued_edit_stays_recoverable_when_turn_finishes() {
-        let mut app = queued_app();
-        app.paste("draft");
-        begin_steer_edit(&mut app);
-        app.paste(" revised");
-        app.apply(Update::State(StateUpdate::Idle(
-            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
-        )));
-        assert!(app.pending_steers.is_empty());
-        assert!(app.editing_steer());
-        assert!(!app.queue_handoff);
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        assert_eq!(app.editor.text(), "pending a revised");
-        app.handle_key(press(KeyCode::Esc));
-        assert_eq!(app.editor.text(), "draft");
     }
 
     #[test]
@@ -8792,7 +8360,7 @@ mod tests {
             app.handle_key(press(KeyCode::F(2)));
             if empty {
                 for id in ["a", "b", "c"] {
-                    app.steer_revoked(id);
+                    settle_prompt(&mut app, id);
                 }
             }
             assert!(matches!(
@@ -8840,165 +8408,38 @@ mod tests {
     }
 
     #[test]
-    fn queued_inflight_mutations_reject_duplicates_and_keep_newer_edit_text() {
-        let mut app = queued_app();
-        app.paste("draft");
-        begin_steer_edit(&mut app);
-        let text = app.editor.text().to_owned();
-        let token = app.begin_steer_mutation("a", Some(text.clone())).unwrap();
-        assert!(app.begin_steer_mutation("a", Some(text.clone())).is_none());
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        app.paste(" newer revision");
-        app.apply(Update::SteerMutationFinished {
-            id: "a".into(),
-            token,
-            result: Ok(()),
-        });
-        assert_eq!(app.pending_steers[0].text, text);
-        assert_eq!(app.editor.text(), "pending a newer revision");
-        assert!(app.editing_steer());
-        app.handle_key(press(KeyCode::Esc));
-        assert_eq!(app.editor.text(), "draft");
-        app.handle_key(press(KeyCode::F(2)));
-        app.begin_steer_mutation("a", None).unwrap();
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Delete)),
-            Action::None
-        ));
-    }
-
-    #[test]
-    fn queued_old_completion_cannot_close_reopened_same_id_edit_or_new_request() {
-        let mut app = queued_app();
-        app.paste("draft");
-        begin_steer_edit(&mut app);
-        let token = app
-            .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
-            .unwrap();
-        app.handle_key(press(KeyCode::Esc));
-        begin_steer_edit(&mut app); // Identical text and ID, but a different edit.
-        app.apply(Update::SteerMutationFinished {
-            id: "a".into(),
-            token,
-            result: Ok(()),
-        });
-        assert!(app.editing_steer());
-        let next = app
-            .begin_steer_mutation("a", Some("replacement".into()))
-            .unwrap();
-        app.apply(Update::SteerMutationFinished {
-            id: "a".into(),
-            token,
-            result: Ok(()),
-        });
-        assert_eq!(app.steer_mutations["a"].token, next);
-        assert_eq!(app.pending_steers[0].text, "pending a");
-        app.handle_key(press(KeyCode::Esc));
-        assert_eq!(app.editor.text(), "draft");
-    }
-
-    #[test]
-    fn queued_async_error_unlocks_retry_without_losing_either_draft() {
-        let mut app = queued_app();
-        app.paste("draft");
-        begin_steer_edit(&mut app);
-        app.paste(" revision");
-        let token = app
-            .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
-            .unwrap();
-        app.apply(Update::SteerMutationFinished {
-            id: "a".into(),
-            token,
-            result: Err(super::SteerMutationError {
-                message: "retry".into(),
-                unavailable: false,
-            }),
-        });
-        assert!(app.steer_mutations.is_empty());
-        assert_eq!(app.editor.text(), "pending a revision");
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::ReplaceSteer { .. }
-        ));
-        app.handle_key(press(KeyCode::Esc));
-        assert_eq!(app.editor.text(), "draft");
-    }
-
-    #[test]
-    fn queued_session_switch_clears_inflight_state_and_rejects_old_completion() {
-        let mut app = queued_app();
-        app.paste("draft");
-        begin_steer_edit(&mut app);
-        let token = app
-            .begin_steer_mutation("a", Some("old replacement".into()))
-            .unwrap();
-        app.start_session("new-session".into());
-        assert!(app.steer_mutations.is_empty());
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "a".into(),
-            text: "new session message".into(),
-        });
-        begin_steer_edit(&mut app);
-        let next = app
-            .begin_steer_mutation("a", Some("new replacement".into()))
-            .unwrap();
-        app.apply(Update::SteerMutationFinished {
-            id: "a".into(),
-            token,
-            result: Ok(()),
-        });
-        assert_eq!(app.steer_mutations["a"].token, next);
-        assert_eq!(app.pending_steers[0].text, "new session message");
-        assert_eq!(app.editor.text(), "new session message");
-    }
-
-    #[test]
-    fn queued_media_steering_submits_but_only_allows_removal() {
-        let mut app = queued_app();
-        app.attach(
-            PathBuf::from("image.png"),
-            "image/png",
-            AttachmentKind::Image,
-            3,
-        );
-        let Action::Submit { prompt, inject } = app.handle_key(press(KeyCode::Enter)) else {
-            panic!("expected media steer submission");
+    fn rejected_prompt_with_media_is_recallable_without_overwriting_the_composer() {
+        let mut app = app();
+        app.attach("old.png".into(), "image/png", AttachmentKind::Image, 5);
+        let Action::Submit { prompt, delivery } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected submission");
         };
-        assert!(inject);
-        assert_eq!(prompt.attachments.len(), 1);
-        app.apply(Update::SteerAccepted {
-            id: "media".into(),
-            text: prompt.text,
-            editable: false,
+        let media = prompt.attachments.clone();
+        let text = prompt.text.clone();
+        let id = request_id("media");
+        app.start_prompt(id.clone(), prompt, delivery);
+        app.paste("new draft");
+        app.attach("new.png".into(), "image/png", AttachmentKind::Image, 5);
+        assert_ne!(app.attachments[0].placeholder, media[0].placeholder);
+        let newer_draft = app.editor.text().to_owned();
+        let newer_media = app.attachments.clone();
+        app.apply(Update::PromptSettled {
+            id,
+            result: Err(agent_client_protocol::Error::invalid_params()),
         });
-        app.selected_steer = Some("media".into());
-        app.queue_focused = true;
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        assert!(!app.editing_steer());
-        assert!(
-            app.toast_text()
-                .unwrap()
-                .contains("with media cannot be edited")
-        );
-        assert!(
-            app.begin_steer_mutation("media", Some("text replacement".into()))
-                .is_none()
-        );
-        assert!(
-            matches!(app.handle_key(press(KeyCode::Delete)), Action::RevokeSteer { id } if id == "media")
-        );
-        assert!(app.begin_steer_mutation("media", None).is_some());
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.editor.text(), newer_draft);
+        assert_eq!(app.attachments, newer_media);
+        app.editor.clear();
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.editor.text(), text);
+        assert_eq!(app.attachments, media);
+        assert!(app.pending_prompts.is_empty());
     }
 
     #[test]
-    fn active_text_is_preserved_when_steering_is_not_advertised() {
+    fn active_text_is_preserved_when_no_delivery_modes_are_advertised() {
         let mut app = app();
         app.apply(Update::State(StateUpdate::Running(
             RunningStateUpdate::new(),
@@ -10334,7 +9775,7 @@ mod tests {
 
     #[test]
     fn session_cost_reports_replace_totals_and_reset_with_session() {
-        use agent_client_protocol::schema::{MaybeUndefined, v2::Cost};
+        use agent_client_protocol::{schema::MaybeUndefined, v2::schema::Cost};
         let mut app = app();
         assert!(app.cost.is_none());
         for amount in [0.0, 1.25, 1.25, 2.0] {
@@ -10415,7 +9856,7 @@ mod tests {
     #[test]
     fn subagent_cost_totals_include_nested_and_removed_sessions_by_currency() {
         use crate::events::SubagentStatus;
-        use agent_client_protocol::schema::v2::Cost;
+        use agent_client_protocol::v2::schema::Cost;
         let mut app = app();
         assert!(app.subagent_cost_totals().is_empty());
         for (id, parent) in [

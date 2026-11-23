@@ -115,7 +115,6 @@ impl Subagents {
                     startup_reservation: Weak::new(),
                     permit: Some(self.reserve().unwrap()),
                     cache_key: None,
-                    finished: Default::default(),
                 },
             )
             .unwrap();
@@ -414,7 +413,6 @@ fn manager_with_disconnected_session(
         startup_reservation: Weak::new(),
         permit: Some(manager.acquire_permit().unwrap()),
         cache_key: None,
-        finished: Default::default(),
     }));
     manager.sessions.lock().unwrap().insert(
         "source".into(),
@@ -2540,21 +2538,13 @@ async fn shutdown_preserves_completed_generation_results() {
         let state = scenario.manager.lookup(&handle).unwrap();
         let before = {
             let locked = state.lock().await;
-            (
-                locked.outcome,
-                locked.generation_finished_at_unix_ms,
-                locked.finished.len(),
-            )
+            (locked.outcome, locked.generation_finished_at_unix_ms)
         };
         scenario.manager.shutdown().await.unwrap();
         let locked = state.lock().await;
         assert_eq!(locked.status, SubagentStatus::Removed);
         assert_eq!(
-            (
-                locked.outcome,
-                locked.generation_finished_at_unix_ms,
-                locked.finished.len()
-            ),
+            (locked.outcome, locked.generation_finished_at_unix_ms,),
             before
         );
     }
@@ -2592,14 +2582,6 @@ async fn cancelled_shutdown_keeps_cleanup_owned_and_settles_running_generation()
         assert_eq!(locked.status, SubagentStatus::Removed);
         assert_eq!(locked.outcome, Some(GenerationOutcome::Failed));
         assert!(locked.generation_finished_at_unix_ms.is_some());
-        assert_eq!(
-            locked.finished.back().unwrap().generation,
-            locked.generation
-        );
-        assert_eq!(
-            locked.finished.back().unwrap().outcome,
-            GenerationOutcome::Failed
-        );
         assert!(locked.child.is_none());
     }
     assert_eq!(

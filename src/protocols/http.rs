@@ -140,7 +140,7 @@ impl HttpOptions {
 #[derive(Clone)]
 struct AcpRouter {
     router: Router,
-    cors: agent_client_protocol_http::CorsOptions,
+    allowed_origins: Vec<String>,
 }
 
 impl AcpRouter {
@@ -148,9 +148,11 @@ impl AcpRouter {
         if !matches!(request.uri().path(), "/acp" | "/acp/v2") {
             return;
         }
-        if let agent_client_protocol_http::CorsOptions::AllowOrigins(origins) = &self.cors
-            && let Some(origin) = request.headers().get(header::ORIGIN)
-            && origins.contains(origin)
+        if let Some(origin) = request.headers().get(header::ORIGIN)
+            && self
+                .allowed_origins
+                .iter()
+                .any(|allowed| origin.as_bytes() == allowed.as_bytes())
         {
             response
                 .headers_mut()
@@ -251,7 +253,7 @@ pub async fn start_with_options(
             sessions,
             cors.clone(),
         )),
-        cors,
+        allowed_origins: options.allowed_origins,
     });
     let stop_accepting = crate::resilient_fs::shutdown_token().child_token();
     let accepts_stopped = CancellationToken::new();
@@ -522,7 +524,7 @@ mod tests {
         }
         assert_eq!(
             super::HttpOptions::default().cors().unwrap(),
-            agent_client_protocol_http::CorsOptions::Disabled
+            agent_client_protocol_http::CorsOptions::disabled()
         );
         assert!(
             super::HttpOptions {

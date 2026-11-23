@@ -56,7 +56,7 @@ fn guarded_tokens(transcript: &[Item]) -> Option<u128> {
 }
 
 pub(super) fn error(message: &str) -> Error {
-    agent_client_protocol::util::internal_error(message)
+    Error::internal_error().data(message)
 }
 
 impl Guard {

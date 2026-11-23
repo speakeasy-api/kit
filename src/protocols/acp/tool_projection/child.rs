@@ -229,7 +229,7 @@ fn patches(request: &ToolRequest, items: &[Value], truncated: bool) -> Vec<Value
 }
 
 fn legacy_diff(entry: &Value) -> Option<Value> {
-    let diff: agent_client_protocol::schema::v1::Diff =
+    let diff: agent_client_protocol::v1::schema::Diff =
         serde_json::from_value(entry.clone()).ok()?;
     super::diff_content(&diff.path, diff.old_text.as_deref(), Some(&diff.new_text))
 }

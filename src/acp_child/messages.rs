@@ -1,7 +1,7 @@
 //! Text projection of v2 message-ID-keyed append and replacement updates.
 use std::collections::HashMap;
 
-use agent_client_protocol::schema::{MaybeUndefined, v2};
+use agent_client_protocol::{schema::MaybeUndefined, v2::schema as v2};
 use serde_json::Value;
 
 /// Each ID has one stable first-seen position and its current text. Notification
@@ -10,6 +10,7 @@ use serde_json::Value;
 #[derive(Clone, Debug, Default)]
 pub(super) struct Messages {
     entries: HashMap<String, (usize, String)>,
+    retained_bytes: usize,
 }
 
 pub(super) fn parse(
@@ -60,12 +61,16 @@ impl Messages {
             _ => return false,
         };
         let position = self.entries.len();
-        let (_, current) = self
-            .entries
-            .entry(id)
-            .or_insert_with(|| (position, String::new()));
+        // IDs and order entries also occupy space even for non-text updates.
+        let entry_bytes = id.len() + std::mem::size_of::<(String, usize, String)>();
+        let (_, current) = self.entries.entry(id).or_insert_with(|| {
+            self.retained_bytes += entry_bytes;
+            (position, String::new())
+        });
         if let Some(text) = text {
+            self.retained_bytes += text.len();
             if replacement {
+                self.retained_bytes -= current.len();
                 *current = text;
             } else {
                 current.push_str(&text);
@@ -74,7 +79,12 @@ impl Messages {
         handled
     }
 
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
     pub(super) fn finish(&mut self) -> String {
+        self.retained_bytes = 0;
         let mut entries: Vec<_> = std::mem::take(&mut self.entries).into_values().collect();
         entries.sort_by_key(|(position, _)| *position);
         entries.into_iter().map(|(_, text)| text).collect()

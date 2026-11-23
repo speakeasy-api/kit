@@ -1,10 +1,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use super::{Client, Version, initialize, request};
-use agent_client_protocol::{
-    Builder, Channel,
-    schema::{ProtocolVersion, v2},
-};
+use agent_client_protocol::{Builder, Channel, schema::ProtocolVersion, v2::schema as v2};
 use agentkit_acp as v1;
 use std::{path::PathBuf, time::Duration};
 
@@ -65,7 +62,7 @@ async fn sdk_v1_negotiation(offer: Version) {
     let (client_wire, agent_wire) = Channel::duplex();
     let server = tokio::spawn(async move {
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .on_receive_request(
                 async move |req: v1::InitializeRequest, responder, _cx| {
                     // The SDK selects v1 before dispatching to its typed handler.

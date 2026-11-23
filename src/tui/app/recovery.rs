@@ -14,6 +14,7 @@ pub(super) struct Candidate {
 
 impl App {
     fn recovery_failed(&mut self, message: &str) {
+        self.mark_pending_outcome_unknown();
         self.elicitations.clear();
         self.gateway_candidate = None;
         self.gateway_blocked = true;
@@ -48,7 +49,7 @@ impl App {
                 );
                 candidate.session_id = Some(session.clone());
                 candidate.can_steer = self.can_steer;
-                candidate.can_replace_steer = self.can_replace_steer;
+                candidate.can_queue = self.can_queue;
                 self.gateway_candidate = Some(Candidate {
                     app: Box::new(candidate),
                     epoch: marker.epoch,
@@ -66,21 +67,10 @@ impl App {
                 self.model_dialog = None;
                 self.effort_dialog = None;
                 self.cancel_clipboard_placeholders();
-                // The replacement target belongs to the old connection, but
-                // both unsent drafts belong to the client. Restore the ordinary
-                // composer and keep the edited text available for manual recall.
-                let steering_draft = self
-                    .steer_edit
-                    .as_ref()
-                    .map(|_| self.editor.text().to_owned());
-                self.cancel_steer_edit();
-                if let Some(text) = steering_draft {
-                    self.editor.remember(text);
-                }
-                self.selected_steer = None;
+                self.mark_pending_outcome_unknown();
+                self.selected_prompt = None;
                 self.queue_focused = false;
                 self.queue_handoff = false;
-                self.steer_mutations.clear();
                 self.gateway_status = Some(format!(
                     "Reconnecting {}/{}{} · previous outcome unknown; no automatic resubmission",
                     marker.attempt.unwrap_or(1),
@@ -161,7 +151,7 @@ impl App {
                     auth_methods,
                     voice_enabled,
                     can_steer,
-                    can_replace_steer,
+                    can_queue,
                     show_thoughts,
                     agents_visible,
                     show_logs,
@@ -169,7 +159,7 @@ impl App {
                     storage_pending,
                     storage_exhausted,
                     next_model_switch,
-                    next_steer_token,
+                    pending_prompts,
                     next_file_search_revision
                 );
                 candidate.next_attachment = candidate.next_attachment.max(self.next_attachment);
@@ -217,7 +207,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::tui::recovery::Marker;
-    use agent_client_protocol::schema::v2::{IdleStateUpdate, RunningStateUpdate};
+    use agent_client_protocol::v2::schema::{IdleStateUpdate, RunningStateUpdate};
 
     fn app() -> App {
         let mut app = App::new(
@@ -258,7 +248,7 @@ mod tests {
         app.apply(Update::GatewayRecovery(event(Kind::Replay, vec![update])));
     }
     fn snapshot(app: &mut App, running: bool) {
-        use agent_client_protocol::schema::v2::{
+        use agent_client_protocol::v2::schema::{
             SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption,
         };
         let model = if running {
@@ -300,85 +290,33 @@ mod tests {
             .join("\n")
     }
 
-    fn active_modified_steer(app: &mut App) {
-        app.can_steer = true;
-        app.can_replace_steer = true;
-        app.apply(Update::State(StateUpdate::Running(
-            RunningStateUpdate::new(),
-        )));
-        app.apply(Update::SteerAccepted {
-            editable: true,
-            id: "old-target".into(),
-            text: "queued steering".into(),
-        });
-        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.editing_steer());
-        app.paste(" modified but unsent");
-        assert_eq!(app.editor.text(), "queued steering modified but unsent");
-    }
-
-    fn assert_both_drafts_recallable(app: &mut App) {
-        assert!(!app.editing_steer());
-        assert_eq!(app.editor.text(), "unsent draft");
-        assert!(matches!(
-            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            Action::None
-        ));
-        assert_eq!(app.editor.text(), "queued steering modified but unsent");
-        assert!(matches!(
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            Action::None
-        ));
-        assert_eq!(app.editor.text(), "unsent draft");
-    }
-
     #[test]
-    fn failed_recovery_preserves_active_modified_steer_and_ordinary_draft() {
-        let mut app = app();
-        active_modified_steer(&mut app);
-        let before = text(&app);
-        app.apply(Update::GatewayRecovery(event(Kind::Begin, Vec::new())));
-        assert_both_drafts_recallable(&mut app);
-        app.apply(Update::GatewayRecovery(event(Kind::Failed, Vec::new())));
-        assert!(app.gateway_blocked);
-        assert_eq!(text(&app), before);
-        assert_eq!(app.pending_steers[0].text, "queued steering");
-        assert_both_drafts_recallable(&mut app);
-    }
-
-    #[test]
-    fn committed_recovery_preserves_active_modified_steer_without_old_target() {
-        for running in [false, true] {
+    fn recovery_preserves_unsettled_prompt_and_composer_without_retrying() {
+        use crate::tui::wire;
+        for commit in [false, true] {
             let mut app = app();
-            active_modified_steer(&mut app);
-            app.apply(Update::GatewayRecovery(event(Kind::Begin, Vec::new())));
-            // Even if the same target survives replay, the unsent edit must not
-            // retain replacement authority or be automatically submitted.
-            replay(
-                &mut app,
-                Update::SteerAccepted {
-                    editable: true,
-                    id: "old-target".into(),
-                    text: "queued steering".into(),
+            app.start_prompt(
+                "old-request".to_owned().into(),
+                SubmittedPrompt {
+                    text: "pending steer".into(),
+                    attachments: vec![],
                 },
+                Some(wire::PromptDelivery::Steer),
             );
-            snapshot(&mut app, running);
-            app.apply(Update::GatewayRecovery(event(Kind::Commit, Vec::new())));
-            assert!(!app.gateway_blocked);
-            if running {
-                assert_eq!(app.pending_steers[0].text, "queued steering");
-            } else {
-                assert!(app.pending_steers.is_empty());
+            app.apply(Update::GatewayRecovery(event(Kind::Begin, Vec::new())));
+            if commit {
+                snapshot(&mut app, true);
             }
-            assert_both_drafts_recallable(&mut app);
-            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-            app.last_key = None;
-            assert!(matches!(
-                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                Action::Submit { prompt, .. }
-                    if prompt.text == "queued steering modified but unsent"
-            ));
+            let finish = if commit { Kind::Commit } else { Kind::Failed };
+            app.apply(Update::GatewayRecovery(event(finish, Vec::new())));
+            assert_eq!(app.editor.text(), "unsent draft");
+            assert_eq!(app.gateway_blocked, !commit);
+            app.apply(Update::PromptSettled {
+                id: "old-request".to_owned().into(),
+                result: Ok("message-1".into()),
+            });
+            assert_eq!(app.pending_prompts[0].prompt.text, "pending steer");
+            assert!(app.pending_prompts[0].status == PendingPromptStatus::OutcomeUnknown);
         }
     }
 

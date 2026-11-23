@@ -7,9 +7,10 @@ use agentkit_loop::{
 use async_trait::async_trait;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 pub(super) const KEY: &str = "dev.kit.acp.message_id";
+const PROMPT_KEY: &str = "dev.kit.acp.prompt_key";
 pub(super) const ORDER_KEY: &str = "dev.kit.acp.presentation_order";
 pub(super) const SECTIONS_KEY: &str = "dev.kit.acp.thought_sections";
 #[derive(serde::Deserialize)]
@@ -29,6 +30,91 @@ pub(super) fn stamp_user(items: &mut [agentkit_core::Item]) -> super::wire::Mess
         }
     }
     id
+}
+
+/// Record the retry key on the same item as its canonical wire identity.
+/// The session ID prevents inherited entries from claiming keys in a fork.
+/// Replay projects content and message ID, not this private item metadata.
+pub(super) fn stamp_prompt(
+    items: &mut [agentkit_core::Item],
+    request: &super::wire::PromptRequest,
+) -> super::wire::MessageId {
+    let id = stamp_user(items);
+    if let Some(key) = &request.idempotency_key {
+        let metadata = serde_json::Value::Object(serde_json::Map::from_iter([
+            (
+                "sessionId".into(),
+                serde_json::Value::String(request.session_id.to_string()),
+            ),
+            (
+                "key".into(),
+                serde_json::Value::String(key.as_str().to_owned()),
+            ),
+        ]));
+        for item in items.iter_mut().filter(|item| item.kind == ItemKind::User) {
+            item.metadata.insert(PROMPT_KEY.into(), metadata.clone());
+        }
+    }
+    id
+}
+
+pub(super) fn restored_prompt_keys(
+    session_id: &super::wire::SessionId,
+    transcript: &[agentkit_core::Item],
+) -> impl Iterator<Item = (super::wire::IdempotencyKey, super::wire::MessageId)> {
+    let session_id = session_id.to_string();
+    transcript.iter().filter_map(move |item| {
+        if item.kind != ItemKind::User {
+            return None;
+        }
+        let private = item.metadata.get(PROMPT_KEY)?;
+        if private.get("sessionId")?.as_str()? != session_id {
+            return None;
+        }
+        let key = super::wire::IdempotencyKey::new(private.get("key")?.as_str()?).ok()?;
+        let id = item.metadata.get(KEY)?.as_str()?;
+        if id.is_empty() {
+            return None;
+        }
+        Some((key, super::wire::MessageId::new(id)))
+    })
+}
+
+/// Index of committed user messages for the lifetime of one attachment. The
+/// actor is the only writer; receive handlers only clone a known message ID.
+#[derive(Default)]
+pub(super) struct PromptKeys(RwLock<HashMap<super::wire::IdempotencyKey, super::wire::MessageId>>);
+
+impl PromptKeys {
+    pub(super) fn restore(
+        session_id: &super::wire::SessionId,
+        transcript: &[agentkit_core::Item],
+    ) -> Self {
+        let mut keys = HashMap::new();
+        for (key, id) in restored_prompt_keys(session_id, transcript) {
+            keys.entry(key).or_insert(id);
+        }
+        Self(RwLock::new(keys))
+    }
+
+    pub(super) fn get(&self, key: &super::wire::IdempotencyKey) -> Option<super::wire::MessageId> {
+        self.0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    pub(super) fn record(&self, key: super::wire::IdempotencyKey, id: super::wire::MessageId) {
+        // Recovery is safe: the only guarded mutation inserts a complete pair
+        // of inert strings. Driver commitment precedes the lock; no callbacks,
+        // I/O, await, or response completion occur while holding it.
+        self.0
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key)
+            .or_insert(id);
+    }
 }
 
 pub(crate) struct Adapter<A> {

@@ -1,4 +1,5 @@
 // Handwritten Kit-specific presentation and private-extension adapters layered on ACP v2.
+import CryptoKit
 import Foundation
 
 enum JSONValue: Codable, Equatable {
@@ -73,7 +74,7 @@ enum JSONValue: Codable, Equatable {
 enum DesktopContentBlock: Codable, Equatable {
     case text(String)
     case image(data: String?, mimeType: String?, uri: String?)
-    case audio(data: String?, mimeType: String?)
+    case audio(data: String?, mimeType: String?, fingerprint: SHA256.Digest? = nil)
     case resourceLink(uri: String, name: String?, mimeType: String?)
     case resource(uri: String?, mimeType: String?, text: String?, blob: String?)
     case unknown(type: String)
@@ -101,7 +102,7 @@ enum DesktopContentBlock: Codable, Equatable {
         case .text(let text): try values.encode("text", forKey: .type); try values.encode(text, forKey: .text)
         case .image(let data, let mimeType, let uri):
             try values.encode("image", forKey: .type); try values.encodeIfPresent(data, forKey: .data); try values.encodeIfPresent(mimeType, forKey: .mimeType); try values.encodeIfPresent(uri, forKey: .uri)
-        case .audio(let data, let mimeType):
+        case .audio(let data, let mimeType, _):
             try values.encode("audio", forKey: .type); try values.encodeIfPresent(data, forKey: .data); try values.encodeIfPresent(mimeType, forKey: .mimeType)
         case .resourceLink(let uri, let name, let mimeType):
             try values.encode("resource_link", forKey: .type); try values.encode(uri, forKey: .uri); try values.encodeIfPresent(name, forKey: .name); try values.encodeIfPresent(mimeType, forKey: .mimeType)
@@ -115,14 +116,20 @@ enum DesktopContentBlock: Codable, Equatable {
         }
     }
 
-    fileprivate func limited(maximumBytes: Int, previewBytes: Int) -> DesktopContentBlock {
+    fileprivate func limited(maximumBytes: Int, previewBytes: Int, fingerprintAudio: Bool = false) -> DesktopContentBlock {
         switch self {
         case .text(let text): .text(JSONValue.limit(text, maximumBytes: maximumBytes, previewBytes: previewBytes))
         case .image(let data, let mimeType, let uri): .image(data: data.map { JSONValue.limit($0, maximumBytes: maximumBytes, previewBytes: previewBytes) }, mimeType: mimeType, uri: uri)
-        case .audio(let data, let mimeType): .audio(data: data.map { JSONValue.limit($0, maximumBytes: maximumBytes, previewBytes: previewBytes) }, mimeType: mimeType)
+        case .audio(let data, let mimeType, let fingerprint):
+            .audio(data: data.map { JSONValue.limit($0, maximumBytes: maximumBytes, previewBytes: previewBytes) }, mimeType: mimeType,
+                   fingerprint: fingerprint ?? (fingerprintAudio ? data.map(Self.audioFingerprint) : nil))
         case .resource(let uri, let mimeType, let text, let blob): .resource(uri: uri, mimeType: mimeType, text: text.map { JSONValue.limit($0, maximumBytes: maximumBytes, previewBytes: previewBytes) }, blob: blob.map { JSONValue.limit($0, maximumBytes: maximumBytes, previewBytes: previewBytes) })
         default: self
         }
+    }
+    // Match the exact payload sent on the wire before the transcript caps it.
+    static func audioFingerprint(_ base64: String) -> SHA256.Digest {
+        SHA256.hash(data: Data(base64.utf8))
     }
 }
 
@@ -372,7 +379,9 @@ enum DesktopUpdate: Equatable {
 
     func limited(maximumBytes: Int = 256 * 1024, previewBytes: Int = 16 * 1024) -> DesktopUpdate {
         switch self {
-        case .userMessage(var value): value.content = value.content.map { $0.limited(maximumBytes: maximumBytes, previewBytes: previewBytes) }; return .userMessage(value)
+        case .userMessage(var value):
+            value.content = value.content.map { $0.limited(maximumBytes: maximumBytes, previewBytes: previewBytes, fingerprintAudio: true) }
+            return .userMessage(value)
         case .agentMessage(var value): value.content = value.content.map { $0.limited(maximumBytes: maximumBytes, previewBytes: previewBytes) }; return .agentMessage(value)
         case .agentThought(var value): value.content = value.content.map { $0.limited(maximumBytes: maximumBytes, previewBytes: previewBytes) }; return .agentThought(value)
         case .toolCall(var value): value.rawInput = value.rawInput?.limitingPayloadStrings(maximumBytes: maximumBytes, previewBytes: previewBytes); value.rawOutput = value.rawOutput?.limitingPayloadStrings(maximumBytes: maximumBytes, previewBytes: previewBytes); return .toolCall(value)

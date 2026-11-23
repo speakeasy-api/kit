@@ -10,9 +10,7 @@ write_lock = threading.Lock()
 log_lock = threading.Lock()
 state_lock = threading.Lock()
 next_session = 1
-next_injection = 1
-# state_lock owns IDs and pending contents; delivery removes before emitting.
-pending_injections = {}
+next_steer = 1
 supports_fork = "--no-fork" not in sys.argv
 supports_steer = "--steer" in sys.argv
 supports_models = "--models" in sys.argv
@@ -38,10 +36,11 @@ new_release = option("--new-release")
 fork_release = option("--fork-release")
 prompt_release = option("--prompt-release")
 prompt_release_text = option("--prompt-release-text")
-inject_release = option("--inject-release")
-inject_ack_release = option("--inject-ack-release")
-mutation_ack_release = option("--mutation-ack-release")
-mutation_committed = option("--mutation-committed")
+steer_ack_release = option("--steer-ack-release")
+rollover_receipt_order = option("--rollover-receipt-order")
+prompt_receipt_order = rollover_receipt_order or option("--prompt-receipt-order")
+initial_foreground = option("--initial-foreground")
+repeat_idle_before = option("--repeat-idle-before")
 close_release = option("--close-release")
 close_release_session = option("--close-release-session")
 fail_close_session = option("--fail-close-session")
@@ -97,9 +96,8 @@ def log_request(request):
         entry["additionalDirectories"] = params["additionalDirectories"]
     if request.get("method") == "session/prompt":
         entry["text"] = params["prompt"][0]["text"]
-    if request.get("method") == "session/inject":
-        entry["text"] = params["content"][0]["text"]
-        entry["mode"] = params["mode"]
+        if params.get("delivery") is not None:
+            entry["delivery"] = params["delivery"]
     if request.get("method") is None and "result" in request:
         entry["id"] = request.get("id")
         entry["result"] = request["result"]
@@ -135,6 +133,20 @@ def fork(request):
     respond(request["id"], {"sessionId": session_id})
 
 
+def session_update(session_id, update):
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+
+
+def rollover_turn(session_id, message_id, content, started=True):
+    if started:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+    session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                "content": content})
+    session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "agent-" + message_id,
+                                "content": {"type": "text", "text": "unrelated reply"}})
+    session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+
+
 def prompt(request):
     params = request["params"]
     session_id = params["sessionId"]
@@ -142,8 +154,139 @@ def prompt(request):
     if "MOCK_REJECT" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "prompt rejected"}})
         return
-    respond(request["id"], {"messageId": "user-1"})
-    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "running"}}})
+    message_id = f"user-{request['id']}" if supports_steer else "user-1"
+    if rollover_receipt_order:
+        rollover_turn(session_id, "rollover-before", params["prompt"],
+                      started=rollover_receipt_order != "after-echo")
+    output_overflow_case = text in ("MOCK_CAPTURE_IMAGE_ECHOES", "MOCK_CAPTURE_ANSWER_OVERFLOW")
+    delayed_receipt = prompt_receipt_order == "after-idle" or output_overflow_case
+    pre_echo_answer = text == "MOCK_CAPTURE_PRE_ECHO"
+    if prompt_receipt_order != "after-echo" and not delayed_receipt and not pre_echo_answer:
+        respond(request["id"], {"messageId": message_id})
+    if text in ("MOCK_ACTIVE_BEFORE_ECHO", "MOCK_UNRELATED_ROLLOVERS"):
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+        time.sleep(0.2)  # Let the waiter observe Idle if it already has the receipt.
+        session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before or "running"})
+        if prompt_receipt_order == "after-echo":
+            # Deliberately put the receipt after activation but before the live echo.
+            respond(request["id"], {"messageId": message_id})
+        if text == "MOCK_UNRELATED_ROLLOVERS":
+            session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+            for index in range(12):
+                rollover_turn(session_id, f"wrong-{index}", params["prompt"])
+                time.sleep(1)
+            return
+        time.sleep(6)  # A stale Idle must not expire while this foreground turn is active.
+        session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                    "content": params["prompt"]})
+        session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "active-answer",
+                                    "content": {"type": "text", "text": "late echo after activation"}})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        return
+    if text in ("MOCK_MISSING_ECHO", "MOCK_LATE_ECHO"):
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+        session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "unmatched-answer",
+                                    "content": {"type": "text", "text": "unmatched answer"}})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        if delayed_receipt or prompt_receipt_order == "after-echo":
+            respond(request["id"], {"messageId": message_id})
+        if text == "MOCK_LATE_ECHO":
+            session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                        "content": params["prompt"]})
+            session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "matched-answer",
+                                        "content": {"type": "text", "text": "matched answer"}})
+            session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        elif request_log is not None:
+            with open(request_log + ".uncorrelated-idle", "w", encoding="utf-8"):
+                pass
+        return
+    answerless = text in ("MOCK_ANSWERLESS_IDLE", "MOCK_MALFORMED_THOUGHTS")
+    if "--omit-prompt-running" not in sys.argv and not repeat_idle_before and not answerless:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+    if text == "MOCK_CAPTURE_TRUNCATED_TERMINAL":
+        for _ in range(5):
+            session_update(session_id, {
+                "sessionUpdate": "terminal_output_chunk", "terminalId": "terminal-1",
+                "data": "A" * (4 * 1024 * 1024),
+            })
+        text = "terminal output truncated"
+    if pre_echo_answer:
+        # Another insertion in this foreground turn is not a rollover boundary.
+        session_update(session_id, {"sessionUpdate": "user_message", "messageId": "same-turn-steer",
+                                    "content": [{"type": "text", "text": "same turn steer"}]})
+        session_update(session_id, {
+            "sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
+            "content": {"type": "text", "text": "before "},
+        })
+        if prompt_receipt_order != "after-echo" and not delayed_receipt:
+            respond(request["id"], {"messageId": message_id})
+        text = "after"
+    if supports_steer and text != "MOCK_CAPTURE_IMAGE_ECHOES":
+        session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                    "content": params["prompt"]})
+    if repeat_idle_before:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+        if repeat_idle_before != "none":
+            session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before})
+    if prompt_receipt_order == "after-echo" and not delayed_receipt:
+        respond(request["id"], {"messageId": message_id})
+    if text in ("MOCK_LONG_THOUGHT_NO_RUNNING", "MOCK_LONG_WHOLE_THOUGHT_NO_RUNNING"):
+        thought = {"type": "text", "text": "thinking"}
+        whole = text == "MOCK_LONG_WHOLE_THOUGHT_NO_RUNNING"
+        session_update(session_id, {"sessionUpdate": "agent_thought" if whole else "agent_thought_chunk",
+                                    "messageId": "thought-1", "content": [thought] if whole else thought})
+        time.sleep(6)  # The real Idle arrives after Kit's ambiguity window.
+        text = "streaming"
+    answer_patches = {"MOCK_ANSWER_PATCH_OMITTED": {},
+                      "MOCK_ANSWER_PATCH_NULL": {"content": None},
+                      "MOCK_ANSWER_PATCH_EMPTY": {"content": []},
+                      "MOCK_ANSWER_PATCH_EMPTY_TEXT": {"content": [{"type": "text", "text": ""}]},
+                      "MOCK_ANSWER_PATCH_EMPTY_CHUNK": {"sessionUpdate": "agent_message_chunk",
+                                                       "content": {"type": "text", "text": ""}}}
+    if text in answer_patches:
+        session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer",
+                                    **answer_patches[text]})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+        # No Running update: only the real answer can verify the next Idle.
+        session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer",
+                                    "content": [{"type": "text", "text": "real answer"}]})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        return
+    if answerless:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "error"})
+        if text == "MOCK_MALFORMED_THOUGHTS":
+            session_update(session_id, {"sessionUpdate": "agent_thought"})
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk"})
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk",
+                                        "content": {"type": "text", "text": "missing message ID"}})
+            for i, patch in enumerate(({}, {"content": None}, {"content": []},
+                                       {"content": [{"type": "text"}]},
+                                       {"content": [{"type": "text", "text": ""}]})):
+                session_update(session_id, {"sessionUpdate": "agent_thought",
+                                            "messageId": f"empty-thought-{i}", **patch})
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "empty-chunk",
+                                        "content": {"type": "text", "text": ""}})
+            empty_extension = {"type": "_empty"}
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "extension-chunk",
+                                        "content": empty_extension})
+            session_update(session_id, {"sessionUpdate": "agent_thought", "messageId": "extension-replacement",
+                                        "content": [{**empty_extension, "_meta": {"hint": "ignored"}}]})
+        if delayed_receipt:
+            respond(request["id"], {"messageId": message_id})
+        return
+    if text == "MOCK_CAPTURE_IMAGE_ECHOES":
+        for _ in range(5):
+            session_update(session_id, {
+                "sessionUpdate": "user_message_chunk", "messageId": message_id,
+                "content": {"type": "image", "mimeType": "image/png", "data": "A" * (4 * 1024 * 1024)},
+            })
+        text = "images echoed"
+    if text == "MOCK_CAPTURE_ANSWER_OVERFLOW":
+        for _ in range(5):
+            session_update(session_id, {
+                "sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
+                "content": {"type": "text", "text": "x" * (4 * 1024 * 1024)},
+            })
     if "MOCK_PERMISSION" in text:
         send({
             "jsonrpc": "2.0", "id": "permission-1", "method": "session/request_permission",
@@ -300,70 +443,40 @@ def prompt(request):
         },
     })
     send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn", "usage": {"totalTokens": 12, "inputTokens": 7, "outputTokens": 5}}}})
+    if delayed_receipt:
+        if rollover_receipt_order or output_overflow_case:
+            rollover_turn(session_id, "rollover-after", params["prompt"])
+        respond(request["id"], {"messageId": message_id})
     if "--exit-after-prompt" in sys.argv:
         time.sleep(0.05)
         os._exit(0)
 
 
-def inject(request):
-    global next_injection
+def steer_prompt(request):
+    global next_steer
     params = request["params"]
-    text = next((block.get("text", "") for block in params["content"] if block.get("type") == "text"), "")
-    if "MOCK_AUTH_INJECT" in text:
+    text = next((block.get("text", "") for block in params["prompt"] if block.get("type") == "text"), "")
+    if "MOCK_AUTH_STEER" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {
             "code": -32000, "message": "remote-secret-message",
             "data": {"methodId": "selected-login", "token": "remote-secret-data"},
         }})
         return
-    if "MOCK_REJECT_INJECT" in text:
-        send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "injection rejected"}})
+    if "MOCK_REJECT_STEER" in text:
+        send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "steer rejected"}})
         return
     with state_lock:
-        message_id = f"injected-{next_injection}"
-        next_injection += 1
-        pending_injections[message_id] = (params["sessionId"], params["content"])
-    while inject_ack_release is not None and not os.path.exists(inject_ack_release):
+        message_id = f"steered-{next_steer}"
+        next_steer += 1
+    while steer_ack_release is not None and not os.path.exists(steer_ack_release):
         time.sleep(0.01)
     respond(request["id"], {"messageId": message_id})
-    if inject_ack_release is not None:
-        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "notice", "title": "Injection acknowledged"}}})
-    while inject_release is not None and not os.path.exists(inject_release):
-        time.sleep(0.01)
-    with state_lock:
-        pending = pending_injections.pop(message_id, None)
-    if pending is not None:
-        send({
-            "jsonrpc": "2.0", "method": "session/update",
-            "params": {"sessionId": pending[0], "update": {
-                "sessionUpdate": "user_message", "messageId": message_id, "content": pending[1],
-            }},
-        })
-
-
-def mutate_pending_injection(request):
-    params = request["params"]
-    replacement = params.get("content")
-    rejected = replacement is not None and any("MOCK_REJECT_REPLACE" in block.get("text", "") for block in replacement)
-    with state_lock:
-        pending = pending_injections.get(params["messageId"])
-        accepted = not rejected and pending is not None and pending[0] == params["sessionId"]
-        if accepted:
-            if replacement is None:
-                del pending_injections[params["messageId"]]
-            else:
-                pending_injections[params["messageId"]] = (pending[0], replacement)
-    if mutation_committed is not None:
-        with open(mutation_committed, "w", encoding="utf-8") as marker:
-            marker.write("committed" if accepted else "rejected")
-    # No I/O or callbacks while state_lock is held. Delayed replies exercise
-    # delivery racing an already committed mutation without resurrecting rows.
-    while mutation_ack_release is not None and not os.path.exists(mutation_ack_release):
-        time.sleep(0.01)
-    if accepted:
-        respond(request["id"], {})
-    else:
-        send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "pending injection unavailable or rejected"}})
-    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "notice", "title": "Mutation acknowledged"}}})
+    send({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": params["sessionId"], "update": {
+            "sessionUpdate": "user_message", "messageId": message_id, "content": params["prompt"],
+        }},
+    })
 
 
 def close(request):
@@ -404,9 +517,12 @@ for line in sys.stdin:
             "info": {"name": "mock-acp", "version": "2.0.0"},
             "authMethods": [{"type": "agent", "methodId": "browser-login", "name": "secret-name", "description": "secret-description"}],
             "capabilities": {"session": {
-                "prompt": {name: {} for name in prompt_capability_names if name},
+                "prompt": {
+                    **{name: {} for name in prompt_capability_names if name},
+                    **({"delivery": {"steer": {}}} if supports_steer else {}),
+                },
+                **({"fork": {}} if supports_fork else {}),
                 **({"additionalDirectories": {}} if "--additional-directories" in sys.argv else {}),
-                **({"inject": {"modes": ["steer"], "steerInStream": ["finish"], "pending": {"replace": "--pending-replace" in sys.argv}}} if supports_steer else {}),
             }},
         })
     elif method == "session/new":
@@ -433,6 +549,11 @@ for line in sys.stdin:
                     {"value": value, "name": value} for value in model_ids
                 ],
             }]
+        if initial_foreground:
+            update = {"sessionUpdate": "state_update", "state": initial_foreground}
+            if initial_foreground == "idle":
+                update["stopReason"] = "refusal"
+            session_update(session_id, update)
         respond(request["id"], result)
         if "--crash-after-new" in sys.argv:
             threading.Thread(target=lambda: (time.sleep(0.05), os._exit(86)), daemon=True).start()
@@ -524,11 +645,13 @@ for line in sys.stdin:
         else:
             respond(request["id"], {"receipt": {"accepted": True}})
     elif method == "session/prompt":
-        threading.Thread(target=prompt, args=(request,), daemon=True).start()
-    elif method == "session/inject":
-        threading.Thread(target=inject, args=(request,), daemon=True).start()
-    elif method in ("session/replace_inject", "session/revoke_inject"):
-        threading.Thread(target=mutate_pending_injection, args=(request,), daemon=True).start()
+        delivery = request["params"].get("delivery")
+        if delivery is None:
+            threading.Thread(target=prompt, args=(request,), daemon=True).start()
+        elif delivery == "steer" and supports_steer:
+            threading.Thread(target=steer_prompt, args=(request,), daemon=True).start()
+        else:
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "unsupported prompt delivery"}})
     elif method == "session/set_config_option":
         params = request["params"]
         value = params["value"]

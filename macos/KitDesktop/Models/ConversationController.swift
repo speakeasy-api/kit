@@ -49,15 +49,16 @@ final class ConversationController: ObservableObject {
     @Published private(set) var agentRoster = AgentRoster()
     @Published private(set) var runtimeSessionID: String?
     @Published private(set) var pendingSteers: [PendingSteer] = []
+    @Published private(set) var savedDrafts: [SavedDraft] = []
     @Published private(set) var canSteer = false
-    @Published private(set) var isInjecting = false
-    @Published private(set) var isMutatingSteerIDs: Set<String> = []
-    var supportsPendingSteerEdit: Bool { client.supportsPendingSteerEdit }
+    @Published private var ordinaryPromptPending = false
 
     struct PendingSteer: Identifiable, Equatable {
-        let id: String
+        let id = UUID()
         let text: String
         let attachmentCount: Int
+        var requestID: Int?
+        var isWithdrawing = false
 
         var summary: String {
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
@@ -65,10 +66,22 @@ final class ConversationController: ObservableObject {
         }
     }
 
+    struct SavedDraft: Identifiable {
+        let id = UUID()
+        let text: String
+        let attachments: [Attachment]
+
+        var summary: String {
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
+            return attachments.map { $0.url.lastPathComponent }.joined(separator: ", ")
+        }
+    }
+
     let conversationID: UUID
     var canCancel: Bool { foregroundRunning }
     var acceptsInput: Bool {
-        isReady && ((foregroundRunning && canSteer && !isInjecting) || (!foregroundRunning && autonomousTurns.isEmpty))
+        isReady && (foregroundRunning ? canSteer
+            : autonomousTurns.isEmpty && !ordinaryPromptPending && pendingSteers.isEmpty)
     }
     private enum Turn: Hashable { case foreground(UUID), autonomous(Int) }
     private enum Settlement {
@@ -77,22 +90,6 @@ final class ConversationController: ObservableObject {
         case processExit(Int32)
         case shutdown
     }
-    private struct ComposerTransaction {
-        let turn: Turn
-        let text: String
-        let originalDraft: String
-        let attachments: [Attachment]
-        var transcriptEntryID: UUID?
-        var echoedText = ""
-        var echoedTextComplete = false
-        var echoedAttachmentIndex = 0
-    }
-
-    private struct InjectionSnapshot {
-        let text: String
-        let attachments: [Attachment]
-    }
-
     var shouldPresentAgentRoster: Bool {
         !client.childSessions.roster.rowsByID.isEmpty || runtimeTransportAvailable != false && Self.shouldPresentAgentRoster(
             expectedSessionID: expectedRuntimeSessionID, runtimeSessionID: runtimeSessionID,
@@ -129,7 +126,10 @@ final class ConversationController: ObservableObject {
     private var latestAssistantSource = ""
     private var activeTurns: Set<Turn> = []
     private var settledTurns: Set<Turn> = []
-    private var composerTransaction: ComposerTransaction?
+    private var locallyRenderedMessages: Set<String> = []
+    private var localAudioByMessageID: [String: [PromptAudioAttachment]] = [:]
+    private var localAudioMessageOrder: [String] = []
+    private var steerAcceptedWhileIdle = false
     private var shuttingDown = false
     private var retrying = false
     private var clientGeneration: UInt64 = 0
@@ -280,37 +280,90 @@ final class ConversationController: ObservableObject {
             return
         }
         let turn = Turn.foreground(UUID())
-        composerTransaction = ComposerTransaction(turn: turn, text: text, originalDraft: draft, attachments: files)
+        steerAcceptedWhileIdle = false
+        ordinaryPromptPending = true
         draft = ""
         attachments = []
         latestAssistantSource = ""
         foregroundStartedAt = nil
         status = "Sending…"
         reduceSettlement(.started(turn, prompt: text))
-        client.prompt(text: text, attachments: files, onSent: { [weak self] in
-            guard let self, self.composerTransaction?.turn == turn else { return }
+        let activeClient = client
+        let generation = clientGeneration
+        activeClient.prompt(text: text, attachments: files, onSent: { [weak self] _ in
+            guard let self, self.activeTurns.contains(turn) else { return }
             self.foregroundStartedAt = self.clock.now
-            self.status = "Running…"
-            let media = files.map { file in
-                UserMediaPresentation(kind: file.kind, mimeType: file.mimeType, name: file.url.lastPathComponent, url: file.url)
-            }
-            let blocks: [DesktopContentBlock] = [.text(text)] + files.map { file in
-                file.kind == .image ? .image(data: nil, mimeType: file.mimeType, uri: file.url.absoluteString) : .audio(data: nil, mimeType: file.mimeType)
-            }
-            let entry = TranscriptEntry(
-                role: .user, text: text, contentBlocks: blocks,
-                presentation: .user(UserMessagePresentation(text: text, media: media))
-            )
-            self.appendEntry(entry)
-            self.composerTransaction?.transcriptEntryID = entry.id
-        }) { [weak self] result in
-            guard let self else { return }
+        }) { [weak self, weak activeClient] result in
+            guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
+            self.ordinaryPromptPending = false
             switch result {
-            case .failure(let error): self.reduceSettlement(.terminal(turn, reason: "error", error: error))
-            case .success:
-                // ACP v2 acknowledges prompt acceptance here. State updates settle the turn.
-                break
+            case .failure(let error):
+                if case ACPClientError.remote(-32800, _) = error {
+                    self.reduceSettlement(.terminal(turn, reason: "cancelled", error: nil))
+                } else {
+                    self.restorePrompt(text: text, attachments: files)
+                    self.fail(error)
+                    self.reduceSettlement(.terminal(turn, reason: "error", error: error))
+                }
+            case .success(let response):
+                self.showAcceptedPrompt(response, text: text, attachments: files)
             }
+        }
+    }
+
+    private func showAcceptedPrompt(_ receipt: PromptReceipt, text: String, attachments: [Attachment]) {
+        let id = receipt.messageId
+        reconcileLocalAudio(receipt)
+        let identity = MessageIdentity(role: TranscriptRole.user.rawValue, id: id)
+        guard messageEntryIDs[identity] == nil else { return }
+        // The response proves insertion. If the agent's update arrives later,
+        // reconcile the local presentation with the first full message or chunk.
+        let media = attachments.map { file in
+            UserMediaPresentation(kind: file.kind, mimeType: file.mimeType, name: file.url.lastPathComponent, url: file.url)
+        }
+        let blocks: [DesktopContentBlock] = [.text(text)] + attachments.map { file in
+            file.kind == .image
+                ? .image(data: nil, mimeType: file.mimeType, uri: file.url.absoluteString)
+                : .audio(data: nil, mimeType: file.mimeType, fingerprint: receipt.audio.first { $0.file.id == file.id }?.fingerprint)
+        }
+        let entry = TranscriptEntry(role: .user, text: text, contentBlocks: blocks,
+                                    presentation: .user(UserMessagePresentation(text: text, media: media)))
+        appendEntry(entry)
+        messageEntryIDs[identity] = entry.id
+        locallyRenderedMessages.insert(id)
+    }
+
+    private func reconcileLocalAudio(_ receipt: PromptReceipt) {
+        guard !receipt.audio.isEmpty else { return }
+        if localAudioByMessageID.updateValue(receipt.audio, forKey: receipt.messageId) == nil {
+            localAudioMessageOrder.append(receipt.messageId)
+            // A steer receipt can arrive before any echo. Keep these references bounded too.
+            if localAudioMessageOrder.count > Self.maximumEntries {
+                localAudioByMessageID.removeValue(forKey: localAudioMessageOrder.removeFirst())
+            }
+        }
+        let identity = MessageIdentity(role: TranscriptRole.user.rawValue, id: receipt.messageId)
+        guard let entryID = messageEntryIDs[identity], let index = transcriptIndex(for: entryID) else { return }
+        let media = userMedia(entries[index].contentBlocks, messageID: receipt.messageId)
+        changedTranscriptIndices.insert(index)
+        entries[index].presentation = .user(UserMessagePresentation(text: entries[index].text, media: media))
+        transcriptRevision += 1
+    }
+
+    private func userMedia(_ blocks: [DesktopContentBlock], messageID: String) -> [UserMediaPresentation] {
+        var files = localAudioByMessageID[messageID] ?? []
+        return blocks.flatMap { block -> [UserMediaPresentation] in
+            if case .audio(let data, let mimeType?, let fingerprint?) = block,
+               let index = files.firstIndex(where: { $0.fingerprint == fingerprint && $0.file.mimeType == mimeType }) {
+                let file = files.remove(at: index).file
+                // A complete echo is a snapshot of what was sent. Only consult the mutable
+                // source file when the echoed bytes are missing or were truncated.
+                let echoedData = data.flatMap { Data(base64Encoded: $0) }
+                return [UserMediaPresentation(id: file.id, kind: .audio, mimeType: mimeType,
+                                              name: file.url.lastPathComponent, data: echoedData,
+                                              url: echoedData == nil ? file.url : nil)]
+            }
+            return Self.userContent(block).media
         }
     }
 
@@ -523,43 +576,29 @@ final class ConversationController: ObservableObject {
 
     private func applyMessage(_ message: DesktopMessageUpdate, role: TranscriptRole) {
         let identity = MessageIdentity(role: role.rawValue, id: message.messageId)
-        let deliveredSteer = role == .user && pendingSteers.contains(where: { $0.id == message.messageId })
-        if deliveredSteer { pendingSteers.removeAll { $0.id == message.messageId }; isMutatingSteerIDs.remove(message.messageId) }
-        if message.replace, !message.hasContent {
-            if role == .user, !deliveredSteer, let optimistic = composerTransaction?.transcriptEntryID {
-                messageEntryIDs[identity] = optimistic
-            }
-            return
-        }
-        if role == .user, !deliveredSteer, composerTransaction != nil {
-            if !message.content.isEmpty, consumeComposerEcho(message.content, requireComplete: message.replace) {
-                if let optimistic = composerTransaction?.transcriptEntryID { messageEntryIDs[identity] = optimistic }
-                return
-            }
-            if message.replace, let optimistic = composerTransaction?.transcriptEntryID {
-                messageEntryIDs[identity] = optimistic
-            }
-        }
+        guard !message.replace || message.hasContent else { return }
+        let replacesLocalContent = role == .user && locallyRenderedMessages.remove(message.messageId) != nil
+        let replacesContent = message.replace || replacesLocalContent
         let blocks = message.content
         let text = blocks.map(Self.contentText).joined()
         if role == .assistant { latestAssistantSource = TranscriptContentBuffer.text(message.replace ? text : latestAssistantSource + text) }
         if let entryID = messageEntryIDs[identity], let index = transcriptIndex(for: entryID) {
-            if message.replace {
+            if replacesContent {
                 changedTranscriptIndices.insert(index)
                 entries[index].contentBlocks = TranscriptContentBuffer.append(blocks)
                 changedTranscriptIndices.insert(index)
                 entries[index].text = TranscriptContentBuffer.text(text)
-                if role == .user {
-                    changedTranscriptIndices.insert(index)
-                    entries[index].presentation = .user(UserMessagePresentation(
-                        text: entries[index].text, media: blocks.flatMap { Self.userContent($0).media }
-                    ))
-                }
             } else {
                 changedTranscriptIndices.insert(index)
                 entries[index].contentBlocks = TranscriptContentBuffer.append(blocks, to: entries[index].contentBlocks)
                 changedTranscriptIndices.insert(index)
                 entries[index].text = TranscriptContentBuffer.text(entries[index].text + text)
+            }
+            if role == .user {
+                let changesMedia = replacesContent || blocks.contains { if case .text = $0 { return false }; return true }
+                let media = changesMedia ? userMedia(entries[index].contentBlocks, messageID: message.messageId)
+                    : entries[index].presentation?.userMessage?.media ?? []
+                entries[index].presentation = .user(UserMessagePresentation(text: entries[index].text, media: media))
             }
             changedTranscriptIndices.insert(index)
             entries[index].formatted = nil
@@ -570,11 +609,12 @@ final class ConversationController: ObservableObject {
             return
         }
         let limitedText = TranscriptContentBuffer.text(text)
+        let retainedBlocks = TranscriptContentBuffer.append(blocks)
         let presentation: TranscriptPresentation? = role == .user
-            ? .user(UserMessagePresentation(text: limitedText, media: blocks.flatMap { Self.userContent($0).media }))
+            ? .user(UserMessagePresentation(text: limitedText, media: userMedia(retainedBlocks, messageID: message.messageId)))
             : nil
         let entry = TranscriptEntry(
-            role: role, text: limitedText, isStreaming: true, contentBlocks: TranscriptContentBuffer.append(blocks), presentation: presentation
+            role: role, text: limitedText, isStreaming: true, contentBlocks: retainedBlocks, presentation: presentation
         )
         appendEntry(entry)
         messageEntryIDs[identity] = entry.id
@@ -584,6 +624,12 @@ final class ConversationController: ObservableObject {
     private func applySessionState(_ state: DesktopSessionState) {
         switch state.state {
         case "running":
+            if !foregroundRunning, !pendingSteers.isEmpty || steerAcceptedWhileIdle {
+                // A held steer can start the next turn if the prior turn ended first.
+                foregroundStartedAt = clock.now
+                reduceSettlement(.started(.foreground(UUID()), prompt: ""))
+            }
+            steerAcceptedWhileIdle = false
             canSteer = client.supportsSteering && foregroundRunning
             status = "Running…"
         case "requires_action":
@@ -591,7 +637,7 @@ final class ConversationController: ObservableObject {
             status = "Action required"
         case "idle":
             canSteer = false
-            pendingSteers.removeAll(); isMutatingSteerIDs.removeAll()
+            steerAcceptedWhileIdle = false
             if let usage = state.usage { tokenUsage = usage }
             if let turn = activeTurns.first(where: { if case .foreground = $0 { return true }; return false }) {
                 reduceSettlement(.terminal(turn, reason: state.stopReason ?? "end_turn", error: nil))
@@ -757,7 +803,13 @@ final class ConversationController: ObservableObject {
             for entry in entries.prefix(count) {
                 if let callID = entry.toolCallID { toolStates.removeValue(forKey: callID) }
             }
+            let evictedAudioIDs = Set(messageEntryIDs.compactMap { identity, entryID in
+                identity.role == TranscriptRole.user.rawValue && removed.contains(entryID) ? identity.id : nil
+            })
+            for id in evictedAudioIDs { localAudioByMessageID.removeValue(forKey: id) }
+            localAudioMessageOrder.removeAll { evictedAudioIDs.contains($0) }
             messageEntryIDs = messageEntryIDs.filter { !removed.contains($0.value) }
+            locallyRenderedMessages = locallyRenderedMessages.filter { messageEntryIDs[MessageIdentity(role: TranscriptRole.user.rawValue, id: $0)] != nil }
             planEntryIDs = planEntryIDs.filter { !removed.contains($0.value) }
             rebuildTranscriptProjection = true; entries.removeFirst(count)
             streamingEntryIDs.subtract(removed)
@@ -872,38 +924,6 @@ final class ConversationController: ObservableObject {
         transcriptRevision += 1
     }
 
-    private func consumeComposerEcho(_ contents: [DesktopContentBlock], requireComplete: Bool) -> Bool {
-        guard var transaction = composerTransaction else { return false }
-        for content in contents {
-            switch content {
-            case .text(let text):
-                if transaction.text.isEmpty {
-                    guard text.isEmpty else { return false }
-                    transaction.echoedTextComplete = true
-                } else {
-                    guard !transaction.echoedTextComplete else { return false }
-                    let candidate = transaction.echoedText + text
-                    guard transaction.text.hasPrefix(candidate) else { return false }
-                    transaction.echoedText = candidate
-                    transaction.echoedTextComplete = candidate == transaction.text
-                }
-            case .image:
-                guard transaction.echoedAttachmentIndex < transaction.attachments.count, transaction.attachments[transaction.echoedAttachmentIndex].kind == .image else { return false }
-                transaction.echoedAttachmentIndex += 1
-            case .audio:
-                guard transaction.echoedAttachmentIndex < transaction.attachments.count, transaction.attachments[transaction.echoedAttachmentIndex].kind == .audio else { return false }
-                transaction.echoedAttachmentIndex += 1
-            default: return false
-            }
-        }
-        if requireComplete {
-            guard (transaction.text.isEmpty || transaction.echoedTextComplete),
-                  transaction.echoedAttachmentIndex == transaction.attachments.count else { return false }
-        }
-        composerTransaction = transaction
-        return true
-    }
-
     private func reduceSettlement(_ event: Settlement) {
         switch event {
         case .started(let turn, let prompt):
@@ -927,16 +947,6 @@ final class ConversationController: ObservableObject {
                 foregroundStartedAt = nil
                 foregroundRunning = false
                 canSteer = false
-                isInjecting = false
-                pendingSteers.removeAll(); isMutatingSteerIDs.removeAll()
-                if let transaction = composerTransaction, transaction.turn == turn {
-                    if let error {
-                        restoreComposer(transaction)
-                        if let entryID = transaction.transcriptEntryID { rebuildTranscriptProjection = true; entries.removeAll { $0.id == entryID } }
-                        fail(error)
-                    }
-                    composerTransaction = nil
-                }
             case .autonomous(let id):
                 appendTurnDuration(since: autonomousStartedAt.removeValue(forKey: id))
                 autonomousTurns.remove(id)
@@ -955,6 +965,7 @@ final class ConversationController: ObservableObject {
         case .shutdown:
             guard !shuttingDown else { return }
             shuttingDown = true
+            pendingSteers.removeAll()
             status = "Closing…"
             isReady = false
             isUpdatingConfig = false
@@ -964,98 +975,71 @@ final class ConversationController: ObservableObject {
         }
     }
 
-    private func restoreComposer(_ transaction: ComposerTransaction) {
-        if draft.isEmpty { draft = transaction.originalDraft }
-        else if !transaction.originalDraft.isEmpty, draft != transaction.originalDraft { draft = transaction.originalDraft + "\n" + draft }
-        var restored = transaction.attachments
-        restored.append(contentsOf: attachments.filter { current in !restored.contains(where: { $0.url == current.url }) })
-        attachments = restored
-    }
-
     private func sendSteer(text: String, attachments files: [Attachment]) {
-        guard let turn = activeTurns.first(where: { if case .foreground = $0 { return true }; return false }) else { return }
-        let snapshot = InjectionSnapshot(text: text, attachments: files)
+        let item = PendingSteer(text: text, attachmentCount: files.count)
+        pendingSteers.append(item)
         draft = ""
         attachments = []
-        isInjecting = true
-        status = "Queueing…"
         let activeClient = client
         let generation = clientGeneration
-        activeClient.inject(text: text, attachments: files) { [weak self, weak activeClient] result in
+        activeClient.prompt(text: text, attachments: files, delivery: .steer, onSent: { [weak self] requestID in
+            guard let self, let index = self.pendingSteers.firstIndex(where: { $0.id == item.id }) else { return }
+            self.pendingSteers[index].requestID = requestID
+        }) { [weak self, weak activeClient] result in
             guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
-            guard self.activeTurns.contains(turn) else { return }
-            self.isInjecting = false
+            self.pendingSteers.removeAll { $0.id == item.id }
             switch result {
+            case .failure(ACPClientError.remote(-32800, _)):
+                break // The agent did not insert the steer.
             case .failure(let error):
-                self.restoreInjection(snapshot)
+                self.restorePrompt(text: text, attachments: files)
                 self.fail(error)
-            case .success(let response):
-                guard self.foregroundRunning else { return }
-                self.pendingSteers.append(PendingSteer(
-                    id: response.messageId, text: text, attachmentCount: files.count
-                ))
-                self.status = "Running…"
+            case .success(let receipt):
+                self.reconcileLocalAudio(receipt)
+                // A user_message update owns placement and content, whether it
+                // arrived already or follows this insertion acknowledgement.
+                if !self.foregroundRunning { self.steerAcceptedWhileIdle = true }
             }
         }
     }
 
-    func replacePendingSteer(id: String, text: String) {
-        guard supportsPendingSteerEdit, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              pendingSteers.first(where: { $0.id == id })?.attachmentCount == 0 else { return }
-        mutatePendingSteer(id: id, replacement: text)
+    func withdrawPendingSteer(id: UUID) {
+        guard isReady, !shuttingDown,
+              let index = pendingSteers.firstIndex(where: { $0.id == id }),
+              let requestID = pendingSteers[index].requestID, !pendingSteers[index].isWithdrawing else { return }
+        pendingSteers[index].isWithdrawing = true
+        client.withdrawPrompt(requestID: requestID)
     }
 
-    func revokePendingSteer(id: String) {
-        mutatePendingSteer(id: id, replacement: nil)
+    private func restorePrompt(text: String, attachments files: [Attachment]) {
+        let snapshot = SavedDraft(text: text, attachments: files)
+        if !mergeDraft(snapshot) { savedDrafts.append(snapshot) }
     }
 
-    private func mutatePendingSteer(id: String, replacement: String?) {
-        guard isReady, client.supportsSteering, !shuttingDown, !isMutatingSteerIDs.contains(id),
-              pendingSteers.contains(where: { $0.id == id }),
-              let turn = activeTurns.first(where: { if case .foreground = $0 { return true }; return false }) else { return }
-        let activeClient = client
-        let generation = clientGeneration
-        isMutatingSteerIDs.insert(id)
-        let completion: (Result<[String: Any], Error>) -> Void = { [weak self, weak activeClient] result in
-            guard let self, let activeClient, !self.shuttingDown,
-                  self.isCurrentClient(activeClient, generation: generation), self.activeTurns.contains(turn) else { return }
-            self.isMutatingSteerIDs.remove(id)
-            // Delivery is authoritative: a late replacement/revoke reply never
-            // recreates a pending row or rewrites an already delivered prompt.
-            guard let index = self.pendingSteers.firstIndex(where: { $0.id == id }) else { return }
-            switch result {
-            case .failure(let error): self.fail(error)
-            case .success:
-                if let replacement {
-                    self.pendingSteers[index] = PendingSteer(id: id, text: replacement, attachmentCount: 0)
-                } else {
-                    self.pendingSteers.remove(at: index)
-                }
-            }
-        }
-        if let replacement {
-            activeClient.replacePendingSteer(id: id, text: replacement, completion: completion)
+    func restoreSavedDraft(id: UUID) {
+        guard let index = savedDrafts.firstIndex(where: { $0.id == id }) else { return }
+        let saved = savedDrafts[index]
+        if mergeDraft(saved) {
+            savedDrafts.remove(at: index)
         } else {
-            activeClient.revokePendingSteer(id: id, completion: completion)
+            // Keep both drafts intact; the composer can only hold one of them.
+            savedDrafts[index] = SavedDraft(text: draft, attachments: attachments)
+            draft = saved.text
+            attachments = saved.attachments
         }
     }
 
-    private func restoreInjection(_ snapshot: InjectionSnapshot) {
+    private func mergeDraft(_ snapshot: SavedDraft) -> Bool {
+        let restored = snapshot.attachments + attachments.filter { current in
+            !snapshot.attachments.contains { $0.url == current.url }
+        }
+        guard restored.count <= Self.maximumAttachmentCount,
+              restored.reduce(Int64(0), { $0 + $1.size }) <= Self.maximumTotalAttachmentBytes else { return false }
         if draft.isEmpty { draft = snapshot.text }
         else if !snapshot.text.isEmpty, draft != snapshot.text { draft = snapshot.text + "\n" + draft }
-        var restored = snapshot.attachments
-        var totalBytes = restored.reduce(Int64(0)) { $0 + $1.size }
-        for current in attachments where !restored.contains(where: { $0.url == current.url }) {
-            guard restored.count < Self.maximumAttachmentCount,
-                  totalBytes + current.size <= Self.maximumTotalAttachmentBytes
-            else { continue }
-            restored.append(current)
-            totalBytes += current.size
-        }
         attachments = restored
+        return true
     }
-
-
 
     private func recordDiagnostic(_ line: String, updateStatus: Bool = true) {
         diagnostics.append(line)
@@ -1090,6 +1074,9 @@ final class ConversationController: ObservableObject {
         rebuildTranscriptProjection = true; entries.removeAll(keepingCapacity: true)
         streamingEntryIDs.removeAll()
         messageEntryIDs.removeAll()
+        locallyRenderedMessages.removeAll()
+        localAudioByMessageID.removeAll()
+        localAudioMessageOrder.removeAll()
         planEntryIDs.removeAll()
         toolStates.removeAll()
         activeThoughtEntryID = nil
@@ -1201,8 +1188,9 @@ final class ConversationController: ObservableObject {
         isUpdatingConfig = false
         agentRoster = AgentRoster()
         canSteer = false
-        isInjecting = false
-        pendingSteers.removeAll(); isMutatingSteerIDs.removeAll()
+        ordinaryPromptPending = false
+        steerAcceptedWhileIdle = false
+        pendingSteers.removeAll()
     }
 
     // Matches diagnostic_transport::LEASE. Check before accepting each frame as well
@@ -1286,7 +1274,7 @@ final class ConversationController: ObservableObject {
                 kind: .image, mimeType: mimeType ?? "image/*",
                 data: data.flatMap { Data(base64Encoded: $0) }, url: uri.flatMap(URL.init(string:))
             )])
-        case .audio(let data, let mimeType):
+        case .audio(let data, let mimeType, _):
             return UserMessagePresentation(text: "", media: [UserMediaPresentation(
                 kind: .audio, mimeType: mimeType ?? "audio/*", data: data.flatMap { Data(base64Encoded: $0) }
             )])
@@ -1385,7 +1373,7 @@ final class ConversationController: ObservableObject {
         switch content {
         case .text(let text): return text
         case .image(_, let mimeType, let uri): return uri.map { "[Image output](\($0))" } ?? "Image output (inline \(mimeType ?? "image"))"
-        case .audio(_, let mimeType): return "Audio output (inline \(mimeType ?? "audio"))"
+        case .audio(_, let mimeType, _): return "Audio output (inline \(mimeType ?? "audio"))"
         case .resourceLink(let uri, _, _): return uri
         case .resource(let uri, let mimeType, let text, _): return text ?? uri ?? "Resource output (inline \(mimeType ?? "resource"))"
         case .unknown(let type): return "Unsupported content (\(type))"

@@ -1,9 +1,10 @@
 # Pinned ACP v2 schema
 
-`acp-v2.schema.json` and `acp-v2.meta.json` are copied verbatim from the ACP
-unstable v2 schema at `danielkov/agent-client-protocol` commit
-`b7ddb8370e72e3adb6b895f879876cdd3f717ab9`, the source of the `agentkit-acp-schema` 1.9.1 crate in
-Kit's Rust dependency graph. They are persistent, versioned build inputs.
+`acp-v2.schema.json` and `acp-v2.meta.json` are copied verbatim from
+`schema/v2/schema.unstable.json` and `schema/v2/meta.unstable.json` in the
+[`agentkit-acp-schema` 1.19.0 source commit](https://github.com/danielkov/agent-client-protocol/tree/a20b71197e7f948271913804b760e11669f89e78).
+They are persistent, versioned build inputs. The generator uses the full
+revision from the source commit link above in the generated Swift header.
 
 Run `scripts/generate-acp-swift.py` after intentionally updating the pin. CI runs
 `scripts/generate-acp-swift.py --check`; generation is local and never fetches

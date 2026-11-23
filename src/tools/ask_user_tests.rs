@@ -594,7 +594,7 @@ fn v1_response(value: Value) -> v1::CreateElicitationResponse {
 #[tokio::test]
 async fn v1_real_acp_request_returns_answer() {
     let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
-    let client = agent_client_protocol::Client.builder().on_receive_request(
+    let client = agent_client_protocol::Client.v1().on_receive_request(
         async move |request: v1::CreateElicitationRequest, responder, _cx| {
             assert_eq!(request.message, "Choose the implementation.");
             let v1::ElicitationMode::Form(form) = request.mode else {
@@ -640,7 +640,7 @@ async fn v1_real_acp_request_returns_answer() {
             .await
     });
     agent_client_protocol::Agent
-        .builder()
+        .v1()
         .on_receive_request(
             async move |_request: v1::InitializeRequest, responder, _cx| {
                 responder.respond(v1::InitializeResponse::new(
@@ -714,7 +714,7 @@ async fn v1_turn_cancellation_cancels_individual_acp_request() {
     let interrupt = controller.clone();
     let (cancelled, cancellation_seen) = tokio::sync::oneshot::channel();
     let cancelled = Arc::new(tokio::sync::Mutex::new(Some(cancelled)));
-    let client = agent_client_protocol::Client.builder().on_receive_request(
+    let client = agent_client_protocol::Client.v1().on_receive_request(
         async move |request: v1::CreateElicitationRequest, responder, cx| {
             let v1::ElicitationMode::Form(form) = request.mode else {
                 panic!("expected form")
@@ -765,7 +765,7 @@ async fn v1_turn_cancellation_cancels_individual_acp_request() {
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .on_receive_request(
                 async move |_request: v1::InitializeRequest, responder, _cx| {
                     responder.respond(v1::InitializeResponse::new(

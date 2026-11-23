@@ -53,7 +53,6 @@ impl Subagents {
                 permit: None,
                 startup_reservation: Weak::new(),
                 cache_key: None,
-                finished: Default::default(),
             };
             if sessions
                 .insert(

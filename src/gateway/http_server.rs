@@ -1,5 +1,6 @@
 //! ACP HTTP connection adapter. Only the resident actor owns execution.
 use super::*;
+use agent_client_protocol::v2::schema as wire;
 use agent_client_protocol::{
     Agent, BoundedChannel, ChannelLimits, ChargedFrame, ConnectTo, TransportFrame,
 };
@@ -138,7 +139,14 @@ impl Connection {
                 return Err(Failure::conflict("connection already initialized"));
             }
             // Use the same pinned ACP v2 schema/capabilities as the local agent.
-            let mut capabilities = serde_json::to_value(agentkit_acp::v2::agent_capabilities())
+            let mut capabilities = agentkit_acp::v2::agent_capabilities();
+            capabilities
+                .session
+                .get_or_insert_with(wire::SessionCapabilities::new)
+                .prompt
+                .get_or_insert_with(wire::PromptCapabilities::new)
+                .delivery = Some(wire::PromptDeliveryCapabilities::new(true, true));
+            let mut capabilities = serde_json::to_value(capabilities)
                 .map_err(|e| Failure::unavailable(e.to_string()))?;
             capabilities["_meta"] = object([("kit/session/status", object([]))]);
             if let Some(session) = capabilities["session"].as_object_mut() {
@@ -196,6 +204,34 @@ impl Connection {
             return Err(Failure::bad("initialize is required"));
         }
         if method == "$/cancel_request" {
+            if message.get("id").is_some() {
+                return Err(Failure::bad("request cancellation must be a notification"));
+            }
+            let Some(id) = message["params"]
+                .get("requestId")
+                .filter(|id| id.is_string() || id.as_i64().is_some() || id.as_u64().is_some())
+            else {
+                return Err(Failure::bad("valid cancellation requestId required"));
+            };
+            // Unlike session operations this notification has no sessionId.
+            // Find the pending request in this connection, never by a global ID.
+            let key = id.to_string();
+            let mut matching = self
+                .controls
+                .values_mut()
+                .filter(|control| control.pending.contains_key(&key));
+            let Some(control) = matching.next() else {
+                return Ok(None);
+            };
+            if matching.next().is_some() {
+                return Err(Failure::conflict("ambiguous cancellation request id"));
+            }
+            // A late withdrawal cannot affect a replaced or exited resident.
+            // Let the normal flush settle only this session's pending calls.
+            match control.send(message, Arc::clone(charge)).await {
+                Ok(_) | Err(Failure(_, _, "controller_replaced" | "unavailable")) => {}
+                Err(error) => return Err(error),
+            }
             return Ok(None);
         }
         if method == "session/list" {
@@ -258,7 +294,7 @@ impl Connection {
             if let Some(servers) = message["params"].get("mcpServers")
                 && !servers.is_null()
             {
-                serde_json::from_value::<Vec<agent_client_protocol::schema::v2::McpServer>>(
+                serde_json::from_value::<Vec<agent_client_protocol::v2::schema::McpServer>>(
                     servers.clone(),
                 )
                 .map_err(|_| Failure::bad("invalid mcpServers configuration"))?;
@@ -528,54 +564,41 @@ impl Connection {
                     return Ok(());
                 };
                 let charged_frame = Arc::new(charged_frame);
-                // Retain admission through every decoded batch entry and actor await.
-                // Child-bound messages share this lease until writer serialization.
-                let messages = match charged_frame.decode() {
-                    TransportFrame::Single(message) => vec![message],
-                    TransportFrame::Batch(batch) => batch
-                        .into_entries()
-                        .map(|entry| match entry {
-                            agent_client_protocol::TransportBatchEntry::Message(message) => {
-                                Ok(message)
-                            }
-                            agent_client_protocol::TransportBatchEntry::Malformed {
-                                error, ..
-                            } => Err(error),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
+                // Retain admission through the actor await and child writer handoff.
+                let message = match charged_frame.decode() {
+                    TransportFrame::Single(message) => message,
                     TransportFrame::Malformed { error, .. } => return Err(error),
+                    _ => return Err(channel.tx.fail("unsupported ACP frame")),
                 };
-                for message in messages {
-                    let message = serde_json::to_value(message).map_err(sdk_error)?;
-                    let id = message.get("id").cloned();
-                    let response = match self.request(message, &channel, &charged_frame).await {
-                        Ok(Some(result)) => id.map(|id| {
-                            object([("jsonrpc", "2.0".into()), ("id", id), ("result", result)])
-                        }),
-                        Ok(None) => None,
-                        Err(error) => {
-                            // A notification has no reply ID. If actor admission
-                            // rejects it, fail the transport instead of hiding
-                            // accepted-but-unperformed work from the sender.
-                            let Some(id) = id else {
-                                return Err(channel.tx.fail(&error.1));
-                            };
-                            Some(object([
-                                ("jsonrpc", "2.0".into()),
-                                ("id", id),
-                                (
-                                    "error",
-                                    object([
-                                        ("code", (-32000).into()),
-                                        ("data", error.data()),
-                                        ("message", error.1.into()),
-                                    ]),
-                                ),
-                            ]))
-                        }
-                    };
-                    self.flush_with_response(&channel, response).await?;
-                }
+                let message = serde_json::to_value(message).map_err(sdk_error)?;
+                let id = message.get("id").cloned();
+                let response = match self.request(message, &channel, &charged_frame).await {
+                    Ok(Some(result)) => id.map(|id| {
+                        object([("jsonrpc", "2.0".into()), ("id", id), ("result", result)])
+                    }),
+                    Ok(None) => None,
+                    Err(error) => {
+                        // A notification has no reply ID. If actor admission
+                        // rejects it, fail the transport instead of hiding
+                        // accepted-but-unperformed work from the sender.
+                        let Some(id) = id else {
+                            return Err(channel.tx.fail(&error.1));
+                        };
+                        Some(object([
+                            ("jsonrpc", "2.0".into()),
+                            ("id", id),
+                            (
+                                "error",
+                                object([
+                                    ("code", (-32000).into()),
+                                    ("data", error.data()),
+                                    ("message", error.1.into()),
+                                ]),
+                            ),
+                        ]))
+                    }
+                };
+                self.flush_with_response(&channel, response).await?;
                 drop(charged_frame);
             }
             // Drain after every inbound frame as well as idle ticks; a busy
@@ -957,10 +980,259 @@ mod tests {
             message["params"]["update"]["_meta"]["kit/gateway"],
             json!({"reason":"controller_replaced","terminal":true})
         );
-        serde_json::from_value::<agent_client_protocol::schema::v2::UpdateSessionNotification>(
+        serde_json::from_value::<agent_client_protocol::v2::schema::UpdateSessionNotification>(
             message["params"].clone(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_with_pending_withdrawal_keeps_other_sessions_connected() {
+        use super::super::tests::{isolated_actor, resident_claim};
+
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let mut connection = Connection::new(gateway);
+        let [resident, unrelated] = ["resident", "unrelated"].map(|session| {
+            let mut actor = isolated_actor();
+            actor.id = session.into();
+            actor.session_result = Some(json!({"configOptions":[]}));
+            let (writes, mut writer) = mpsc::channel(1);
+            let attached = actor.command(resident_claim(&actor, false, 60), &writes).unwrap();
+            let (sender, mut receiver) = mpsc::channel::<Envelope>(2);
+            let (stopped_tx, stopped) = watch::channel(());
+            connection.controls.insert(session.into(), Control {
+                session: session.into(),
+                attachment: attached["attachment"].as_str().unwrap().into(),
+                entry: Entry { root: actor.root.clone(), sender, stopped },
+                cursor: actor.attachment.as_ref().unwrap().next,
+                closed: false,
+                pending: HashMap::new(),
+            });
+            async move {
+                let _stopped = stopped_tx;
+                while let Some(envelope) = receiver.recv().await {
+                    let method = match &envelope.request {
+                        Request::Send { message, .. } => message["method"].as_str().map(str::to_owned),
+                        _ => None,
+                    };
+                    // Emulate the child writer freeing exactly one slot after
+                    // the actor has selected Stop rather than the retry future.
+                    let held = (method.as_deref() == Some("session/cancel"))
+                        .then(|| writer.try_recv().unwrap().message);
+                    let result = actor.command(envelope.request, &writes);
+                    if let Some(held) = held {
+                        if result.is_ok() {
+                            let item = writer.try_recv().unwrap();
+                            let mut bytes = Vec::new();
+                            item.write_to(&mut bytes).await.unwrap();
+                            let messages = std::str::from_utf8(&bytes).unwrap().lines()
+                                .map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+                            assert_eq!(messages, [
+                                json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":held["id"]}}),
+                                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}),
+                            ]);
+                            assert!(writer.try_recv().is_err());
+                            actor.output(json!({"jsonrpc":"2.0","id":held["id"],"result":{"stopReason":"cancelled"}}));
+                            assert!(actor.pending.is_empty(), "rejected prompt was tracked");
+                        }
+                    } else if session == "unrelated" && method.as_deref() == Some("session/prompt") {
+                        let prompt = writer.try_recv().unwrap().message;
+                        actor.output(json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}}));
+                    }
+                    let _ = envelope.reply.send(result);
+                }
+            }
+        });
+        let (channel, mut peer) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        let prompt = |id, session| json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":session,"delivery":"steer","prompt":[]}});
+        let client = async move {
+            for message in [
+                json!({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}),
+                prompt(2, "resident"),
+                json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":2}}),
+                prompt(3, "resident"),
+                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}),
+                prompt(4, "unrelated"),
+            ] {
+                send(&peer, message).await.unwrap();
+            }
+            let mut responses = HashMap::new();
+            while responses.len() < 4 {
+                let frame = peer
+                    .rx
+                    .next()
+                    .await
+                    .expect("Stop closed the entire connection");
+                let TransportFrame::Single(message) = frame.decode() else {
+                    panic!("expected single message");
+                };
+                let message = serde_json::to_value(message).unwrap();
+                if let Some(id) = message["id"].as_u64() {
+                    assert!(responses.insert(id, message).is_none());
+                }
+            }
+            assert_eq!(responses[&2]["result"]["stopReason"], "cancelled");
+            assert_eq!(responses[&3]["error"]["data"]["reason"], "unavailable");
+            assert_eq!(responses[&4]["result"]["stopReason"], "end_turn");
+        };
+        let (result, (), (), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connection.run(channel), resident, unrelated, client)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_withdrawal_does_not_disconnect_another_session() {
+        assert_late_withdrawal_is_session_local(false, "controller_replaced").await;
+    }
+
+    #[tokio::test]
+    async fn resident_exit_during_withdrawal_does_not_disconnect_another_session() {
+        assert_late_withdrawal_is_session_local(true, "unavailable").await;
+    }
+
+    async fn assert_late_withdrawal_is_session_local(exited: bool, reason: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let (mut channel, mut peer) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        send(
+            &peer,
+            json!({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}),
+        )
+        .await
+        .unwrap();
+        let charge = Arc::new(channel.rx.next().await.unwrap());
+        let mut connection = Connection::new(gateway);
+        connection
+            .request(
+                json!({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}),
+                &channel,
+                &charge,
+            )
+            .await
+            .unwrap();
+
+        let [mut replaced, mut active] = ["replaced", "active"].map(|session| {
+            let (sender, receiver) = mpsc::channel::<Envelope>(2);
+            let (_stopped, stopped) = watch::channel(());
+            connection.controls.insert(
+                session.into(),
+                Control {
+                    session: session.into(),
+                    attachment: format!("{session}-attachment"),
+                    entry: Entry {
+                        root: PathBuf::new(),
+                        sender,
+                        stopped,
+                    },
+                    cursor: 0,
+                    closed: false,
+                    pending: HashMap::from([(json!(session).to_string(), json!(session))]),
+                },
+            );
+            receiver
+        });
+        // Queue the late notification before the adapter can poll either actor.
+        send(
+            &peer,
+            json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"replaced"}}),
+        )
+        .await
+        .unwrap();
+
+        let replaced_actor = async move {
+            if exited {
+                return;
+            }
+            let withdrawal = replaced.recv().await.unwrap();
+            assert!(
+                matches!(&withdrawal.request, Request::Send { attachment, message, .. }
+                if attachment == "replaced-attachment" && message["method"] == "$/cancel_request")
+            );
+            withdrawal
+                .reply
+                .send(Err(Failure(
+                    StatusCode::CONFLICT,
+                    "replaced".into(),
+                    "controller_replaced",
+                )))
+                .unwrap();
+            let poll = replaced.recv().await.unwrap();
+            assert!(matches!(poll.request, Request::Poll { .. }));
+            poll.reply
+                .send(Err(Failure(
+                    StatusCode::CONFLICT,
+                    "replaced".into(),
+                    "controller_replaced",
+                )))
+                .unwrap();
+        };
+        let active_actor = async {
+            while let Some(envelope) = active.recv().await {
+                match envelope.request {
+                    Request::Poll { cursor, .. } => {
+                        let events = if cursor == 0 {
+                            json!([{"cursor":1,"message":{"jsonrpc":"2.0","id":"active","result":{}}}])
+                        } else {
+                            json!([])
+                        };
+                        let _ = envelope.reply.send(Ok(json!({"events": events})));
+                    }
+                    Request::Detach { .. } => break,
+                    _ => panic!("unexpected operation for the active session"),
+                }
+            }
+        };
+        let client = async {
+            let mut responses = HashMap::new();
+            for _ in 0..3 {
+                let frame = peer
+                    .rx
+                    .next()
+                    .await
+                    .expect("connection closed before pending calls settled");
+                let TransportFrame::Single(message) = frame.decode() else {
+                    panic!("expected single message")
+                };
+                let message = serde_json::to_value(message).unwrap();
+                if message["method"] == "session/update" {
+                    assert_eq!(message["params"]["sessionId"], "replaced");
+                } else {
+                    responses.insert(message["id"].as_str().unwrap().to_owned(), message);
+                }
+            }
+            assert_eq!(responses["replaced"]["error"]["data"]["reason"], reason);
+            assert_eq!(responses["active"]["result"], json!({}));
+            drop(peer);
+        };
+        let (result, (), (), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                connection.run(channel),
+                replaced_actor,
+                active_actor,
+                client
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

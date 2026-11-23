@@ -4,7 +4,7 @@
 //! Broadcast wakeups occur only after a complete state commit; a panic poisons
 //! and isolates streaming instead of recovering uncertain
 //! parent-before-child ordering. IDs and ownership survive prompt generations.
-use agent_client_protocol::schema::v1::{self as acp, SessionUpdate};
+use agent_client_protocol::v1::schema::{self as acp, SessionUpdate};
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},

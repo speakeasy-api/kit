@@ -1,10 +1,9 @@
 //! Connection-bound, foreground-only structured user questions.
 use std::{collections::BTreeSet, sync::Arc};
 
-use agent_client_protocol::{
-    Client, ConnectionTo, V2ConnectionTo,
-    schema::{v1, v2 as wire},
-};
+use agent_client_protocol::v1::schema as v1;
+use agent_client_protocol::v2::{ConnectionTo as V2ConnectionTo, schema as wire};
+use agent_client_protocol::{Client, v1::ConnectionTo};
 use agentkit_core::{ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,

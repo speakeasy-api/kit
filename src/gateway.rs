@@ -330,11 +330,30 @@ struct Entry {
 }
 #[derive(Debug)]
 struct ChildWrite {
+    // Stop can share one slot with the normalized withdrawals it must follow.
+    withdrawals: Vec<u64>,
     message: Value,
     // A batch lease can be shared by several accepted child writes. Retain it
     // through serialization/write completion, even after the HTTP owner drops.
     _charge: Option<Arc<agent_client_protocol::ChargedFrame>>,
 }
+impl ChildWrite {
+    async fn write_to(&self, stdin: &mut (impl tokio::io::AsyncWrite + Unpin)) -> io::Result<()> {
+        for &id in &self.withdrawals {
+            write_message(stdin, &withdrawal_message(id)).await?;
+        }
+        write_message(stdin, &self.message).await
+    }
+}
+
+fn withdrawal_message(id: u64) -> Value {
+    object([
+        ("jsonrpc", "2.0".into()),
+        ("method", "$/cancel_request".into()),
+        ("params", object([("requestId", id.into())])),
+    ])
+}
+
 struct Envelope {
     request: Request,
     reply: oneshot::Sender<ResultValue>,
@@ -700,6 +719,8 @@ struct Pending {
     attachment: String,
     original: Value,
     method: String,
+    explicit_delivery: bool,
+    withdrawal_pending: bool,
     // The caller's policy, independent of full internal child cache seeding.
     replay: bool,
 }
@@ -795,23 +816,40 @@ impl Actor {
         let mut writer = tokio::task::JoinSet::new();
         writer.spawn(async move {
             while let Some(message) = queued.recv().await {
-                write_message(&mut stdin, &message.message).await?;
+                message.write_to(&mut stdin).await?;
                 drop(message);
             }
             Ok::<_, io::Error>(())
         });
         let mut lines = framing::Lines::new(stdout);
         loop {
+            let withdrawal = self.next_withdrawal();
             let event = {
+                let withdrawal_permit = std::pin::pin!(async {
+                    if withdrawal.is_some() {
+                        writes.reserve().await
+                    } else {
+                        std::future::pending().await
+                    }
+                });
                 let command = std::pin::pin!(commands.recv());
                 let line = std::pin::pin!(lines.next_line());
                 let exited = std::pin::pin!(child.wait());
                 let written = std::pin::pin!(writer.join_next());
                 let io = std::pin::pin!(select(line, select(exited, written)));
-                match select(command, io).await {
-                    Either::Left((command, _)) => Either::Left(command),
-                    Either::Right((Either::Left((line, _)), _)) => Either::Right(Some(line)),
-                    Either::Right((Either::Right(_), _)) => Either::Right(None),
+                match select(withdrawal_permit, std::pin::pin!(select(command, io))).await {
+                    Either::Left((permit, _)) => {
+                        let (Some(id), Ok(permit)) = (withdrawal, permit) else {
+                            break;
+                        };
+                        self.send_withdrawal(id, permit);
+                        continue;
+                    }
+                    Either::Right((Either::Left((command, _)), _)) => Either::Left(command),
+                    Either::Right((Either::Right((Either::Left((line, _)), _)), _)) => {
+                        Either::Right(Some(line))
+                    }
+                    Either::Right((Either::Right((Either::Right(_), _)), _)) => Either::Right(None),
                 }
             };
             match event {
@@ -837,6 +875,7 @@ impl Actor {
                             if let Some(reply) = self.output(message)
                                 && writes
                                     .try_send(ChildWrite {
+                                        withdrawals: Vec::new(),
                                         message: reply,
                                         _charge: None,
                                     })
@@ -927,7 +966,10 @@ impl Actor {
         if let Some(attachment) = &mut self.attachment
             && !attachment.push(message)
         {
-            self.attachment = None;
+            let retired = self.attachment.take().map(|attachment| attachment.id);
+            if let Some(id) = retired {
+                self.mark_withdrawals(&id);
+            }
         }
     }
     fn remember(&mut self, message: Value) {
@@ -1130,9 +1172,49 @@ impl Actor {
         }
         Ok(messages)
     }
+    fn mark_withdrawals(&mut self, attachment: &str) {
+        // The backlog is one bit per bounded pending request. Settlement
+        // removes the bit with the request, so we never cancel an already
+        // answered ID or hold an extra unbounded queue when child stdin stalls.
+        for pending in self.pending.values_mut() {
+            if pending.attachment == attachment && pending.explicit_delivery {
+                pending.withdrawal_pending = true;
+            }
+        }
+    }
+
+    fn next_withdrawal(&self) -> Option<u64> {
+        self.pending
+            .iter()
+            .filter_map(|(&id, p)| p.withdrawal_pending.then_some(id))
+            .min()
+    }
+
+    fn send_withdrawal(&mut self, id: u64, permit: mpsc::Permit<'_, ChildWrite>) {
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.withdrawal_pending = false;
+            permit.send(ChildWrite {
+                withdrawals: Vec::new(),
+                message: withdrawal_message(id),
+                _charge: None,
+            });
+        }
+    }
+
+    fn flush_withdrawals(&mut self, writes: &mpsc::Sender<ChildWrite>) {
+        while let Some(id) = self.next_withdrawal() {
+            let Ok(permit) = writes.try_reserve() else {
+                break;
+            };
+            self.send_withdrawal(id, permit);
+        }
+    }
+
     fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
-        if (self.closed || self.pending.values().any(|p| p.method == "session/close"))
+        let closing = self.closed || self.pending.values().any(|p| p.method == "session/close");
+        if closing
             && !matches!(request, Request::Poll { .. } | Request::Detach { .. })
+            && !matches!(&request, Request::Send { message, .. } if message["method"] == "$/cancel_request")
         {
             return Err(Failure::conflict(
                 "session is closing or closed; restore after cleanup",
@@ -1268,6 +1350,10 @@ impl Actor {
                 };
             // No fallible work after the ownership commit. The previous controller
             // survives every replay/snapshot preparation failure.
+            if let Some(previous) = self.attachment.take() {
+                self.mark_withdrawals(&previous.id);
+                self.flush_withdrawals(writes);
+            }
             self.committed_owner = Some(CommittedOwner {
                 id: id.clone(),
                 recovery_id,
@@ -1299,8 +1385,10 @@ impl Actor {
             })?;
         attachment.touched = Instant::now();
         match request {
-            Request::Detach { .. } => {
+            Request::Detach { attachment, .. } => {
                 self.attachment = None;
+                self.mark_withdrawals(&attachment);
+                self.flush_withdrawals(writes);
                 Ok(object([]))
             }
             Request::Poll { cursor, .. } => {
@@ -1361,10 +1449,42 @@ impl Actor {
                 if method == "kit/background/cancel" && message["params"]["session_id"] != self.id {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
-                // Request-task cancellation is not an execution interrupt. In
-                // particular, SDK teardown must not cancel detached work; use
-                // explicit session/cancel (which is session-scoped) instead.
+                // Only withdraw a prompt from the same attachment. A request
+                // cancellation never interrupts work for an inserted prompt.
                 if method == "$/cancel_request" {
+                    if original.is_some() {
+                        return Err(Failure::bad("request cancellation must be a notification"));
+                    }
+                    let Some(id) = message["params"].get("requestId").filter(|id| {
+                        id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
+                    }) else {
+                        return Err(Failure::bad("valid cancellation requestId required"));
+                    };
+                    // Leave a validated late withdrawal to the admitted close
+                    // instead of starting another child write.
+                    if closing {
+                        return Ok(object([]));
+                    }
+                    let Some((&child_id, pending)) =
+                        self.pending.iter_mut().find(|(_, pending)| {
+                            pending.attachment == attachment
+                                && pending.original == *id
+                                && pending.method == "session/prompt"
+                        })
+                    else {
+                        return Ok(object([]));
+                    };
+                    // The normalized child notification needs only the remapped
+                    // ID. Do not retain the transport charge with the retry bit.
+                    match writes.try_reserve() {
+                        Ok(permit) => self.send_withdrawal(child_id, permit),
+                        Err(mpsc::error::TrySendError::Full(())) => {
+                            pending.withdrawal_pending = true;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            return Err(Failure::unavailable("child input writer closed"));
+                        }
+                    }
                     return Ok(object([]));
                 }
                 if !matches!(
@@ -1373,9 +1493,6 @@ impl Actor {
                         | "session/new"
                         | "session/resume"
                         | "session/prompt"
-                        | "session/inject"
-                        | "session/revoke_inject"
-                        | "session/replace_inject"
                         | "session/cancel"
                         | "session/close"
                         | "kit/background/cancel"
@@ -1463,7 +1580,8 @@ impl Actor {
                     }
                     return Ok(object([]));
                 }
-                if self.pending.len() >= 128 {
+                let stop = method == "session/cancel" && original.is_none();
+                if !stop && self.pending.len() >= 128 {
                     return Err(Failure::unavailable("too many pending ACP requests"));
                 }
                 if matches!(method.as_str(), "session/new" | "session/resume") {
@@ -1497,26 +1615,59 @@ impl Actor {
                         .checked_add(1)
                         .ok_or_else(|| Failure::unavailable("request id exhausted"))?;
                     message["id"] = Value::from(self.serial);
+                    let explicit_delivery = method == "session/prompt"
+                        && matches!(
+                            message["params"]["delivery"].as_str(),
+                            Some("steer" | "queue")
+                        );
                     Some(Pending {
                         attachment,
                         original,
                         method,
+                        explicit_delivery,
+                        withdrawal_pending: false,
                         replay,
                     })
                 } else {
                     None
                 };
-                // Capacity is checked before publishing the pending record. No
-                // await separates acceptance and commit; cancellation cannot
-                // strand a reserved ID or suppress an accepted child write.
-                writes
-                    .try_send(ChildWrite {
-                        message,
-                        _charge: charge,
-                    })
-                    .map_err(|_| {
+                // Capacity can return after the withdrawal retry is polled. Stop
+                // must use that first slot without passing accepted withdrawals;
+                // other messages still let the withdrawals take available slots.
+                let permit = loop {
+                    let permit = writes.try_reserve().map_err(|_| {
                         Failure::unavailable("child input queue unavailable; message not accepted")
                     })?;
+                    if stop {
+                        break permit;
+                    }
+                    let Some(id) = self.next_withdrawal() else {
+                        break permit;
+                    };
+                    self.send_withdrawal(id, permit);
+                };
+                let mut withdrawals = Vec::new();
+                if stop {
+                    // At most one normalized ID per entry in the bounded pending
+                    // map, and no new writer slots or transport charges for them.
+                    withdrawals.extend(
+                        self.pending
+                            .iter()
+                            .filter_map(|(&id, pending)| pending.withdrawal_pending.then_some(id)),
+                    );
+                    withdrawals.sort_unstable();
+                    for id in &withdrawals {
+                        if let Some(pending) = self.pending.get_mut(id) {
+                            pending.withdrawal_pending = false;
+                        }
+                    }
+                }
+                // No await separates the accepted write from its pending record.
+                permit.send(ChildWrite {
+                    withdrawals,
+                    message,
+                    _charge: charge,
+                });
                 if let Some(pending) = pending {
                     self.pending.insert(self.serial, pending);
                 }
@@ -1526,7 +1677,10 @@ impl Actor {
         }
     }
 }
-async fn write_message(stdin: &mut tokio::process::ChildStdin, message: &Value) -> io::Result<()> {
+async fn write_message(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &Value,
+) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
     tokio::time::timeout(Duration::from_secs(10), stdin.write_all(&bytes))
