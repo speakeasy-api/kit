@@ -49,7 +49,7 @@ use prompt::ChildPrompt;
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
-const AMBIGUOUS_IDLE_SETTLE: Duration = CANCEL_SETTLE;
+const UNVERIFIED_IDLE_SETTLE: Duration = CANCEL_SETTLE;
 const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
@@ -814,17 +814,15 @@ async fn wait_for_prompt_boundary(
     capture: &Mutex<capture::Capture>,
     mut updates: watch::Receiver<()>,
 ) -> Result<Option<agent_client_protocol::v2::schema::StopReason>, ChildError> {
-    let mut deadline = None;
     loop {
         // Mark the watch seen before reading capture: a notification after the
         // read must wake us, and one before it is reflected in capture.
         updates.borrow_and_update();
         match prompt_boundary(capture)? {
             capture::Boundary::Settled(reason) => return Ok(reason),
-            capture::Boundary::Waiting => deadline = None,
-            capture::Boundary::AmbiguousIdle => {
-                let deadline = *deadline
-                    .get_or_insert_with(|| tokio::time::Instant::now() + AMBIGUOUS_IDLE_SETTLE);
+            capture::Boundary::Waiting => {}
+            capture::Boundary::UnverifiedIdle(observed) => {
+                let deadline = observed + UNVERIFIED_IDLE_SETTLE;
                 if tokio::time::Instant::now() >= deadline {
                     return Err(ambiguous_prompt_error());
                 }
@@ -1731,9 +1729,21 @@ async fn run(
                 }
                 if matches!(params["update"]["sessionUpdate"].as_str(), Some("user_message" | "user_message_chunk")) {
                     if let Some(id) = params["update"]["messageId"].as_str() {
-                        route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
+                        let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
+                        if changed {
+                            route.boundary_changed.send_replace(());
+                        }
                     }
                     return Ok(());
+                }
+                // Thoughts are activity, not answer content. Use typed wire evidence
+                // before falling through to the existing inspection/roster handling.
+                if matches!(notification.as_ref().map(|notification| &notification.update),
+                    Some(SessionUpdate::AgentThoughtChunk(_))) {
+                    let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_thought();
+                    if changed {
+                        route.boundary_changed.send_replace(());
+                    }
                 }
                 if let Some(update) = messages::parse(&params["update"])? {
                     let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_message(update);
@@ -2223,7 +2233,9 @@ async fn run(
                                     let _ = protocol::cancel(&connection, version, session_id.clone());
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
                                         Ok(result) => (result, true),
-                                        Err(_) if matches!(prompt_boundary(&capture), Ok(capture::Boundary::AmbiguousIdle)) => {
+                                        // Cancellation may expire before the Idle grace window.
+                                        // An observed but unverified Idle still only quarantines this session.
+                                        Err(_) if matches!(prompt_boundary(&capture), Ok(capture::Boundary::UnverifiedIdle(_))) => {
                                             (Err(ambiguous_prompt_error()), true)
                                         }
                                         Err(_) => {
@@ -4569,7 +4581,97 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn correlated_prompt_keeps_streaming_after_stale_idle_without_running() {
+    async fn missing_echo_quarantines_only_its_session_even_when_cancelled() {
+        async fn check(receipt_order: &str, cancel: bool) {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![format!("--prompt-receipt-order={receipt_order}")],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let sibling = child
+                .fork(None, None, &TurnCancellation::default())
+                .await
+                .unwrap();
+            let controller = agentkit_core::CancellationController::new();
+            let request = child.prompt(
+                child.session_id(),
+                "MOCK_MISSING_ECHO".into(),
+                controller.handle().checkpoint(),
+            );
+            let interrupt = async {
+                if cancel {
+                    let idle = root.path().join("requests.uncorrelated-idle");
+                    while !idle.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    controller.interrupt();
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(request, interrupt).0
+            })
+            .await
+            .expect("an uncorrelated Idle must bound settlement");
+            assert!(matches!(result, Err(ChildError::TerminalFailed(_))));
+            assert!(matches!(
+                child
+                    .prompt(
+                        child.session_id(),
+                        "unsafe retry".into(),
+                        TurnCancellation::default()
+                    )
+                    .await,
+                Err(ChildError::TerminalFailed(_))
+            ));
+            if cancel {
+                let log = std::fs::read_to_string(root.path().join("requests")).unwrap();
+                assert!(log.lines().any(|line| {
+                    let request: Value = serde_json::from_str(line).unwrap();
+                    request["method"] == "session/cancel"
+                        && request["sessionId"] == child.session_id()
+                }));
+            }
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                sibling.prompt(
+                    sibling.session_id(),
+                    "healthy sibling".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output.text, "healthy sibling");
+            child.close().await.unwrap();
+        }
+        tokio::join!(check("before-echo", false), check("after-idle", true));
+    }
+
+    #[tokio::test]
+    async fn late_echo_can_recover_but_cannot_claim_the_preceding_idle_or_output() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            child.prompt(
+                child.session_id(),
+                "MOCK_LATE_ECHO".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.text, "matched answer");
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_keeps_reasoning_after_stale_idle_without_running() {
         let root = tempfile::tempdir().unwrap();
         let child = steering_test_support::start(
             &root,
@@ -4584,14 +4686,14 @@ for line in sys.stdin:
             Duration::from_secs(10),
             child.prompt(
                 child.session_id(),
-                "MOCK_LONG_ANSWER_NO_RUNNING".into(),
+                "MOCK_LONG_THOUGHT_NO_RUNNING".into(),
                 TurnCancellation::default(),
             ),
         )
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(result.text, "still streaming");
+        assert_eq!(result.text, "streaming");
         child.close().await.unwrap();
     }
 

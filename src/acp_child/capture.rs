@@ -1,7 +1,8 @@
 //! Result capture for legacy routes and insertion-correlated draft v2 prompts.
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use agent_client_protocol::v2::schema::{MessageId, StopReason};
+use tokio::time::Instant;
 
 use super::{ChildError, ChildOutput, protocol::Foreground};
 
@@ -12,7 +13,7 @@ pub(super) enum Receipt {
 
 pub(super) enum Boundary {
     Waiting,
-    AmbiguousIdle,
+    UnverifiedIdle(Instant),
     Settled(Option<StopReason>),
 }
 
@@ -40,22 +41,23 @@ impl Capture {
     }
 
     pub(super) fn boundary(&self) -> Boundary {
-        let turn = match self {
-            Self::Legacy(turn) => turn,
-            Self::Correlated(correlation) if correlation.matched => {
-                if correlation.current.ambiguous_idle {
-                    return Boundary::AmbiguousIdle;
-                }
-                &correlation.current.turn
-            }
-            Self::Correlated(_) => return Boundary::Waiting,
-        };
-        turn.idle().map_or(Boundary::Waiting, Boundary::Settled)
+        match self {
+            Self::Legacy(turn) => turn.idle().map_or(Boundary::Waiting, Boundary::Settled),
+            Self::Correlated(correlation) => correlation.boundary(),
+        }
     }
 
-    pub(super) fn echo(&mut self, id: &str) {
-        if let Self::Correlated(correlation) = self {
-            correlation.echo(id);
+    pub(super) fn echo(&mut self, id: &str) -> bool {
+        match self {
+            Self::Legacy(_) => false,
+            Self::Correlated(correlation) => correlation.echo(id),
+        }
+    }
+
+    pub(super) fn record_thought(&mut self) -> bool {
+        match self {
+            Self::Legacy(_) => false,
+            Self::Correlated(correlation) => correlation.progress(Progress::Thought),
         }
     }
 
@@ -77,14 +79,9 @@ impl Capture {
         &mut self,
         update: agent_client_protocol::v2::schema::SessionUpdate,
     ) -> bool {
-        let changed = if let Self::Correlated(correlation) = self
-            && (correlation.matched || !correlation.current.echoes.is_empty())
-        {
-            // Only the first answer update can lift the ambiguity deadline.
-            let first = !std::mem::replace(&mut correlation.current.answer_observed, true);
-            first && correlation.current.clear_ambiguous_idle() && correlation.matched
-        } else {
-            false
+        let changed = match self {
+            Self::Legacy(_) => false,
+            Self::Correlated(correlation) => correlation.progress(Progress::Answer),
         };
         self.record_output(|output| output.record_message(update));
         changed
@@ -142,19 +139,26 @@ impl Turn {
 
 #[derive(Default)]
 struct Candidate {
-    echoes: BTreeMap<String, bool>,
+    echoes: BTreeSet<String>,
     echo_bytes: usize,
     turn: Turn,
     answer_observed: bool,
-    ambiguous_idle: bool,
+    thought: Thought,
+    unverified_idle: Option<Instant>,
     output_overflow: bool,
 }
 
-impl Candidate {
-    fn clear_ambiguous_idle(&mut self) -> bool {
-        self.echoes.values_mut().for_each(|idle| *idle = false);
-        std::mem::take(&mut self.ambiguous_idle)
-    }
+enum Progress {
+    Thought,
+    Answer,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum Thought {
+    #[default]
+    Unseen,
+    Observed,
+    ClearedIdle,
 }
 
 // A receipt may follow the entire matching turn. Keep bounded provisional turn
@@ -165,7 +169,8 @@ const MAX_PROVISIONAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct Correlation {
-    receipt: Option<String>,
+    receipt: Option<(String, Instant)>,
+    idle_without_match: Option<Instant>,
     matched: bool,
     current: Candidate,
     completed: Vec<Candidate>,
@@ -176,24 +181,81 @@ pub(super) struct Correlation {
 }
 
 impl Correlation {
-    fn echo(&mut self, id: &str) {
+    fn boundary(&self) -> Boundary {
+        let Some((_, accepted)) = self.receipt else {
+            return Boundary::Waiting;
+        };
+        let idle = if self.matched {
+            if let Some(reason) = self.current.turn.idle() {
+                return Boundary::Settled(reason);
+            }
+            self.current.unverified_idle
+        } else {
+            self.idle_without_match
+        };
+        // An Idle may precede the receipt. Give correlation a full window from
+        // acceptance, without letting unrelated traffic extend that window.
+        idle.map_or(Boundary::Waiting, |idle| {
+            Boundary::UnverifiedIdle(idle.max(accepted))
+        })
+    }
+
+    fn echo(&mut self, id: &str) -> bool {
         if self.matched {
-            return;
+            return false;
         }
-        if let Some(receipt) = &self.receipt {
-            self.matched = receipt == id;
-        } else if !self.current.echoes.contains_key(id) {
+        if let Some((receipt, _)) = &self.receipt {
+            if receipt == id {
+                self.match_current();
+                return true;
+            }
+        } else if !self.current.echoes.contains(id) {
             if self.echo_count == MAX_UNCONFIRMED_ECHOES
                 || id.len() > MAX_UNCONFIRMED_ECHO_BYTES - self.echo_bytes
             {
                 self.echo_overflow = true;
-                return;
+                return false;
             }
             self.echo_count += 1;
             self.echo_bytes += id.len();
             self.current.echo_bytes += id.len();
-            self.current.echoes.insert(id.to_owned(), false);
+            self.current.echoes.insert(id.to_owned());
         }
+        false
+    }
+
+    fn match_current(&mut self) {
+        self.matched = true;
+        // A late echo proves insertion, not that a previously observed Idle
+        // ended this turn. Without other evidence, keep the same deadline.
+        if self.current.turn.foreground == Foreground::Waiting
+            && self.current.thought == Thought::Unseen
+            && !self.current.answer_observed
+        {
+            self.current.unverified_idle = self.idle_without_match;
+        }
+    }
+
+    fn progress(&mut self, progress: Progress) -> bool {
+        if !self.matched && self.current.echoes.is_empty() {
+            return false;
+        }
+        let turn = &mut self.current;
+        match progress {
+            Progress::Answer if !turn.answer_observed => turn.answer_observed = true,
+            Progress::Thought if turn.thought != Thought::ClearedIdle => {
+                turn.thought = if turn.unverified_idle.is_some() {
+                    Thought::ClearedIdle
+                } else {
+                    Thought::Observed
+                };
+            }
+            _ => return false,
+        }
+        // Reasoning can disprove one stale Idle even if the stream began before
+        // the snapshot. Repeated thoughts cannot keep rearming that grace period.
+        // Neither kind of progress retroactively makes the prior Idle terminal.
+        turn.unverified_idle.take().is_some() && self.matched
     }
 
     fn receipt(&mut self, id: MessageId) -> Receipt {
@@ -201,60 +263,64 @@ impl Correlation {
         if let Some(index) = self
             .completed
             .iter()
-            .position(|turn| turn.echoes.contains_key(&id))
+            .position(|turn| turn.echoes.contains(&id))
         {
             self.current = self.completed.swap_remove(index);
-            self.matched = true;
-        } else if let Some(ambiguous_idle) = self.current.echoes.get(&id) {
-            self.matched = true;
-            self.current.ambiguous_idle = *ambiguous_idle;
+            self.match_current();
+        } else if self.current.echoes.contains(&id) {
+            self.match_current();
         } else if self.echo_overflow {
             return Receipt::EchoOverflow;
         }
         self.completed.clear();
-        // Keep the current Running candidate even without an echo: its echo
-        // can still arrive later. All other candidates have been discarded.
+        // The current turn may have multiple insertions. Keep its output
+        // until a foreground boundary, even if only a different ID has echoed.
         self.output_bytes = self.current.turn.output.retained_bytes();
         self.current.echoes.clear();
         self.current.echo_bytes = 0;
         self.echo_count = 0;
         self.echo_bytes = 0;
-        self.receipt = Some(id);
+        self.receipt = Some((id, Instant::now()));
         Receipt::Accepted
     }
 
     // Return whether a waiting prompt must recheck its boundary.
     fn state(&mut self, state: Foreground, repeated_idle: bool) -> bool {
+        let idle = matches!(state, Foreground::Idle(_));
+        let newly_unverified = if idle && !self.matched && self.idle_without_match.is_none() {
+            self.idle_without_match = Some(Instant::now());
+            self.receipt.is_some()
+        } else {
+            false
+        };
         // An echo only establishes insertion. A repeated Idle carries no turn
         // identifier, and even its stop reason may be from an earlier turn.
-        if repeated_idle && !self.current.answer_observed {
-            if self.current.turn.foreground == Foreground::Waiting {
-                if self.matched {
-                    return !std::mem::replace(&mut self.current.ambiguous_idle, true);
-                }
-                self.current
-                    .echoes
-                    .values_mut()
-                    .for_each(|idle| *idle = true);
-            }
-            return false;
-        }
-        let active = state == Foreground::Running;
-        if self.current.turn.foreground == Foreground::Waiting
-            && matches!(state, Foreground::Idle(_))
+        if repeated_idle
+            && !self.current.answer_observed
+            && self.current.turn.foreground == Foreground::Waiting
         {
+            if (self.matched || !self.current.echoes.is_empty())
+                && self.current.unverified_idle.is_none()
+            {
+                self.current.unverified_idle = Some(Instant::now());
+                return self.matched || newly_unverified;
+            }
+            return newly_unverified;
+        }
+        if self.current.turn.foreground == Foreground::Waiting && idle {
             if !self.matched && self.current.echoes.is_empty() {
-                // Registration can miss an unrelated turn's Running. Its Idle
-                // still marks a boundary, but cannot settle this route without an echo.
+                // An Idle without an echo cannot identify this request's turn.
                 self.discard_current();
-                return false;
+                return newly_unverified;
             }
             self.current.turn.foreground = state;
-        } else if !self.current.turn.state(state) {
-            // Resume the ordinary wait once the peer reports active work.
-            return active && self.current.clear_ambiguous_idle() && self.matched;
+        } else {
+            let active = state == Foreground::Running;
+            if !self.current.turn.state(state) {
+                return active && self.current.unverified_idle.take().is_some() && self.matched;
+            }
         }
-        self.current.ambiguous_idle = false;
+        self.current.unverified_idle = None;
         if self.matched {
             return true;
         }
@@ -263,7 +329,7 @@ impl Correlation {
         } else {
             self.completed.push(std::mem::take(&mut self.current));
         }
-        false
+        newly_unverified
     }
 
     fn discard_current(&mut self) {
@@ -301,5 +367,49 @@ impl Correlation {
         } else {
             self.output_bytes = other_bytes + retained;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_macros)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncorrelated_idle_survives_wrong_echoes_and_a_late_matching_echo_alone() {
+        let mut capture = Capture::new(true);
+        capture.state(Foreground::Idle(Some(StopReason::Refusal)), false);
+        assert!(matches!(capture.boundary(), Boundary::Waiting));
+        assert!(matches!(
+            capture.receipt(MessageId::new("ours")),
+            Receipt::Accepted
+        ));
+        let Boundary::UnverifiedIdle(observed) = capture.boundary() else {
+            panic!("acceptance must bound the wait after an uncorrelated Idle");
+        };
+        assert!(!capture.echo("theirs"));
+        assert!(!capture.record_thought());
+        assert!(!capture.state(Foreground::Idle(None), true));
+        assert!(capture.echo("ours"));
+        assert!(matches!(capture.boundary(), Boundary::UnverifiedIdle(same) if same == observed));
+        assert!(capture.record_thought());
+        assert!(matches!(capture.boundary(), Boundary::Waiting));
+    }
+
+    #[test]
+    fn a_thought_stream_can_clear_one_stale_snapshot_but_does_not_settle_an_idle() {
+        let mut capture = Capture::new(true);
+        capture.receipt(MessageId::new("ours"));
+        capture.echo("ours");
+        assert!(!capture.record_thought());
+        assert!(capture.state(Foreground::Idle(Some(StopReason::Refusal)), true));
+        assert!(capture.record_thought());
+        assert!(matches!(capture.boundary(), Boundary::Waiting));
+        assert!(capture.state(Foreground::Idle(Some(StopReason::Refusal)), true));
+        assert!(!capture.record_thought());
+        assert!(matches!(capture.boundary(), Boundary::UnverifiedIdle(_)));
+        assert!(capture.state(Foreground::Running, false));
+        assert!(capture.state(Foreground::Idle(None), false));
+        assert!(matches!(capture.boundary(), Boundary::Settled(None)));
     }
 }

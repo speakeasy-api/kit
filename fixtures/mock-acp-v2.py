@@ -160,8 +160,26 @@ def prompt(request):
                       started=rollover_receipt_order != "after-echo")
     output_overflow_case = text in ("MOCK_CAPTURE_IMAGE_ECHOES", "MOCK_CAPTURE_ANSWER_OVERFLOW")
     delayed_receipt = prompt_receipt_order == "after-idle" or output_overflow_case
-    if prompt_receipt_order != "after-echo" and not delayed_receipt:
+    pre_echo_answer = text == "MOCK_CAPTURE_PRE_ECHO"
+    if prompt_receipt_order != "after-echo" and not delayed_receipt and not pre_echo_answer:
         respond(request["id"], {"messageId": message_id})
+    if text in ("MOCK_MISSING_ECHO", "MOCK_LATE_ECHO"):
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+        session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "unmatched-answer",
+                                    "content": {"type": "text", "text": "unmatched answer"}})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        if delayed_receipt or prompt_receipt_order == "after-echo":
+            respond(request["id"], {"messageId": message_id})
+        if text == "MOCK_LATE_ECHO":
+            session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                        "content": params["prompt"]})
+            session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "matched-answer",
+                                        "content": {"type": "text", "text": "matched answer"}})
+            session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        elif request_log is not None:
+            with open(request_log + ".uncorrelated-idle", "w", encoding="utf-8"):
+                pass
+        return
     answerless = text == "MOCK_ANSWERLESS_IDLE"
     if "--omit-prompt-running" not in sys.argv and not repeat_idle_before and not answerless:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
@@ -172,11 +190,16 @@ def prompt(request):
                 "data": "A" * (4 * 1024 * 1024),
             })
         text = "terminal output truncated"
-    if text == "MOCK_CAPTURE_PRE_ECHO":
+    if pre_echo_answer:
+        # Another insertion in this foreground turn is not a rollover boundary.
+        session_update(session_id, {"sessionUpdate": "user_message", "messageId": "same-turn-steer",
+                                    "content": [{"type": "text", "text": "same turn steer"}]})
         session_update(session_id, {
             "sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
             "content": {"type": "text", "text": "before "},
         })
+        if prompt_receipt_order != "after-echo" and not delayed_receipt:
+            respond(request["id"], {"messageId": message_id})
         text = "after"
     if supports_steer and text != "MOCK_CAPTURE_IMAGE_ECHOES":
         session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
@@ -187,9 +210,9 @@ def prompt(request):
             session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before})
     if prompt_receipt_order == "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
-    if text == "MOCK_LONG_ANSWER_NO_RUNNING":
-        session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
-                                    "content": {"type": "text", "text": "still "}})
+    if text == "MOCK_LONG_THOUGHT_NO_RUNNING":
+        session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "thought-1",
+                                    "content": {"type": "text", "text": "thinking"}})
         time.sleep(6)  # The real Idle arrives after Kit's ambiguity window.
         text = "streaming"
     if answerless:
