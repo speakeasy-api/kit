@@ -1,3 +1,4 @@
+import Darwin
 import SwiftUI
 import XCTest
 @testable import Kit
@@ -234,6 +235,50 @@ final class PromptDeliveryTests: XCTestCase {
         let thirdURL = try XCTUnwrap(admitted)
         XCTAssertEqual(Set(try files.contentsOfDirectory(atPath: directory.path)), [recent.lastPathComponent, thirdURL.lastPathComponent])
         XCTAssertEqual(try Data(contentsOf: recent), second.data)
+    }
+
+    @MainActor
+    func testContendedPlaybackLockDoesNotBlockUnrelatedOpen() async throws {
+        let directory = temporaryDirectory()
+        let cache = TranscriptMediaCache(playbackDirectory: directory)
+        let expired = await cache.openURL(TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: 2)))
+        let expiredURL = try XCTUnwrap(expired)
+        let files = FileManager.default
+        try files.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -2 * 24 * 60 * 60)], ofItemAtPath: expiredURL.path)
+
+        // A separately opened descriptor contends just like a different Desktop process.
+        let fd = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        defer { _ = Darwin.close(fd) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw POSIXError(.EIO) }
+
+        let snapshot = TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: 4))
+        let direct = TranscriptMedia(mimeType: "audio/wav", url: URL(string: "https://example.com/audio.wav"))
+        let snapshotFinished = expectation(description: "snapshot gives up while playback lock is held")
+        let directFinished = expectation(description: "cleanup and direct open finish while playback lock is held")
+        let snapshotTask = Task {
+            let opened = await cache.openURL(snapshot)
+            snapshotFinished.fulfill()
+            return opened
+        }
+        let directTask = Task {
+            await cache.prunePlaybackFiles()
+            let opened = await cache.openURL(direct)
+            directFinished.fulfill()
+            return opened
+        }
+        await fulfillment(of: [snapshotFinished, directFinished], timeout: 3)
+        XCTAssertTrue(files.fileExists(atPath: expiredURL.path), "Busy cleanup must skip the sweep")
+        // Always unlock before awaiting the tasks, even if the waiting assertions failed.
+        XCTAssertEqual(flock(fd, LOCK_UN), 0)
+        let snapshotURL = await snapshotTask.value
+        let directURL = await directTask.value
+        XCTAssertNil(snapshotURL)
+        XCTAssertEqual(directURL, direct.url)
+
+        let openedAfterUnlock = await cache.openURL(snapshot)
+        XCTAssertNotNil(openedAfterUnlock)
+        XCTAssertFalse(files.fileExists(atPath: expiredURL.path), "Admission should still prune expired snapshots")
     }
 
     @MainActor

@@ -49,6 +49,7 @@ use prompt::ChildPrompt;
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
+const AMBIGUOUS_IDLE_SETTLE: Duration = CANCEL_SETTLE;
 const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
@@ -565,9 +566,23 @@ fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActi
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum SessionPromptState {
+    #[default]
+    Ready,
+    // An unverified boundary cannot safely separate future output from this turn.
+    Unsettled,
+}
+
+fn ambiguous_prompt_error() -> ChildError {
+    ChildError::TerminalFailed(
+        "nested agent reported Idle without a verifiable completion for this prompt".into(),
+    )
+}
+
 struct Prompt {
     // The worker, not the waiting caller, owns serialization until settlement.
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: tokio::sync::OwnedMutexGuard<SessionPromptState>,
     session_id: SessionId,
     /// The subagent id that owns this turn, so usage events name the roster row.
     owner: String,
@@ -578,7 +593,7 @@ struct Prompt {
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
 }
 struct Fork {
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: tokio::sync::OwnedMutexGuard<SessionPromptState>,
     session_id: SessionId,
     model: Option<String>,
     parent: Option<(String, String)>,
@@ -739,7 +754,7 @@ struct Route {
     owner: String,
     generation: u64,
     capture: Arc<Mutex<capture::Capture>>,
-    idle: watch::Sender<protocol::Foreground>,
+    boundary_changed: watch::Sender<()>,
 }
 impl Route {
     fn record_state(
@@ -747,13 +762,13 @@ impl Route {
         state: protocol::Foreground,
         repeated_idle: bool,
     ) -> Result<(), agent_client_protocol::Error> {
-        let idle = self
+        let changed = self
             .capture
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?
             .state(state, repeated_idle);
-        if let Some(idle) = idle {
-            self.idle.send_replace(idle);
+        if changed {
+            self.boundary_changed.send_replace(());
         }
         Ok(())
     }
@@ -785,6 +800,45 @@ impl Route {
         if let Some(update) = inspection_event(&self.owner, self.generation, update) {
             transcript.record(&update);
         }
+    }
+}
+
+fn prompt_boundary(capture: &Mutex<capture::Capture>) -> Result<capture::Boundary, ChildError> {
+    Ok(capture
+        .lock()
+        .map_err(|error| ChildError::Failed(error.to_string()))?
+        .boundary())
+}
+
+async fn wait_for_prompt_boundary(
+    capture: &Mutex<capture::Capture>,
+    mut updates: watch::Receiver<()>,
+) -> Result<Option<agent_client_protocol::v2::schema::StopReason>, ChildError> {
+    let mut deadline = None;
+    loop {
+        // Mark the watch seen before reading capture: a notification after the
+        // read must wake us, and one before it is reflected in capture.
+        updates.borrow_and_update();
+        match prompt_boundary(capture)? {
+            capture::Boundary::Settled(reason) => return Ok(reason),
+            capture::Boundary::Waiting => deadline = None,
+            capture::Boundary::AmbiguousIdle => {
+                let deadline = *deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + AMBIGUOUS_IDLE_SETTLE);
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ambiguous_prompt_error());
+                }
+                if let Ok(result) = tokio::time::timeout_at(deadline, updates.changed()).await {
+                    result.map_err(|error| ChildError::Failed(error.to_string()))?;
+                }
+                // Recheck capture even at expiry: terminal evidence can race the timer.
+                continue;
+            }
+        }
+        updates
+            .changed()
+            .await
+            .map_err(|error| ChildError::Failed(error.to_string()))?;
     }
 }
 
@@ -1154,7 +1208,7 @@ pub(crate) struct ChildSession {
     tx: mpsc::Sender<Request>,
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
-    serial: Arc<tokio::sync::Mutex<()>>,
+    serial: Arc<tokio::sync::Mutex<SessionPromptState>>,
     closed: watch::Receiver<bool>,
     descendant_parent: Option<String>,
 }
@@ -1277,7 +1331,7 @@ impl ChildSession {
                         tx: actor_tx,
                         session_id: ready.session_id,
                         capabilities: ready.capabilities,
-                        serial: Arc::new(tokio::sync::Mutex::new(())),
+                        serial: Arc::default(),
                         closed: closed_rx,
                         descendant_parent: ready.descendant_parent,
                     },
@@ -1372,6 +1426,9 @@ impl ChildSession {
             Either::Left((serial, _)) => serial,
             Either::Right(((), _)) => return Err(ChildError::Cancelled),
         };
+        if *serial == SessionPromptState::Unsettled {
+            return Err(ambiguous_prompt_error());
+        }
         if !self.supports_native_fork() {
             return Err(ChildError::Failed(
                 "ACP harness does not support session/fork".into(),
@@ -1406,7 +1463,7 @@ impl ChildSession {
             tx: self.tx.clone(),
             session_id,
             capabilities: self.capabilities.clone(),
-            serial: Arc::new(tokio::sync::Mutex::new(())),
+            serial: Arc::default(),
             closed: self.closed.clone(),
             descendant_parent,
         })
@@ -1459,6 +1516,9 @@ impl ChildSession {
             Either::Left((serial, _)) => serial,
             Either::Right(((), _)) => return Err(ChildError::Cancelled),
         };
+        if *serial == SessionPromptState::Unsettled {
+            return Err(ambiguous_prompt_error());
+        }
         let (reply, response) = oneshot::channel();
         let request = Request::Prompt(Prompt {
             serial,
@@ -1676,7 +1736,10 @@ async fn run(
                     return Ok(());
                 }
                 if let Some(update) = messages::parse(&params["update"])? {
-                    route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_message(update);
+                    let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_message(update);
+                    if changed {
+                        route.boundary_changed.send_replace(());
+                    }
                     return Ok(());
                 }
                 // Capture rich tool values without round-tripping through the v1
@@ -1768,9 +1831,9 @@ async fn run(
                     return std::future::pending().await;
                 }
                 let id = SessionId::new(id.clone());
-                let (idle, _) = watch::channel(protocol::Foreground::Waiting);
+                let (boundary_changed, _) = watch::channel(());
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
-                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, capture: Arc::clone(&replay_capture), idle });
+                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, capture: Arc::clone(&replay_capture), boundary_changed });
                 stream_routes.begin_resume(id.to_string());
                 let result = protocol::resume(&connection, version, id.clone(), root.clone(), additional_directories.clone()).await;
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
@@ -2113,15 +2176,15 @@ async fn run(
                         let fatal = fatal_tx.clone();
                         let session_snapshots = Arc::clone(&session_snapshots);
                         tasks.spawn(async move {
-                            let _serial = prompt.serial;
+                            let mut serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
                             let capture = Arc::new(Mutex::new(capture::Capture::new(supports_steer)));
-                            let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
+                            let (boundary_changed, boundary_updates) = watch::channel(());
                             if let Some(transcript) = &prompt.transcript {
                                 stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone());
                             }
                             if let Ok(mut routes) = routes.lock() {
-                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, capture: Arc::clone(&capture), idle: idle_tx });
+                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, capture: Arc::clone(&capture), boundary_changed });
                             }
                             if !prompt.owner.is_empty() {
                                 crate::events::emit(&crate::events::RuntimeEvent::SubagentCapabilities {
@@ -2133,25 +2196,20 @@ async fn run(
                                 }
                             }
                             let request = async {
-                                let receipt = match protocol::prompt(&connection, version, session_id.clone(), prompt.content).await? {
+                                let request_error = |error| ChildError::Failed(child_request_error(error, &auth_methods));
+                                let receipt = match protocol::prompt(&connection, version, session_id.clone(), prompt.content).await.map_err(request_error)? {
                                     protocol::PromptAcceptance::V1(response) => return Ok(*response),
                                     protocol::PromptAcceptance::V2(receipt) => receipt,
                                 };
-                                let receipt = capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.receipt(receipt);
-                                let state = match receipt {
-                                    capture::Receipt::EchoOverflow => {
-                                        // An omitted echo ID could own the receipt. Keep the
-                                        // serial guard until the actor invalidates the connection.
-                                        let _ = fatal.send(());
-                                        return std::future::pending().await;
-                                    }
-                                    capture::Receipt::Settled(idle) => idle,
-                                    capture::Receipt::Waiting => idle_rx.wait_for(|state| matches!(state, protocol::Foreground::Idle(_))).await.map_err(agent_client_protocol::Error::into_internal_error)?.clone(),
-                                };
-                                match state {
-                                    protocol::Foreground::Idle(reason) => protocol::completion(reason),
-                                    _ => Err(agent_client_protocol::Error::internal_error()),
+                                let receipt = capture.lock().map_err(agent_client_protocol::Error::into_internal_error).map_err(request_error)?.receipt(receipt);
+                                if matches!(receipt, capture::Receipt::EchoOverflow) {
+                                    // An omitted echo ID could own the receipt. Keep the
+                                    // serial guard until the actor invalidates the connection.
+                                    let _ = fatal.send(());
+                                    return std::future::pending().await;
                                 }
+                                let reason = wait_for_prompt_boundary(&capture, boundary_updates).await?;
+                                protocol::completion(reason).map_err(request_error)
                             };
                             tokio::pin!(request);
                             // Response-first matches the original biased race.
@@ -2160,11 +2218,14 @@ async fn run(
                                 &mut request,
                                 std::pin::pin!(prompt.cancellation.cancelled()),
                             ).await {
-                                Either::Left((result, _)) => (result.map_err(|error| child_request_error(error, &auth_methods)), false),
+                                Either::Left((result, _)) => (result, false),
                                 Either::Right(((), _)) => {
                                     let _ = protocol::cancel(&connection, version, session_id.clone());
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
-                                        Ok(result) => (result.map_err(|error| child_request_error(error, &auth_methods)), true),
+                                        Ok(result) => (result, true),
+                                        Err(_) if matches!(prompt_boundary(&capture), Ok(capture::Boundary::AmbiguousIdle)) => {
+                                            (Err(ambiguous_prompt_error()), true)
+                                        }
                                         Err(_) => {
                                             let _ = prompt.reply.send(Err(ChildError::TerminalCancelled));
                                             let _ = fatal.send(());
@@ -2174,8 +2235,13 @@ async fn run(
                                 }
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
-                            let outcome = if cancelled { Err(ChildError::Cancelled) } else {
-                                response.map_err(ChildError::Failed).and_then(|response| {
+                            let outcome = if let Err(error @ ChildError::TerminalFailed(_)) = response {
+                                // Quarantine this session before releasing its gate. A sibling
+                                // has its own gate and can continue using the connection.
+                                *serial = SessionPromptState::Unsettled;
+                                Err(error)
+                            } else if cancelled { Err(ChildError::Cancelled) } else {
+                                response.and_then(|response| {
                                     let mut output = capture.lock()
                                         .map_err(|error| ChildError::Failed(error.to_string()))?
                                         .take_result()?;
@@ -2416,7 +2482,7 @@ mod test_support {
                     tx,
                     session_id: "test".into(),
                     capabilities: agentkit_acp::AgentCapabilities::default(),
-                    serial: Arc::new(tokio::sync::Mutex::new(())),
+                    serial: Arc::default(),
                     closed: watch::channel(false).1,
                     descendant_parent: None,
                 },
@@ -2431,7 +2497,7 @@ mod test_support {
                 tx,
                 session_id: "test".into(),
                 capabilities: agentkit_acp::AgentCapabilities::default(),
-                serial: Arc::new(tokio::sync::Mutex::new(())),
+                serial: Arc::default(),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
             }
@@ -2581,7 +2647,7 @@ mod tests {
                 tx,
                 session_id: "test".into(),
                 capabilities,
-                serial: Arc::new(tokio::sync::Mutex::new(())),
+                serial: Arc::default(),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
             },
@@ -4417,6 +4483,116 @@ for line in sys.stdin:
             assert_eq!(result.text, "ordinary reply", "receipt {receipt_order}");
             child.close().await.unwrap();
         }
+    }
+
+    async fn assert_answerless_idle_keeps_siblings_alive(receipt_order: &str, cancel: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(
+            &root,
+            vec![format!("--prompt-receipt-order={receipt_order}")],
+        )
+        .await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let sibling = child
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
+        let prompt = |text: &'static str| {
+            child.prompt(child.session_id(), text.into(), TurnCancellation::default())
+        };
+        assert_eq!(prompt("first answer").await.unwrap().text, "first answer");
+
+        let controller = agentkit_core::CancellationController::new();
+        let result = async {
+            let choice = child.prompt(
+                child.session_id(),
+                "MOCK_ANSWERLESS_IDLE".into(),
+                controller.handle().checkpoint(),
+            );
+            let interrupt = async {
+                if cancel {
+                    // Observe the second submission, not the earlier healthy turn.
+                    let log = root.path().join("requests");
+                    while !std::fs::read_to_string(&log)
+                        .unwrap_or_default()
+                        .contains("MOCK_ANSWERLESS_IDLE")
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    controller.interrupt();
+                }
+            };
+            tokio::join!(choice, interrupt).0
+        };
+        let error = tokio::time::timeout(Duration::from_secs(10), result)
+            .await
+            .expect("ambiguous completion must be bounded")
+            .unwrap_err();
+        assert!(matches!(error, ChildError::TerminalFailed(message)
+            if message.contains("without a verifiable completion")));
+        assert!(matches!(
+            prompt("unsafe to submit again").await,
+            Err(ChildError::TerminalFailed(_))
+        ));
+        assert!(!child.is_closed());
+        if cancel {
+            let log = std::fs::read_to_string(root.path().join("requests")).unwrap();
+            assert!(log.lines().any(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["method"] == "session/cancel" && request["sessionId"] == child.session_id()
+            }));
+        }
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            sibling.prompt(
+                sibling.session_id(),
+                "sibling answer".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.text, "sibling answer");
+        child.close().await.unwrap();
+        sibling.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_bounds_answerless_idle() {
+        assert_answerless_idle_keeps_siblings_alive("before-echo", false).await;
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_bounds_answerless_idle_during_cancellation() {
+        assert_answerless_idle_keeps_siblings_alive("after-idle", true).await;
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_keeps_streaming_after_stale_idle_without_running() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(
+            &root,
+            vec![
+                "--initial-foreground=idle".into(),
+                "--repeat-idle-before=none".into(),
+            ],
+        )
+        .await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.prompt(
+                child.session_id(),
+                "MOCK_LONG_ANSWER_NO_RUNNING".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.text, "still streaming");
+        child.close().await.unwrap();
     }
 
     #[tokio::test]

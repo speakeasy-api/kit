@@ -1,14 +1,19 @@
 //! Result capture for legacy routes and insertion-correlated draft v2 prompts.
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
-use agent_client_protocol::v2::schema::MessageId;
+use agent_client_protocol::v2::schema::{MessageId, StopReason};
 
 use super::{ChildError, ChildOutput, protocol::Foreground};
 
 pub(super) enum Receipt {
-    Waiting,
-    Settled(Foreground),
+    Accepted,
     EchoOverflow,
+}
+
+pub(super) enum Boundary {
+    Waiting,
+    AmbiguousIdle,
+    Settled(Option<StopReason>),
 }
 
 pub(super) enum Capture {
@@ -27,11 +32,25 @@ impl Capture {
         }
     }
 
-    pub(super) fn state(&mut self, state: Foreground, repeated_idle: bool) -> Option<Foreground> {
+    pub(super) fn state(&mut self, state: Foreground, repeated_idle: bool) -> bool {
         match self {
             Self::Legacy(turn) => turn.state(state),
             Self::Correlated(correlation) => correlation.state(state, repeated_idle),
         }
+    }
+
+    pub(super) fn boundary(&self) -> Boundary {
+        let turn = match self {
+            Self::Legacy(turn) => turn,
+            Self::Correlated(correlation) if correlation.matched => {
+                if correlation.current.ambiguous_idle {
+                    return Boundary::AmbiguousIdle;
+                }
+                &correlation.current.turn
+            }
+            Self::Correlated(_) => return Boundary::Waiting,
+        };
+        turn.idle().map_or(Boundary::Waiting, Boundary::Settled)
     }
 
     pub(super) fn echo(&mut self, id: &str) {
@@ -42,7 +61,7 @@ impl Capture {
 
     pub(super) fn receipt(&mut self, id: MessageId) -> Receipt {
         match self {
-            Self::Legacy(_) => Receipt::Waiting,
+            Self::Legacy(_) => Receipt::Accepted,
             Self::Correlated(correlation) => correlation.receipt(id),
         }
     }
@@ -57,13 +76,18 @@ impl Capture {
     pub(super) fn record_message(
         &mut self,
         update: agent_client_protocol::v2::schema::SessionUpdate,
-    ) {
-        if let Self::Correlated(correlation) = self
+    ) -> bool {
+        let changed = if let Self::Correlated(correlation) = self
             && (correlation.matched || !correlation.current.echoes.is_empty())
         {
-            correlation.current.answer_observed = true;
-        }
+            // Only the first answer update can lift the ambiguity deadline.
+            let first = !std::mem::replace(&mut correlation.current.answer_observed, true);
+            first && correlation.current.clear_ambiguous_idle() && correlation.matched
+        } else {
+            false
+        };
         self.record_output(|output| output.record_message(update));
+        changed
     }
 
     pub(super) fn take_result(&mut self) -> Result<ChildOutput, ChildError> {
@@ -104,26 +128,33 @@ impl Default for Turn {
 }
 
 impl Turn {
-    fn state(&mut self, state: Foreground) -> Option<Foreground> {
-        if self.foreground.advance(state) {
-            self.idle()
-        } else {
-            None
-        }
+    fn state(&mut self, state: Foreground) -> bool {
+        self.foreground.advance(state) && matches!(self.foreground, Foreground::Idle(_))
     }
 
-    fn idle(&self) -> Option<Foreground> {
-        matches!(self.foreground, Foreground::Idle(_)).then(|| self.foreground.clone())
+    fn idle(&self) -> Option<Option<StopReason>> {
+        match &self.foreground {
+            Foreground::Idle(reason) => Some(reason.clone()),
+            _ => None,
+        }
     }
 }
 
 #[derive(Default)]
 struct Candidate {
-    echoes: BTreeSet<String>,
+    echoes: BTreeMap<String, bool>,
     echo_bytes: usize,
     turn: Turn,
     answer_observed: bool,
+    ambiguous_idle: bool,
     output_overflow: bool,
+}
+
+impl Candidate {
+    fn clear_ambiguous_idle(&mut self) -> bool {
+        self.echoes.values_mut().for_each(|idle| *idle = false);
+        std::mem::take(&mut self.ambiguous_idle)
+    }
 }
 
 // A receipt may follow the entire matching turn. Keep bounded provisional turn
@@ -151,7 +182,7 @@ impl Correlation {
         }
         if let Some(receipt) = &self.receipt {
             self.matched = receipt == id;
-        } else if !self.current.echoes.contains(id) {
+        } else if !self.current.echoes.contains_key(id) {
             if self.echo_count == MAX_UNCONFIRMED_ECHOES
                 || id.len() > MAX_UNCONFIRMED_ECHO_BYTES - self.echo_bytes
             {
@@ -161,7 +192,7 @@ impl Correlation {
             self.echo_count += 1;
             self.echo_bytes += id.len();
             self.current.echo_bytes += id.len();
-            self.current.echoes.insert(id.to_owned());
+            self.current.echoes.insert(id.to_owned(), false);
         }
     }
 
@@ -170,12 +201,13 @@ impl Correlation {
         if let Some(index) = self
             .completed
             .iter()
-            .position(|turn| turn.echoes.contains(&id))
+            .position(|turn| turn.echoes.contains_key(&id))
         {
             self.current = self.completed.swap_remove(index);
             self.matched = true;
-        } else if self.current.echoes.contains(&id) {
+        } else if let Some(ambiguous_idle) = self.current.echoes.get(&id) {
             self.matched = true;
+            self.current.ambiguous_idle = *ambiguous_idle;
         } else if self.echo_overflow {
             return Receipt::EchoOverflow;
         }
@@ -188,45 +220,50 @@ impl Correlation {
         self.echo_count = 0;
         self.echo_bytes = 0;
         self.receipt = Some(id);
-        if self.matched
-            && let Some(idle) = self.current.turn.idle()
-        {
-            Receipt::Settled(idle)
-        } else {
-            Receipt::Waiting
-        }
+        Receipt::Accepted
     }
 
-    fn state(&mut self, state: Foreground, repeated_idle: bool) -> Option<Foreground> {
-        // An echo only establishes insertion. For children that omit an active
-        // snapshot, require an agent message after the echo before accepting an
-        // otherwise repeated Idle as the answer's boundary.
+    // Return whether a waiting prompt must recheck its boundary.
+    fn state(&mut self, state: Foreground, repeated_idle: bool) -> bool {
+        // An echo only establishes insertion. A repeated Idle carries no turn
+        // identifier, and even its stop reason may be from an earlier turn.
         if repeated_idle && !self.current.answer_observed {
-            return None;
+            if self.current.turn.foreground == Foreground::Waiting {
+                if self.matched {
+                    return !std::mem::replace(&mut self.current.ambiguous_idle, true);
+                }
+                self.current
+                    .echoes
+                    .values_mut()
+                    .for_each(|idle| *idle = true);
+            }
+            return false;
         }
-        let idle = if self.current.turn.foreground == Foreground::Waiting
+        let active = state == Foreground::Running;
+        if self.current.turn.foreground == Foreground::Waiting
             && matches!(state, Foreground::Idle(_))
         {
             if !self.matched && self.current.echoes.is_empty() {
                 // Registration can miss an unrelated turn's Running. Its Idle
                 // still marks a boundary, but cannot settle this route without an echo.
                 self.discard_current();
-                return None;
+                return false;
             }
             self.current.turn.foreground = state;
-            self.current.turn.idle()?
-        } else {
-            self.current.turn.state(state)?
-        };
+        } else if !self.current.turn.state(state) {
+            // Resume the ordinary wait once the peer reports active work.
+            return active && self.current.clear_ambiguous_idle() && self.matched;
+        }
+        self.current.ambiguous_idle = false;
         if self.matched {
-            return Some(idle);
+            return true;
         }
         if self.current.echoes.is_empty() {
             self.discard_current();
         } else {
             self.completed.push(std::mem::take(&mut self.current));
         }
-        None
+        false
     }
 
     fn discard_current(&mut self) {
@@ -238,7 +275,7 @@ impl Correlation {
 
     fn record_output(&mut self, record: impl FnOnce(&mut ChildOutput)) {
         if self.current.output_overflow
-            || self.current.turn.idle().is_some()
+            || matches!(self.current.turn.foreground, Foreground::Idle(_))
             || !(self.matched
                 || self.current.turn.foreground == Foreground::Running
                 || !self.current.echoes.is_empty())

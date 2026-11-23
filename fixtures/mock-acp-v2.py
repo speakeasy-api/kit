@@ -162,7 +162,8 @@ def prompt(request):
     delayed_receipt = prompt_receipt_order == "after-idle" or output_overflow_case
     if prompt_receipt_order != "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
-    if "--omit-prompt-running" not in sys.argv and not repeat_idle_before:
+    answerless = text == "MOCK_ANSWERLESS_IDLE"
+    if "--omit-prompt-running" not in sys.argv and not repeat_idle_before and not answerless:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
     if text == "MOCK_CAPTURE_TRUNCATED_TERMINAL":
         for _ in range(5):
@@ -182,9 +183,20 @@ def prompt(request):
                                     "content": params["prompt"]})
     if repeat_idle_before:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
-        session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before})
+        if repeat_idle_before != "none":
+            session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before})
     if prompt_receipt_order == "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
+    if text == "MOCK_LONG_ANSWER_NO_RUNNING":
+        session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
+                                    "content": {"type": "text", "text": "still "}})
+        time.sleep(6)  # The real Idle arrives after Kit's ambiguity window.
+        text = "streaming"
+    if answerless:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "error"})
+        if delayed_receipt:
+            respond(request["id"], {"messageId": message_id})
+        return
     if text == "MOCK_CAPTURE_IMAGE_ECHOES":
         for _ in range(5):
             session_update(session_id, {

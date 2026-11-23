@@ -134,7 +134,7 @@ actor TranscriptMediaCache {
         } catch { return nil }
     }
 
-    func openURL(_ media: TranscriptMedia) -> URL? {
+    func openURL(_ media: TranscriptMedia) async -> URL? {
         if let url = TranscriptMedia.safeURL(media.url) {
             if !url.isFileURL { return url }
             // Do not let a media-looking symlink launch an application or script.
@@ -150,27 +150,42 @@ actor TranscriptMediaCache {
               let ext = type.preferredFilenameExtension else { return nil }
         guard let directory = playbackDirectory else { return nil }
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        let files = FileManager.default
+        let url = directory.appendingPathComponent("Kit-media-\(digest)").appendingPathExtension(ext)
         do {
-            try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            return try Self.withPlaybackDirectoryLock(in: directory) {
-                let url = directory.appendingPathComponent("Kit-media-\(digest)").appendingPathExtension(ext)
-                if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-                    guard values.isRegularFile == true, values.isSymbolicLink == false else { return nil }
-                    // External players can edit files. Only reuse a file that still holds the snapshot.
-                    let cached = TranscriptMedia(mimeType: media.mimeType, url: url)
-                    if (try? cached.boundedData()) == data {
-                        try files.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
-                        return url
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let clock = ContinuousClock()
+            let deadline = clock.now + .milliseconds(250)
+            repeat {
+                try Task.checkCancellation()
+                do {
+                    return try Self.withPlaybackDirectoryLock(in: directory) {
+                        try openPlaybackSnapshot(data, mimeType: media.mimeType, at: url)
                     }
-                } else {
-                    // Never evict a recent snapshot to make room for a new one.
-                    guard try pruneExpiredPlaybackFiles(in: directory) < playbackCapacity else { return nil }
+                } catch is PlaybackLockUnavailable {
+                    // Suspend without holding a descriptor or blocking other actor calls.
+                    try await clock.sleep(until: min(deadline, clock.now + .milliseconds(10)))
                 }
-                try data.write(to: url, options: .atomic)
+            } while clock.now < deadline
+            return nil
+        } catch { return nil }
+    }
+
+    // Called only while holding the playback directory lock.
+    private func openPlaybackSnapshot(_ data: Data, mimeType: String, at url: URL) throws -> URL? {
+        if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
+            guard values.isRegularFile == true, values.isSymbolicLink == false else { return nil }
+            // External players can edit files. Only reuse a file that still holds the snapshot.
+            let cached = TranscriptMedia(mimeType: mimeType, url: url)
+            if (try? cached.boundedData()) == data {
+                try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
                 return url
             }
-        } catch { return nil }
+        } else {
+            // Never evict a recent snapshot to make room for a new one.
+            guard try pruneExpiredPlaybackFiles(in: url.deletingLastPathComponent()) < playbackCapacity else { return nil }
+        }
+        try data.write(to: url, options: .atomic)
+        return url
     }
 
     func prunePlaybackFiles() {
@@ -203,15 +218,18 @@ actor TranscriptMediaCache {
             .range(of: #"\AKit-media-[0-9a-f]{64}\z"#, options: .regularExpression) != nil
     }
 
+    private struct PlaybackLockUnavailable: Error {}
+
     private static func withPlaybackDirectoryLock<T>(in directory: URL, _ body: () throws -> T) throws -> T {
         // Lock the directory itself: Kit never removes it, and closing the descriptor releases
         // the lock on every exit (including process termination) without a separate lock file.
         let fd = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         defer { _ = Darwin.close(fd) }
-        while flock(fd, LOCK_EX) != 0 {
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let error = errno
-            guard error == EINTR else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(error)) }
+            if error == EWOULDBLOCK || error == EINTR { throw PlaybackLockUnavailable() }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(error))
         }
         return try body()
     }

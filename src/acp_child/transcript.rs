@@ -688,7 +688,7 @@ mod tests {
             owner: "child".into(),
             generation: 1,
             capture: Arc::new(Mutex::new(super::super::capture::Capture::new(false))),
-            idle: tokio::sync::watch::channel(super::super::protocol::Foreground::Waiting).0,
+            boundary_changed: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -744,11 +744,19 @@ mod tests {
             route.capture.lock().unwrap().take_output().text,
             "execution continues"
         );
-        let mut completion = route.idle.subscribe();
+        let completion = route.boundary_changed.subscribe();
         route
-            .idle
-            .send_replace(super::super::protocol::Foreground::Idle(None));
-        completion.changed().await.unwrap();
+            .record_state(super::super::protocol::Foreground::Running, false)
+            .unwrap();
+        route
+            .record_state(super::super::protocol::Foreground::Idle(None), false)
+            .unwrap();
+        assert_eq!(
+            super::super::wait_for_prompt_boundary(&route.capture, completion)
+                .await
+                .unwrap(),
+            None
+        );
 
         let other = Transcript::start();
         let _ = std::panic::catch_unwind(|| {
