@@ -37,6 +37,7 @@ fork_release = option("--fork-release")
 prompt_release = option("--prompt-release")
 prompt_release_text = option("--prompt-release-text")
 steer_ack_release = option("--steer-ack-release")
+rollover_receipt_order = option("--rollover-receipt-order")
 close_release = option("--close-release")
 close_release_session = option("--close-release-session")
 fail_close_session = option("--fail-close-session")
@@ -129,6 +130,20 @@ def fork(request):
     respond(request["id"], {"sessionId": session_id})
 
 
+def session_update(session_id, update):
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+
+
+def rollover_turn(session_id, message_id, content, started=True):
+    if started:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+    session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                "content": content})
+    session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "agent-" + message_id,
+                                "content": {"type": "text", "text": "unrelated reply"}})
+    session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+
+
 def prompt(request):
     params = request["params"]
     session_id = params["sessionId"]
@@ -136,8 +151,18 @@ def prompt(request):
     if "MOCK_REJECT" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "prompt rejected"}})
         return
-    respond(request["id"], {"messageId": "user-1"})
-    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "running"}}})
+    message_id = f"user-{request['id']}" if supports_steer else "user-1"
+    if rollover_receipt_order:
+        rollover_turn(session_id, "rollover-before", params["prompt"],
+                      started=rollover_receipt_order != "after-echo")
+    if rollover_receipt_order not in ("after-echo", "after-idle"):
+        respond(request["id"], {"messageId": message_id})
+    session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+    if supports_steer:
+        session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                    "content": params["prompt"]})
+    if rollover_receipt_order == "after-echo":
+        respond(request["id"], {"messageId": message_id})
     if "MOCK_PERMISSION" in text:
         send({
             "jsonrpc": "2.0", "id": "permission-1", "method": "session/request_permission",
@@ -294,6 +319,9 @@ def prompt(request):
         },
     })
     send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn", "usage": {"totalTokens": 12, "inputTokens": 7, "outputTokens": 5}}}})
+    if rollover_receipt_order == "after-idle":
+        rollover_turn(session_id, "rollover-after", params["prompt"])
+        respond(request["id"], {"messageId": message_id})
     if "--exit-after-prompt" in sys.argv:
         time.sleep(0.05)
         os._exit(0)

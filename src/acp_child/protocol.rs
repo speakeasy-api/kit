@@ -335,30 +335,33 @@ pub(super) fn fork(
     }))
 }
 
+pub(super) enum PromptAcceptance {
+    V1(v1::PromptResponse),
+    V2(v2::MessageId),
+}
+
 pub(super) async fn prompt(
     connection: &ConnectionTo<Agent>,
     version: Version,
     session_id: v1::SessionId,
     content: Vec<v1::ContentBlock>,
-) -> Result<v1::PromptResponse, Error> {
+) -> Result<PromptAcceptance, Error> {
     match version {
-        Version::V1 => {
+        Version::V1 => Ok(PromptAcceptance::V1(
             connection
                 .send_request(v1::PromptRequest::new(session_id, content))
                 .block_task()
-                .await
-        }
+                .await?,
+        )),
         Version::V2 => {
-            connection
+            let inserted = connection
                 .send_request(v2::PromptRequest::new(
                     session_id.to_string(),
                     cast(content)?,
                 ))
                 .block_task()
                 .await?;
-            // Acceptance is not completion. The caller replaces this response with
-            // the idle state update after foreground work settles.
-            Ok(v1::PromptResponse::new(v1::StopReason::EndTurn))
+            Ok(PromptAcceptance::V2(inserted.message_id))
         }
     }
 }

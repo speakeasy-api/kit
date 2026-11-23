@@ -1199,6 +1199,50 @@ fn replacing_a_controller_withdraws_only_its_explicit_pending_prompt() {
 }
 
 #[test]
+fn client_withdrawal_waits_for_writer_capacity_unless_the_prompt_settles() {
+    for settles_first in [false, true] {
+        let mut actor = isolated_actor();
+        let (writes, mut received) = mpsc::channel(1);
+        actor.session_result = Some(json!({"configOptions":[]}));
+        actor
+            .command(resident_claim(&actor, false, 60), &writes)
+            .unwrap();
+        let attachment = actor.attachment.as_ref().unwrap().id.clone();
+        actor.command(Request::Send {
+            session: "resident".into(),
+            attachment: attachment.clone(),
+            message: json!({"jsonrpc":"2.0","id":"held","method":"session/prompt","params":{"sessionId":"resident","delivery":"steer","prompt":[]}}),
+            charge: None,
+        }, &writes).unwrap();
+        assert_eq!(writes.capacity(), 0);
+        actor.command(Request::Send {
+            session: "resident".into(),
+            attachment,
+            message: json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"held"}}),
+            charge: None,
+        }, &writes).unwrap();
+
+        let prompt = received.try_recv().unwrap().message;
+        if settles_first {
+            actor.output(
+                json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}}),
+            );
+        }
+        actor.flush_withdrawals(&writes);
+        if !settles_first {
+            let cancellation = received.try_recv().unwrap().message;
+            assert_eq!(cancellation["method"], "$/cancel_request");
+            assert_eq!(cancellation["params"]["requestId"], prompt["id"]);
+        }
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(actor.next_withdrawal(), None);
+    }
+}
+
+#[test]
 fn overflowing_the_controller_output_withdraws_its_held_prompt() {
     let mut actor = isolated_actor();
     let (writes, mut received) = mpsc::channel(2);
@@ -1986,6 +2030,95 @@ open(sys.argv[1],'w').write('cleaned')
             .await
             .contains_key("resident")
     );
+}
+
+#[tokio::test]
+async fn withdrawal_racing_close_keeps_another_session_connected() {
+    use agent_client_protocol::{ConnectTo, TransportFrame};
+    use futures_util::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let harness = Harness::new().await;
+    harness.child().await;
+    let closing = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    harness.child_source("closing", r#"
+import sys,json,socket
+held=None
+def result(req,value):
+ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':value}),flush=True)
+for line in sys.stdin:
+ req=json.loads(line); method=req['method']
+ if method=='initialize': result(req,{'protocolVersion':2,'info':{'name':'fake','version':'1'},'capabilities':{}})
+ elif method in ('session/new','session/resume'): result(req,{'sessionId':'closing','configOptions':[]})
+ elif method=='session/prompt': held=req
+ elif method=='session/close':
+  assert held is not None
+  with socket.create_connection(('127.0.0.1',int(sys.argv[1]))) as gate:
+   assert gate.recv(1)==b'G'
+  result(held,{'stopReason':'cancelled'})
+  result(req,{})
+ else: raise AssertionError(method)
+"#, &[closing.local_addr().unwrap().port().to_string()]).await;
+
+    let http = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::AUTHORIZATION,
+            "Bearer boundary-secret".parse().unwrap(),
+        )]))
+        .build()
+        .unwrap();
+    let transport =
+        agent_client_protocol_http::HttpClient::from_http_client(&harness.url, http).unwrap();
+    let (mut channel, drive) = transport.into_channel_and_future();
+    let transport = tokio::spawn(drive.unwrap());
+    let send = |message| {
+        channel
+            .tx
+            .unbounded_send(TransportFrame::Single(
+                serde_json::from_value(message).unwrap(),
+            ))
+            .unwrap()
+    };
+    let mut responses = Vec::new();
+    let mut receive = async |id: u64| {
+        while !responses.iter().any(|message: &Value| message["id"] == id) {
+            let frame = channel
+                .rx
+                .next()
+                .await
+                .expect("SDK transport closed before response");
+            let TransportFrame::Single(message) = frame else {
+                panic!("unexpected frame")
+            };
+            responses.push(serde_json::to_value(message).unwrap());
+        }
+        let message = responses
+            .iter()
+            .find(|message| message["id"] == id)
+            .unwrap();
+        assert!(message.get("result").is_some(), "{message}");
+        message["result"].clone()
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"close-race","version":"1"},"capabilities":{}}}));
+        receive(1).await;
+        for (id, session) in [(2, "closing"), (3, "resident")] {
+            send(json!({"jsonrpc":"2.0","id":id,"method":"session/resume","params":{"sessionId":session,"cwd":harness.gateway.roots[0]}}));
+            receive(id).await;
+        }
+        send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"closing","delivery":"steer","prompt":[]}}));
+        send(json!({"jsonrpc":"2.0","id":5,"method":"session/close","params":{"sessionId":"closing"}}));
+        let (mut gate, _) = closing.accept().await.unwrap();
+        send(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":4}}));
+        send(json!({"jsonrpc":"2.0","id":6,"method":"kit/session/status","params":{"sessionId":"resident"}}));
+        receive(6).await;
+        gate.write_all(b"G").await.unwrap();
+        assert_eq!(receive(4).await["stopReason"], "cancelled");
+        receive(5).await;
+        send(json!({"jsonrpc":"2.0","id":7,"method":"kit/session/status","params":{"sessionId":"resident"}}));
+        receive(7).await;
+    }).await.unwrap();
+    transport.abort();
 }
 
 #[tokio::test]

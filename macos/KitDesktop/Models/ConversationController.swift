@@ -356,9 +356,12 @@ final class ConversationController: ObservableObject {
             if case .audio(let data, let mimeType?, let fingerprint?) = block,
                let index = files.firstIndex(where: { $0.fingerprint == fingerprint && $0.file.mimeType == mimeType }) {
                 let file = files.remove(at: index).file
+                // A complete echo is a snapshot of what was sent. Only consult the mutable
+                // source file when the echoed bytes are missing or were truncated.
+                let echoedData = data.flatMap { Data(base64Encoded: $0) }
                 return [UserMediaPresentation(id: file.id, kind: .audio, mimeType: mimeType,
-                                              name: file.url.lastPathComponent,
-                                              data: data.flatMap { Data(base64Encoded: $0) }, url: file.url)]
+                                              name: file.url.lastPathComponent, data: echoedData,
+                                              url: echoedData == nil ? file.url : nil)]
             }
             return Self.userContent(block).media
         }

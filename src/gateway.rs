@@ -1195,8 +1195,10 @@ impl Actor {
     }
 
     fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
-        if (self.closed || self.pending.values().any(|p| p.method == "session/close"))
+        let closing = self.closed || self.pending.values().any(|p| p.method == "session/close");
+        if closing
             && !matches!(request, Request::Poll { .. } | Request::Detach { .. })
+            && !matches!(&request, Request::Send { message, .. } if message["method"] == "$/cancel_request")
         {
             return Err(Failure::conflict(
                 "session is closing or closed; restore after cleanup",
@@ -1442,24 +1444,31 @@ impl Actor {
                     }) else {
                         return Err(Failure::bad("valid cancellation requestId required"));
                     };
-                    let Some((&child_id, _)) = self.pending.iter().find(|(_, pending)| {
-                        pending.attachment == attachment
-                            && pending.original == *id
-                            && pending.method == "session/prompt"
-                    }) else {
+                    // Leave a validated late withdrawal to the admitted close
+                    // instead of starting another child write.
+                    if closing {
+                        return Ok(object([]));
+                    }
+                    let Some((&child_id, pending)) =
+                        self.pending.iter_mut().find(|(_, pending)| {
+                            pending.attachment == attachment
+                                && pending.original == *id
+                                && pending.method == "session/prompt"
+                        })
+                    else {
                         return Ok(object([]));
                     };
-                    message["params"]["requestId"] = child_id.into();
-                    writes
-                        .try_send(ChildWrite {
-                            message,
-                            _charge: charge,
-                        })
-                        .map_err(|_| {
-                            Failure::unavailable(
-                                "child input queue unavailable; cancellation not accepted",
-                            )
-                        })?;
+                    // The normalized child notification needs only the remapped
+                    // ID. Do not retain the transport charge with the retry bit.
+                    match writes.try_reserve() {
+                        Ok(permit) => self.send_withdrawal(child_id, permit),
+                        Err(mpsc::error::TrySendError::Full(())) => {
+                            pending.withdrawal_pending = true;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            return Err(Failure::unavailable("child input writer closed"));
+                        }
+                    }
                     return Ok(object([]));
                 }
                 if !matches!(

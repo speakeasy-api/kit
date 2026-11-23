@@ -14,6 +14,7 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, UntypedMessage};
 
+mod capture;
 mod messages;
 #[cfg(test)]
 mod negotiation_tests;
@@ -727,17 +728,51 @@ impl InspectionSegments {
     }
 }
 
-/// Where one in-flight prompt's session updates land.
+/// Where one in-flight prompt's session updates land. The notification callback
+/// records echoes, output, and foreground transitions in wire order; the prompt
+/// task records the receipt and takes the result. The capture lock is never held
+/// while notifying the waiter or acquiring the session routes lock.
 #[derive(Clone)]
 struct Route {
     transcript: Option<Transcript>,
     inspection_segments: Arc<Mutex<InspectionSegments>>,
     owner: String,
     generation: u64,
-    output: Arc<Mutex<ChildOutput>>,
+    capture: Arc<Mutex<capture::Capture>>,
     idle: watch::Sender<protocol::Foreground>,
 }
 impl Route {
+    fn record_state(
+        &self,
+        state: protocol::Foreground,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let idle = self
+            .capture
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+            .state(state);
+        if let Some(idle) = idle {
+            self.idle.send_replace(idle);
+        }
+        Ok(())
+    }
+
+    fn record_output(
+        &self,
+        update: &Value,
+        f: impl FnOnce(&mut ChildOutput),
+    ) -> Result<(), agent_client_protocol::Error> {
+        if let Some(output) = self
+            .capture
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+            .output_mut(update)
+        {
+            f(output);
+        }
+        Ok(())
+    }
+
     fn record_inspection(&self, mut update: Value) {
         let Some(transcript) = &self.transcript else {
             return;
@@ -1597,13 +1632,15 @@ async fn run(
                 };
                 if let Some(state) = protocol::foreground(&params)? {
                     route.record_inspection(params["update"].clone());
-                    // Startup/replayed idle cannot settle a newly submitted turn.
-                    route.idle.send_if_modified(|current| current.advance(state));
+                    route.record_state(state)?;
                     return Ok(());
                 }
                 route.record_inspection(params["update"].clone());
+                if let Some(id) = capture::echo_id(&params["update"]) {
+                    route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
+                }
                 if let Some(update) = messages::parse(&params["update"])? {
-                    if let Ok(mut output) = route.output.lock() { output.record_message(update); }
+                    route.record_output(&params["update"], |output| output.record_message(update))?;
                     return Ok(());
                 }
                 // Capture rich tool values without round-tripping through the v1
@@ -1615,9 +1652,7 @@ async fn run(
                         | "terminal_update" | "terminal_output_chunk"));
                 if tool_update {
                     let value = params["update"].clone();
-                    if let Ok(mut output) = route.output.lock() {
-                        output.record_tool_value(value);
-                    }
+                    route.record_output(&params["update"], |output| output.record_tool_value(value))?;
                 }
                 // Reuse normalized configuration identifiers for captured output.
                 let Some(notification) = notification else { return Ok(()); };
@@ -1629,8 +1664,8 @@ async fn run(
                 if let Some(usage) = subagent_usage(&route.owner, &params["update"]) {
                     crate::events::emit(&usage);
                 }
-                if !tool_update && let Ok(mut output) = route.output.lock() {
-                    output.record(notification.update);
+                if !tool_update {
+                    route.record_output(&params["update"], |output| output.record(notification.update))?;
                 }
                 Ok(())
             },
@@ -1688,7 +1723,7 @@ async fn run(
             // Startup privately owns this route. Notifications are its only output
             // writers; response completion removes the route before publishing replay.
             // Failure/cancellation drops the entire startup connection and its route.
-            let replay_output = Arc::new(Mutex::new(ChildOutput::default()));
+            let replay_capture = Arc::new(Mutex::new(capture::Capture::new(false)));
             let session_result = if let Some((id, true)) = &persisted
                 && !config.harnesses.is_kit(&harness)
             {
@@ -1699,7 +1734,7 @@ async fn run(
                 let id = SessionId::new(id.clone());
                 let (idle, _) = watch::channel(protocol::Foreground::Waiting);
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
-                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, output: Arc::clone(&replay_output), idle });
+                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, capture: Arc::clone(&replay_capture), idle });
                 stream_routes.begin_resume(id.to_string());
                 let result = protocol::resume(&connection, version, id.clone(), root.clone(), additional_directories.clone()).await;
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
@@ -1717,7 +1752,7 @@ async fn run(
                     return Err(error);
                 }
             };
-            let mut replay = replay_output.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.clone();
+            let mut replay = replay_capture.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.take_output();
             replay.finish_messages();
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;
@@ -2044,13 +2079,13 @@ async fn run(
                         tasks.spawn(async move {
                             let _serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
-                            let output = Arc::new(Mutex::new(ChildOutput::default()));
+                            let capture = Arc::new(Mutex::new(capture::Capture::new(supports_steer)));
                             let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
                             if let Some(transcript) = &prompt.transcript {
                                 stream_routes.register(&session_id.to_string(), &prompt.owner, prompt.generation, transcript.clone());
                             }
                             if let Ok(mut routes) = routes.lock() {
-                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, output: Arc::clone(&output), idle: idle_tx });
+                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, capture: Arc::clone(&capture), idle: idle_tx });
                             }
                             if !prompt.owner.is_empty() {
                                 crate::events::emit(&crate::events::RuntimeEvent::SubagentCapabilities {
@@ -2062,14 +2097,25 @@ async fn run(
                                 }
                             }
                             let request = async {
-                                let response = protocol::prompt(&connection, version, session_id.clone(), prompt.content).await?;
-                                if version == protocol::Version::V2 {
-                                    let state = idle_rx.wait_for(|state| matches!(state, protocol::Foreground::Idle(_))).await.map_err(agent_client_protocol::Error::into_internal_error)?.clone();
-                                    if let protocol::Foreground::Idle(reason) = state {
-                                        return protocol::completion(reason);
+                                let receipt = match protocol::prompt(&connection, version, session_id.clone(), prompt.content).await? {
+                                    protocol::PromptAcceptance::V1(response) => return Ok(response),
+                                    protocol::PromptAcceptance::V2(receipt) => receipt,
+                                };
+                                let receipt = capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.receipt(receipt);
+                                let state = match receipt {
+                                    capture::Receipt::Overflow => {
+                                        // We cannot prove which turn settled. Keep the serial guard
+                                        // until the actor invalidates the connection.
+                                        let _ = fatal.send(());
+                                        return std::future::pending().await;
                                     }
+                                    capture::Receipt::Settled(idle) => idle,
+                                    capture::Receipt::Waiting => idle_rx.wait_for(|state| matches!(state, protocol::Foreground::Idle(_))).await.map_err(agent_client_protocol::Error::into_internal_error)?.clone(),
+                                };
+                                match state {
+                                    protocol::Foreground::Idle(reason) => protocol::completion(reason),
+                                    _ => Err(agent_client_protocol::Error::internal_error()),
                                 }
-                                Ok::<_, agent_client_protocol::Error>(response)
                             };
                             tokio::pin!(request);
                             // Response-first matches the original biased race.
@@ -2092,7 +2138,7 @@ async fn run(
                                 }
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
-                            let mut output = output.lock().map(|output| output.clone()).unwrap_or_default();
+                            let mut output = capture.lock().map(|mut capture| capture.take_output()).unwrap_or_default();
                             output.finish_messages();
                             match config_snapshots.get(&session_id) {
                                 Ok(Some(options)) => output.config_snapshot(options),
@@ -4237,6 +4283,31 @@ for line in sys.stdin:
         .unwrap();
         let update = event;
         assert_eq!(update["rawOutput"].as_str().unwrap().len(), 65536);
+    }
+
+    #[tokio::test]
+    async fn ordinary_prompt_returns_its_own_turn_after_a_rollover_steer() {
+        for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![format!("--rollover-receipt-order={receipt_order}")],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt(
+                    "s-test".into(),
+                    "ordinary reply".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out with receipt {receipt_order}"))
+            .unwrap_or_else(|error| panic!("failed with receipt {receipt_order}: {error}"));
+            assert_eq!(output.text, "ordinary reply", "receipt {receipt_order}");
+        }
     }
 
     #[tokio::test]

@@ -687,7 +687,7 @@ mod tests {
             inspection_segments: Arc::default(),
             owner: "child".into(),
             generation: 1,
-            output: Arc::default(),
+            capture: Arc::new(Mutex::new(super::super::capture::Capture::new(false))),
             idle: tokio::sync::watch::channel(super::super::protocol::Foreground::Waiting).0,
         }
     }
@@ -738,12 +738,14 @@ mod tests {
         assert!(transcript.read(0).await.is_err());
         // The execution accumulator and completion signal remain usable.
         route
-            .output
-            .lock()
-            .unwrap()
-            .text
-            .push_str("execution continues");
-        assert_eq!(route.output.lock().unwrap().text, "execution continues");
+            .record_output(&Value::Null, |output| {
+                output.text.push_str("execution continues")
+            })
+            .unwrap();
+        assert_eq!(
+            route.capture.lock().unwrap().take_output().text,
+            "execution continues"
+        );
         let mut completion = route.idle.subscribe();
         route
             .idle

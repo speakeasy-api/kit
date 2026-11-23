@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Kit
 
@@ -130,6 +131,42 @@ final class PromptDeliveryTests: XCTestCase {
     }
 
     @MainActor
+    func testCompleteAudioEchoPlaysSentBytesAfterSourceChangesInBothOrders() async throws {
+        for updateFirst in [false, true] {
+            let directory = temporaryDirectory()
+            let controller = makeController(directory: directory, updateFirst: updateFirst)
+            controller.start()
+            try await waitUntil { controller.isReady }
+
+            let url = directory.appendingPathComponent("recording.wav")
+            let audio = waveAudio(pcmBytes: 2)
+            try audio.write(to: url)
+            let attachment = Attachment(url: url, kind: .audio, mimeType: "audio/wav", size: Int64(audio.count))
+            controller.draft = "audio: match"
+            controller.attachments = [attachment]
+            controller.send()
+            try await waitUntil { controller.acceptsInput }
+
+            let entry = try XCTUnwrap(controller.entries.last(where: { $0.role == .user }))
+            let media = try XCTUnwrap(entry.presentation?.userMessage?.media.first)
+            XCTAssertEqual(media.id, attachment.id)
+            XCTAssertEqual(media.name, "recording.wav")
+            XCTAssertEqual(media.data, audio)
+            let resolved = TranscriptMedia(mimeType: media.mimeType, name: media.name, data: media.data, url: media.url)
+            XCTAssertEqual(resolved.label, "recording.wav")
+
+            try Data([0]).write(to: url)
+            let cache = TranscriptMediaCache()
+            let playback = await cache.openURL(resolved)
+            let playbackURL = try XCTUnwrap(playback)
+            defer { if playbackURL != url { try? FileManager.default.removeItem(at: playbackURL) } }
+            XCTAssertNotEqual(playbackURL, url)
+            XCTAssertEqual(try Data(contentsOf: playbackURL), audio)
+            await close(controller)
+        }
+    }
+
+    @MainActor
     func testLargeAudioEchoMatchesLocalFileInBothOrders() async throws {
         for updateFirst in [false, true] {
             let directory = temporaryDirectory()
@@ -139,14 +176,7 @@ final class PromptDeliveryTests: XCTestCase {
 
             let url = directory.appendingPathComponent("recording.wav")
             // 1 MiB of 8-bit mono PCM, well above the Desktop inline preview cap.
-            let pcmBytes = 1024 * 1024
-            var audio = Data("RIFF".utf8)
-            audio.append(contentsOf: [36, 0, 16, 0])
-            audio.append(contentsOf: "WAVEfmt ".utf8)
-            audio.append(contentsOf: [16, 0, 0, 0, 1, 0, 1, 0, 64, 31, 0, 0, 64, 31, 0, 0, 1, 0, 8, 0])
-            audio.append(contentsOf: "data".utf8)
-            audio.append(contentsOf: [0, 0, 16, 0])
-            audio.append(Data(repeating: 128, count: pcmBytes))
+            let audio = waveAudio(pcmBytes: 1024 * 1024)
             try audio.write(to: url)
             let attachment = Attachment(url: url, kind: .audio, mimeType: "audio/wav", size: Int64(audio.count))
 
@@ -166,7 +196,9 @@ final class PromptDeliveryTests: XCTestCase {
                     XCTAssertNil(media.first?.data, "Echoed payload is above the inline limit")
                     if action == "match" {
                         let resolved = TranscriptMedia(mimeType: attachment.mimeType, url: media.first?.url)
-                        XCTAssertEqual(try resolved.boundedData(), audio)
+                        let playbackURL = await TranscriptMediaCache().openURL(resolved)
+                        XCTAssertEqual(playbackURL, url)
+                        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(playbackURL)), audio)
                     }
                 }
             }
@@ -218,6 +250,59 @@ final class PromptDeliveryTests: XCTestCase {
         controller.restoreSavedDraft(id: savedNewer.id)
         XCTAssertEqual(controller.draft, "newer draft")
         XCTAssertEqual(controller.attachments.map(\.url), [newer])
+        XCTAssertTrue(controller.savedDrafts.isEmpty)
+        await close(controller)
+    }
+
+    @MainActor
+    func testSavedDraftPickerStaysCompactAndAllRejectedDraftsRemainRecoverable() async throws {
+        let directory = temporaryDirectory()
+        let controller = makeController(directory: directory)
+        controller.start()
+        try await waitUntil { controller.isReady }
+
+        let files = try (0..<ConversationController.maximumAttachmentCount).map { index in
+            let url = directory.appendingPathComponent("submitted-\(index).png")
+            try Data([1]).write(to: url)
+            return url
+        }
+        let newer = directory.appendingPathComponent("newer.png")
+        try Data([1]).write(to: newer)
+        let held = directory.appendingPathComponent("reject-held")
+        let release = directory.appendingPathComponent("reject-now")
+        let texts = (1...20).map { "held rejection \($0)" }
+        for (index, text) in texts.enumerated() {
+            controller.draft = text
+            controller.attachments = []
+            controller.addAttachments(files)
+            controller.send()
+            try await waitUntil { FileManager.default.fileExists(atPath: held.path) }
+
+            controller.draft = "newer draft"
+            controller.addAttachments([newer])
+            try Data().write(to: release)
+            try await waitUntil { controller.acceptsInput && controller.savedDrafts.count == index + 1 }
+            try FileManager.default.removeItem(at: held)
+            try FileManager.default.removeItem(at: release)
+        }
+
+        let saved = controller.savedDrafts
+        XCTAssertEqual(saved.map(\.text), texts)
+        func pickerHeight(_ drafts: [ConversationController.SavedDraft]) -> CGFloat {
+            NSHostingView(rootView: SavedDraftPicker(drafts: drafts, recover: controller.restoreSavedDraft))
+                .fittingSize.height
+        }
+        let singleDraftHeight = pickerHeight(Array(saved.prefix(1)))
+        XCTAssertGreaterThan(singleDraftHeight, 0)
+        XCTAssertEqual(pickerHeight(saved), singleDraftHeight, accuracy: 1)
+
+        for item in saved {
+            controller.draft = ""
+            controller.attachments = []
+            controller.restoreSavedDraft(id: item.id)
+            XCTAssertEqual(controller.draft, item.text)
+            XCTAssertEqual(controller.attachments.map(\.url), files)
+        }
         XCTAssertTrue(controller.savedDrafts.isEmpty)
         await close(controller)
     }
@@ -337,7 +422,7 @@ final class PromptDeliveryTests: XCTestCase {
                     error(id, -32602, "steer rejected")
                 else:
                     held[id] = blocks
-            elif blocks[0]["text"] == "held rejection":
+            elif blocks[0]["text"].startswith("held rejection"):
                 rejection = id
                 (directory / "reject-held").touch()
             elif blocks[0]["text"].startswith("audio: "):
@@ -403,6 +488,17 @@ final class PromptDeliveryTests: XCTestCase {
         }
         XCTFail("Condition did not become true")
         throw NSError(domain: "PromptDeliveryTests", code: 1)
+    }
+
+    private func waveAudio(pcmBytes: Int) -> Data {
+        var audio = Data("RIFF".utf8)
+        withUnsafeBytes(of: UInt32(pcmBytes + 36).littleEndian) { audio.append(contentsOf: $0) }
+        audio.append(contentsOf: "WAVEfmt ".utf8)
+        audio.append(contentsOf: [16, 0, 0, 0, 1, 0, 1, 0, 64, 31, 0, 0, 64, 31, 0, 0, 1, 0, 8, 0])
+        audio.append(contentsOf: "data".utf8)
+        withUnsafeBytes(of: UInt32(pcmBytes).littleEndian) { audio.append(contentsOf: $0) }
+        audio.append(Data(repeating: 128, count: pcmBytes))
+        return audio
     }
 
     private func temporaryDirectory() -> URL {

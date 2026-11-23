@@ -435,6 +435,23 @@ private struct ConversationRow: View {
     }
 }
 
+struct SavedDraftPicker: View {
+    let drafts: [ConversationController.SavedDraft]
+    let recover: (UUID) -> Void
+
+    var body: some View {
+        Menu("Saved drafts (\(drafts.count))") {
+            ForEach(drafts) { draft in
+                Button(draft.summary) { recover(draft.id) }
+            }
+        }
+        .fixedSize()
+        .controlSize(.small)
+        .help("Restore a saved draft or swap it with the current draft if both do not fit")
+        .padding(.bottom, 6)
+    }
+}
+
 private struct ConversationContentLayout: Layout {
     let rosterVisible: Bool
     let rosterBesideComposer: Bool
@@ -624,18 +641,8 @@ private struct ConversationView: View {
     private var composer: some View {
         VStack(spacing: 0) {
             if !controller.pendingSteers.isEmpty { pendingSteersBar }
-            ForEach(controller.savedDrafts) { item in
-                HStack(spacing: 8) {
-                    Text("Saved draft").brandMicroLabel().foregroundStyle(.secondary)
-                    Text(item.summary).lineLimit(1)
-                    Spacer()
-                    Button("Recover") { controller.restoreSavedDraft(id: item.id) }
-                        .help("Restore this draft or swap it with the current draft if both do not fit")
-                }
-                .font(.caption)
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(Brand.paper, in: RoundedRectangle(cornerRadius: Brand.Radius.small))
-                .frame(maxWidth: 790)
+            if !controller.savedDrafts.isEmpty {
+                SavedDraftPicker(drafts: controller.savedDrafts, recover: controller.restoreSavedDraft)
             }
             if !commandSuggestions.isEmpty { commandBar }
             VStack(spacing: 10) {
