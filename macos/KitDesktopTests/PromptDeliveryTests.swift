@@ -156,13 +156,32 @@ final class PromptDeliveryTests: XCTestCase {
             XCTAssertEqual(resolved.label, "recording.wav")
 
             try Data([0]).write(to: url)
-            let cache = TranscriptMediaCache()
+            let playbackDirectory = directory.appendingPathComponent("playback", isDirectory: true)
+            let cache = TranscriptMediaCache(playbackDirectory: playbackDirectory)
             let playback = await cache.openURL(resolved)
             let playbackURL = try XCTUnwrap(playback)
-            defer { if playbackURL != url { try? FileManager.default.removeItem(at: playbackURL) } }
             XCTAssertNotEqual(playbackURL, url)
             XCTAssertEqual(try Data(contentsOf: playbackURL), audio)
+
+            let files = FileManager.default
+            let old = Date(timeIntervalSinceNow: -2 * 24 * 60 * 60)
+            try files.setAttributes([.modificationDate: old], ofItemAtPath: playbackURL.path)
+            let reopened = await cache.openURL(resolved)
+            XCTAssertEqual(reopened, playbackURL)
+            XCTAssertEqual(try files.contentsOfDirectory(atPath: playbackDirectory.path), [playbackURL.lastPathComponent])
+            await cache.prunePlaybackFiles()
+            XCTAssertTrue(files.fileExists(atPath: playbackURL.path), "Reopening refreshes the grace period")
+
+            try Data([1]).write(to: playbackURL)
+            let restored = await cache.openURL(resolved)
+            XCTAssertEqual(restored, playbackURL)
+            XCTAssertEqual(try Data(contentsOf: playbackURL), audio)
             await close(controller)
+
+            try files.setAttributes([.modificationDate: old], ofItemAtPath: playbackURL.path)
+            await TranscriptMediaCache(playbackDirectory: playbackDirectory).prunePlaybackFiles()
+            XCTAssertFalse(files.fileExists(atPath: playbackURL.path))
+            XCTAssertEqual(try Data(contentsOf: url), Data([0]), "Pruning does not touch the source")
         }
     }
 

@@ -155,14 +155,36 @@ def prompt(request):
     if rollover_receipt_order:
         rollover_turn(session_id, "rollover-before", params["prompt"],
                       started=rollover_receipt_order != "after-echo")
-    if rollover_receipt_order not in ("after-echo", "after-idle"):
+    delayed_receipt = rollover_receipt_order == "after-idle" or text in (
+        "MOCK_CAPTURE_IMAGE_ECHOES", "MOCK_CAPTURE_ANSWER_OVERFLOW",
+    )
+    if rollover_receipt_order != "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
     session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
-    if supports_steer:
+    if text == "MOCK_CAPTURE_PRE_ECHO":
+        session_update(session_id, {
+            "sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
+            "content": {"type": "text", "text": "before "},
+        })
+        text = "after"
+    if supports_steer and text != "MOCK_CAPTURE_IMAGE_ECHOES":
         session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
                                     "content": params["prompt"]})
-    if rollover_receipt_order == "after-echo":
+    if rollover_receipt_order == "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
+    if text == "MOCK_CAPTURE_IMAGE_ECHOES":
+        for _ in range(5):
+            session_update(session_id, {
+                "sessionUpdate": "user_message_chunk", "messageId": message_id,
+                "content": {"type": "image", "mimeType": "image/png", "data": "A" * (4 * 1024 * 1024)},
+            })
+        text = "images echoed"
+    if text == "MOCK_CAPTURE_ANSWER_OVERFLOW":
+        for _ in range(5):
+            session_update(session_id, {
+                "sessionUpdate": "agent_message_chunk", "messageId": "agent-1",
+                "content": {"type": "text", "text": "x" * (4 * 1024 * 1024)},
+            })
     if "MOCK_PERMISSION" in text:
         send({
             "jsonrpc": "2.0", "id": "permission-1", "method": "session/request_permission",
@@ -319,7 +341,7 @@ def prompt(request):
         },
     })
     send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn", "usage": {"totalTokens": 12, "inputTokens": 7, "outputTokens": 5}}}})
-    if rollover_receipt_order == "after-idle":
+    if delayed_receipt:
         rollover_turn(session_id, "rollover-after", params["prompt"])
         respond(request["id"], {"messageId": message_id})
     if "--exit-after-prompt" in sys.argv:
@@ -396,6 +418,7 @@ for line in sys.stdin:
                     **{name: {} for name in prompt_capability_names if name},
                     **({"delivery": {"steer": {}}} if supports_steer else {}),
                 },
+                **({"fork": {}} if supports_fork else {}),
                 **({"additionalDirectories": {}} if "--additional-directories" in sys.argv else {}),
             }},
         })

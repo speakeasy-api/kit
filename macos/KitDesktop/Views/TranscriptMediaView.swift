@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -70,8 +71,15 @@ struct TranscriptMedia: Equatable {
 /// Actor isolation confines decoding and its bounded cache off the UI actor.
 actor TranscriptMediaCache {
     static let shared = TranscriptMediaCache()
+    private static let playbackGracePeriod: TimeInterval = 24 * 60 * 60
+    private let playbackDirectory: URL?
     private var thumbnails: [TranscriptMediaIdentity: (media: TranscriptMedia, image: CGImage)] = [:]
     private var order: [TranscriptMediaIdentity] = []
+
+    init(playbackDirectory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
+        .first?.appendingPathComponent("com.speakeasy.kit.desktop-playback", isDirectory: true)) {
+        self.playbackDirectory = playbackDirectory
+    }
 
     func thumbnail(
         _ media: TranscriptMedia, identity: TranscriptMediaIdentity, allowRemote: Bool = false
@@ -133,9 +141,45 @@ actor TranscriptMediaCache {
         guard let type = imageType ?? UTType(mimeType: media.mimeType),
               type.conforms(to: .image) || type.conforms(to: .audio),
               let ext = type.preferredFilenameExtension else { return nil }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("Kit-media-\(UUID().uuidString).\(ext)")
-        do { try data.write(to: url, options: .atomic); return url } catch { return nil }
+        guard let directory = playbackDirectory else { return nil }
+        let files = FileManager.default
+        do {
+            try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            guard Self.isPlaybackDirectory(directory) else { return nil }
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let url = directory.appendingPathComponent(digest).appendingPathExtension(ext)
+            if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
+                guard values.isRegularFile == true, values.isSymbolicLink == false else { return nil }
+                // External players can edit files. Only reuse a file that still holds the snapshot.
+                let cached = TranscriptMedia(mimeType: media.mimeType, url: url)
+                if (try? cached.boundedData()) == data {
+                    try files.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+                    return url
+                }
+            }
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch { return nil }
+    }
+
+    func prunePlaybackFiles() {
+        guard let directory = playbackDirectory, Self.isPlaybackDirectory(directory) else { return }
+        let files = FileManager.default
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
+        guard let urls = try? files.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys)) else { return }
+        // Modification time tracks the last open. Leave a grace period for external players.
+        let cutoff = Date().addingTimeInterval(-Self.playbackGracePeriod)
+        for url in urls {
+            guard let values = try? url.resourceValues(forKeys: keys),
+                  values.isRegularFile == true, values.isSymbolicLink == false,
+                  let modified = values.contentModificationDate, modified < cutoff else { continue }
+            try? files.removeItem(at: url)
+        }
+    }
+
+    private static func isPlaybackDirectory(_ directory: URL) -> Bool {
+        guard let values = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return false }
+        return values.isDirectory == true && values.isSymbolicLink == false
     }
 }
 

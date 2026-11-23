@@ -4,22 +4,12 @@ use std::collections::BTreeSet;
 use agent_client_protocol::v2::schema::MessageId;
 use serde_json::Value;
 
-use super::{ChildOutput, protocol::Foreground};
-
-pub(super) fn echo_id(update: &Value) -> Option<&str> {
-    if matches!(
-        update["sessionUpdate"].as_str(),
-        Some("user_message" | "user_message_chunk")
-    ) {
-        return update["messageId"].as_str();
-    }
-    None
-}
+use super::{ChildError, ChildOutput, protocol::Foreground};
 
 pub(super) enum Receipt {
     Waiting,
     Settled(Foreground),
-    Overflow,
+    EchoOverflow,
 }
 
 pub(super) enum Capture {
@@ -65,6 +55,18 @@ impl Capture {
         }
     }
 
+    pub(super) fn take_result(&mut self) -> Result<ChildOutput, ChildError> {
+        if let Self::Correlated(correlation) = self
+            && correlation.matched
+            && correlation.current.output_overflow
+        {
+            return Err(ChildError::Failed(
+                "nested agent exceeded the provisional output limit".into(),
+            ));
+        }
+        Ok(self.take_output())
+    }
+
     pub(super) fn take_output(&mut self) -> ChildOutput {
         match self {
             Self::Legacy(turn) => std::mem::take(&mut turn.output),
@@ -107,13 +109,17 @@ impl Turn {
 #[derive(Default)]
 struct Candidate {
     echoes: BTreeSet<String>,
+    echo_bytes: usize,
     turn: Turn,
+    output_bytes: usize,
+    output_overflow: bool,
 }
 
 // A receipt may follow the entire matching turn. Keep bounded provisional turn
 // captures, never a shared output buffer spanning distinct Running/Idle pairs.
 const MAX_UNCONFIRMED_ECHOES: usize = 64;
-const MAX_UNCONFIRMED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UNCONFIRMED_ECHO_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROVISIONAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct Correlation {
@@ -122,46 +128,54 @@ pub(super) struct Correlation {
     current: Candidate,
     completed: Vec<Candidate>,
     echo_count: usize,
-    buffered_bytes: usize,
-    overflow: bool,
+    echo_bytes: usize,
+    output_bytes: usize,
+    echo_overflow: bool,
 }
 
 impl Correlation {
     fn echo(&mut self, id: &str) {
-        if self.matched || self.overflow {
+        if self.matched {
             return;
         }
         if let Some(receipt) = &self.receipt {
             self.matched = receipt == id;
         } else if !self.current.echoes.contains(id) {
-            if self.echo_count == MAX_UNCONFIRMED_ECHOES || !self.reserve(id.len()) {
-                self.discard_unconfirmed();
+            if self.echo_count == MAX_UNCONFIRMED_ECHOES
+                || id.len() > MAX_UNCONFIRMED_ECHO_BYTES - self.echo_bytes
+            {
+                self.echo_overflow = true;
                 return;
             }
             self.echo_count += 1;
+            self.echo_bytes += id.len();
+            self.current.echo_bytes += id.len();
             self.current.echoes.insert(id.to_owned());
         }
     }
 
     fn receipt(&mut self, id: MessageId) -> Receipt {
-        if self.overflow {
-            return Receipt::Overflow;
-        }
         let id = id.to_string();
-        if let Some(turn) = self
+        if let Some(index) = self
             .completed
-            .drain(..)
-            .find(|turn| turn.echoes.contains(&id))
+            .iter()
+            .position(|turn| turn.echoes.contains(&id))
         {
-            self.current = turn;
+            self.current = self.completed.swap_remove(index);
             self.matched = true;
-        } else {
-            self.matched = self.current.echoes.contains(&id);
-            if !self.matched {
-                self.current.turn.output = ChildOutput::default();
-            }
+        } else if self.current.echoes.contains(&id) {
+            self.matched = true;
+        } else if self.echo_overflow {
+            return Receipt::EchoOverflow;
         }
+        self.completed.clear();
+        // Keep the current Running candidate even without an echo: its echo
+        // can still arrive later. All other candidates have been discarded.
+        self.output_bytes = self.current.output_bytes;
         self.current.echoes.clear();
+        self.current.echo_bytes = 0;
+        self.echo_count = 0;
+        self.echo_bytes = 0;
         self.receipt = Some(id);
         if self.matched
             && let Some(idle) = self.current.turn.idle()
@@ -179,42 +193,51 @@ impl Correlation {
         {
             // Registration can miss an unrelated turn's Running. Its Idle
             // still marks a boundary, but cannot settle or contaminate this route.
-            self.current = Candidate::default();
+            self.discard_current();
             return None;
         }
         let idle = self.current.turn.state(state)?;
         if self.matched {
             return Some(idle);
         }
-        let finished = std::mem::take(&mut self.current);
-        if !finished.echoes.is_empty() {
-            self.completed.push(finished);
+        if self.current.echoes.is_empty() {
+            self.discard_current();
+        } else {
+            self.completed.push(std::mem::take(&mut self.current));
         }
         None
     }
 
+    fn discard_current(&mut self) {
+        let discarded = std::mem::take(&mut self.current);
+        self.echo_count -= discarded.echoes.len();
+        self.echo_bytes -= discarded.echo_bytes;
+        self.output_bytes -= discarded.output_bytes;
+    }
+
     fn output_mut(&mut self, update: &Value) -> Option<&mut ChildOutput> {
-        if !(self.matched || !self.current.echoes.is_empty()) || self.current.turn.idle().is_some()
+        if self.current.output_overflow
+            || self.current.turn.idle().is_some()
+            || !(self.matched
+                || self.current.turn.foreground == Foreground::Running
+                || !self.current.echoes.is_empty())
         {
             return None;
         }
-        // Only the provisional buffer needs an aggregate limit. A normal
-        // confirmed result keeps the existing child output limits.
-        if self.receipt.is_none() && !self.reserve(update.to_string().len()) {
-            self.discard_unconfirmed();
-            return None;
+        // Bound the total provisional payload, even when the receipt is known
+        // but its echo has not arrived. An overflow only invalidates this
+        // candidate's payload; its echo IDs and foreground state still settle.
+        if !self.matched {
+            let bytes = update.to_string().len();
+            if bytes > MAX_PROVISIONAL_OUTPUT_BYTES - self.output_bytes {
+                self.output_bytes -= std::mem::take(&mut self.current.output_bytes);
+                self.current.turn.output = ChildOutput::default();
+                self.current.output_overflow = true;
+                return None;
+            }
+            self.output_bytes += bytes;
+            self.current.output_bytes += bytes;
         }
         Some(&mut self.current.turn.output)
-    }
-
-    fn reserve(&mut self, bytes: usize) -> bool {
-        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
-        self.buffered_bytes <= MAX_UNCONFIRMED_BYTES
-    }
-
-    fn discard_unconfirmed(&mut self) {
-        self.overflow = true;
-        self.completed.clear();
-        self.current = Candidate::default();
     }
 }

@@ -1614,17 +1614,23 @@ impl Actor {
                 } else {
                     None
                 };
-                // Capacity is checked before publishing the pending record. No
-                // await separates acceptance and commit; cancellation cannot
-                // strand a reserved ID or suppress an accepted child write.
-                writes
-                    .try_send(ChildWrite {
-                        message,
-                        _charge: charge,
-                    })
-                    .map_err(|_| {
+                // Capacity may return after the actor's withdrawal retry is
+                // polled but before it handles this command. Give each acquired
+                // permit to a pending withdrawal first so Stop cannot pass it.
+                let permit = loop {
+                    let permit = writes.try_reserve().map_err(|_| {
                         Failure::unavailable("child input queue unavailable; message not accepted")
                     })?;
+                    let Some(id) = self.next_withdrawal() else {
+                        break permit;
+                    };
+                    self.send_withdrawal(id, permit);
+                };
+                // No await separates the accepted write from its pending record.
+                permit.send(ChildWrite {
+                    message,
+                    _charge: charge,
+                });
                 if let Some(pending) = pending {
                     self.pending.insert(self.serial, pending);
                 }

@@ -1636,8 +1636,11 @@ async fn run(
                     return Ok(());
                 }
                 route.record_inspection(params["update"].clone());
-                if let Some(id) = capture::echo_id(&params["update"]) {
-                    route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
+                if matches!(params["update"]["sessionUpdate"].as_str(), Some("user_message" | "user_message_chunk")) {
+                    if let Some(id) = params["update"]["messageId"].as_str() {
+                        route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.echo(id);
+                    }
+                    return Ok(());
                 }
                 if let Some(update) = messages::parse(&params["update"])? {
                     route.record_output(&params["update"], |output| output.record_message(update))?;
@@ -2103,9 +2106,9 @@ async fn run(
                                 };
                                 let receipt = capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.receipt(receipt);
                                 let state = match receipt {
-                                    capture::Receipt::Overflow => {
-                                        // We cannot prove which turn settled. Keep the serial guard
-                                        // until the actor invalidates the connection.
+                                    capture::Receipt::EchoOverflow => {
+                                        // An omitted echo ID could own the receipt. Keep the
+                                        // serial guard until the actor invalidates the connection.
                                         let _ = fatal.send(());
                                         return std::future::pending().await;
                                     }
@@ -2138,18 +2141,19 @@ async fn run(
                                 }
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
-                            let mut output = capture.lock().map(|mut capture| capture.take_output()).unwrap_or_default();
-                            output.finish_messages();
-                            match config_snapshots.get(&session_id) {
-                                Ok(Some(options)) => output.config_snapshot(options),
-                                Ok(None) => {},
-                                Err(error) => {
-                                    let _ = prompt.reply.send(Err(ChildError::Failed(error.to_string())));
-                                    return;
-                                }
-                            }
                             let outcome = if cancelled { Err(ChildError::Cancelled) } else {
-                                response.map_err(ChildError::Failed).and_then(|response| prompt_outcome(response, output))
+                                response.map_err(ChildError::Failed).and_then(|response| {
+                                    let mut output = capture.lock()
+                                        .map_err(|error| ChildError::Failed(error.to_string()))?
+                                        .take_result()?;
+                                    output.finish_messages();
+                                    if let Some(options) = config_snapshots.get(&session_id)
+                                        .map_err(|error| ChildError::Failed(error.to_string()))?
+                                    {
+                                        output.config_snapshot(options);
+                                    }
+                                    prompt_outcome(response, output)
+                                })
                             };
                             let _ = prompt.reply.send(outcome);
                         });
@@ -4308,6 +4312,74 @@ for line in sys.stdin:
             .unwrap_or_else(|error| panic!("failed with receipt {receipt_order}: {error}"));
             assert_eq!(output.text, "ordinary reply", "receipt {receipt_order}");
         }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_captures_answer_before_echo_without_rollover_output() {
+        for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![format!("--rollover-receipt-order={receipt_order}")],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt(
+                    "s-test".into(),
+                    "MOCK_CAPTURE_PRE_ECHO".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.text, "before after", "receipt {receipt_order}");
+            child.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_output_overflow_does_not_disconnect_shared_child() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        let sibling = child
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let result = child
+                .prompt(
+                    "s-test".into(),
+                    "MOCK_CAPTURE_IMAGE_ECHOES".into(),
+                    TurnCancellation::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.text, "images echoed");
+            let error = child
+                .prompt(
+                    "s-test".into(),
+                    "MOCK_CAPTURE_ANSWER_OVERFLOW".into(),
+                    TurnCancellation::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ChildError::Failed(message) if message.contains("provisional output limit")));
+            for (session, reply) in [(&sibling, "sibling reply"), (&child, "next reply")] {
+                let result = session
+                    .prompt("s-test".into(), reply.into(), TurnCancellation::default())
+                    .await
+                    .unwrap();
+                assert_eq!(result.text, reply);
+            }
+            sibling.close().await.unwrap();
+            child.close().await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

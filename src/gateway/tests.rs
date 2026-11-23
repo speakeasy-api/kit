@@ -1243,6 +1243,51 @@ fn client_withdrawal_waits_for_writer_capacity_unless_the_prompt_settles() {
 }
 
 #[test]
+fn pending_withdrawal_claims_the_only_writer_slot_before_stop() {
+    let mut actor = isolated_actor();
+    let (writes, mut received) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 60), &writes)
+        .unwrap();
+    let attachment = actor.attachment.as_ref().unwrap().id.clone();
+    let send = |message| Request::Send {
+        session: "resident".into(),
+        attachment: attachment.clone(),
+        message,
+        charge: None,
+    };
+    actor
+        .command(send(json!({"jsonrpc":"2.0","id":"held","method":"session/prompt","params":{"sessionId":"resident","delivery":"steer","prompt":[]}})), &writes)
+        .unwrap();
+    actor
+        .command(
+            send(
+                json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"held"}}),
+            ),
+            &writes,
+        )
+        .unwrap();
+    let prompt = received.try_recv().unwrap().message;
+
+    // Capacity returned after the retry was polled, but before handling Stop.
+    let stop = || {
+        send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}))
+    };
+    let result = actor.command(stop(), &writes);
+    let cancellation = received.try_recv().unwrap().message;
+    assert_eq!(cancellation["method"], "$/cancel_request");
+    assert_eq!(cancellation["params"]["requestId"], prompt["id"]);
+    assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+
+    actor.command(stop(), &writes).unwrap();
+    assert_eq!(
+        received.try_recv().unwrap().message["method"],
+        "session/cancel"
+    );
+}
+
+#[test]
 fn overflowing_the_controller_output_withdraws_its_held_prompt() {
     let mut actor = isolated_actor();
     let (writes, mut received) = mpsc::channel(2);
