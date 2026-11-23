@@ -73,12 +73,18 @@ actor TranscriptMediaCache {
     static let shared = TranscriptMediaCache()
     private static let playbackGracePeriod: TimeInterval = 24 * 60 * 60
     private let playbackDirectory: URL?
+    private let playbackCapacity: Int
     private var thumbnails: [TranscriptMediaIdentity: (media: TranscriptMedia, image: CGImage)] = [:]
     private var order: [TranscriptMediaIdentity] = []
 
-    init(playbackDirectory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
-        .first?.appendingPathComponent("com.speakeasy.kit.desktop-playback", isDirectory: true)) {
+    init(
+        playbackDirectory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
+            .first?.appendingPathComponent("com.speakeasy.kit.desktop-playback", isDirectory: true),
+        // Each snapshot is at most TranscriptMedia.maximumBytes, so 32 slots cap Kit writes at 320 MiB.
+        playbackCapacity: Int = 32
+    ) {
         self.playbackDirectory = playbackDirectory
+        self.playbackCapacity = playbackCapacity
     }
 
     func thumbnail(
@@ -147,7 +153,7 @@ actor TranscriptMediaCache {
             try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             guard Self.isPlaybackDirectory(directory) else { return nil }
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            let url = directory.appendingPathComponent(digest).appendingPathExtension(ext)
+            let url = directory.appendingPathComponent("Kit-media-\(digest)").appendingPathExtension(ext)
             if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
                 guard values.isRegularFile == true, values.isSymbolicLink == false else { return nil }
                 // External players can edit files. Only reuse a file that still holds the snapshot.
@@ -156,6 +162,9 @@ actor TranscriptMediaCache {
                     try files.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
                     return url
                 }
+            } else {
+                // Never evict a recent snapshot to make room for a new one.
+                guard try pruneExpiredPlaybackFiles(in: directory) < playbackCapacity else { return nil }
             }
             try data.write(to: url, options: .atomic)
             return url
@@ -164,17 +173,30 @@ actor TranscriptMediaCache {
 
     func prunePlaybackFiles() {
         guard let directory = playbackDirectory, Self.isPlaybackDirectory(directory) else { return }
+        _ = try? pruneExpiredPlaybackFiles(in: directory)
+    }
+
+    private func pruneExpiredPlaybackFiles(in directory: URL) throws -> Int {
         let files = FileManager.default
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
-        guard let urls = try? files.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys)) else { return }
+        let urls = try files.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         // Modification time tracks the last open. Leave a grace period for external players.
         let cutoff = Date().addingTimeInterval(-Self.playbackGracePeriod)
-        for url in urls {
-            guard let values = try? url.resourceValues(forKeys: keys),
-                  values.isRegularFile == true, values.isSymbolicLink == false,
-                  let modified = values.contentModificationDate, modified < cutoff else { continue }
-            try? files.removeItem(at: url)
+        var retained = 0
+        for url in urls where Self.isPlaybackSnapshotName(url) {
+            let values = try url.resourceValues(forKeys: keys)
+            guard values.isRegularFile == true, values.isSymbolicLink == false else { continue }
+            if let modified = values.contentModificationDate, modified < cutoff,
+               (try? files.removeItem(at: url)) != nil { continue }
+            // A failed removal still occupies a slot.
+            retained += 1
         }
+        return retained
+    }
+
+    private static func isPlaybackSnapshotName(_ url: URL) -> Bool {
+        !url.pathExtension.isEmpty && url.deletingPathExtension().lastPathComponent
+            .range(of: #"\AKit-media-[0-9a-f]{64}\z"#, options: .regularExpression) != nil
     }
 
     private static func isPlaybackDirectory(_ directory: URL) -> Bool {

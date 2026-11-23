@@ -446,7 +446,7 @@ fn bind_policy_requires_separate_explicit_opt_ins() {
     }
 }
 
-fn isolated_actor() -> Actor {
+pub(super) fn isolated_actor() -> Actor {
     Actor {
         id: "resident".into(),
         root: PathBuf::from("/approved"),
@@ -538,6 +538,7 @@ fn failed_child_enqueue_does_not_publish_pending_request() {
     let attachment = attached["attachment"].as_str().unwrap().to_owned();
     writes
         .try_send(ChildWrite {
+            withdrawals: Vec::new(),
             message: json!({"occupied":true}),
             _charge: None,
         })
@@ -1080,7 +1081,7 @@ for line in sys.stdin:
     }
 }
 
-fn resident_claim(actor: &Actor, replay: bool, id: u64) -> Request {
+pub(super) fn resident_claim(actor: &Actor, replay: bool, id: u64) -> Request {
     Request::Attach {
         session: actor.id.clone(),
         replace: true,
@@ -1242,8 +1243,11 @@ fn client_withdrawal_waits_for_writer_capacity_unless_the_prompt_settles() {
     }
 }
 
-#[test]
-fn pending_withdrawal_claims_the_only_writer_slot_before_stop() {
+#[tokio::test]
+async fn stop_uses_one_writer_slot_for_all_pending_withdrawals() {
+    use agent_client_protocol::{BoundedChannel, ChannelLimits, TransportFrame};
+    use futures_util::StreamExt as _;
+
     let mut actor = isolated_actor();
     let (writes, mut received) = mpsc::channel(1);
     actor.session_result = Some(json!({"configOptions":[]}));
@@ -1251,40 +1255,76 @@ fn pending_withdrawal_claims_the_only_writer_slot_before_stop() {
         .command(resident_claim(&actor, false, 60), &writes)
         .unwrap();
     let attachment = actor.attachment.as_ref().unwrap().id.clone();
-    let send = |message| Request::Send {
+    let send = |message, charge| Request::Send {
         session: "resident".into(),
         attachment: attachment.clone(),
         message,
-        charge: None,
+        charge,
     };
-    actor
-        .command(send(json!({"jsonrpc":"2.0","id":"held","method":"session/prompt","params":{"sessionId":"resident","delivery":"steer","prompt":[]}})), &writes)
-        .unwrap();
-    actor
-        .command(
-            send(
-                json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"held"}}),
-            ),
-            &writes,
-        )
-        .unwrap();
-    let prompt = received.try_recv().unwrap().message;
-
-    // Capacity returned after the retry was polled, but before handling Stop.
-    let stop = || {
-        send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}))
-    };
-    let result = actor.command(stop(), &writes);
-    let cancellation = received.try_recv().unwrap().message;
-    assert_eq!(cancellation["method"], "$/cancel_request");
-    assert_eq!(cancellation["params"]["requestId"], prompt["id"]);
-    assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
-
-    actor.command(stop(), &writes).unwrap();
-    assert_eq!(
-        received.try_recv().unwrap().message["method"],
-        "session/cancel"
+    let prompt = |id| json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":"resident","delivery":"steer","prompt":[]}});
+    let cancel =
+        |id| json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":id}});
+    let stop = json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}});
+    let mut child_ids = Vec::new();
+    for id in 0..128 {
+        actor.command(send(prompt(id), None), &writes).unwrap();
+        if id < 127 {
+            child_ids.push(received.try_recv().unwrap().message["id"].clone());
+        }
+    }
+    // A full pending map must not prevent Stop, which owns no response ID.
+    for id in (0..128).rev() {
+        actor.command(send(cancel(id), None), &writes).unwrap();
+    }
+    actor.command(send(cancel(0), None), &writes).unwrap();
+    assert!(actor.command(send(stop.clone(), None), &writes).is_err());
+    assert!(
+        actor
+            .pending
+            .values()
+            .all(|pending| pending.withdrawal_pending)
     );
+    child_ids.push(received.try_recv().unwrap().message["id"].clone());
+
+    let (peer, mut channel) = BoundedChannel::duplex(ChannelLimits {
+        max_buffered_frames: 1,
+        ..ChannelLimits::default()
+    })
+    .unwrap();
+    let stop_frame = || TransportFrame::parse_json(&stop.to_string());
+    peer.tx.try_send(stop_frame()).unwrap();
+    let charge = Arc::new(channel.rx.next().await.unwrap());
+    actor
+        .command(send(stop.clone(), Some(charge)), &writes)
+        .unwrap();
+    assert_eq!(writes.capacity(), 0);
+    assert_eq!(actor.next_withdrawal(), None);
+
+    let item = received.try_recv().unwrap();
+    assert!(received.try_recv().is_err());
+    let mut next = std::pin::pin!(peer.tx.send(stop_frame()));
+    assert!(futures_util::poll!(next.as_mut()).is_pending());
+    let mut bytes = Vec::new();
+    item.write_to(&mut bytes).await.unwrap();
+    drop(item);
+    assert!(matches!(
+        futures_util::poll!(next),
+        std::task::Poll::Ready(Ok(()))
+    ));
+    let messages = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let (last, withdrawals) = messages.split_last().unwrap();
+    assert_eq!(last, &stop);
+    assert_eq!(withdrawals.len(), child_ids.len());
+    for (withdrawal, child_id) in withdrawals.iter().zip(child_ids) {
+        assert_eq!(
+            withdrawal,
+            &json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":child_id}})
+        );
+    }
 }
 
 #[test]

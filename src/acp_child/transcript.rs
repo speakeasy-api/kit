@@ -738,9 +738,7 @@ mod tests {
         assert!(transcript.read(0).await.is_err());
         // The execution accumulator and completion signal remain usable.
         route
-            .record_output(&Value::Null, |output| {
-                output.text.push_str("execution continues")
-            })
+            .record_output(|output| output.text.push_str("execution continues"))
             .unwrap();
         assert_eq!(
             route.capture.lock().unwrap().take_output().text,

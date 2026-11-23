@@ -330,11 +330,30 @@ struct Entry {
 }
 #[derive(Debug)]
 struct ChildWrite {
+    // Stop can share one slot with the normalized withdrawals it must follow.
+    withdrawals: Vec<u64>,
     message: Value,
     // A batch lease can be shared by several accepted child writes. Retain it
     // through serialization/write completion, even after the HTTP owner drops.
     _charge: Option<Arc<agent_client_protocol::ChargedFrame>>,
 }
+impl ChildWrite {
+    async fn write_to(&self, stdin: &mut (impl tokio::io::AsyncWrite + Unpin)) -> io::Result<()> {
+        for &id in &self.withdrawals {
+            write_message(stdin, &withdrawal_message(id)).await?;
+        }
+        write_message(stdin, &self.message).await
+    }
+}
+
+fn withdrawal_message(id: u64) -> Value {
+    object([
+        ("jsonrpc", "2.0".into()),
+        ("method", "$/cancel_request".into()),
+        ("params", object([("requestId", id.into())])),
+    ])
+}
+
 struct Envelope {
     request: Request,
     reply: oneshot::Sender<ResultValue>,
@@ -797,7 +816,7 @@ impl Actor {
         let mut writer = tokio::task::JoinSet::new();
         writer.spawn(async move {
             while let Some(message) = queued.recv().await {
-                write_message(&mut stdin, &message.message).await?;
+                message.write_to(&mut stdin).await?;
                 drop(message);
             }
             Ok::<_, io::Error>(())
@@ -856,6 +875,7 @@ impl Actor {
                             if let Some(reply) = self.output(message)
                                 && writes
                                     .try_send(ChildWrite {
+                                        withdrawals: Vec::new(),
                                         message: reply,
                                         _charge: None,
                                     })
@@ -1173,13 +1193,9 @@ impl Actor {
     fn send_withdrawal(&mut self, id: u64, permit: mpsc::Permit<'_, ChildWrite>) {
         if let Some(pending) = self.pending.get_mut(&id) {
             pending.withdrawal_pending = false;
-            let message = object([
-                ("jsonrpc", "2.0".into()),
-                ("method", "$/cancel_request".into()),
-                ("params", object([("requestId", id.into())])),
-            ]);
             permit.send(ChildWrite {
-                message,
+                withdrawals: Vec::new(),
+                message: withdrawal_message(id),
                 _charge: None,
             });
         }
@@ -1564,7 +1580,8 @@ impl Actor {
                     }
                     return Ok(object([]));
                 }
-                if self.pending.len() >= 128 {
+                let stop = method == "session/cancel" && original.is_none();
+                if !stop && self.pending.len() >= 128 {
                     return Err(Failure::unavailable("too many pending ACP requests"));
                 }
                 if matches!(method.as_str(), "session/new" | "session/resume") {
@@ -1614,20 +1631,40 @@ impl Actor {
                 } else {
                     None
                 };
-                // Capacity may return after the actor's withdrawal retry is
-                // polled but before it handles this command. Give each acquired
-                // permit to a pending withdrawal first so Stop cannot pass it.
+                // Capacity can return after the withdrawal retry is polled. Stop
+                // must use that first slot without passing accepted withdrawals;
+                // other messages still let the withdrawals take available slots.
                 let permit = loop {
                     let permit = writes.try_reserve().map_err(|_| {
                         Failure::unavailable("child input queue unavailable; message not accepted")
                     })?;
+                    if stop {
+                        break permit;
+                    }
                     let Some(id) = self.next_withdrawal() else {
                         break permit;
                     };
                     self.send_withdrawal(id, permit);
                 };
+                let mut withdrawals = Vec::new();
+                if stop {
+                    // At most one normalized ID per entry in the bounded pending
+                    // map, and no new writer slots or transport charges for them.
+                    withdrawals.extend(
+                        self.pending
+                            .iter()
+                            .filter_map(|(&id, pending)| pending.withdrawal_pending.then_some(id)),
+                    );
+                    withdrawals.sort_unstable();
+                    for id in &withdrawals {
+                        if let Some(pending) = self.pending.get_mut(id) {
+                            pending.withdrawal_pending = false;
+                        }
+                    }
+                }
                 // No await separates the accepted write from its pending record.
                 permit.send(ChildWrite {
+                    withdrawals,
                     message,
                     _charge: charge,
                 });
@@ -1640,7 +1677,10 @@ impl Actor {
         }
     }
 }
-async fn write_message(stdin: &mut tokio::process::ChildStdin, message: &Value) -> io::Result<()> {
+async fn write_message(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &Value,
+) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
     tokio::time::timeout(Duration::from_secs(10), stdin.write_all(&bytes))

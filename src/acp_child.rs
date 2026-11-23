@@ -759,17 +759,12 @@ impl Route {
 
     fn record_output(
         &self,
-        update: &Value,
-        f: impl FnOnce(&mut ChildOutput),
+        record: impl FnOnce(&mut ChildOutput),
     ) -> Result<(), agent_client_protocol::Error> {
-        if let Some(output) = self
-            .capture
+        self.capture
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?
-            .output_mut(update)
-        {
-            f(output);
-        }
+            .record_output(record);
         Ok(())
     }
 
@@ -912,6 +907,10 @@ pub(crate) struct ChildOutput {
 }
 
 impl ChildOutput {
+    fn retained_bytes(&self) -> usize {
+        self.text.len() + self.update_bytes + self.messages.retained_bytes()
+    }
+
     fn finish_messages(&mut self) {
         self.text.push_str(&self.messages.finish());
     }
@@ -1643,7 +1642,7 @@ async fn run(
                     return Ok(());
                 }
                 if let Some(update) = messages::parse(&params["update"])? {
-                    route.record_output(&params["update"], |output| output.record_message(update))?;
+                    route.record_output(|output| output.record_message(update))?;
                     return Ok(());
                 }
                 // Capture rich tool values without round-tripping through the v1
@@ -1655,7 +1654,7 @@ async fn run(
                         | "terminal_update" | "terminal_output_chunk"));
                 if tool_update {
                     let value = params["update"].clone();
-                    route.record_output(&params["update"], |output| output.record_tool_value(value))?;
+                    route.record_output(|output| output.record_tool_value(value))?;
                 }
                 // Reuse normalized configuration identifiers for captured output.
                 let Some(notification) = notification else { return Ok(()); };
@@ -1668,7 +1667,7 @@ async fn run(
                     crate::events::emit(&usage);
                 }
                 if !tool_update {
-                    route.record_output(&params["update"], |output| output.record(notification.update))?;
+                    route.record_output(|output| output.record(notification.update))?;
                 }
                 Ok(())
             },
@@ -4312,6 +4311,62 @@ for line in sys.stdin:
             .unwrap_or_else(|error| panic!("failed with receipt {receipt_order}: {error}"));
             assert_eq!(output.text, "ordinary reply", "receipt {receipt_order}");
         }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_settles_after_echo_without_running() {
+        for receipt_order in ["before-echo", "after-echo", "after-idle"] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    "--omit-prompt-running".into(),
+                    format!("--rollover-receipt-order={receipt_order}"),
+                ],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                child.prompt(
+                    "s-test".into(),
+                    "ordinary reply".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out with receipt {receipt_order}"))
+            .unwrap_or_else(|error| panic!("failed with receipt {receipt_order}: {error}"));
+            assert_eq!(result.text, "ordinary reply", "receipt {receipt_order}");
+            child.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_returns_answer_after_discarding_oversized_rich_output() {
+        let root = tempfile::tempdir().unwrap();
+        let child = steering_test_support::start(&root, vec![]).await;
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.prompt(
+                "s-test".into(),
+                "MOCK_CAPTURE_TRUNCATED_TERMINAL".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.text, "terminal output truncated");
+        assert!(result.updates_truncated);
+        assert!(
+            result
+                .updates
+                .iter()
+                .all(|update| update["sessionUpdate"] != "terminal_output_chunk")
+        );
+        child.close().await.unwrap();
     }
 
     #[tokio::test]

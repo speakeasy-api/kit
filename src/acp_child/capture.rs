@@ -2,7 +2,6 @@
 use std::collections::BTreeSet;
 
 use agent_client_protocol::v2::schema::MessageId;
-use serde_json::Value;
 
 use super::{ChildError, ChildOutput, protocol::Foreground};
 
@@ -48,10 +47,10 @@ impl Capture {
         }
     }
 
-    pub(super) fn output_mut(&mut self, update: &Value) -> Option<&mut ChildOutput> {
+    pub(super) fn record_output(&mut self, record: impl FnOnce(&mut ChildOutput)) {
         match self {
-            Self::Legacy(turn) => Some(&mut turn.output),
-            Self::Correlated(correlation) => correlation.output_mut(update),
+            Self::Legacy(turn) => record(&mut turn.output),
+            Self::Correlated(correlation) => correlation.record_output(record),
         }
     }
 
@@ -111,7 +110,6 @@ struct Candidate {
     echoes: BTreeSet<String>,
     echo_bytes: usize,
     turn: Turn,
-    output_bytes: usize,
     output_overflow: bool,
 }
 
@@ -171,7 +169,7 @@ impl Correlation {
         self.completed.clear();
         // Keep the current Running candidate even without an echo: its echo
         // can still arrive later. All other candidates have been discarded.
-        self.output_bytes = self.current.output_bytes;
+        self.output_bytes = self.current.turn.output.retained_bytes();
         self.current.echoes.clear();
         self.current.echo_bytes = 0;
         self.echo_count = 0;
@@ -187,16 +185,20 @@ impl Correlation {
     }
 
     fn state(&mut self, state: Foreground) -> Option<Foreground> {
-        if !self.matched
-            && matches!(self.current.turn.foreground, Foreground::Waiting)
+        let idle = if self.current.turn.foreground == Foreground::Waiting
             && matches!(state, Foreground::Idle(_))
         {
-            // Registration can miss an unrelated turn's Running. Its Idle
-            // still marks a boundary, but cannot settle or contaminate this route.
-            self.discard_current();
-            return None;
-        }
-        let idle = self.current.turn.state(state)?;
+            if !self.matched && self.current.echoes.is_empty() {
+                // Registration can miss an unrelated turn's Running. Its Idle
+                // still marks a boundary, but cannot settle this route without an echo.
+                self.discard_current();
+                return None;
+            }
+            self.current.turn.foreground = state;
+            self.current.turn.idle()?
+        } else {
+            self.current.turn.state(state)?
+        };
         if self.matched {
             return Some(idle);
         }
@@ -212,32 +214,36 @@ impl Correlation {
         let discarded = std::mem::take(&mut self.current);
         self.echo_count -= discarded.echoes.len();
         self.echo_bytes -= discarded.echo_bytes;
-        self.output_bytes -= discarded.output_bytes;
+        self.output_bytes -= discarded.turn.output.retained_bytes();
     }
 
-    fn output_mut(&mut self, update: &Value) -> Option<&mut ChildOutput> {
+    fn record_output(&mut self, record: impl FnOnce(&mut ChildOutput)) {
         if self.current.output_overflow
             || self.current.turn.idle().is_some()
             || !(self.matched
                 || self.current.turn.foreground == Foreground::Running
                 || !self.current.echoes.is_empty())
         {
-            return None;
+            return;
         }
-        // Bound the total provisional payload, even when the receipt is known
-        // but its echo has not arrived. An overflow only invalidates this
-        // candidate's payload; its echo IDs and foreground state still settle.
-        if !self.matched {
-            let bytes = update.to_string().len();
-            if bytes > MAX_PROVISIONAL_OUTPUT_BYTES - self.output_bytes {
-                self.output_bytes -= std::mem::take(&mut self.current.output_bytes);
-                self.current.turn.output = ChildOutput::default();
-                self.current.output_overflow = true;
-                return None;
-            }
-            self.output_bytes += bytes;
-            self.current.output_bytes += bytes;
+        let output = &mut self.current.turn.output;
+        if self.matched {
+            record(output);
+            return;
         }
-        Some(&mut self.current.turn.output)
+        let other_bytes = self.output_bytes - output.retained_bytes();
+        record(output);
+        // Charge what the recorder kept, not the wire frame. Rich updates can
+        // truncate, and message replacements can release previously held bytes.
+        let retained = output.retained_bytes();
+        if retained > MAX_PROVISIONAL_OUTPUT_BYTES - other_bytes {
+            // Only this candidate's payload overflowed; its echo and state can
+            // still settle, without affecting any other candidates.
+            *output = ChildOutput::default();
+            self.current.output_overflow = true;
+            self.output_bytes = other_bytes;
+        } else {
+            self.output_bytes = other_bytes + retained;
+        }
     }
 }

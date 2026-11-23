@@ -186,6 +186,57 @@ final class PromptDeliveryTests: XCTestCase {
     }
 
     @MainActor
+    func testPlaybackPruningLeavesUnownedNeighbors() async throws {
+        let files = FileManager.default
+        let directory = temporaryDirectory()
+        let cache = TranscriptMediaCache(playbackDirectory: directory)
+        let audio = waveAudio(pcmBytes: 2)
+        let snapshot = await cache.openURL(TranscriptMedia(mimeType: "audio/wav", data: audio))
+        let snapshotURL = try XCTUnwrap(snapshot)
+        let neighbors = ["recording.wav", snapshotURL.lastPathComponent + ".sidecar"]
+            .map { directory.appendingPathComponent($0) }
+        let old = Date(timeIntervalSinceNow: -2 * 24 * 60 * 60)
+        for url in neighbors {
+            try audio.write(to: url)
+            try files.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+        }
+        try files.setAttributes([.modificationDate: old], ofItemAtPath: snapshotURL.path)
+
+        await cache.prunePlaybackFiles()
+        XCTAssertFalse(files.fileExists(atPath: snapshotURL.path))
+        for url in neighbors {
+            XCTAssertEqual(try Data(contentsOf: url), audio)
+        }
+    }
+
+    @MainActor
+    func testPlaybackCapacityReclaimsExpiredSnapshotsButKeepsRecentOnes() async throws {
+        let files = FileManager.default
+        let directory = temporaryDirectory()
+        let cache = TranscriptMediaCache(playbackDirectory: directory, playbackCapacity: 2)
+        let first = TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: 2))
+        let second = TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: 4))
+        let third = TranscriptMedia(mimeType: "audio/wav", data: waveAudio(pcmBytes: 6))
+        let firstURL = await cache.openURL(first)
+        let secondURL = await cache.openURL(second)
+        let expired = try XCTUnwrap(firstURL)
+        let recent = try XCTUnwrap(secondURL)
+
+        let reopenedCache = TranscriptMediaCache(playbackDirectory: directory, playbackCapacity: 2)
+        let refused = await reopenedCache.openURL(third)
+        XCTAssertNil(refused)
+        XCTAssertEqual(Set(try files.contentsOfDirectory(atPath: directory.path)), [expired.lastPathComponent, recent.lastPathComponent])
+        let reused = await reopenedCache.openURL(second)
+        XCTAssertEqual(reused, recent, "A cache hit does not require an extra slot")
+
+        try files.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -2 * 24 * 60 * 60)], ofItemAtPath: expired.path)
+        let admitted = await reopenedCache.openURL(third)
+        let thirdURL = try XCTUnwrap(admitted)
+        XCTAssertEqual(Set(try files.contentsOfDirectory(atPath: directory.path)), [recent.lastPathComponent, thirdURL.lastPathComponent])
+        XCTAssertEqual(try Data(contentsOf: recent), second.data)
+    }
+
+    @MainActor
     func testLargeAudioEchoMatchesLocalFileInBothOrders() async throws {
         for updateFirst in [false, true] {
             let directory = temporaryDirectory()

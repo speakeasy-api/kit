@@ -160,7 +160,15 @@ def prompt(request):
     )
     if rollover_receipt_order != "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
-    session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+    if "--omit-prompt-running" not in sys.argv:
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
+    if text == "MOCK_CAPTURE_TRUNCATED_TERMINAL":
+        for _ in range(5):
+            session_update(session_id, {
+                "sessionUpdate": "terminal_output_chunk", "terminalId": "terminal-1",
+                "data": "A" * (4 * 1024 * 1024),
+            })
+        text = "terminal output truncated"
     if text == "MOCK_CAPTURE_PRE_ECHO":
         session_update(session_id, {
             "sessionUpdate": "agent_message_chunk", "messageId": "agent-1",

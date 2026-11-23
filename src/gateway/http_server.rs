@@ -987,6 +987,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_with_pending_withdrawal_keeps_other_sessions_connected() {
+        use super::super::tests::{isolated_actor, resident_claim};
+
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let mut connection = Connection::new(gateway);
+        let [resident, unrelated] = ["resident", "unrelated"].map(|session| {
+            let mut actor = isolated_actor();
+            actor.id = session.into();
+            actor.session_result = Some(json!({"configOptions":[]}));
+            let (writes, mut writer) = mpsc::channel(1);
+            let attached = actor.command(resident_claim(&actor, false, 60), &writes).unwrap();
+            let (sender, mut receiver) = mpsc::channel::<Envelope>(2);
+            let (stopped_tx, stopped) = watch::channel(());
+            connection.controls.insert(session.into(), Control {
+                session: session.into(),
+                attachment: attached["attachment"].as_str().unwrap().into(),
+                entry: Entry { root: actor.root.clone(), sender, stopped },
+                cursor: actor.attachment.as_ref().unwrap().next,
+                closed: false,
+                pending: HashMap::new(),
+            });
+            async move {
+                let _stopped = stopped_tx;
+                while let Some(envelope) = receiver.recv().await {
+                    let method = match &envelope.request {
+                        Request::Send { message, .. } => message["method"].as_str().map(str::to_owned),
+                        _ => None,
+                    };
+                    // Emulate the child writer freeing exactly one slot after
+                    // the actor has selected Stop rather than the retry future.
+                    let held = (method.as_deref() == Some("session/cancel"))
+                        .then(|| writer.try_recv().unwrap().message);
+                    let result = actor.command(envelope.request, &writes);
+                    if let Some(held) = held {
+                        if result.is_ok() {
+                            let item = writer.try_recv().unwrap();
+                            let mut bytes = Vec::new();
+                            item.write_to(&mut bytes).await.unwrap();
+                            let messages = std::str::from_utf8(&bytes).unwrap().lines()
+                                .map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+                            assert_eq!(messages, [
+                                json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":held["id"]}}),
+                                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}),
+                            ]);
+                            assert!(writer.try_recv().is_err());
+                            actor.output(json!({"jsonrpc":"2.0","id":held["id"],"result":{"stopReason":"cancelled"}}));
+                            assert!(actor.pending.is_empty(), "rejected prompt was tracked");
+                        }
+                    } else if session == "unrelated" && method.as_deref() == Some("session/prompt") {
+                        let prompt = writer.try_recv().unwrap().message;
+                        actor.output(json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}}));
+                    }
+                    let _ = envelope.reply.send(result);
+                }
+            }
+        });
+        let (channel, mut peer) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        let prompt = |id, session| json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":session,"delivery":"steer","prompt":[]}});
+        let client = async move {
+            for message in [
+                json!({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}),
+                prompt(2, "resident"),
+                json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":2}}),
+                prompt(3, "resident"),
+                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}),
+                prompt(4, "unrelated"),
+            ] {
+                send(&peer, message).await.unwrap();
+            }
+            let mut responses = HashMap::new();
+            while responses.len() < 4 {
+                let frame = peer
+                    .rx
+                    .next()
+                    .await
+                    .expect("Stop closed the entire connection");
+                let TransportFrame::Single(message) = frame.decode() else {
+                    panic!("expected single message");
+                };
+                let message = serde_json::to_value(message).unwrap();
+                if let Some(id) = message["id"].as_u64() {
+                    assert!(responses.insert(id, message).is_none());
+                }
+            }
+            assert_eq!(responses[&2]["result"]["stopReason"], "cancelled");
+            assert_eq!(responses[&3]["error"]["data"]["reason"], "unavailable");
+            assert_eq!(responses[&4]["result"]["stopReason"], "end_turn");
+        };
+        let (result, (), (), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connection.run(channel), resident, unrelated, client)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_withdrawal_does_not_disconnect_another_session() {
         assert_late_withdrawal_is_session_local(false, "controller_replaced").await;
     }
