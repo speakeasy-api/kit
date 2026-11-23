@@ -2098,7 +2098,7 @@ async fn run(
                             }
                             let request = async {
                                 let receipt = match protocol::prompt(&connection, version, session_id.clone(), prompt.content).await? {
-                                    protocol::PromptAcceptance::V1(response) => return Ok(response),
+                                    protocol::PromptAcceptance::V1(response) => return Ok(*response),
                                     protocol::PromptAcceptance::V2(receipt) => receipt,
                                 };
                                 let receipt = capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.receipt(receipt);

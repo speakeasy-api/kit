@@ -336,7 +336,7 @@ pub(super) fn fork(
 }
 
 pub(super) enum PromptAcceptance {
-    V1(v1::PromptResponse),
+    V1(Box<v1::PromptResponse>),
     V2(v2::MessageId),
 }
 
@@ -347,12 +347,11 @@ pub(super) async fn prompt(
     content: Vec<v1::ContentBlock>,
 ) -> Result<PromptAcceptance, Error> {
     match version {
-        Version::V1 => Ok(PromptAcceptance::V1(
-            connection
-                .send_request(v1::PromptRequest::new(session_id, content))
-                .block_task()
-                .await?,
-        )),
+        Version::V1 => connection
+            .send_request(v1::PromptRequest::new(session_id, content))
+            .block_task()
+            .await
+            .map(|response| PromptAcceptance::V1(Box::new(response))),
         Version::V2 => {
             let inserted = connection
                 .send_request(v2::PromptRequest::new(
