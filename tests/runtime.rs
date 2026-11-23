@@ -452,6 +452,186 @@ async fn subagent_retains_idle_config_notifications_on_next_prompt() {
     );
 }
 
+// The parent runs the real subagent/prompt tools. Only the nested Kit's HTTP
+// inference provider is fake; its ACP v2 transport and turn capture are real.
+#[tokio::test]
+async fn kit_subagent_overlapping_prompt_callers_get_their_own_complete_results() {
+    use axum::{Json, Router, body::Body, extract::State, response::IntoResponse, routing::post};
+    use serde_json::Value;
+    use tokio::{net::TcpListener, sync::mpsc};
+
+    type Replies = mpsc::Sender<String>;
+    type Requests = mpsc::Sender<(Value, Replies)>;
+
+    async fn inference(
+        State(requests): State<Requests>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        let (reply, chunks) = mpsc::channel::<String>(1);
+        requests.send((body, reply)).await.unwrap();
+        let stream = futures_util::stream::unfold(chunks, |mut chunks| async {
+            chunks
+                .recv()
+                .await
+                .map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), chunks))
+        });
+        (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+    }
+
+    async fn answer(reply: &Replies, text: &str, finish: Option<&str>) {
+        let event = json!({"id":"controlled", "choices":[{
+            "index":0, "delta":{"role":"assistant", "content":text}, "finish_reason":finish,
+        }]});
+        reply.send(format!("data: {event}\n\n")).await.unwrap();
+        if finish.is_some() {
+            reply.send("data: [DONE]\n\n".into()).await.unwrap();
+        }
+    }
+
+    fn result(outcome: ToolExecutionOutcome) -> Value {
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("parent tool failed: {outcome:?}");
+        };
+        let ToolOutput::Structured(value) = result.result.output else {
+            panic!("parent tool returned non-structured output");
+        };
+        value
+    }
+
+    async fn next_request(
+        requests: &mut mpsc::Receiver<(Value, Replies)>,
+        prompt: &str,
+    ) -> Replies {
+        let (body, reply) = requests.recv().await.expect("missing inference request");
+        let messages = body["messages"].as_array().unwrap();
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .unwrap();
+        assert!(
+            last_user["content"].to_string().contains(prompt),
+            "expected {prompt}, got {last_user}"
+        );
+        reply
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/stream", listener.local_addr().unwrap());
+    let (requests, mut received) = mpsc::channel(4);
+    let provider = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(post(inference)).with_state(requests),
+        )
+        .await
+        .unwrap();
+    });
+    let runtime = kit::Runtime::new_with_provider_and_credentials(
+        directory.path(),
+        "test/model",
+        kit::ProviderKind::OpenRouter,
+        kit::tools::CredentialStorage::Memory,
+    )
+    .unwrap();
+    // Select the built-in Kit profile with the Cargo-built executable, not the
+    // test executable that current_exe() would find in this integration crate.
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "kit".into(),
+        kit::AcpHarnessProfile {
+            command: "/usr/bin/env".into(),
+            args: vec![
+                "-i".into(),
+                format!("HOME={}", directory.path().display()),
+                "OPENROUTER_API_KEY=local-test-key".into(),
+                format!("OPENROUTER_BASE_URL={url}"),
+                env!("CARGO_BIN_EXE_kit").into(),
+                "acp".into(),
+                "--protocol-version".into(),
+                "2".into(),
+            ],
+            permissions: kit::AcpPermissionPolicy::Deny,
+        },
+    )]))
+    .unwrap();
+    let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.kit".into()).unwrap();
+    let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
+    let scope = ToolExecutionScope {
+        executor: Arc::new(BasicToolExecutor::new([source])),
+        session_id: SessionId::new("parent"),
+        turn_id: TurnId::new("turn"),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation: None,
+    };
+    let call = |id, name, input| {
+        scope.execute_child(ToolRequest {
+            call_id: ToolCallId::new(id),
+            tool_name: ToolName::new(name),
+            input,
+            session_id: scope.session_id.clone(),
+            turn_id: scope.turn_id.clone(),
+            metadata: MetadataMap::new(),
+        })
+    };
+
+    let finished = tokio::time::timeout(Duration::from_secs(20), async {
+        let seed = call("seed", "subagent", json!({"prompt":"seed-prompt"}));
+        tokio::pin!(seed);
+        let seed_reply = tokio::select! {
+            reply = next_request(&mut received, "seed-prompt") => reply,
+            early = &mut seed => panic!("seed settled before inference: {early:?}"),
+        };
+        answer(&seed_reply, "seed-answer", Some("stop")).await;
+        drop(seed_reply);
+        let child = result(seed.await);
+        assert_eq!(child["output"], "seed-answer");
+        let a = call(
+            "a",
+            "prompt",
+            json!({"subagent":child,"prompt":"caller-A-prompt"}),
+        );
+        let b = call(
+            "b",
+            "prompt",
+            json!({"subagent":child,"prompt":"caller-B-prompt"}),
+        );
+        tokio::pin!(a, b);
+        let a_reply = tokio::select! {
+            reply = next_request(&mut received, "caller-A-prompt") => reply,
+            early = &mut a => panic!("A settled before inference: {early:?}"),
+        };
+        // Poll B while A's provider response is still held. Today B waits in
+        // the parent; this test does not prescribe how the wire admits B.
+        assert!(
+            futures_util::poll!(&mut b).is_pending(),
+            "B settled while A was still held"
+        );
+        answer(&a_reply, "only-A-answer", Some("stop")).await;
+        drop(a_reply);
+        let (a, b, ()) = tokio::join!(&mut a, &mut b, async {
+            let b_reply = next_request(&mut received, "caller-B-prompt").await;
+            answer(&b_reply, "only-B-prefix", None).await;
+            answer(&b_reply, "-and-B-suffix", Some("stop")).await;
+        });
+        let a = result(a);
+        let b = result(b);
+        assert_eq!(a["output"], "only-A-answer");
+        assert_eq!(b["output"], "only-B-prefix-and-B-suffix");
+        assert_eq!(a["id"], child["id"]);
+        assert_eq!(b["id"], child["id"]);
+        assert_eq!(a["generation"], 2);
+        assert_eq!(b["generation"], 3);
+    })
+    .await;
+    provider.abort();
+    finished.expect("nested Kit prompts did not settle");
+}
+
 #[tokio::test]
 async fn subagent_rejects_unsupported_or_mismatched_config_options() {
     for (advertise, key, value) in [

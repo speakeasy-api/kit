@@ -1323,7 +1323,20 @@ async fn shutdown_reaps_resident_with_live_http_controller() {
 
 // A genuine provider boundary: each HTTP inference request is observable and
 // independently released, including requests abandoned by session/cancel.
-type ProviderRequest = (Value, tokio::sync::oneshot::Sender<&'static str>);
+type ProviderAnswer = (&'static str, Option<&'static str>);
+struct ProviderRelease(tokio::sync::oneshot::Sender<ProviderAnswer>);
+
+impl ProviderRelease {
+    fn send(self, answer: &'static str) -> Result<(), ProviderAnswer> {
+        self.0.send((answer, None))
+    }
+
+    fn send_chunks(self, [first, second]: [&'static str; 2]) -> Result<(), ProviderAnswer> {
+        self.0.send((first, Some(second)))
+    }
+}
+
+type ProviderRequest = (Value, ProviderRelease);
 async fn controlled_provider() -> (
     Fixture,
     tokio::sync::mpsc::Receiver<ProviderRequest>,
@@ -1336,22 +1349,31 @@ async fn controlled_provider() -> (
         axum::Json(body): axum::Json<Value>,
     ) -> impl axum::response::IntoResponse {
         let (release, answer) = tokio::sync::oneshot::channel();
-        requests.send((body, release)).await.unwrap();
-        let answer = answer.await.unwrap_or("abandoned");
+        requests
+            .send((body, ProviderRelease(release)))
+            .await
+            .unwrap();
+        let (first, second) = answer.await.unwrap_or(("abandoned", None));
+        let mut parts = std::iter::once(first).chain(second).peekable();
         // Keep individual ACP frames below the frame ceiling even when the
         // complete answer is large enough to saturate an HTTP mailbox.
-        let mut remaining = answer;
         let mut events = String::new();
-        while !remaining.is_empty() {
-            let mut end = remaining.len().min(64 * 1024);
-            while !remaining.is_char_boundary(end) {
-                end -= 1;
+        while let Some(mut remaining) = parts.next() {
+            while !remaining.is_empty() {
+                let mut end = remaining.len().min(64 * 1024);
+                while !remaining.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let (content, rest) = remaining.split_at(end);
+                let finish = if rest.is_empty() && parts.peek().is_none() {
+                    Some("stop")
+                } else {
+                    None
+                };
+                let chunk = json!({"id":"controlled-test","choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":finish}]});
+                events.push_str(&format!("data: {chunk}\n\n"));
+                remaining = rest;
             }
-            let (content, rest) = remaining.split_at(end);
-            let finish = if rest.is_empty() { Some("stop") } else { None };
-            let chunk = json!({"id":"controlled-test","choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":finish}]});
-            events.push_str(&format!("data: {chunk}\n\n"));
-            remaining = rest;
         }
         events.push_str("data: [DONE]\n\n");
         ([("content-type", "text/event-stream")], events)
@@ -1736,7 +1758,10 @@ async fn sdk_ordinary_prompt_can_be_submitted_while_busy() {
 }
 
 async fn sdk_waiting_prompt_starts_a_separate_turn(delivery: Option<&str>) {
+    const FIRST: &str = "Finish this task first";
     const FOLLOW_UP: &str = "Do this after the first task";
+    const FIRST_ANSWER: [&str; 1] = ["First answer"];
+    const FOLLOW_UP_ANSWER: [&str; 2] = ["Follow-up ", "answer"];
     let (fixture, mut requests, provider) = controlled_provider().await;
     let (mut gateway, url) = fixture.gateway().await;
     let mut client = SdkClient::connect(&url).await;
@@ -1744,58 +1769,132 @@ async fn sdk_waiting_prompt_starts_a_separate_turn(delivery: Option<&str>) {
         .request(2, "session/new", json!({"cwd":fixture.root}))
         .await;
     let id = created["result"]["sessionId"].as_str().unwrap();
-    client.start_prompt(3, id, "Finish this task first").await;
-    let (first_body, release_first) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
-    assert!(!first_body["messages"].to_string().contains(FOLLOW_UP));
-    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":id,"delivery":delivery,"prompt":[{"type":"text","text":FOLLOW_UP}]}})));
-    client.fence_prompt_admission(id).await;
-    release_first.send("First answer").unwrap();
-    let queued = client.response(4).await;
-    let message_id = queued["result"]["messageId"]
+    client.updates.clear();
+    let first = client
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId":id,"prompt":[{"type":"text","text":FIRST}]}),
+        )
+        .await;
+    let first_id = first["result"]["messageId"]
         .as_str()
-        .expect("insertion receipt");
+        .expect("first insertion receipt");
+    let (first_body, release_first) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    let first_messages = first_body["messages"].to_string();
+    assert!(first_messages.contains(FIRST) && !first_messages.contains(FOLLOW_UP));
+
+    let mut params = json!({"sessionId":id,"prompt":[{"type":"text","text":FOLLOW_UP}]});
+    if let Some(delivery) = delivery {
+        params["delivery"] = json!(delivery);
+    }
+    assert!(client.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":params})));
+    client.fence_prompt_admission(id).await;
+    assert!(matches!(
+        requests.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    release_first.send(FIRST_ANSWER[0]).unwrap();
+    let queued = client.response(4).await;
+    let queued_id = queued["result"]["messageId"]
+        .as_str()
+        .expect("queued insertion receipt");
+    assert_ne!(first_id, queued_id);
     let (second_body, release_second) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
     assert!(
         second_body["messages"].to_string().contains(FOLLOW_UP),
         "{second_body}"
     );
-    release_second.send("Follow-up answer").unwrap();
+    release_second.send_chunks(FOLLOW_UP_ANSWER).unwrap();
+    // A new session can also send an initial idle snapshot with no stop reason.
+    let is_idle_snapshot = |update: &Value| {
+        update["sessionUpdate"] == "state_update"
+            && update["state"] == "idle"
+            && update["stopReason"].is_null()
+    };
     timeout(WAIT, async {
-        let mut first_idle = None;
-        let mut queued_message = None;
-        let mut idle_count = 0;
-        let mut index = 0;
-        loop {
-            while let Some(update) = client.updates.get(index) {
-                if update["sessionUpdate"] == "state_update" && update["state"] == "idle" {
-                    first_idle.get_or_insert(index);
-                    idle_count += 1;
-                }
-                if update["sessionUpdate"] == "user_message" && update["messageId"] == message_id {
-                    queued_message = Some(index);
-                }
-                if idle_count == 2
-                    && let (Some(first), Some(queued)) = (first_idle, queued_message)
-                {
-                    assert!(
-                        first < queued,
-                        "queued input appeared before the first turn ended"
-                    );
-                    return;
-                }
-                index += 1;
-            }
+        let is_turn_idle = |update: &Value| {
+            update["sessionUpdate"] == "state_update"
+                && update["state"] == "idle"
+                && !is_idle_snapshot(update)
+        };
+        let mut idle_count = client
+            .updates
+            .iter()
+            .filter(|update| is_turn_idle(update))
+            .count();
+        while idle_count < 2 {
             let Some(TransportFrame::Single(message)) = client.channel.rx.next().await else {
                 panic!("connection closed before queued work finished");
             };
             let message = serde_json::to_value(message).unwrap();
             if message["method"] == "session/update" {
-                client.updates.push(message["params"]["update"].clone());
+                let update = &message["params"]["update"];
+                idle_count += usize::from(is_turn_idle(update));
+                client.updates.push(update.clone());
             }
         }
     })
     .await
     .expect("queued turn did not finish");
+
+    // Ignore unrelated usage/metadata updates, but require both complete turn
+    // lifecycles with no input or output leaking across the first idle boundary.
+    let lifecycle: Vec<_> = client
+        .updates
+        .iter()
+        .filter(|update| {
+            matches!(
+                update["sessionUpdate"].as_str(),
+                Some("state_update" | "user_message" | "agent_message" | "agent_message_chunk")
+            )
+        })
+        .skip_while(|update| is_idle_snapshot(update))
+        .collect();
+    assert_eq!(
+        lifecycle.len(),
+        6 + FIRST_ANSWER.len() + FOLLOW_UP_ANSWER.len(),
+        "{lifecycle:?}"
+    );
+    let (first_turn, queued_turn) = lifecycle.split_at(3 + FIRST_ANSWER.len());
+    let mut answer_ids = Vec::new();
+    for (turn, receipt_id, prompt, answer) in [
+        (first_turn, first_id, FIRST, FIRST_ANSWER.as_slice()),
+        (
+            queued_turn,
+            queued_id,
+            FOLLOW_UP,
+            FOLLOW_UP_ANSWER.as_slice(),
+        ),
+    ] {
+        let [running, input, chunks @ .., idle] = turn else {
+            panic!("incomplete turn lifecycle: {turn:?}");
+        };
+        assert_eq!(running["sessionUpdate"], "state_update", "{turn:?}");
+        assert_eq!(running["state"], "running", "{turn:?}");
+        assert_eq!(input["sessionUpdate"], "user_message", "{turn:?}");
+        assert_eq!(input["messageId"], receipt_id, "{turn:?}");
+        assert_eq!(
+            input["content"],
+            json!([{"type":"text","text":prompt}]),
+            "{turn:?}"
+        );
+        let answer_id = chunks[0]["messageId"].as_str().expect("answer message ID");
+        for (chunk, text) in chunks.iter().zip(answer) {
+            assert_eq!(chunk["sessionUpdate"], "agent_message_chunk", "{turn:?}");
+            assert_eq!(chunk["messageId"], answer_id, "{turn:?}");
+            assert_eq!(
+                chunk["content"],
+                json!({"type":"text","text":text}),
+                "{turn:?}"
+            );
+        }
+        answer_ids.push(answer_id);
+        assert_eq!(idle["sessionUpdate"], "state_update", "{turn:?}");
+        assert_eq!(idle["state"], "idle", "{turn:?}");
+        assert_eq!(idle["stopReason"], "end_turn", "{turn:?}");
+    }
+    assert_ne!(answer_ids[0], answer_ids[1]);
     client.detach().await;
     stop_gateway(&mut gateway).await;
     provider.abort();
