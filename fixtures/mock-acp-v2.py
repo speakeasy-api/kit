@@ -266,6 +266,11 @@ def prompt(request):
                                             "messageId": f"empty-thought-{i}", **patch})
             session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "empty-chunk",
                                         "content": {"type": "text", "text": ""}})
+            empty_extension = {"type": "_empty"}
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "extension-chunk",
+                                        "content": empty_extension})
+            session_update(session_id, {"sessionUpdate": "agent_thought", "messageId": "extension-replacement",
+                                        "content": [{**empty_extension, "_meta": {"hint": "ignored"}}]})
         if delayed_receipt:
             respond(request["id"], {"messageId": message_id})
         return

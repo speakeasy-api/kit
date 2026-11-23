@@ -15,12 +15,29 @@ fn block_has_progress(block: &ContentBlock) -> bool {
     !matches!(block, ContentBlock::Text(text) if text.text.is_empty())
 }
 
+fn thought_block_has_progress(block: &ContentBlock) -> bool {
+    // An extension discriminator or metadata alone does not show work.
+    match block {
+        ContentBlock::Other(extension) => extension.fields.iter().any(|(name, value)| {
+            name != "_meta"
+                && match value {
+                    Value::Null => false,
+                    Value::String(text) => !text.is_empty(),
+                    Value::Array(items) => !items.is_empty(),
+                    Value::Object(fields) => !fields.is_empty(),
+                    _ => true,
+                }
+        }),
+        _ => block_has_progress(block),
+    }
+}
+
 pub(super) fn thought_has_progress(update: &Value) -> bool {
     match update["sessionUpdate"].as_str() {
         Some("agent_thought_chunk") => ContentChunk::deserialize(update)
-            .is_ok_and(|chunk| block_has_progress(&chunk.content)),
+            .is_ok_and(|chunk| thought_block_has_progress(&chunk.content)),
         Some("agent_thought") => AgentThought::deserialize(update).is_ok_and(|thought| {
-            matches!(thought.content, MaybeUndefined::Value(content) if content.iter().any(block_has_progress))
+            matches!(thought.content, MaybeUndefined::Value(content) if content.iter().any(thought_block_has_progress))
         }),
         _ => false,
     }
