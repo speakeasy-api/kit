@@ -237,11 +237,15 @@ def prompt(request):
                                     "messageId": "thought-1", "content": [thought] if whole else thought})
         time.sleep(6)  # The real Idle arrives after Kit's ambiguity window.
         text = "streaming"
-    if text in ("MOCK_ANSWER_PATCH_OMITTED", "MOCK_ANSWER_PATCH_NULL", "MOCK_ANSWER_PATCH_EMPTY"):
-        patch = {"MOCK_ANSWER_PATCH_OMITTED": {},
-                 "MOCK_ANSWER_PATCH_NULL": {"content": None},
-                 "MOCK_ANSWER_PATCH_EMPTY": {"content": []}}[text]
-        session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer", **patch})
+    answer_patches = {"MOCK_ANSWER_PATCH_OMITTED": {},
+                      "MOCK_ANSWER_PATCH_NULL": {"content": None},
+                      "MOCK_ANSWER_PATCH_EMPTY": {"content": []},
+                      "MOCK_ANSWER_PATCH_EMPTY_TEXT": {"content": [{"type": "text", "text": ""}]},
+                      "MOCK_ANSWER_PATCH_EMPTY_CHUNK": {"sessionUpdate": "agent_message_chunk",
+                                                       "content": {"type": "text", "text": ""}}}
+    if text in answer_patches:
+        session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer",
+                                    **answer_patches[text]})
         session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
         # No Running update: only the real answer can verify the next Idle.
         session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer",
@@ -254,9 +258,12 @@ def prompt(request):
             session_update(session_id, {"sessionUpdate": "agent_thought"})
             session_update(session_id, {"sessionUpdate": "agent_thought_chunk"})
             for i, patch in enumerate(({}, {"content": None}, {"content": []},
-                                       {"content": [{"type": "text"}]})):
+                                       {"content": [{"type": "text"}]},
+                                       {"content": [{"type": "text", "text": ""}]})):
                 session_update(session_id, {"sessionUpdate": "agent_thought",
                                             "messageId": f"empty-thought-{i}", **patch})
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "empty-chunk",
+                                        "content": {"type": "text", "text": ""}})
         if delayed_receipt:
             respond(request["id"], {"messageId": message_id})
         return

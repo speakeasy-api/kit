@@ -3,11 +3,15 @@ use std::collections::BTreeSet;
 
 use agent_client_protocol::{
     schema::MaybeUndefined,
-    v2::schema::{MessageId, SessionUpdate, StopReason},
+    v2::schema::{ContentBlock, MessageId, SessionUpdate, StopReason},
 };
 use tokio::time::Instant;
 
 use super::{ChildError, ChildOutput, protocol::Foreground};
+
+pub(super) fn block_has_progress(block: &ContentBlock) -> bool {
+    !matches!(block, ContentBlock::Text(text) if text.text.is_empty())
+}
 
 pub(super) enum Receipt {
     Accepted,
@@ -81,9 +85,9 @@ impl Capture {
     pub(super) fn record_message(&mut self, update: SessionUpdate) -> bool {
         // Metadata-only patches and clears still apply, but cannot disprove Idle.
         let has_content = match &update {
-            SessionUpdate::AgentMessageChunk(_) => true,
+            SessionUpdate::AgentMessageChunk(chunk) => block_has_progress(&chunk.content),
             SessionUpdate::AgentMessage(message) => {
-                matches!(&message.content, MaybeUndefined::Value(content) if !content.is_empty())
+                matches!(&message.content, MaybeUndefined::Value(content) if content.iter().any(block_has_progress))
             }
             _ => false,
         };

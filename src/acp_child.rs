@@ -1739,13 +1739,14 @@ async fn run(
                 // Thoughts are activity, not answer content. The v1 projection
                 // omits whole-message v2 thoughts.
                 if matches!(notification.as_ref().map(|notification| &notification.update),
-                    Some(SessionUpdate::AgentThoughtChunk(_)))
+                    Some(SessionUpdate::AgentThoughtChunk(chunk))
+                        if !matches!(&chunk.content, ContentBlock::Text(text) if text.text.is_empty()))
                     || (params["update"]["sessionUpdate"] == "agent_thought"
                         && agent_client_protocol::v2::schema::AgentThought::deserialize(&params["update"])
                             .is_ok_and(|thought| matches!(
                                 thought.content,
                                 agent_client_protocol::schema::MaybeUndefined::Value(content)
-                                    if !content.is_empty()
+                                    if content.iter().any(capture::block_has_progress)
                             )))
                 {
                     let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_thought();
@@ -4790,6 +4791,8 @@ for line in sys.stdin:
             "MOCK_ANSWER_PATCH_OMITTED",
             "MOCK_ANSWER_PATCH_NULL",
             "MOCK_ANSWER_PATCH_EMPTY",
+            "MOCK_ANSWER_PATCH_EMPTY_TEXT",
+            "MOCK_ANSWER_PATCH_EMPTY_CHUNK",
         ] {
             let root = tempfile::tempdir().unwrap();
             let child = steering_test_support::start(
