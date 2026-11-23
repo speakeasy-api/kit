@@ -1736,10 +1736,13 @@ async fn run(
                     }
                     return Ok(());
                 }
-                // Thoughts are activity, not answer content. Use typed wire evidence
-                // before falling through to the existing inspection/roster handling.
+                // Thoughts are activity, not answer content. The v1 projection
+                // omits whole-message v2 thoughts.
                 if matches!(notification.as_ref().map(|notification| &notification.update),
-                    Some(SessionUpdate::AgentThoughtChunk(_))) {
+                    Some(SessionUpdate::AgentThoughtChunk(_)))
+                    || (params["update"]["sessionUpdate"] == "agent_thought"
+                        && agent_client_protocol::v2::schema::AgentThought::deserialize(&params["update"]).is_ok())
+                {
                     let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_thought();
                     if changed {
                         route.boundary_changed.send_replace(());
@@ -4671,29 +4674,108 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn correlated_prompt_keeps_reasoning_after_stale_idle_without_running() {
+    async fn correlated_prompt_ignores_stale_idle_when_foreground_activates_before_echo() {
+        async fn check(receipt_order: &str, active_state: &str) {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    format!("--prompt-receipt-order={receipt_order}"),
+                    format!("--repeat-idle-before={active_state}"),
+                ],
+            )
+            .await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                child.prompt(
+                    child.session_id(),
+                    "MOCK_ACTIVE_BEFORE_ECHO".into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.text, "late echo after activation");
+            child.close().await.unwrap();
+        }
+        tokio::join!(
+            check("before-echo", "running"),
+            check("after-echo", "requires_action"),
+        );
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_rearms_unmatched_idle_without_deferral_by_unrelated_turns() {
         let root = tempfile::tempdir().unwrap();
-        let child = steering_test_support::start(
-            &root,
-            vec![
-                "--initial-foreground=idle".into(),
-                "--repeat-idle-before=none".into(),
-            ],
-        )
-        .await;
-        std::fs::write(root.path().join("release"), b"release").unwrap();
-        let result = tokio::time::timeout(
+        let child = steering_test_support::start(&root, vec![]).await;
+        let error = tokio::time::timeout(
             Duration::from_secs(10),
             child.prompt(
                 child.session_id(),
-                "MOCK_LONG_THOUGHT_NO_RUNNING".into(),
+                "MOCK_UNRELATED_ROLLOVERS".into(),
                 TurnCancellation::default(),
             ),
         )
         .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(result.text, "streaming");
+        .expect("unrelated foreground rollovers must not extend the unmatched Idle deadline")
+        .unwrap_err();
+        assert!(matches!(error, ChildError::TerminalFailed(_)));
+        assert!(!child.is_closed());
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlated_prompt_keeps_reasoning_after_stale_idle_without_running() {
+        async fn check(prompt: &str) {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    "--initial-foreground=idle".into(),
+                    "--repeat-idle-before=none".into(),
+                ],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                child.prompt(
+                    child.session_id(),
+                    prompt.into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.text, "streaming");
+            child.close().await.unwrap();
+        }
+        tokio::join!(
+            check("MOCK_LONG_THOUGHT_NO_RUNNING"),
+            check("MOCK_LONG_WHOLE_THOUGHT_NO_RUNNING"),
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_thoughts_do_not_clear_the_idle_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let child =
+            steering_test_support::start(&root, vec!["--initial-foreground=idle".into()]).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.prompt(
+                child.session_id(),
+                "MOCK_MALFORMED_THOUGHTS".into(),
+                TurnCancellation::default(),
+            ),
+        )
+        .await
+        .expect("malformed thoughts must not extend the Idle deadline")
+        .unwrap_err();
+        assert!(matches!(error, ChildError::TerminalFailed(_)));
+        assert!(!child.is_closed());
         child.close().await.unwrap();
     }
 

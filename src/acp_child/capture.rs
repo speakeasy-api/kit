@@ -171,6 +171,7 @@ const MAX_PROVISIONAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub(super) struct Correlation {
     receipt: Option<(String, Instant)>,
     idle_without_match: Option<Instant>,
+    resumed_without_match_after_receipt: bool,
     matched: bool,
     current: Candidate,
     completed: Vec<Candidate>,
@@ -316,8 +317,21 @@ impl Correlation {
             self.current.turn.foreground = state;
         } else {
             let active = state == Foreground::Running;
+            // Explicit foreground activity can invalidate a stale Idle before the
+            // insertion is echoed. Once accepted, allow this recovery only once:
+            // unrelated turn rollovers must not indefinitely defer correlation.
+            let resumed_unmatched = active
+                && !self.matched
+                && self.current.turn.foreground == Foreground::Waiting
+                && !self.resumed_without_match_after_receipt
+                && self.idle_without_match.take().is_some()
+                && self.receipt.is_some();
+            if resumed_unmatched {
+                self.resumed_without_match_after_receipt = true;
+            }
             if !self.current.turn.state(state) {
-                return active && self.current.unverified_idle.take().is_some() && self.matched;
+                let cleared_idle = active && self.current.unverified_idle.take().is_some();
+                return resumed_unmatched || (cleared_idle && self.matched);
             }
         }
         self.current.unverified_idle = None;
@@ -394,6 +408,26 @@ mod tests {
         assert!(matches!(capture.boundary(), Boundary::UnverifiedIdle(same) if same == observed));
         assert!(capture.record_thought());
         assert!(matches!(capture.boundary(), Boundary::Waiting));
+    }
+
+    // Tokio's paused-test macro uses expect when building its test runtime.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test(start_paused = true)]
+    async fn unmatched_activation_rearms_only_one_idle_deadline_after_receipt() {
+        use std::time::Duration;
+
+        let mut capture = Capture::new(true);
+        capture.receipt(MessageId::new("ours"));
+        assert!(capture.state(Foreground::Idle(None), false));
+        assert!(capture.state(Foreground::Running, false));
+        assert!(matches!(capture.boundary(), Boundary::Waiting));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let observed = Instant::now();
+        assert!(capture.state(Foreground::Idle(None), false));
+        assert!(!capture.state(Foreground::Running, false));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!capture.state(Foreground::Idle(None), false));
+        assert!(matches!(capture.boundary(), Boundary::UnverifiedIdle(same) if same == observed));
     }
 
     #[test]

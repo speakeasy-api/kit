@@ -163,6 +163,26 @@ def prompt(request):
     pre_echo_answer = text == "MOCK_CAPTURE_PRE_ECHO"
     if prompt_receipt_order != "after-echo" and not delayed_receipt and not pre_echo_answer:
         respond(request["id"], {"messageId": message_id})
+    if text in ("MOCK_ACTIVE_BEFORE_ECHO", "MOCK_UNRELATED_ROLLOVERS"):
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+        time.sleep(0.2)  # Let the waiter observe Idle if it already has the receipt.
+        session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before or "running"})
+        if prompt_receipt_order == "after-echo":
+            # Deliberately put the receipt after activation but before the live echo.
+            respond(request["id"], {"messageId": message_id})
+        if text == "MOCK_UNRELATED_ROLLOVERS":
+            session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+            for index in range(12):
+                rollover_turn(session_id, f"wrong-{index}", params["prompt"])
+                time.sleep(1)
+            return
+        time.sleep(6)  # A stale Idle must not expire while this foreground turn is active.
+        session_update(session_id, {"sessionUpdate": "user_message", "messageId": message_id,
+                                    "content": params["prompt"]})
+        session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "active-answer",
+                                    "content": {"type": "text", "text": "late echo after activation"}})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        return
     if text in ("MOCK_MISSING_ECHO", "MOCK_LATE_ECHO"):
         session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
         session_update(session_id, {"sessionUpdate": "agent_message_chunk", "messageId": "unmatched-answer",
@@ -180,7 +200,7 @@ def prompt(request):
             with open(request_log + ".uncorrelated-idle", "w", encoding="utf-8"):
                 pass
         return
-    answerless = text == "MOCK_ANSWERLESS_IDLE"
+    answerless = text in ("MOCK_ANSWERLESS_IDLE", "MOCK_MALFORMED_THOUGHTS")
     if "--omit-prompt-running" not in sys.argv and not repeat_idle_before and not answerless:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "running"})
     if text == "MOCK_CAPTURE_TRUNCATED_TERMINAL":
@@ -210,13 +230,18 @@ def prompt(request):
             session_update(session_id, {"sessionUpdate": "state_update", "state": repeat_idle_before})
     if prompt_receipt_order == "after-echo" and not delayed_receipt:
         respond(request["id"], {"messageId": message_id})
-    if text == "MOCK_LONG_THOUGHT_NO_RUNNING":
-        session_update(session_id, {"sessionUpdate": "agent_thought_chunk", "messageId": "thought-1",
-                                    "content": {"type": "text", "text": "thinking"}})
+    if text in ("MOCK_LONG_THOUGHT_NO_RUNNING", "MOCK_LONG_WHOLE_THOUGHT_NO_RUNNING"):
+        thought = {"type": "text", "text": "thinking"}
+        whole = text == "MOCK_LONG_WHOLE_THOUGHT_NO_RUNNING"
+        session_update(session_id, {"sessionUpdate": "agent_thought" if whole else "agent_thought_chunk",
+                                    "messageId": "thought-1", "content": [thought] if whole else thought})
         time.sleep(6)  # The real Idle arrives after Kit's ambiguity window.
         text = "streaming"
     if answerless:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "error"})
+        if text == "MOCK_MALFORMED_THOUGHTS":
+            session_update(session_id, {"sessionUpdate": "agent_thought"})
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk"})
         if delayed_receipt:
             respond(request["id"], {"messageId": message_id})
         return
