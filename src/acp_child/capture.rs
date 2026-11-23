@@ -12,7 +12,7 @@ pub(super) enum Receipt {
 }
 
 pub(super) enum Capture {
-    Legacy(Turn),
+    Legacy(Box<Turn>),
     Correlated(Box<Correlation>),
 }
 
@@ -23,7 +23,7 @@ impl Capture {
         if correlate {
             Self::Correlated(Box::default())
         } else {
-            Self::Legacy(Turn::default())
+            Self::Legacy(Box::default())
         }
     }
 
