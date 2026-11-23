@@ -257,6 +257,8 @@ def prompt(request):
         if text == "MOCK_MALFORMED_THOUGHTS":
             session_update(session_id, {"sessionUpdate": "agent_thought"})
             session_update(session_id, {"sessionUpdate": "agent_thought_chunk"})
+            session_update(session_id, {"sessionUpdate": "agent_thought_chunk",
+                                        "content": {"type": "text", "text": "missing message ID"}})
             for i, patch in enumerate(({}, {"content": None}, {"content": []},
                                        {"content": [{"type": "text"}]},
                                        {"content": [{"type": "text", "text": ""}]})):

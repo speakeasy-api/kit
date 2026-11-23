@@ -1736,19 +1736,9 @@ async fn run(
                     }
                     return Ok(());
                 }
-                // Thoughts are activity, not answer content. The v1 projection
-                // omits whole-message v2 thoughts.
-                if matches!(notification.as_ref().map(|notification| &notification.update),
-                    Some(SessionUpdate::AgentThoughtChunk(chunk))
-                        if !matches!(&chunk.content, ContentBlock::Text(text) if text.text.is_empty()))
-                    || (params["update"]["sessionUpdate"] == "agent_thought"
-                        && agent_client_protocol::v2::schema::AgentThought::deserialize(&params["update"])
-                            .is_ok_and(|thought| matches!(
-                                thought.content,
-                                agent_client_protocol::schema::MaybeUndefined::Value(content)
-                                    if content.iter().any(capture::block_has_progress)
-                            )))
-                {
+                // Use the native schema: the v1 projection allows thought
+                // chunks without a message ID and omits whole v2 thoughts.
+                if capture::thought_has_progress(&params["update"]) {
                     let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_thought();
                     if changed {
                         route.boundary_changed.send_replace(());

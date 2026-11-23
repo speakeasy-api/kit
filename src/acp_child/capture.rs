@@ -3,14 +3,27 @@ use std::collections::BTreeSet;
 
 use agent_client_protocol::{
     schema::MaybeUndefined,
-    v2::schema::{ContentBlock, MessageId, SessionUpdate, StopReason},
+    v2::schema::{AgentThought, ContentBlock, ContentChunk, MessageId, SessionUpdate, StopReason},
 };
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::time::Instant;
 
 use super::{ChildError, ChildOutput, protocol::Foreground};
 
-pub(super) fn block_has_progress(block: &ContentBlock) -> bool {
+fn block_has_progress(block: &ContentBlock) -> bool {
     !matches!(block, ContentBlock::Text(text) if text.text.is_empty())
+}
+
+pub(super) fn thought_has_progress(update: &Value) -> bool {
+    match update["sessionUpdate"].as_str() {
+        Some("agent_thought_chunk") => ContentChunk::deserialize(update)
+            .is_ok_and(|chunk| block_has_progress(&chunk.content)),
+        Some("agent_thought") => AgentThought::deserialize(update).is_ok_and(|thought| {
+            matches!(thought.content, MaybeUndefined::Value(content) if content.iter().any(block_has_progress))
+        }),
+        _ => false,
+    }
 }
 
 pub(super) enum Receipt {
