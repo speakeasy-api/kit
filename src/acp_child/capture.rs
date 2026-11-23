@@ -1,7 +1,10 @@
 //! Result capture for legacy routes and insertion-correlated draft v2 prompts.
 use std::collections::BTreeSet;
 
-use agent_client_protocol::v2::schema::{MessageId, StopReason};
+use agent_client_protocol::{
+    schema::MaybeUndefined,
+    v2::schema::{MessageId, SessionUpdate, StopReason},
+};
 use tokio::time::Instant;
 
 use super::{ChildError, ChildOutput, protocol::Foreground};
@@ -75,13 +78,18 @@ impl Capture {
         }
     }
 
-    pub(super) fn record_message(
-        &mut self,
-        update: agent_client_protocol::v2::schema::SessionUpdate,
-    ) -> bool {
+    pub(super) fn record_message(&mut self, update: SessionUpdate) -> bool {
+        // Metadata-only patches and clears still apply, but cannot disprove Idle.
+        let has_content = match &update {
+            SessionUpdate::AgentMessageChunk(_) => true,
+            SessionUpdate::AgentMessage(message) => {
+                matches!(&message.content, MaybeUndefined::Value(content) if !content.is_empty())
+            }
+            _ => false,
+        };
         let changed = match self {
-            Self::Legacy(_) => false,
-            Self::Correlated(correlation) => correlation.progress(Progress::Answer),
+            Self::Correlated(correlation) if has_content => correlation.progress(Progress::Answer),
+            _ => false,
         };
         self.record_output(|output| output.record_message(update));
         changed

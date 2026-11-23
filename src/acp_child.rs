@@ -4785,6 +4785,39 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn correlated_prompt_ignores_answer_patches_without_content_after_stale_idle() {
+        for prompt in [
+            "MOCK_ANSWER_PATCH_OMITTED",
+            "MOCK_ANSWER_PATCH_NULL",
+            "MOCK_ANSWER_PATCH_EMPTY",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let child = steering_test_support::start(
+                &root,
+                vec![
+                    "--initial-foreground=idle".into(),
+                    "--repeat-idle-before=none".into(),
+                ],
+            )
+            .await;
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                child.prompt(
+                    child.session_id(),
+                    prompt.into(),
+                    TurnCancellation::default(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out with {prompt}"))
+            .unwrap_or_else(|error| panic!("failed with {prompt}: {error}"));
+            assert_eq!(result.text, "real answer", "{prompt}");
+            child.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn correlated_prompt_returns_answer_after_discarding_oversized_rich_output() {
         let root = tempfile::tempdir().unwrap();
         let child = steering_test_support::start(&root, vec![]).await;

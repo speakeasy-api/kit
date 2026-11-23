@@ -237,6 +237,17 @@ def prompt(request):
                                     "messageId": "thought-1", "content": [thought] if whole else thought})
         time.sleep(6)  # The real Idle arrives after Kit's ambiguity window.
         text = "streaming"
+    if text in ("MOCK_ANSWER_PATCH_OMITTED", "MOCK_ANSWER_PATCH_NULL", "MOCK_ANSWER_PATCH_EMPTY"):
+        patch = {"MOCK_ANSWER_PATCH_OMITTED": {},
+                 "MOCK_ANSWER_PATCH_NULL": {"content": None},
+                 "MOCK_ANSWER_PATCH_EMPTY": {"content": []}}[text]
+        session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer", **patch})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"})
+        # No Running update: only the real answer can verify the next Idle.
+        session_update(session_id, {"sessionUpdate": "agent_message", "messageId": "answer",
+                                    "content": [{"type": "text", "text": "real answer"}]})
+        session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"})
+        return
     if answerless:
         session_update(session_id, {"sessionUpdate": "state_update", "state": "idle", "stopReason": "error"})
         if text == "MOCK_MALFORMED_THOUGHTS":
