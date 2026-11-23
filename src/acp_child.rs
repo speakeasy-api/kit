@@ -1741,7 +1741,12 @@ async fn run(
                 if matches!(notification.as_ref().map(|notification| &notification.update),
                     Some(SessionUpdate::AgentThoughtChunk(_)))
                     || (params["update"]["sessionUpdate"] == "agent_thought"
-                        && agent_client_protocol::v2::schema::AgentThought::deserialize(&params["update"]).is_ok())
+                        && agent_client_protocol::v2::schema::AgentThought::deserialize(&params["update"])
+                            .is_ok_and(|thought| matches!(
+                                thought.content,
+                                agent_client_protocol::schema::MaybeUndefined::Value(content)
+                                    if !content.is_empty()
+                            )))
                 {
                     let changed = route.capture.lock().map_err(agent_client_protocol::Error::into_internal_error)?.record_thought();
                     if changed {
@@ -4759,7 +4764,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn malformed_thoughts_do_not_clear_the_idle_deadline() {
+    async fn thoughts_without_usable_content_do_not_clear_the_idle_deadline() {
         let root = tempfile::tempdir().unwrap();
         let child =
             steering_test_support::start(&root, vec!["--initial-foreground=idle".into()]).await;

@@ -242,6 +242,10 @@ def prompt(request):
         if text == "MOCK_MALFORMED_THOUGHTS":
             session_update(session_id, {"sessionUpdate": "agent_thought"})
             session_update(session_id, {"sessionUpdate": "agent_thought_chunk"})
+            for i, patch in enumerate(({}, {"content": None}, {"content": []},
+                                       {"content": [{"type": "text"}]})):
+                session_update(session_id, {"sessionUpdate": "agent_thought",
+                                            "messageId": f"empty-thought-{i}", **patch})
         if delayed_receipt:
             respond(request["id"], {"messageId": message_id})
         return
