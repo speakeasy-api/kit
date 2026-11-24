@@ -817,7 +817,7 @@ impl<M> KitCompactionBackend<M> {
             }
             None => summary,
         };
-        if summary.trim().is_empty() {
+        if unwrap_compaction_summary(&summary).trim().is_empty() {
             return Err(CompactionError::Failed(
                 "compaction summary is empty".into(),
             ));
@@ -1985,30 +1985,33 @@ mod tests {
     #[tokio::test]
     async fn blank_hook_summary_fails_compaction() {
         use crate::ahp::test_support::{hooks, intercept};
-        let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
-        backend.respond(
-            "context.compact.before",
-            json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "  "}]}]),
-        );
-        let compactor = KitCompactionBackend {
-            adapter: NoModelTurn,
-            telemetry: TelemetryConfig::default(),
-            session_id: SessionId::new("compaction"),
-            owner_session_id: SessionId::new("owner"),
-            hooks: Some(hooks),
-        };
+        let framed_blank = format!("{COMPACTION_SUMMARY_OPEN}  {COMPACTION_SUMMARY_CLOSE}");
+        for payload in ["  ", framed_blank.as_str()] {
+            let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
+            backend.respond(
+                "context.compact.before",
+                json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": payload}]}]),
+            );
+            let compactor = KitCompactionBackend {
+                adapter: NoModelTurn,
+                telemetry: TelemetryConfig::default(),
+                session_id: SessionId::new("compaction"),
+                owner_session_id: SessionId::new("owner"),
+                hooks: Some(hooks),
+            };
 
-        let result = compactor
-            .summarize(
-                SummaryRequest::new(
-                    vec![Item::text(ItemKind::User, "old request")],
-                    CompactionReason::Manual,
-                ),
-                None,
-            )
-            .await;
+            let result = compactor
+                .summarize(
+                    SummaryRequest::new(
+                        vec![Item::text(ItemKind::User, "old request")],
+                        CompactionReason::Manual,
+                    ),
+                    None,
+                )
+                .await;
 
-        assert!(matches!(result, Err(CompactionError::Failed(_))));
+            assert!(matches!(result, Err(CompactionError::Failed(_))));
+        }
     }
 
     #[tokio::test]

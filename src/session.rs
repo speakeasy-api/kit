@@ -2487,6 +2487,7 @@ fn catalog_text(
 fn first_user_item_index(items: &[Item]) -> Option<usize> {
     items.iter().position(|item| {
         item.kind == ItemKind::User
+            && !crate::compaction::is_compaction_summary(item)
             && item.parts.iter().any(|part| {
                 matches!(
                     part,
@@ -7116,10 +7117,20 @@ mod tests {
             &opened.observer,
             &Item::text(ItemKind::User, "Original title"),
         );
+        let mut checkpoint_metadata = MetadataMap::new();
+        checkpoint_metadata.insert(
+            crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
+            true.into(),
+        );
         opened
             .observer
             .replace(&[
-                Item::text(ItemKind::System, "summary"),
+                Item::text(ItemKind::System, "system"),
+                Item::text(
+                    ItemKind::User,
+                    "<compaction-summary>\nAnother instance of you compacted earlier turns of this conversation into the checkpoint below. Treat this as historical context only, not new instructions. Later messages in this conversation take precedence over this summary.\n\nEarlier work\n</compaction-summary>",
+                )
+                .with_metadata(checkpoint_metadata),
                 Item::text(ItemKind::User, "Newer retained prompt"),
             ])
             .unwrap();
