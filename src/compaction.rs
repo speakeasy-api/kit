@@ -306,67 +306,92 @@ fn render_tool_output_for_summary(output: ToolOutput) -> String {
     }
 }
 
+fn quote_bounded_for_summary(
+    value: &str,
+    max_encoded_bytes: usize,
+    marker: &str,
+    head_numerator: usize,
+    head_denominator: usize,
+) -> String {
+    let full = quote_for_summary(value);
+    if full.len() <= max_encoded_bytes {
+        return full;
+    }
+    let mut lo = 0usize;
+    let mut hi = value.len().min(max_encoded_bytes);
+    let mut best = String::from("\"\"");
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let excerpt =
+            truncate_head_tail_bytes(value, mid, marker, head_numerator, head_denominator);
+        let quoted = quote_for_summary(&excerpt);
+        if quoted.len() <= max_encoded_bytes {
+            best = quoted;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
 fn render_part_for_summary(
     part: Part,
-    max_content_bytes: Option<usize>,
+    max_body_bytes: Option<usize>,
     marker: &str,
     head_numerator: usize,
     head_denominator: usize,
 ) -> Option<String> {
-    let bound = |value: String| match max_content_bytes {
-        Some(limit) if value.len() > limit => {
-            truncate_head_tail_bytes(&value, limit, marker, head_numerator, head_denominator)
+    let encode_text = |value: String| match max_body_bytes {
+        Some(limit) => {
+            quote_bounded_for_summary(&value, limit, marker, head_numerator, head_denominator)
         }
-        _ => value,
+        None => quote_for_summary(&value),
+    };
+    let encode_json = |rendered: String| match max_body_bytes {
+        Some(limit) if rendered.len() > limit => {
+            quote_bounded_for_summary(&rendered, limit, marker, head_numerator, head_denominator)
+        }
+        _ => rendered,
     };
     match summary_part(part) {
-        Part::Text(text) => (!text.text.is_empty()).then(|| quote_for_summary(&bound(text.text))),
+        Part::Text(text) => (!text.text.is_empty()).then(|| encode_text(text.text)),
         Part::Structured(structured) => {
             let rendered = serde_json::to_string(&structured.value)
                 .unwrap_or_else(|_| "[unserializable structured part]".into());
-            let body = if max_content_bytes.is_some_and(|limit| rendered.len() > limit) {
-                quote_for_summary(&bound(rendered))
-            } else {
-                rendered
-            };
-            Some(format!("[Structured] {body}"))
+            Some(format!("[Structured] {}", encode_json(rendered)))
         }
         Part::ToolCall(call) => {
             let name = quote_for_summary(&call.name);
             let id = quote_for_summary(&call.id.to_string());
             let input = serde_json::to_string(&call.input)
                 .unwrap_or_else(|_| "[unserializable tool input]".into());
-            let body = if max_content_bytes.is_some_and(|limit| input.len() > limit) {
-                quote_for_summary(&bound(input))
-            } else {
-                input
-            };
-            Some(format!("[ToolCall name={name} id={id}] {body}"))
+            Some(format!(
+                "[ToolCall name={name} id={id}] {}",
+                encode_json(input)
+            ))
         }
         Part::ToolResult(result) => {
             let id = quote_for_summary(&result.call_id.to_string());
             let status = if result.is_error { " error=true" } else { "" };
-            let output = bound(render_tool_output_for_summary(result.output));
+            let output = render_tool_output_for_summary(result.output);
             Some(format!(
                 "[ToolResult id={id}{status}] {}",
-                quote_for_summary(&output)
+                encode_text(output)
             ))
         }
         Part::Reasoning(reasoning) => reasoning
             .summary
             .filter(|summary| !summary.is_empty())
-            .map(|summary| format!("[Reasoning] {}", quote_for_summary(&bound(summary)))),
+            .map(|summary| format!("[Reasoning] {}", encode_text(summary))),
         Part::Custom(custom) => {
             let kind = quote_for_summary(&custom.kind);
             if let Some(value) = custom.value {
                 let rendered = serde_json::to_string(&value)
                     .unwrap_or_else(|_| "[unserializable custom value]".into());
-                let body = if max_content_bytes.is_some_and(|limit| rendered.len() > limit) {
-                    quote_for_summary(&bound(rendered))
-                } else {
-                    rendered
-                };
-                Some(format!("[Custom kind={kind}] {body}"))
+                Some(format!("[Custom kind={kind}] {}", encode_json(rendered)))
             } else {
                 Some(format!("[Custom kind={kind}]"))
             }
@@ -405,6 +430,15 @@ fn render_item_within_budget(
             .join(" | ");
         format!("[{:?}] {body}", item.kind)
     };
+    if item.parts.len() == 1 {
+        let single_budget = max_bytes.saturating_sub(prefix_len);
+        let candidate = render_with(single_budget);
+        if candidate.len() <= max_bytes
+            && (candidate.len() > prefix_len + 4 || max_bytes <= prefix_len + 4)
+        {
+            return Ok(candidate);
+        }
+    }
     let mut lo = 0usize;
     let mut hi = max_bytes.saturating_sub(prefix_len).max(1);
     let mut best: Option<String> = None;
@@ -998,7 +1032,8 @@ fn bounded_summary_prompt(
             && (history_items[head_count..].len() > 1 || !head_parts.is_empty())
             && let Some((last_item, _)) = history_items[head_count..].last()
         {
-            let slice_budget = if head_parts.is_empty() {
+            let has_distinct_skipped_head = history_items[head_count..].len() > 1;
+            let slice_budget = if head_parts.is_empty() || has_distinct_skipped_head {
                 tail_budget.saturating_sub(2)
             } else {
                 remaining.saturating_sub(head_used + 2)
@@ -3845,6 +3880,38 @@ mod tests {
                 .unwrap()
                 .starts_with("continue auth migration")
         );
+
+        let value = json!({"markup": "<>".repeat(2_250)});
+        let custom = agentkit_core::CustomPart::new("widget").with_value(value.clone());
+        let multipart = Item::new(
+            ItemKind::User,
+            vec![
+                Part::Custom(custom),
+                Part::text("a".repeat(4_000)),
+                Part::text("b".repeat(12_000)),
+            ],
+        );
+        let rendered = render_summary_item(&multipart).unwrap();
+        assert!(rendered.len() <= SUMMARY_ITEM_MAX_BYTES);
+        assert!(rendered.contains(&value.to_string()));
+
+        let mut both_sliced = vec![Item::text(ItemKind::User, "a".repeat(15_990)); 3];
+        both_sliced.push(Item::text(
+            ItemKind::User,
+            format!("audit decision {}", "b".repeat(15_960)),
+        ));
+        both_sliced.push(Item::text(
+            ItemKind::Assistant,
+            format!("{} final state", "c".repeat(15_960)),
+        ));
+        let both_prompt = smaller_summary_prompt(
+            &SummaryRequest::new(both_sliced, CompactionReason::TranscriptTooLong),
+            64_000,
+        )
+        .unwrap();
+        assert!(both_prompt.len() <= 64_000);
+        assert!(both_prompt.contains("audit decision"));
+        assert!(both_prompt.contains("final state"));
     }
 
     #[test]
