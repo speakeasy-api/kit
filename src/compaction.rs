@@ -157,6 +157,11 @@ fn truncate_bytes(value: &str, limit: usize) -> Option<String> {
 }
 
 fn compact_tool_output(output: ToolOutput, limit: usize) -> ToolOutput {
+    if let ToolOutput::Text(text) = output {
+        return truncate_bytes(&text, limit)
+            .map(ToolOutput::Text)
+            .unwrap_or(ToolOutput::Text(text));
+    }
     let projected = summary_tool_output_ref(&output);
     let rendered = match &projected {
         ToolOutput::Text(text) => text.clone(),
@@ -239,11 +244,12 @@ fn summary_part_ref(part: &Part) -> Part {
             file.mime_type.as_deref().unwrap_or("unknown"),
             bounded_reference(&file.data)
         )),
-        Part::ToolResult(result) => {
-            let mut projected = result.clone();
-            projected.output = summary_tool_output_ref(&result.output);
-            Part::ToolResult(projected)
-        }
+        Part::ToolResult(result) => Part::ToolResult(agentkit_core::ToolResultPart {
+            call_id: result.call_id.clone(),
+            output: summary_tool_output_ref(&result.output),
+            is_error: result.is_error,
+            metadata: result.metadata.clone(),
+        }),
         Part::Reasoning(reasoning) => {
             let mut projected = agentkit_core::ReasoningPart {
                 summary: reasoning.summary.clone(),
