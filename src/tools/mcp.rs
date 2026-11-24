@@ -11,7 +11,9 @@ mod refresh;
     clippy::disallowed_macros
 )]
 pub(crate) mod refresh_tests;
+mod skills;
 mod subscriptions;
+pub(crate) use skills::RemoteSkill;
 mod workload;
 pub use subscriptions::McpSubscriptionTool;
 mod schema;
@@ -149,6 +151,7 @@ struct Inner {
     healthy: Arc<AtomicBool>,
     manager: Mutex<McpServerManager>,
     refresh: refresh::Refresh,
+    skills: skills::Inventory,
     subscriptions: subscriptions::Subscriptions,
     catalog: CatalogReader,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
@@ -1998,6 +2001,7 @@ impl McpRuntime {
                 healthy,
                 manager: Mutex::new(manager),
                 refresh: refresh::Refresh::default(),
+                skills: skills::Inventory::default(),
                 subscriptions: subscriptions::Subscriptions::default(),
                 catalog,
                 servers,
@@ -2478,6 +2482,7 @@ impl McpRuntime {
             if let Some(transaction) = &mut backend_publication {
                 let manager = transaction.backend()?;
                 for name in &changed {
+                    self.inner.skills.remove(name);
                     let _ = manager.unregister_server(&McpServerId::new(name)).await;
                 }
                 for name in &changed {
@@ -2600,6 +2605,7 @@ impl McpRuntime {
     async fn initialize_servers(&self, names: &[String]) -> Result<(), String> {
         self.ensure_healthy()?;
         refresh::start(&self.inner);
+        skills::start(&self.inner);
         let _initialization = self.inner.initialization.lock().await;
         let records = {
             let servers = self.inner.servers.read().await;

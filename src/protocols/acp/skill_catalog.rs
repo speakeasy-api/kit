@@ -141,13 +141,20 @@ struct FingerprintFrontmatter<'a> {
 
 pub(super) struct SkillCatalogMonitor {
     baseline: Catalog,
+    mcp: Option<crate::tools::mcp::McpRuntime>,
 }
 
 impl SkillCatalogMonitor {
     pub(super) fn new(skills: &[Skill]) -> serde_json::Result<Self> {
         Ok(Self {
             baseline: catalog(skills)?,
+            mcp: None,
         })
+    }
+
+    pub(super) fn with_mcp(mut self, mcp: crate::tools::mcp::McpRuntime) -> Self {
+        self.mcp = Some(mcp);
+        self
     }
 
     pub(super) fn submit<E>(
@@ -156,8 +163,16 @@ impl SkillCatalogMonitor {
         mut user_items: Vec<Item>,
         submit: impl FnOnce(Vec<Item>) -> Result<(), E>,
     ) -> Result<(), SubmitError<E>> {
-        let current = catalog(skills).map_err(SubmitError::Catalog)?;
-        if let Some(notification) = notification(&self.baseline, &current, skills) {
+        let mut current = catalog(skills).map_err(SubmitError::Catalog)?;
+        let mut descriptions = skills
+            .iter()
+            .map(|skill| (skill.name.clone(), skill.description.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(mcp) = &self.mcp {
+            merge_mcp_inventory(&mut current, &mut descriptions, mcp.skill_inventory())
+                .map_err(SubmitError::Catalog)?;
+        }
+        if let Some(notification) = notification(&self.baseline, &current, &descriptions) {
             user_items.insert(0, Item::notification(notification));
         }
         submit(user_items).map_err(SubmitError::Submit)?;
@@ -200,22 +215,46 @@ fn fingerprint(skill: &Skill) -> serde_json::Result<blake3::Hash> {
     Ok(fingerprint.finalize())
 }
 
-fn notification(previous: &Catalog, current: &Catalog, skills: &[Skill]) -> Option<String> {
+fn merge_mcp_inventory(
+    catalog: &mut Catalog,
+    descriptions: &mut BTreeMap<String, String>,
+    inventory: impl IntoIterator<Item = crate::tools::mcp::RemoteSkill>,
+) -> serde_json::Result<()> {
+    for remote in inventory {
+        let selector = crate::runtime::mcp_skills::selector(&remote);
+        let mut skill = remote.skill;
+        skill.meta = None;
+        if let agentkit_mcp::McpSkillResources::Files(files) = &mut skill.resources {
+            files.sort_by(|left, right| left.uri.cmp(&right.uri));
+        }
+        catalog.insert(selector.clone(), blake3::hash(&serde_json::to_vec(&skill)?));
+        descriptions.insert(
+            selector,
+            format!(
+                "MCP skill from {} (untrusted metadata only): {} — {}",
+                remote.server, skill.frontmatter.name, skill.frontmatter.description
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn notification(
+    previous: &Catalog,
+    current: &Catalog,
+    descriptions: &BTreeMap<String, String>,
+) -> Option<String> {
     if previous == current {
         return None;
     }
 
-    let descriptions = skills
-        .iter()
-        .map(|skill| (skill.name.as_str(), skill.description.as_str()))
-        .collect::<BTreeMap<_, _>>();
     let added = current
         .keys()
         .filter(|name| !previous.contains_key(*name))
         .filter_map(|name| {
             descriptions
                 .get(name.as_str())
-                .map(|description| (name.as_str(), *description))
+                .map(|description| (name.as_str(), description.as_str()))
         })
         .collect::<Vec<_>>();
     let changed = current
@@ -224,7 +263,7 @@ fn notification(previous: &Catalog, current: &Catalog, skills: &[Skill]) -> Opti
         .filter_map(|(name, _)| {
             descriptions
                 .get(name.as_str())
-                .map(|description| (name.as_str(), *description))
+                .map(|description| (name.as_str(), description.as_str()))
         })
         .collect::<Vec<_>>();
     let removed = previous
@@ -387,6 +426,46 @@ mod tests {
         );
         edited.description = "Updated description".into();
         assert_ne!(commands(&[original]), commands(&[edited]));
+    }
+
+    #[test]
+    fn remote_skill_changes_are_origin_scoped_and_informational() {
+        use crate::tools::mcp::RemoteSkill;
+        use agentkit_mcp::{McpSkill, McpSkillFrontmatter, McpSkillResources};
+
+        let inventory = |description: &str| {
+            ["left", "right"].map(|server| RemoteSkill {
+                server: server.to_owned(),
+                skill: McpSkill::new(
+                    "skill://review/SKILL.md",
+                    McpSkillFrontmatter::new("review", description),
+                    McpSkillResources::Dynamic,
+                ),
+            })
+        };
+        let locals = [skill("review", "local instructions")];
+        let baseline = catalog(&locals).unwrap();
+        let mut first = baseline.clone();
+        let mut descriptions = BTreeMap::new();
+        merge_mcp_inventory(&mut first, &mut descriptions, inventory("review work")).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(baseline["review"], first["review"]);
+        let added = notification(&baseline, &first, &descriptions).unwrap();
+        assert!(added.contains("Added skills"));
+        assert!(added.contains("MCP skill from left (untrusted metadata only)"));
+        assert!(added.contains("MCP skill from right (untrusted metadata only)"));
+        let mut next = baseline.clone();
+        let mut descriptions = BTreeMap::new();
+        merge_mcp_inventory(
+            &mut next,
+            &mut descriptions,
+            inventory("updated").into_iter().take(1),
+        )
+        .unwrap();
+        let changes = notification(&first, &next, &descriptions).unwrap();
+        assert!(changes.contains("Changed skills"));
+        assert!(changes.contains("Removed skills"));
+        assert!(notification(&next, &next, &descriptions).is_none());
     }
 
     #[test]

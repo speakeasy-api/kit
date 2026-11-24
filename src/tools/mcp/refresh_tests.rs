@@ -21,7 +21,17 @@ struct PeerState {
     listen_error: Option<i64>,
     capabilities: Value,
     listen_requests: usize,
+    skills: SkillsFixture,
     resource_subscriptions: std::collections::BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct SkillsFixture {
+    name: Option<&'static str>,
+    cursor_requests: Vec<Option<String>>,
+    fail: bool,
+    gate: Option<oneshot::Receiver<()>>,
+    file_requests: usize,
 }
 
 pub(crate) struct Peer {
@@ -55,6 +65,7 @@ impl Peer {
             listen_error: None,
             capabilities: json!({"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true}}),
             listen_requests: 0,
+            skills: SkillsFixture::default(),
             resource_subscriptions: Default::default(),
         }));
         let (notifications, _) = broadcast::channel(32);
@@ -85,6 +96,12 @@ impl Peer {
             requests,
             task,
         }
+    }
+
+    async fn advertise_skills(&self, name: &'static str) {
+        let mut state = self.state.lock().await;
+        state.capabilities["extensions"] = json!({agentkit_mcp::MCP_SKILLS_EXTENSION_ID: {}});
+        state.skills.name = Some(name);
     }
 
     async fn set(&self, tools: Vec<Value>, method: &str) {
@@ -247,11 +264,47 @@ async fn serve(
             return;
         }
         "initialize" => {
-            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true}},"serverInfo":{"name":"refresh-peer","version":"1"}})
+            json!({"protocolVersion":"2025-11-25","capabilities":state.lock().await.capabilities.clone(),"serverInfo":{"name":"refresh-peer","version":"1"}})
         }
         "resources/list" => json!({"resources":[{"uri":"test://messages","name":"messages"}]}),
         "resources/templates/list" => json!({"resourceTemplates":[]}),
+        "skills/list" => {
+            let cursor = request["params"]["cursor"].as_str().map(str::to_owned);
+            let (name, fail, gate) = {
+                let mut state = state.lock().await;
+                state.skills.cursor_requests.push(cursor.clone());
+                (
+                    state.skills.name,
+                    state.skills.fail,
+                    state.skills.gate.take(),
+                )
+            };
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            if fail || name.is_none() {
+                response(
+                    &mut stream,
+                    "200 OK",
+                    Some(json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":-32603,"message":"no skills inventory"}})),
+                )
+                .await;
+                return;
+            }
+            let name = name.unwrap();
+            match cursor.as_deref() {
+                None => {
+                    json!({"resultType":"complete","skills":[remote_skill(name)],"nextCursor":"second"})
+                }
+                Some("second") => {
+                    json!({"resultType":"complete","skills":[remote_skill(&format!("{name}-second"))]})
+                }
+                Some(other) => panic!("unexpected skill cursor: {other}"),
+            }
+        }
         "resources/read" => {
+            state.lock().await.skills.file_requests += 1;
             json!({"contents":[{"uri":request["params"]["uri"],"mimeType":"text/plain","text":"Hello from the subscribed resource"}]})
         }
         "resources/subscribe" | "resources/unsubscribe" => {
@@ -887,4 +940,122 @@ async fn retired_session_unsubscribes_replayed_legacy_resources() {
         .await
         .unwrap();
     assert!(peer.state.lock().await.resource_subscriptions.is_empty());
+}
+
+fn remote_skill(name: &str) -> Value {
+    json!({"uri": format!("skill://fixture/{name}/SKILL.md"),
+        "frontmatter": {"name": name, "description": "Untrusted server metadata"},
+        "resources": "dynamic"})
+}
+
+fn skill_names(runtime: &McpRuntime) -> Vec<(String, String)> {
+    runtime
+        .skill_inventory()
+        .into_iter()
+        .map(|remote| (remote.server, remote.skill.name().to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_lists_metadata_across_pages_and_connection_replacement() {
+    let one = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    let two = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    let unsupported = Peer::new(vec![tool("read", "string")]).await;
+    one.advertise_skills("one").await;
+    two.advertise_skills("two").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let runtime = runtime(&path, &[("peer", &one), ("unsupported", &unsupported)]).await;
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    assert_eq!(
+        skill_names(&runtime),
+        [
+            ("peer".into(), "one".into()),
+            ("peer".into(), "one-second".into())
+        ]
+    );
+    let expected = vec![None, Some("second".into())];
+    assert_eq!(one.state.lock().await.skills.cursor_requests, expected);
+    assert_eq!(one.state.lock().await.skills.file_requests, 0);
+    assert!(
+        unsupported
+            .state
+            .lock()
+            .await
+            .skills
+            .cursor_requests
+            .is_empty()
+    );
+
+    config(&path, &[("peer", &two)]);
+    runtime.reload_config().await.unwrap();
+    assert!(skill_names(&runtime).is_empty());
+    runtime.initialize_uninitialized().await.unwrap();
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    assert_eq!(
+        skill_names(&runtime),
+        [
+            ("peer".into(), "two".into()),
+            ("peer".into(), "two-second".into())
+        ]
+    );
+    config(&path, &[]);
+    runtime.reload_config().await.unwrap();
+    assert!(skill_names(&runtime).is_empty());
+    assert_eq!(two.state.lock().await.skills.cursor_requests, expected);
+    assert_eq!(two.state.lock().await.skills.file_requests, 0);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_does_not_publish_retired_or_failed_work() {
+    let old = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    let new = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    old.advertise_skills("retired").await;
+    new.advertise_skills("unavailable").await;
+    new.state.lock().await.skills.fail = true;
+    let (release, gate) = oneshot::channel();
+    old.state.lock().await.skills.gate = Some(gate);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let runtime = runtime(&path, &[("peer", &old)]).await;
+    eventually(async || old.state.lock().await.skills.cursor_requests.len() == 1).await;
+    config(&path, &[("peer", &new)]);
+    runtime.reload_config().await.unwrap();
+    assert!(skill_names(&runtime).is_empty());
+    runtime.initialize_uninitialized().await.unwrap();
+    let _ = release.send(());
+    eventually(async || new.state.lock().await.skills.cursor_requests.len() == 1).await;
+    assert!(skill_names(&runtime).is_empty());
+    let (records, tools) = runtime.discovery_catalog().await.unwrap();
+    assert!(matches!(records["peer"].status, ServerStatus::Connected));
+    assert_eq!(tools["peer"].len(), 1);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_filters_out_old_oauth_transport_epochs() {
+    let peer = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    peer.advertise_skills("before-auth").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let runtime = runtime(&path, &[("peer", &peer)]).await;
+    eventually(async || skill_names(&runtime).len() == 2).await;
+
+    let (release, gate) = oneshot::channel();
+    {
+        let mut state = peer.state.lock().await;
+        state.skills.name = Some("after-auth");
+        state.skills.gate = Some(gate);
+    }
+    // The normal auth application path reconnects the underlying transport
+    // even though the manager continues to point at the same connection Arc.
+    runtime
+        .apply_credentials("peer", connect_auth_request("peer"), "oauth-token".into())
+        .await
+        .unwrap()
+        .complete();
+    assert!(skill_names(&runtime).is_empty());
+    release.send(()).unwrap();
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    assert_eq!(skill_names(&runtime)[0].1, "after-auth");
+    assert_eq!(peer.state.lock().await.skills.file_requests, 0);
 }
