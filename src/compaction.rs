@@ -313,9 +313,11 @@ fn quote_bounded_for_summary(
     head_numerator: usize,
     head_denominator: usize,
 ) -> String {
-    let full = quote_for_summary(value);
-    if full.len() <= max_encoded_bytes {
-        return full;
+    if value.len().saturating_add(2) <= max_encoded_bytes {
+        let full = quote_for_summary(value);
+        if full.len() <= max_encoded_bytes {
+            return full;
+        }
     }
     let mut lo = 0usize;
     let mut hi = value.len().min(max_encoded_bytes);
@@ -1032,13 +1034,26 @@ fn bounded_summary_prompt(
             && (history_items[head_count..].len() > 1 || !head_parts.is_empty())
             && let Some((last_item, _)) = history_items[head_count..].last()
         {
+            let min_slice = marker.len() + 17;
             let has_distinct_skipped_head = history_items[head_count..].len() > 1;
+            let shared = remaining.saturating_sub(head_used + 2);
             let slice_budget = if head_parts.is_empty() || has_distinct_skipped_head {
-                tail_budget.saturating_sub(2)
+                let reserved = tail_budget.saturating_sub(2);
+                if reserved >= min_slice {
+                    reserved
+                } else if !head_parts.is_empty() && shared >= min_slice {
+                    if shared >= min_slice * 2 + 2 {
+                        shared / 2
+                    } else {
+                        shared
+                    }
+                } else {
+                    reserved
+                }
             } else {
-                remaining.saturating_sub(head_used + 2)
+                shared
             };
-            if slice_budget > marker.len() + 16 {
+            if slice_budget >= min_slice {
                 let truncated = render_item_within_budget(last_item, slice_budget, marker, 0, 1)?;
                 tail_used = truncated.len() + 2;
                 tail_parts.push(truncated);
@@ -3912,6 +3927,26 @@ mod tests {
         assert!(both_prompt.len() <= 64_000);
         assert!(both_prompt.contains("audit decision"));
         assert!(both_prompt.contains("final state"));
+
+        let tight_both = vec![
+            Item::text(ItemKind::User, "a".repeat(209)),
+            Item::text(
+                ItemKind::User,
+                format!("audit decision {}", "b".repeat(500)),
+            ),
+            Item::text(
+                ItemKind::Assistant,
+                format!("{} final decision", "c".repeat(500)),
+            ),
+        ];
+        let tight_prompt = smaller_summary_prompt(
+            &SummaryRequest::new(tight_both, CompactionReason::TranscriptTooLong),
+            800,
+        )
+        .unwrap();
+        assert!(tight_prompt.len() <= 800);
+        assert!(tight_prompt.contains("audit decision"));
+        assert!(tight_prompt.contains("final decision"));
     }
 
     #[test]
