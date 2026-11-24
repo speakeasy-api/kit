@@ -285,11 +285,12 @@ fn truncate_head_tail_bytes(
     format!("{}{}{}", &value[..head], marker, &value[tail..])
 }
 
+fn escape_xml_delimiters(value: String) -> String {
+    value.replace('<', "\\u003c").replace('>', "\\u003e")
+}
+
 fn quote_for_summary(value: &str) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "\"\"".into())
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
+    escape_xml_delimiters(serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()))
 }
 
 fn render_tool_output_for_summary(output: ToolOutput) -> String {
@@ -352,11 +353,14 @@ fn render_part_for_summary(
         }
         None => quote_for_summary(&value),
     };
-    let encode_json = |rendered: String| match max_body_bytes {
-        Some(limit) if rendered.len() > limit => {
-            quote_bounded_for_summary(&rendered, limit, marker, head_numerator, head_denominator)
+    let encode_json = |rendered: String| {
+        let escaped = escape_xml_delimiters(rendered);
+        match max_body_bytes {
+            Some(limit) if escaped.len() > limit => {
+                quote_bounded_for_summary(&escaped, limit, marker, head_numerator, head_denominator)
+            }
+            _ => escaped,
         }
-        _ => rendered,
     };
     match summary_part(part) {
         Part::Text(text) => (!text.text.is_empty()).then(|| encode_text(text.text)),
@@ -828,11 +832,12 @@ fn referenced_files_section(items: &[Item], max_bytes: usize) -> String {
                 continue;
             };
             for key in PATH_KEYS {
-                if let Some(value) = object.get(*key).and_then(serde_json::Value::as_str) {
-                    let trimmed = value.trim();
-                    if !trimmed.is_empty() && trimmed.len() <= 512 && !trimmed.contains('\n') {
-                        files.insert(trimmed.to_owned());
-                    }
+                if let Some(value) = object.get(*key).and_then(serde_json::Value::as_str)
+                    && !value.trim().is_empty()
+                    && value.len() <= 512
+                    && !value.contains('\n')
+                {
+                    files.insert(value.to_owned());
                 }
             }
         }
@@ -1035,6 +1040,7 @@ fn bounded_summary_prompt(
             && let Some((last_item, _)) = history_items[head_count..].last()
         {
             let min_slice = marker.len() + 17;
+            let min_useful_slice = marker.len() + 64;
             let has_distinct_skipped_head = history_items[head_count..].len() > 1;
             let shared = remaining.saturating_sub(head_used + 2);
             let slice_budget = if head_parts.is_empty() || has_distinct_skipped_head {
@@ -1042,7 +1048,7 @@ fn bounded_summary_prompt(
                 if reserved >= min_slice {
                     reserved
                 } else if !head_parts.is_empty() && shared >= min_slice {
-                    if shared >= min_slice * 2 + 2 {
+                    if shared >= min_useful_slice * 2 + 2 {
                         shared / 2
                     } else {
                         shared
@@ -3808,6 +3814,22 @@ mod tests {
         assert!(section.len() <= 180);
         assert!(section.contains("z.rs\\u003c/referenced-files\\u003e"));
         assert_eq!(section.matches("</referenced-files>").count(), 1);
+
+        let whitespace_paths = ["notes.md", "notes.md "]
+            .into_iter()
+            .enumerate()
+            .map(|(i, path)| {
+                Part::ToolCall(ToolCallPart::new(
+                    format!("call-{i}"),
+                    "edit",
+                    json!({"path": path}),
+                ))
+            })
+            .collect();
+        let ws_section =
+            referenced_files_section(&[Item::new(ItemKind::Assistant, whitespace_paths)], 512);
+        assert!(ws_section.contains("- \"notes.md\"\n"));
+        assert!(ws_section.contains("- \"notes.md \"\n"));
     }
 
     #[tokio::test]
@@ -3896,7 +3918,7 @@ mod tests {
                 .starts_with("continue auth migration")
         );
 
-        let value = json!({"markup": "<>".repeat(2_250)});
+        let value = json!({"markup": "<>".repeat(450)});
         let custom = agentkit_core::CustomPart::new("widget").with_value(value.clone());
         let multipart = Item::new(
             ItemKind::User,
@@ -3908,7 +3930,8 @@ mod tests {
         );
         let rendered = render_summary_item(&multipart).unwrap();
         assert!(rendered.len() <= SUMMARY_ITEM_MAX_BYTES);
-        assert!(rendered.contains(&value.to_string()));
+        assert!(rendered.contains(&escape_xml_delimiters(value.to_string())));
+        assert!(!rendered.contains("<>"));
 
         let mut both_sliced = vec![Item::text(ItemKind::User, "a".repeat(15_990)); 3];
         both_sliced.push(Item::text(
@@ -3947,6 +3970,25 @@ mod tests {
         assert!(tight_prompt.len() <= 800);
         assert!(tight_prompt.contains("audit decision"));
         assert!(tight_prompt.contains("final decision"));
+
+        let threshold_items = vec![
+            Item::text(ItemKind::User, "a".repeat(419)),
+            Item::text(
+                ItemKind::User,
+                format!("audit decision {}", "b".repeat(500)),
+            ),
+            Item::text(
+                ItemKind::Assistant,
+                format!("{} final decision", "c".repeat(500)),
+            ),
+        ];
+        let threshold_request =
+            SummaryRequest::new(threshold_items, CompactionReason::TranscriptTooLong);
+        for budget in [802, 803] {
+            let prompt = smaller_summary_prompt(&threshold_request, budget).unwrap();
+            assert!(prompt.len() <= budget);
+            assert!(prompt.contains("final decision"));
+        }
     }
 
     #[test]
