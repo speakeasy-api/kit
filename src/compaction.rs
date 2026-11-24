@@ -354,11 +354,15 @@ fn render_part_for_summary(
         None => quote_for_summary(&value),
     };
     let encode_json = |rendered: String| {
-        let escaped = escape_xml_delimiters(rendered);
+        let escaped = escape_xml_delimiters(rendered.clone());
         match max_body_bytes {
-            Some(limit) if escaped.len() > limit => {
-                quote_bounded_for_summary(&escaped, limit, marker, head_numerator, head_denominator)
-            }
+            Some(limit) if escaped.len() > limit => quote_bounded_for_summary(
+                &rendered,
+                limit,
+                marker,
+                head_numerator,
+                head_denominator,
+            ),
             _ => escaped,
         }
     };
@@ -1040,7 +1044,7 @@ fn bounded_summary_prompt(
             && let Some((last_item, _)) = history_items[head_count..].last()
         {
             let min_slice = marker.len() + 17;
-            let min_useful_slice = marker.len() + 64;
+            let min_useful_slice = quote_for_summary(marker).len() + 36;
             let has_distinct_skipped_head = history_items[head_count..].len() > 1;
             let shared = remaining.saturating_sub(head_used + 2);
             let slice_budget = if head_parts.is_empty() || has_distinct_skipped_head {
@@ -3989,6 +3993,28 @@ mod tests {
             assert!(prompt.len() <= budget);
             assert!(prompt.contains("final decision"));
         }
+        let prompt_850 = smaller_summary_prompt(&threshold_request, 850).unwrap();
+        assert!(prompt_850.len() <= 850);
+        assert!(prompt_850.contains("audit decision"));
+        assert!(prompt_850.contains("final decision"));
+
+        let clipped_custom = agentkit_core::CustomPart::new("widget")
+            .with_value(json!({"markup": format!("<main>{}", "x".repeat(200))}));
+        let clipped_rendered = render_part_for_summary(
+            Part::Custom(clipped_custom),
+            Some(80),
+            "\n[omitted]\n",
+            1,
+            1,
+        )
+        .unwrap();
+        let clipped_body = clipped_rendered.split_once("] ").unwrap().1;
+        assert!(clipped_body.len() <= 80 && !clipped_body.contains('<'));
+        assert!(
+            serde_json::from_str::<String>(clipped_body)
+                .unwrap()
+                .contains("<main>")
+        );
     }
 
     #[test]
