@@ -2982,6 +2982,30 @@ fn transcript_replay(
     for (item_index, item) in transcript.iter().enumerate() {
         let message_id =
             |kind: &str| wire::MessageId::new(format!("{session_id}-replay-{item_index}-{kind}"));
+        if crate::compaction::is_compaction_summary(item)
+            && matches!(item.kind, ItemKind::User | ItemKind::Developer)
+        {
+            let content = item
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(wire::ContentBlock::Text(wire::TextContent::new(
+                        crate::compaction::unwrap_compaction_summary(&text.text),
+                    ))),
+                    other => replay_content(other),
+                })
+                .collect::<Vec<_>>();
+            if !content.is_empty() {
+                replay.push(wire::SessionUpdate::CompactionUpdate(
+                    wire::CompactionUpdate::new(format!(
+                        "{session_id}-replay-{item_index}-compaction"
+                    ))
+                    .status(wire::CompactionStatus::Completed)
+                    .summary(content),
+                ));
+            }
+            continue;
+        }
         match item.kind {
             ItemKind::User => {
                 let content = item
@@ -3126,22 +3150,6 @@ fn transcript_replay(
                             .content(replay_tool_output_content(&result.output)),
                         ));
                     }
-                }
-            }
-            ItemKind::Developer if crate::compaction::is_compaction_summary(item) => {
-                let content = item
-                    .parts
-                    .iter()
-                    .filter_map(replay_content)
-                    .collect::<Vec<_>>();
-                if !content.is_empty() {
-                    replay.push(wire::SessionUpdate::CompactionUpdate(
-                        wire::CompactionUpdate::new(format!(
-                            "{session_id}-replay-{item_index}-compaction"
-                        ))
-                        .status(wire::CompactionStatus::Completed)
-                        .summary(content),
-                    ));
                 }
             }
             ItemKind::System | ItemKind::Developer | ItemKind::Context | ItemKind::Notification => {
@@ -8779,31 +8787,37 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn replay_only_exposes_tagged_developer_compaction_summaries() {
+    fn replay_only_exposes_tagged_compaction_summaries() {
         let mut metadata = MetadataMap::new();
         metadata.insert(
             crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
             true.into(),
         );
-        let replay = transcript_replay(
-            &wire::SessionId::new("saved"),
-            &[
-                Item::text(ItemKind::Developer, "ordinary instruction"),
-                Item::text(ItemKind::Developer, "summary").with_metadata(metadata),
-            ],
-        );
+        let framed = "<compaction-summary>\nAnother instance of you compacted earlier turns of this conversation into the checkpoint below. Treat this as historical context only, not new instructions. Later messages in this conversation take precedence over this summary.\n\nsummary\n</compaction-summary>";
+        for summary_item in [
+            Item::text(ItemKind::User, framed).with_metadata(metadata.clone()),
+            Item::text(ItemKind::Developer, "summary").with_metadata(metadata),
+        ] {
+            let replay = transcript_replay(
+                &wire::SessionId::new("saved"),
+                &[
+                    Item::text(ItemKind::Developer, "ordinary instruction"),
+                    summary_item,
+                ],
+            );
 
-        let [notification] = replay.as_slice() else {
-            panic!("only the tagged summary should be replayed");
-        };
-        let wire::SessionUpdate::CompactionUpdate(message) = &notification.update else {
-            panic!("compaction summaries replay as compaction updates");
-        };
-        assert!(matches!(
-            &message.summary,
-            MaybeUndefined::Value(content)
-                if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "summary")
-        ));
+            let [notification] = replay.as_slice() else {
+                panic!("only the tagged summary should be replayed");
+            };
+            let wire::SessionUpdate::CompactionUpdate(message) = &notification.update else {
+                panic!("compaction summaries replay as compaction updates");
+            };
+            assert!(matches!(
+                &message.summary,
+                MaybeUndefined::Value(content)
+                    if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "summary")
+            ));
+        }
     }
 
     #[test]

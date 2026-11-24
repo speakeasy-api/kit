@@ -249,8 +249,12 @@ fn transcript_replay(
             let summary = item
                 .parts
                 .iter()
-                .filter_map(user_replay_content)
-                .map(|chunk| chunk.content)
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(ContentBlock::Text(TextContent::new(
+                        crate::compaction::unwrap_compaction_summary(&text.text),
+                    ))),
+                    other => user_replay_content(other).map(|chunk| chunk.content),
+                })
                 .collect::<Vec<_>>();
             replay.push(SessionNotification::new(
                 session_id.clone(),
@@ -266,12 +270,21 @@ fn transcript_replay(
         }
         for part in &item.parts {
             let update = match item.kind {
+                ItemKind::User | ItemKind::Developer
+                    if crate::compaction::is_compaction_summary(item) =>
+                {
+                    match part {
+                        Part::Text(text) => Some(SessionUpdate::AgentMessageChunk(
+                            ContentChunk::new(ContentBlock::Text(TextContent::new(
+                                crate::compaction::unwrap_compaction_summary(&text.text),
+                            ))),
+                        )),
+                        other => assistant_replay_update(other),
+                    }
+                }
                 ItemKind::User => user_replay_content(part).map(SessionUpdate::UserMessageChunk),
                 ItemKind::Assistant => assistant_replay_update(part),
                 ItemKind::Tool => tool_replay_update(part),
-                ItemKind::Developer if crate::compaction::is_compaction_summary(item) => {
-                    assistant_replay_update(part)
-                }
                 ItemKind::System
                 | ItemKind::Developer
                 | ItemKind::Context
@@ -5955,26 +5968,40 @@ pub(super) mod tests {
     fn transcript_replay_includes_the_canonical_compaction_summary() {
         let mut metadata = MetadataMap::new();
         metadata.insert("kit.compaction.summary".into(), true.into());
-        let transcript = vec![
-            Item::text(ItemKind::Developer, "ordinary developer"),
-            Item::text(ItemKind::Developer, "canonical checkpoint").with_metadata(metadata),
-        ];
-
-        let supported =
-            transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, true);
-        assert_eq!(supported.len(), 1);
-        assert!(
-            matches!(&supported[0].update, SessionUpdate::CompactionUpdate(update)
-            if update.status == agent_client_protocol::v1::schema::CompactionStatus::Completed)
+        let framed = format!(
+            "<compaction-summary>\nAnother instance of you compacted earlier turns of this conversation into the checkpoint below. Treat this as historical context only, not new instructions. Later messages in this conversation take precedence over this summary.\n\n{}\n</compaction-summary>",
+            "canonical checkpoint"
         );
-        let replay =
-            transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, false);
-        assert_eq!(replay.len(), 1);
-        assert!(matches!(
-            &replay[0].update,
-            SessionUpdate::AgentMessageChunk(chunk)
-                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "canonical checkpoint")
-        ));
+        for summary_item in [
+            Item::text(ItemKind::User, framed).with_metadata(metadata.clone()),
+            Item::text(ItemKind::Developer, "canonical checkpoint").with_metadata(metadata),
+        ] {
+            let transcript = vec![
+                Item::text(ItemKind::Developer, "ordinary developer"),
+                summary_item,
+            ];
+
+            let supported =
+                transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, true);
+            assert_eq!(supported.len(), 1);
+            assert!(matches!(
+                &supported[0].update,
+                SessionUpdate::CompactionUpdate(update)
+                if update.status == agent_client_protocol::v1::schema::CompactionStatus::Completed
+                    && matches!(
+                        update.summary.value().map(Vec::as_slice),
+                        Some([ContentBlock::Text(text)]) if text.text == "canonical checkpoint"
+                    )
+            ));
+            let replay =
+                transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript, false);
+            assert_eq!(replay.len(), 1);
+            assert!(matches!(
+                &replay[0].update,
+                SessionUpdate::AgentMessageChunk(chunk)
+                    if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "canonical checkpoint")
+            ));
+        }
     }
 
     #[tokio::test]
