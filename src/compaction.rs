@@ -157,7 +157,7 @@ fn truncate_bytes(value: &str, limit: usize) -> Option<String> {
 }
 
 fn compact_tool_output(output: ToolOutput, limit: usize) -> ToolOutput {
-    let projected = summary_tool_output(output);
+    let projected = summary_tool_output_ref(&output);
     let rendered = match &projected {
         ToolOutput::Text(text) => text.clone(),
         other => {
@@ -205,23 +205,27 @@ fn bounded_reference(data: &DataRef) -> String {
     }
 }
 
-fn summary_tool_output(output: ToolOutput) -> ToolOutput {
+fn summary_tool_output_ref(output: &ToolOutput) -> ToolOutput {
     match output {
-        ToolOutput::Parts(parts) => {
-            ToolOutput::Parts(parts.into_iter().map(summary_part).collect())
-        }
+        ToolOutput::Parts(parts) => ToolOutput::Parts(parts.iter().map(summary_part_ref).collect()),
         ToolOutput::Files(files) => ToolOutput::Parts(
             files
-                .into_iter()
-                .map(Part::File)
-                .map(summary_part)
+                .iter()
+                .map(|file| {
+                    Part::text(format!(
+                        "[file attachment: name={}; mime_type={}; {}]",
+                        file.name.as_deref().unwrap_or("unknown"),
+                        file.mime_type.as_deref().unwrap_or("unknown"),
+                        bounded_reference(&file.data)
+                    ))
+                })
                 .collect(),
         ),
-        output => output,
+        other => other.clone(),
     }
 }
 
-fn summary_part(part: Part) -> Part {
+fn summary_part_ref(part: &Part) -> Part {
     match part {
         Part::Media(media) => Part::text(format!(
             "[{:?} attachment: {}; {}]",
@@ -235,27 +239,40 @@ fn summary_part(part: Part) -> Part {
             file.mime_type.as_deref().unwrap_or("unknown"),
             bounded_reference(&file.data)
         )),
-        Part::ToolResult(mut result) => {
-            result.output = summary_tool_output(result.output);
-            Part::ToolResult(result)
+        Part::ToolResult(result) => {
+            let mut projected = result.clone();
+            projected.output = summary_tool_output_ref(&result.output);
+            Part::ToolResult(projected)
         }
-        Part::Reasoning(mut reasoning) => {
-            if reasoning.data.as_ref().is_some_and(|data| {
-                matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
-            }) {
-                reasoning.data = None;
+        Part::Reasoning(reasoning) => {
+            let mut projected = agentkit_core::ReasoningPart {
+                summary: reasoning.summary.clone(),
+                data: None,
+                redacted: reasoning.redacted,
+                metadata: reasoning.metadata.clone(),
+            };
+            if let Some(data) = &reasoning.data
+                && !matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
+            {
+                projected.data = Some(data.clone());
             }
-            Part::Reasoning(reasoning)
+            Part::Reasoning(projected)
         }
-        Part::Custom(mut custom) => {
-            if custom.data.as_ref().is_some_and(|data| {
-                matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
-            }) {
-                custom.data = None;
+        Part::Custom(custom) => {
+            let mut projected = agentkit_core::CustomPart {
+                kind: custom.kind.clone(),
+                value: custom.value.clone(),
+                data: None,
+                metadata: custom.metadata.clone(),
+            };
+            if let Some(data) = &custom.data
+                && !matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
+            {
+                projected.data = Some(data.clone());
             }
-            Part::Custom(custom)
+            Part::Custom(projected)
         }
-        part => part,
+        part => part.clone(),
     }
 }
 
@@ -293,12 +310,12 @@ fn quote_for_summary(value: &str) -> String {
     escape_xml_delimiters(serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()))
 }
 
-fn render_tool_output_for_summary(output: ToolOutput) -> String {
-    match summary_tool_output(output) {
+fn render_tool_output_for_summary(output: &ToolOutput) -> String {
+    match summary_tool_output_ref(output) {
         ToolOutput::Text(text) => text,
         ToolOutput::Parts(parts) => parts
-            .into_iter()
-            .filter_map(|part| render_part_for_summary(part, None, "", 1, 2))
+            .iter()
+            .filter_map(|part| render_projected_part_for_summary(part, None, "", 1, 2))
             .collect::<Vec<_>>()
             .join(" | "),
         other => {
@@ -340,18 +357,18 @@ fn quote_bounded_for_summary(
     best
 }
 
-fn render_part_for_summary(
-    part: Part,
+fn render_projected_part_for_summary(
+    part: &Part,
     max_body_bytes: Option<usize>,
     marker: &str,
     head_numerator: usize,
     head_denominator: usize,
 ) -> Option<String> {
-    let encode_text = |value: String| match max_body_bytes {
+    let encode_text = |value: &str| match max_body_bytes {
         Some(limit) => {
-            quote_bounded_for_summary(&value, limit, marker, head_numerator, head_denominator)
+            quote_bounded_for_summary(value, limit, marker, head_numerator, head_denominator)
         }
-        None => quote_for_summary(&value),
+        None => quote_for_summary(value),
     };
     let encode_json = |rendered: String| {
         let escaped = escape_xml_delimiters(rendered.clone());
@@ -366,8 +383,8 @@ fn render_part_for_summary(
             _ => escaped,
         }
     };
-    match summary_part(part) {
-        Part::Text(text) => (!text.text.is_empty()).then(|| encode_text(text.text)),
+    match part {
+        Part::Text(text) => (!text.text.is_empty()).then(|| encode_text(&text.text)),
         Part::Structured(structured) => {
             let rendered = serde_json::to_string(&structured.value)
                 .unwrap_or_else(|_| "[unserializable structured part]".into());
@@ -386,20 +403,21 @@ fn render_part_for_summary(
         Part::ToolResult(result) => {
             let id = quote_for_summary(&result.call_id.to_string());
             let status = if result.is_error { " error=true" } else { "" };
-            let output = render_tool_output_for_summary(result.output);
+            let output = render_tool_output_for_summary(&result.output);
             Some(format!(
                 "[ToolResult id={id}{status}] {}",
-                encode_text(output)
+                encode_text(&output)
             ))
         }
         Part::Reasoning(reasoning) => reasoning
             .summary
+            .as_deref()
             .filter(|summary| !summary.is_empty())
             .map(|summary| format!("[Reasoning] {}", encode_text(summary))),
         Part::Custom(custom) => {
             let kind = quote_for_summary(&custom.kind);
-            if let Some(value) = custom.value {
-                let rendered = serde_json::to_string(&value)
+            if let Some(value) = &custom.value {
+                let rendered = serde_json::to_string(value)
                     .unwrap_or_else(|_| "[unserializable custom value]".into());
                 Some(format!("[Custom kind={kind}] {}", encode_json(rendered)))
             } else {
@@ -410,6 +428,24 @@ fn render_part_for_summary(
     }
 }
 
+#[cfg(test)]
+fn render_part_for_summary(
+    part: Part,
+    max_body_bytes: Option<usize>,
+    marker: &str,
+    head_numerator: usize,
+    head_denominator: usize,
+) -> Option<String> {
+    let projected = summary_part_ref(&part);
+    render_projected_part_for_summary(
+        &projected,
+        max_body_bytes,
+        marker,
+        head_numerator,
+        head_denominator,
+    )
+}
+
 fn render_item_within_budget(
     item: &Item,
     max_bytes: usize,
@@ -417,18 +453,22 @@ fn render_item_within_budget(
     head_numerator: usize,
     head_denominator: usize,
 ) -> Result<String, CompactionError> {
-    let full = render_protected_summary_item(item)?;
+    let projected_parts = item.parts.iter().map(summary_part_ref).collect::<Vec<_>>();
+    let full_body = projected_parts
+        .iter()
+        .filter_map(|part| render_projected_part_for_summary(part, None, "", 1, 2))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let full = format!("[{:?}] {full_body}", item.kind);
     if full.len() <= max_bytes {
         return Ok(full);
     }
     let prefix_len = format!("[{:?}] ", item.kind).len();
     let render_with = |per_part: usize| -> String {
-        let body = item
-            .parts
+        let body = projected_parts
             .iter()
-            .cloned()
             .filter_map(|part| {
-                render_part_for_summary(
+                render_projected_part_for_summary(
                     part,
                     Some(per_part),
                     marker,
@@ -440,7 +480,7 @@ fn render_item_within_budget(
             .join(" | ");
         format!("[{:?}] {body}", item.kind)
     };
-    if item.parts.len() == 1 {
+    if projected_parts.len() == 1 {
         let single_budget = max_bytes.saturating_sub(prefix_len);
         let candidate = render_with(single_budget);
         if candidate.len() <= max_bytes
@@ -507,15 +547,15 @@ fn render_protected_summary_item(item: &Item) -> Result<String, CompactionError>
     let body = item
         .parts
         .iter()
-        .cloned()
-        .filter_map(|part| render_part_for_summary(part, None, "", 1, 2))
+        .map(summary_part_ref)
+        .filter_map(|part| render_projected_part_for_summary(&part, None, "", 1, 2))
         .collect::<Vec<_>>()
         .join(" | ");
     Ok(format!("[{:?}] {body}", item.kind))
 }
 
-fn render_follow_up_part(part: Part) -> Option<String> {
-    match summary_part(part) {
+fn render_follow_up_part(part: &Part) -> Option<String> {
+    match summary_part_ref(part) {
         Part::Text(text) => (!text.text.trim().is_empty()).then_some(text.text),
         Part::Structured(structured) => serde_json::to_string(&structured.value).ok(),
         Part::Custom(custom) => Some(match custom.value {
@@ -537,7 +577,6 @@ fn render_follow_up_prompt(item: &Item, command_part_index: usize) -> String {
     if let Some(primary) = item
         .parts
         .get(command_part_index)
-        .cloned()
         .and_then(render_follow_up_part)
     {
         let bounded = truncate_bytes(&primary, NEXT_USER_PROMPT_MAX_BYTES).unwrap_or(primary);
@@ -548,7 +587,7 @@ fn render_follow_up_prompt(item: &Item, command_part_index: usize) -> String {
         if index == command_part_index {
             continue;
         }
-        let Some(rendered) = render_follow_up_part(part.clone()) else {
+        let Some(rendered) = render_follow_up_part(part) else {
             continue;
         };
         let remaining =
