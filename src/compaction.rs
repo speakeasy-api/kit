@@ -386,13 +386,8 @@ fn render_item_within_budget(
     if full.len() <= max_bytes {
         return Ok(full);
     }
-    let part_count = item.parts.len().max(1);
     let prefix_len = format!("[{:?}] ", item.kind).len();
-    let mut per_part = max_bytes
-        .saturating_sub(prefix_len + 2)
-        .saturating_div(part_count)
-        .max(marker.len() + 2);
-    for _ in 0..8 {
+    let render_with = |per_part: usize| -> String {
         let body = item
             .parts
             .iter()
@@ -408,34 +403,49 @@ fn render_item_within_budget(
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        let rendered = format!("[{:?}] {body}", item.kind);
-        if rendered.len() <= max_bytes {
-            return Ok(rendered);
+        format!("[{:?}] {body}", item.kind)
+    };
+    let mut lo = 0usize;
+    let mut hi = max_bytes.saturating_sub(prefix_len).max(1);
+    let mut best: Option<String> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = render_with(mid);
+        if candidate.len() <= max_bytes {
+            best = Some(candidate);
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
         }
-        let excess = rendered.len() - max_bytes;
-        let step = excess.div_ceil(part_count).max(4);
-        per_part = per_part.saturating_sub(step).max(1);
     }
-    let mut raw_budget = max_bytes.saturating_sub(prefix_len + 2);
-    for _ in 0..8 {
+    if let Some(best) = best
+        && (best.len() > prefix_len + 4 || max_bytes <= prefix_len + 4)
+    {
+        return Ok(best);
+    }
+    let mut lo = 0usize;
+    let mut hi = full.len().min(max_bytes);
+    let mut fallback_best: Option<String> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
         let fallback_content =
-            truncate_head_tail_bytes(&full, raw_budget, marker, head_numerator, head_denominator);
+            truncate_head_tail_bytes(&full, mid, marker, head_numerator, head_denominator);
         let candidate = format!("[{:?}] {}", item.kind, quote_for_summary(&fallback_content));
         if candidate.len() <= max_bytes {
-            return Ok(candidate);
-        }
-        let excess = candidate.len() - max_bytes;
-        if raw_budget == 0 {
+            fallback_best = Some(candidate);
+            lo = mid + 1;
+        } else if mid == 0 {
             break;
+        } else {
+            hi = mid - 1;
         }
-        raw_budget = raw_budget.saturating_sub(excess.max(1));
     }
-    let minimal = format!("[{:?}] \"\"", item.kind);
-    if minimal.len() <= max_bytes {
-        Ok(minimal)
-    } else {
-        Ok(truncate_bytes(marker.trim(), max_bytes).unwrap_or_else(|| marker.trim().to_string()))
+    if let Some(candidate) = fallback_best {
+        return Ok(candidate);
     }
+    Ok(truncate_bytes(marker.trim(), max_bytes).unwrap_or_else(|| marker.trim().to_string()))
 }
 
 fn render_summary_item(item: &Item) -> Result<String, CompactionError> {
@@ -726,16 +736,30 @@ fn next_user_prompt_section(request: &SummaryRequest) -> String {
         .map(str::trim)
         .filter(|next| !next.is_empty())
         .map(|next| {
-            let mut raw_budget = NEXT_USER_PROMPT_MAX_BYTES;
-            let encoded = loop {
-                let candidate =
-                    truncate_bytes(next, raw_budget).unwrap_or_else(|| next.to_owned());
-                let quoted = quote_for_summary(&candidate);
-                if quoted.len() <= NEXT_USER_PROMPT_MAX_BYTES || raw_budget == 0 {
-                    break quoted;
+            let encoded = {
+                let full_quoted = quote_for_summary(next);
+                if full_quoted.len() <= NEXT_USER_PROMPT_MAX_BYTES {
+                    full_quoted
+                } else {
+                    let mut lo = 0usize;
+                    let mut hi = next.len().min(NEXT_USER_PROMPT_MAX_BYTES);
+                    let mut best = String::from("\"\"");
+                    while lo <= hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let candidate =
+                            truncate_bytes(next, mid).unwrap_or_else(|| next.to_owned());
+                        let quoted = quote_for_summary(&candidate);
+                        if quoted.len() <= NEXT_USER_PROMPT_MAX_BYTES {
+                            best = quoted;
+                            lo = mid + 1;
+                        } else if mid == 0 {
+                            break;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    best
                 }
-                let excess = quoted.len() - NEXT_USER_PROMPT_MAX_BYTES;
-                raw_budget = raw_budget.saturating_sub(excess.max(1));
             };
             format!(
                 "\n\nThe user's next prompt immediately following this compaction is:\n\n<next-user-prompt>\n{encoded}\n</next-user-prompt>\n\nPrioritize preserving details, files, decisions, and context relevant to this next prompt, and drop completed or unrelated context that is no longer needed for it."
@@ -957,16 +981,19 @@ fn bounded_summary_prompt(
         }
         let mut tail_parts: Vec<String> = Vec::new();
         let mut tail_used = 0usize;
+        let mut tail_count = 0usize;
         for (_, rendered) in history_items[head_count..].iter().rev() {
             let needed = rendered.len() + 2;
             if tail_used + needed <= tail_budget {
                 tail_parts.push(rendered.clone());
                 tail_used += needed;
+                tail_count += 1;
             } else {
                 break;
             }
         }
         tail_parts.reverse();
+        let mut tail_sliced = false;
         if tail_parts.is_empty()
             && (history_items[head_count..].len() > 1 || !head_parts.is_empty())
             && let Some((last_item, _)) = history_items[head_count..].last()
@@ -980,14 +1007,19 @@ fn bounded_summary_prompt(
                 let truncated = render_item_within_budget(last_item, slice_budget, marker, 0, 1)?;
                 tail_used = truncated.len() + 2;
                 tail_parts.push(truncated);
+                tail_sliced = true;
             }
         }
-        if head_parts.is_empty()
-            && let Some((first_item, _)) = history_items.first()
+        let unretained_end = history_items
+            .len()
+            .saturating_sub(tail_count + usize::from(tail_sliced));
+        if head_count < unretained_end
+            && let Some((skipped_item, _)) = history_items.get(head_count)
         {
-            let slice_budget = remaining.saturating_sub(tail_used + 2);
+            let slice_budget = remaining.saturating_sub(head_used + tail_used + 2);
             if slice_budget > marker.len() + 16 {
-                let truncated = render_item_within_budget(first_item, slice_budget, marker, 7, 8)?;
+                let truncated =
+                    render_item_within_budget(skipped_item, slice_budget, marker, 7, 8)?;
                 head_parts.push(truncated);
             }
         }
@@ -3756,6 +3788,63 @@ mod tests {
         assert!(prompt.contains("continue auth migration"));
         assert_eq!(prompt.matches("</next-user-prompt>").count(), 1);
         assert_eq!(result.transcript.last().unwrap().parts.len(), 2);
+    }
+
+    #[test]
+    fn bounded_summary_preserves_first_skipped_head_record_and_escape_heavy_excerpts() {
+        let mut items = vec![Item::text(ItemKind::User, "a".repeat(15_990)); 3];
+        items.push(Item::text(
+            ItemKind::User,
+            format!("retain audit decision {}", "b".repeat(15_960)),
+        ));
+        items.push(Item::text(
+            ItemKind::Assistant,
+            format!("final state {}", "c".repeat(256)),
+        ));
+        let request = SummaryRequest::new(items, CompactionReason::TranscriptTooLong);
+        let prompt = smaller_summary_prompt(&request, 64_000).unwrap();
+        assert!(prompt.contains("retain audit decision"));
+        assert!(prompt.contains("final state"));
+        assert!(prompt.len() <= 64_000);
+
+        let markup = "<em>x</em>".repeat(3_000);
+        let escape_heavy = Item::text(
+            ItemKind::User,
+            format!("first decision {markup} final decision"),
+        );
+        let rendered = render_summary_item(&escape_heavy).unwrap();
+        assert!(rendered.len() <= SUMMARY_ITEM_MAX_BYTES);
+        assert!(rendered.contains("first decision"));
+        assert!(rendered.contains("final decision"));
+
+        let next = Item::new(
+            ItemKind::User,
+            vec![
+                Part::text("<em>x</em>".repeat(600)),
+                Part::text("continue auth migration"),
+            ],
+        );
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            NEXT_USER_PROMPT_METADATA_KEY.into(),
+            json!(render_follow_up_prompt(&next, 1)),
+        );
+        let section = next_user_prompt_section(
+            &SummaryRequest::new(vec![], CompactionReason::Manual).with_metadata(metadata),
+        );
+        let encoded = section
+            .split_once("<next-user-prompt>\n")
+            .unwrap()
+            .1
+            .split_once("\n</next-user-prompt>")
+            .unwrap()
+            .0;
+        assert!(encoded.len() <= NEXT_USER_PROMPT_MAX_BYTES);
+        assert!(
+            serde_json::from_str::<String>(encoded)
+                .unwrap()
+                .starts_with("continue auth migration")
+        );
     }
 
     #[test]
