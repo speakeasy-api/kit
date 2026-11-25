@@ -1132,12 +1132,22 @@ async fn mcp_skill_inventory_retries_without_reconnecting() {
         .unwrap()
         .connection();
     let epoch = connection.connection_epoch();
-    eventually(async || {
-        let snapshot = runtime.skill_inventory_snapshot();
-        snapshot.skills.is_empty() && snapshot.truncated
-    })
-    .await;
-    peer.state.lock().await.skills.fail = false;
+    // The fixture records the request and captures its failure flag in the
+    // same critical section. Do not mistake the Pending marker for a retry.
+    eventually(async || !peer.state.lock().await.skills.cursor_requests.is_empty()).await;
+    let (release, gate) = oneshot::channel();
+    let previous_attempts = {
+        let mut state = peer.state.lock().await;
+        state.skills.fail = false;
+        state.skills.gate = Some(gate);
+        state.skills.cursor_requests.len()
+    };
+    eventually(async || peer.state.lock().await.skills.cursor_requests.len() > previous_attempts)
+        .await;
+    let snapshot = runtime.skill_inventory_snapshot();
+    assert!(snapshot.skills.is_empty());
+    assert!(snapshot.truncated);
+    release.send(()).unwrap();
     eventually(async || {
         let snapshot = runtime.skill_inventory_snapshot();
         snapshot.skills.len() == 2 && !snapshot.truncated
