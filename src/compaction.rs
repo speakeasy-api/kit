@@ -487,6 +487,94 @@ fn render_part_for_summary(
     ))
 }
 
+fn prepared_part_min_bytes(part: &PreparedSummaryPart) -> usize {
+    match part {
+        PreparedSummaryPart::Text(text) => text.len().saturating_add(2),
+        PreparedSummaryPart::TaggedText { prefix, text } => {
+            prefix.len().saturating_add(text.len()).saturating_add(2)
+        }
+        PreparedSummaryPart::Json { prefix, raw } => prefix.len().saturating_add(raw.len()),
+        PreparedSummaryPart::Literal(literal) => literal.len(),
+    }
+}
+
+fn try_render_full_within_budget(
+    kind: ItemKind,
+    prepared_parts: &[PreparedSummaryPart],
+    max_bytes: usize,
+) -> Option<String> {
+    let prefix = format!("[{kind:?}] ");
+    let sep_bytes = prepared_parts.len().saturating_sub(1).saturating_mul(3);
+    let min_bytes = prepared_parts.iter().map(prepared_part_min_bytes).fold(
+        prefix.len().saturating_add(sep_bytes),
+        usize::saturating_add,
+    );
+    if min_bytes > max_bytes {
+        return None;
+    }
+    let mut out = String::with_capacity(min_bytes);
+    out.push_str(&prefix);
+    for (index, part) in prepared_parts.iter().enumerate() {
+        if index > 0 {
+            out.push_str(" | ");
+        }
+        let remaining = max_bytes.checked_sub(out.len())?;
+        let rendered = render_prepared_part_for_summary(part, None, "", 1, 2);
+        if rendered.len() > remaining {
+            return None;
+        }
+        out.push_str(&rendered);
+    }
+    Some(out)
+}
+
+fn render_bounded_fallback(
+    kind: ItemKind,
+    prepared_parts: &[PreparedSummaryPart],
+    max_bytes: usize,
+    marker: &str,
+    head_numerator: usize,
+    head_denominator: usize,
+) -> String {
+    let mut head_sample = String::new();
+    for (index, part) in prepared_parts.iter().enumerate() {
+        if head_sample.len() >= max_bytes {
+            break;
+        }
+        if index > 0 {
+            head_sample.push_str(" | ");
+        }
+        let budget = max_bytes.saturating_sub(head_sample.len());
+        head_sample.push_str(&render_prepared_part_for_summary(
+            part,
+            Some(budget),
+            marker,
+            head_numerator,
+            head_denominator,
+        ));
+    }
+    let mut lo = 0usize;
+    let mut hi = head_sample.len().min(max_bytes);
+    let mut fallback_best: Option<String> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let fallback_content =
+            truncate_head_tail_bytes(&head_sample, mid, marker, head_numerator, head_denominator);
+        let candidate = format!("[{kind:?}] {}", quote_for_summary(&fallback_content));
+        if candidate.len() <= max_bytes {
+            fallback_best = Some(candidate);
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    fallback_best.unwrap_or_else(|| {
+        truncate_bytes(marker.trim(), max_bytes).unwrap_or_else(|| marker.trim().to_string())
+    })
+}
+
 fn render_item_within_budget(
     item: &Item,
     max_bytes: usize,
@@ -499,31 +587,25 @@ fn render_item_within_budget(
         .iter()
         .filter_map(prepare_summary_part)
         .collect::<Vec<_>>();
-    let full_body = prepared_parts
-        .iter()
-        .map(|part| render_prepared_part_for_summary(part, None, "", 1, 2))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let full = format!("[{:?}] {full_body}", item.kind);
-    if full.len() <= max_bytes {
+    if let Some(full) = try_render_full_within_budget(item.kind, &prepared_parts, max_bytes) {
         return Ok(full);
     }
     let prefix_len = format!("[{:?}] ", item.kind).len();
     let render_with = |per_part: usize| -> String {
-        let body = prepared_parts
-            .iter()
-            .map(|part| {
-                render_prepared_part_for_summary(
-                    part,
-                    Some(per_part),
-                    marker,
-                    head_numerator,
-                    head_denominator,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" | ");
-        format!("[{:?}] {body}", item.kind)
+        let mut out = format!("[{:?}] ", item.kind);
+        for (index, part) in prepared_parts.iter().enumerate() {
+            if index > 0 {
+                out.push_str(" | ");
+            }
+            out.push_str(&render_prepared_part_for_summary(
+                part,
+                Some(per_part),
+                marker,
+                head_numerator,
+                head_denominator,
+            ));
+        }
+        out
     };
     if prepared_parts.len() == 1 {
         let single_budget = max_bytes.saturating_sub(prefix_len);
@@ -554,27 +636,14 @@ fn render_item_within_budget(
     {
         return Ok(best);
     }
-    let mut lo = 0usize;
-    let mut hi = full.len().min(max_bytes);
-    let mut fallback_best: Option<String> = None;
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let fallback_content =
-            truncate_head_tail_bytes(&full, mid, marker, head_numerator, head_denominator);
-        let candidate = format!("[{:?}] {}", item.kind, quote_for_summary(&fallback_content));
-        if candidate.len() <= max_bytes {
-            fallback_best = Some(candidate);
-            lo = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    if let Some(candidate) = fallback_best {
-        return Ok(candidate);
-    }
-    Ok(truncate_bytes(marker.trim(), max_bytes).unwrap_or_else(|| marker.trim().to_string()))
+    Ok(render_bounded_fallback(
+        item.kind,
+        &prepared_parts,
+        max_bytes,
+        marker,
+        head_numerator,
+        head_denominator,
+    ))
 }
 
 fn render_summary_item(item: &Item) -> Result<String, CompactionError> {
