@@ -1,6 +1,8 @@
 //! Connection-scoped inventory of untrusted Skills extension metadata.
 use super::{Inner, McpRuntime, McpServerId};
-use agentkit_mcp::{McpConnection, McpSkill, McpSkillResources};
+use agentkit_mcp::{
+    McpConnection, McpSkill, McpSkillResources, McpSkillScanLimits, McpSkillScanOutcome,
+};
 use futures_util::{
     FutureExt, StreamExt,
     future::{self, BoxFuture},
@@ -14,7 +16,7 @@ use std::{
 use tokio::{task::AbortHandle, time::Instant};
 
 const CONCURRENCY: usize = 8;
-const LIST_TIMEOUT: Duration = Duration::from_secs(2);
+const PAGE_TIMEOUT: Duration = Duration::from_secs(2);
 const LIST_TIMEOUT_MAX: Duration = Duration::from_secs(20);
 const RETRY_INITIAL: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -22,7 +24,7 @@ pub(super) const INVENTORY_MAX_ENTRIES: usize = 256;
 pub(super) const INVENTORY_MAX_BYTES: usize = 256 * 1024;
 const DESCRIPTION_MAX_BYTES: usize = 1024;
 // Leave room for the envelope and pagination cursor in an 8 KiB selector page.
-const SELECTOR_ROW_MAX_BYTES: usize = 8 * 1024 - 128;
+const SELECTOR_ROW_MAX_BYTES: usize = crate::compose_output::MAX_MODEL_OUTPUT_BYTES - 128;
 
 #[derive(Clone)]
 struct Catalog {
@@ -67,77 +69,107 @@ pub(crate) struct SkillMetadata {
     pub(crate) fingerprint: blake3::Hash,
 }
 
-fn compact_catalog(server: &str, manifests: Vec<McpSkill>) -> Catalog {
-    let total = manifests.len();
-    let mut retained = Vec::new();
-    let mut bytes = 0;
-    for mut manifest in manifests {
-        let name = &manifest.frontmatter.name;
-        let uri = &manifest.uri;
-        // Check decoded sizes before encoding an exact selector. The selector
-        // itself is JSON embedded inside a JSON string, so escaping counts twice.
-        if server
-            .len()
-            .saturating_add(uri.len())
-            .saturating_add(name.len())
-            > SELECTOR_ROW_MAX_BYTES
-        {
-            continue;
-        }
-        let selector = selector(server, uri);
-        let row = serde_json::Value::Object(
-            [
-                ("selector".into(), serde_json::Value::from(selector)),
-                ("name".into(), serde_json::Value::from(name.as_str())),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        if row.to_string().len() > SELECTOR_ROW_MAX_BYTES {
-            continue;
-        }
-        let description = &manifest.frontmatter.description;
-        let description = &description[..description.floor_char_boundary(DESCRIPTION_MAX_BYTES)];
-        // Charge for owned fields and the shared record, not discarded files or extra frontmatter.
-        let charge = server.len()
-            + uri.len()
-            + name.len()
-            + description.len()
-            + size_of::<SkillMetadata>()
-            + size_of::<Arc<SkillMetadata>>()
-            + 2 * size_of::<usize>();
-        if bytes + charge > INVENTORY_MAX_BYTES {
-            continue;
-        }
-        let uri = uri.to_owned();
-        let name = name.to_owned();
-        let description = description.to_owned();
+fn compact_skill(
+    server: &str,
+    mut manifest: McpSkill,
+    remaining_bytes: usize,
+) -> Option<(SkillMetadata, usize)> {
+    let name = &manifest.frontmatter.name;
+    let uri = &manifest.uri;
+    // Check decoded sizes before encoding an exact selector. The selector
+    // itself is JSON embedded inside a JSON string, so escaping counts twice.
+    if server
+        .len()
+        .saturating_add(uri.len())
+        .saturating_add(name.len())
+        > SELECTOR_ROW_MAX_BYTES
+    {
+        return None;
+    }
+    let selector = selector(server, uri);
+    let row = serde_json::Value::Object(
+        [
+            ("selector".into(), serde_json::Value::from(selector)),
+            ("name".into(), serde_json::Value::from(name.as_str())),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    if crate::compose_output::model_json_string_bytes(row.to_string()) > SELECTOR_ROW_MAX_BYTES {
+        return None;
+    }
+    let description = &manifest.frontmatter.description;
+    let description = &description[..description.floor_char_boundary(DESCRIPTION_MAX_BYTES)];
+    // Charge for owned fields and the shared record, not discarded files or extra frontmatter.
+    let charge = server.len()
+        + uri.len()
+        + name.len()
+        + description.len()
+        + size_of::<SkillMetadata>()
+        + size_of::<Arc<SkillMetadata>>()
+        + 2 * size_of::<usize>();
+    if charge > remaining_bytes {
+        return None;
+    }
+    let uri = uri.to_owned();
+    let name = name.to_owned();
+    let description = description.to_owned();
 
-        manifest.meta = None;
-        if let McpSkillResources::Files(files) = &mut manifest.resources {
-            files.sort_unstable_by(|a, b| {
-                (&a.uri, &a.digest, a.size).cmp(&(&b.uri, &b.digest, b.size))
-            });
-        }
-        let mut hash = blake3::Hasher::new();
-        if serde_json::to_writer(&mut hash, &manifest).is_err() {
-            continue;
-        }
-        retained.push(Arc::new(SkillMetadata {
+    manifest.meta = None;
+    if let McpSkillResources::Files(files) = &mut manifest.resources {
+        files
+            .sort_unstable_by(|a, b| (&a.uri, &a.digest, a.size).cmp(&(&b.uri, &b.digest, b.size)));
+    }
+    let mut hash = blake3::Hasher::new();
+    if serde_json::to_writer(&mut hash, &manifest).is_err() {
+        return None;
+    }
+    Some((
+        SkillMetadata {
             uri,
             name,
             description,
             fingerprint: hash.finalize(),
-        }));
-        bytes += charge;
-        if retained.len() == INVENTORY_MAX_ENTRIES {
-            break;
-        }
-    }
-    Catalog {
-        truncated: retained.len() < total,
+        },
+        charge,
+    ))
+}
+
+async fn scan_catalog(
+    connection: &McpConnection,
+    server: &str,
+    retry_delay: Duration,
+) -> Option<Catalog> {
+    // SDK defaults bound entries, pages, and decoded bytes at the entry, page,
+    // and scan levels after transport decoding. Keep only compact rows across pages.
+    let limits = McpSkillScanLimits {
+        page_timeout: (retry_delay * 8).clamp(PAGE_TIMEOUT, LIST_TIMEOUT_MAX / 2),
+        ..McpSkillScanLimits::default()
+    };
+    // Give multiple timely pages room to complete, but bound the whole scan too.
+    let mut retained = Vec::new();
+    let mut remaining_bytes = INVENTORY_MAX_BYTES;
+    let mut truncated = false;
+    let outcome = tokio::time::timeout(
+        limits.page_timeout * 2,
+        connection.visit_skills(limits, |manifest| {
+            if retained.len() < INVENTORY_MAX_ENTRIES
+                && let Some((skill, charge)) = compact_skill(server, manifest, remaining_bytes)
+            {
+                retained.push(Arc::new(skill));
+                remaining_bytes -= charge;
+            } else {
+                truncated = true;
+            }
+        }),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(Catalog {
         skills: retained.into(),
-    }
+        truncated: truncated || matches!(outcome, McpSkillScanOutcome::Truncated(_)),
+    })
 }
 
 #[derive(Default)]
@@ -200,10 +232,10 @@ impl McpRuntime {
         let mut result = SkillInventorySnapshot::default();
         for (server, entry) in snapshot {
             if let EntryState::Ready(catalog) = entry.state
-                && entry
-                    .connection
-                    .upgrade()
-                    .is_some_and(|connection| connection.connection_epoch() == entry.epoch)
+                && entry.connection.upgrade().is_some_and(|connection| {
+                    connection.connection_epoch() == entry.epoch
+                        && !connection.is_transport_closed()
+                })
             {
                 result.truncated |= catalog.truncated;
                 result
@@ -256,6 +288,10 @@ async fn run(weak: Weak<Inner>) {
                 continue;
             }
             let connection = handle.connection();
+            if connection.is_transport_closed() {
+                inner.skills.remove(&name);
+                continue;
+            }
             let epoch = connection.connection_epoch();
             let retry_delay = {
                 let Ok(entries) = inner.skills.entries.lock() else {
@@ -285,24 +321,13 @@ async fn run(weak: Weak<Inner>) {
             active.insert(name.clone());
             pending.push(
                 async move {
-                    // The public SDK API captures one peer and aggregates all pages.
-                    // Bound the wait and discard full manifests before publication;
-                    // this cannot bound the SDK's transient response allocations.
-                    let next_state =
-                        // Grow the attempt budget as well as the retry delay so a
-                        // valid slow listing can complete without blocking setup.
-                        match tokio::time::timeout(
-                            (retry_delay * 8).clamp(LIST_TIMEOUT, LIST_TIMEOUT_MAX),
-                            connection.list_skills(),
-                        ).await {
-                            Ok(Ok(manifests)) => {
-                                EntryState::Ready(compact_catalog(&name, manifests))
-                            }
-                            _ => EntryState::Retry {
-                                at: Instant::now() + retry_delay,
-                                next_delay: (retry_delay * 2).min(RETRY_MAX),
-                            },
-                        };
+                    let next_state = match scan_catalog(&connection, &name, retry_delay).await {
+                        Some(catalog) => EntryState::Ready(catalog),
+                        None => EntryState::Retry {
+                            at: Instant::now() + retry_delay,
+                            next_delay: (retry_delay * 2).min(RETRY_MAX),
+                        },
+                    };
                     Completion {
                         name,
                         connection,
@@ -358,6 +383,7 @@ async fn run(weak: Weak<Inner>) {
             .is_some_and(|handle| {
                 Arc::ptr_eq(&handle.connection(), &connection)
                     && connection.connection_epoch() == epoch
+                    && !connection.is_transport_closed()
             })
         {
             continue;

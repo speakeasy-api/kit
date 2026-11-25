@@ -132,7 +132,7 @@ A stdio server requires a non-empty `command`. Optional fields are `args` (an ar
 
 Kit limits each incoming stdio JSON-RPC line to **64 MiB**, including its trailing newline. This bounds the read buffer while allowing large replies from existing servers that exceed AgentKit's 16 MiB default. To override the limit, set `max_line_length` on the server's entry in a Kit MCP configuration file, for example `"max_line_length": 134217728` for 128 MiB. Use a positive integer in bytes; there is no unlimited setting. Plugin and ACP client-supplied stdio declarations use the Kit default and do not accept this field.
 
-An oversized line closes the connection and fails pending requests. Transport logs report `stdio line exceeded the ...-byte limit` when collected, but a tool call or connection error may only report that the connection closed. A disconnect alone does not confirm an oversized line. If the limit was exceeded, reduce the size of each reply (for example, request smaller pages) or raise `max_line_length` for that trusted server. A change to the config takes effect on the next `tool_search` or `auth` call.
+An oversized line closes the connection and fails pending requests. The resulting error reports `stdio line exceeded the ...-byte limit`. To recover, reduce the size of each reply (for example, request smaller pages) or raise `max_line_length` for that trusted server. A change to the config takes effect on the next `tool_search` or `auth` call.
 
 ### Remote Streamable HTTP transport
 

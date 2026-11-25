@@ -29,6 +29,7 @@ struct PeerState {
 struct SkillsFixture {
     name: Option<&'static str>,
     catalog: Option<Arc<[Value]>>,
+    second_page: Option<Arc<[Value]>>,
     cursor_requests: Vec<Option<String>>,
     fail: bool,
     gate: Option<oneshot::Receiver<()>>,
@@ -272,12 +273,13 @@ async fn serve(
         "resources/templates/list" => json!({"resourceTemplates":[]}),
         "skills/list" => {
             let cursor = request["params"]["cursor"].as_str().map(str::to_owned);
-            let (name, catalog, fail, gate, delay) = {
+            let (name, catalog, second_page, fail, gate, delay) = {
                 let mut state = state.lock().await;
                 state.skills.cursor_requests.push(cursor.clone());
                 (
                     state.skills.name,
                     state.skills.catalog.clone(),
+                    state.skills.second_page.clone(),
                     state.skills.fail,
                     state.skills.gate.take(),
                     state.skills.delay,
@@ -309,7 +311,11 @@ async fn serve(
                         json!({"resultType":"complete","skills":[remote_skill(name)],"nextCursor":"second"})
                     }
                     Some("second") => {
-                        json!({"resultType":"complete","skills":[remote_skill(&format!("{name}-second"))]})
+                        if let Some(catalog) = second_page {
+                            json!({"resultType":"complete","skills":catalog.as_ref()})
+                        } else {
+                            json!({"resultType":"complete","skills":[remote_skill(&format!("{name}-second"))]})
+                        }
                     }
                     Some(other) => panic!("unexpected skill cursor: {other}"),
                 }
@@ -1198,24 +1204,36 @@ async fn mcp_skill_inventory_retries_after_a_listing_timeout() {
 }
 
 #[tokio::test]
-async fn mcp_skill_inventory_grows_deadline_for_valid_slow_pages() {
+async fn mcp_skill_inventory_allows_multiple_slow_pages_in_one_scan() {
     let peer = Peer::with_protocol(Vec::new(), true).await;
     peer.advertise_skills("slow").await;
+    // Both pages fit their individual deadlines, but together exceed one page's budget.
     peer.state.lock().await.skills.delay = Duration::from_millis(1150);
     let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
     eventually(async || skill_names(&runtime).len() == 2).await;
     assert_eq!(
-        peer.state
-            .lock()
-            .await
-            .skills
-            .cursor_requests
-            .iter()
-            .filter(|cursor| cursor.is_none())
-            .count(),
-        2
+        peer.state.lock().await.skills.cursor_requests,
+        [None, Some("second".into())]
     );
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_keeps_prefix_when_the_sdk_caps_a_scan() {
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("first").await;
+    let mut oversized = remote_skill("oversized");
+    let limit = agentkit_mcp::McpSkillScanLimits::default().max_entry_decoded_bytes;
+    oversized["frontmatter"]["description"] = json!("x".repeat(limit + 1));
+    peer.state.lock().await.skills.second_page = Some(vec![oversized].into());
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || runtime.skill_inventory_snapshot().truncated).await;
+    assert_eq!(skill_names(&runtime), [("peer".into(), "first".into())]);
+    let state = peer.state.lock().await;
+    assert_eq!(state.skills.cursor_requests, [None, Some("second".into())]);
+    assert_eq!(state.skills.file_requests, 0);
 }
 
 #[tokio::test]
@@ -1256,4 +1274,41 @@ async fn mcp_skill_inventory_fingerprints_manifest_content_not_wire_order() {
         inventory[0].skill.fingerprint,
         inventory[1].skill.fingerprint
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_skill_inventory_hides_exited_stdio_peers() {
+    let script = r#"
+import json, pathlib, sys, time
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    out = {'jsonrpc': '2.0', 'id': req['id']}
+    method = req['method']
+    if method == 'initialize':
+        out['result'] = {'protocolVersion': '2025-11-25', 'capabilities': {'resources': {}, 'extensions': {'io.modelcontextprotocol/skills': {}}}, 'serverInfo': {'name': 'fixture', 'version': '1'}}
+    elif method == 'resources/list':
+        out['result'] = {'resources': []}
+    elif method == 'skills/list':
+        out['result'] = {'skills': [{'uri': 'skill://example/SKILL.md', 'frontmatter': {'name': 'example', 'description': 'Example'}, 'resources': 'dynamic'}]}
+    else:
+        out['error'] = {'code': -32601, 'message': 'Method not found'}
+    print(json.dumps(out), flush=True)
+    if method == 'skills/list':
+        while not pathlib.Path(sys.argv[1]).exists():
+            time.sleep(0.01)
+        sys.exit(0)
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let exit = dir.path().join("exit");
+    std::fs::write(&path, json!({"mcpServers":{"peer":{"command":"/usr/bin/env","args":["python3","-u","-c",script,exit]}}}).to_string()).unwrap();
+    let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+        .await
+        .unwrap();
+    eventually(async || !runtime.skill_inventory().is_empty()).await;
+    std::fs::write(exit, []).unwrap();
+    eventually(async || runtime.skill_inventory().is_empty()).await;
 }

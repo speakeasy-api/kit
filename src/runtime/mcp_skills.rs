@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{
-    compose_output::MAX_MODEL_OUTPUT_BYTES,
+    compose_output::{MAX_MODEL_OUTPUT_BYTES, model_json_string_bytes},
     tools::mcp::{McpRuntime, RemoteSkill},
 };
 
@@ -107,9 +107,10 @@ fn inventory_page(
         );
         let next = offset.saturating_add(entries.len() + 1);
         let cursor = page_cursor(next, total, fingerprint.as_str());
-        let candidate_bytes =
-            row_bytes + entry.to_string().len() + usize::from(!entries.is_empty());
-        let envelope_bytes = page_result(Vec::new(), truncated, cursor).to_string().len();
+        let candidate_bytes = row_bytes + model_json_string_bytes(entry.to_string()) - 2
+            + usize::from(!entries.is_empty());
+        let envelope_bytes =
+            model_json_string_bytes(page_result(Vec::new(), truncated, cursor).to_string());
         if candidate_bytes + envelope_bytes > MAX_MODEL_OUTPUT_BYTES {
             if entries.is_empty() {
                 return Err(ToolError::Unavailable(
@@ -335,14 +336,14 @@ mod tests {
                 server: "test".into(),
                 skill: Arc::new(SkillMetadata {
                     uri: format!("skill://{i}/SKILL.md"),
-                    name: "x".repeat(4030),
+                    name: "x".repeat(3968),
                     description: String::new(),
                     fingerprint: blake3::hash(&[i]),
                 }),
             })
             .collect::<Vec<_>>();
         let first = inventory_page(inventory.clone(), false, None).unwrap();
-        assert!(first.to_string().len() <= MAX_MODEL_OUTPUT_BYTES);
+        assert!(model_json_string_bytes(first.to_string()) <= MAX_MODEL_OUTPUT_BYTES);
         assert_eq!(first["skills"].as_array().unwrap().len(), 1);
         let cursor = first["next"]
             .as_str()

@@ -7347,6 +7347,12 @@ for line in sys.stdin:
         let failed = runtime.search("mcp").await.unwrap();
         let server = &failed["servers"][0];
         assert_eq!(server["status"], "error");
+        assert!(
+            server["error"]
+                .as_str()
+                .unwrap()
+                .contains("stdio line exceeded the 1024-byte limit")
+        );
         write_config(8192);
         let recovered = runtime.search("mcp").await.unwrap();
         assert_eq!(recovered["servers"][0]["status"], "authenticated");
