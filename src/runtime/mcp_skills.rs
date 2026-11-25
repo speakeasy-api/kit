@@ -138,6 +138,13 @@ fn page_cursor(next: usize, total: usize, fingerprint: &str) -> Value {
     }
 }
 
+pub(crate) fn max_selector_row_bytes() -> usize {
+    // `usize::MAX - 1` and `usize::MAX` have the same decimal width.
+    let cursor = page_cursor(usize::MAX - 1, usize::MAX, &"0".repeat(64));
+    let envelope = model_json_string_bytes(page_result(Vec::new(), false, cursor).to_string());
+    MAX_MODEL_OUTPUT_BYTES - envelope + 2
+}
+
 fn page_result(entries: Vec<Value>, truncated: bool, cursor: Value) -> Value {
     Value::Object(
         [
@@ -352,5 +359,15 @@ mod tests {
             .unwrap();
         let second = inventory_page(inventory.clone(), false, Some(cursor)).unwrap();
         assert_eq!(second["skills"][0]["selector"], inventory[1].selector());
+    }
+
+    #[test]
+    fn skill_inventory_reserves_the_widest_continuation_envelope() {
+        let cursor = page_cursor(usize::MAX - 1, usize::MAX, &"0".repeat(64));
+        let envelope = model_json_string_bytes(page_result(Vec::new(), false, cursor).to_string());
+        assert_eq!(
+            max_selector_row_bytes() - 2 + envelope,
+            MAX_MODEL_OUTPUT_BYTES
+        );
     }
 }

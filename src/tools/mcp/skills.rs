@@ -23,8 +23,6 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 pub(super) const INVENTORY_MAX_ENTRIES: usize = 256;
 pub(super) const INVENTORY_MAX_BYTES: usize = 256 * 1024;
 const DESCRIPTION_MAX_BYTES: usize = 1024;
-// Leave room for the envelope and pagination cursor in an 8 KiB selector page.
-const SELECTOR_ROW_MAX_BYTES: usize = crate::compose_output::MAX_MODEL_OUTPUT_BYTES - 128;
 
 #[derive(Clone)]
 struct Catalog {
@@ -73,6 +71,7 @@ fn compact_skill(
     server: &str,
     mut manifest: McpSkill,
     remaining_bytes: usize,
+    max_row_bytes: usize,
 ) -> Option<(SkillMetadata, usize)> {
     let name = &manifest.frontmatter.name;
     let uri = &manifest.uri;
@@ -82,7 +81,7 @@ fn compact_skill(
         .len()
         .saturating_add(uri.len())
         .saturating_add(name.len())
-        > SELECTOR_ROW_MAX_BYTES
+        > max_row_bytes
     {
         return None;
     }
@@ -95,7 +94,7 @@ fn compact_skill(
         .into_iter()
         .collect(),
     );
-    if crate::compose_output::model_json_string_bytes(row.to_string()) > SELECTOR_ROW_MAX_BYTES {
+    if crate::compose_output::model_json_string_bytes(row.to_string()) > max_row_bytes {
         return None;
     }
     let description = &manifest.frontmatter.description;
@@ -135,26 +134,33 @@ fn compact_skill(
     ))
 }
 
+fn scan_limits(retry_delay: Duration) -> McpSkillScanLimits {
+    McpSkillScanLimits {
+        max_entries: INVENTORY_MAX_ENTRIES,
+        page_timeout: (retry_delay * 8).clamp(PAGE_TIMEOUT, LIST_TIMEOUT_MAX),
+        ..McpSkillScanLimits::default()
+    }
+}
+
 async fn scan_catalog(
     connection: &McpConnection,
     server: &str,
     retry_delay: Duration,
 ) -> Option<Catalog> {
-    // SDK defaults bound entries, pages, and decoded bytes at the entry, page,
-    // and scan levels after transport decoding. Keep only compact rows across pages.
-    let limits = McpSkillScanLimits {
-        page_timeout: (retry_delay * 8).clamp(PAGE_TIMEOUT, LIST_TIMEOUT_MAX / 2),
-        ..McpSkillScanLimits::default()
-    };
+    // Bound advertised entries as well as retained entries so an unneeded
+    // continuation cannot delay or discard an already full catalog.
+    let limits = scan_limits(retry_delay);
+    let max_row_bytes = crate::runtime::mcp_skills::max_selector_row_bytes();
     // Give multiple timely pages room to complete, but bound the whole scan too.
     let mut retained = Vec::new();
     let mut remaining_bytes = INVENTORY_MAX_BYTES;
     let mut truncated = false;
     let outcome = tokio::time::timeout(
-        limits.page_timeout * 2,
+        (limits.page_timeout * 2).min(LIST_TIMEOUT_MAX),
         connection.visit_skills(limits, |manifest| {
             if retained.len() < INVENTORY_MAX_ENTRIES
-                && let Some((skill, charge)) = compact_skill(server, manifest, remaining_bytes)
+                && let Some((skill, charge)) =
+                    compact_skill(server, manifest, remaining_bytes, max_row_bytes)
             {
                 retained.push(Arc::new(skill));
                 remaining_bytes -= charge;
@@ -400,5 +406,17 @@ async fn run(weak: Weak<Inner>) {
         drop(entries);
         drop(manager);
         drop(retired);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_macros)]
+mod tests {
+    #[test]
+    fn mcp_skill_inventory_retries_allow_an_individual_page_up_to_the_scan_ceiling() {
+        assert_eq!(
+            super::scan_limits(super::RETRY_MAX).page_timeout,
+            super::LIST_TIMEOUT_MAX
+        );
     }
 }

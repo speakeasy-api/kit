@@ -303,7 +303,11 @@ async fn serve(
             }
             if let Some(catalog) = catalog {
                 assert!(cursor.is_none());
-                json!({"resultType":"complete","skills":catalog.as_ref()})
+                if second_page.is_some() {
+                    json!({"resultType":"complete","skills":catalog.as_ref(),"nextCursor":"unneeded"})
+                } else {
+                    json!({"resultType":"complete","skills":catalog.as_ref()})
+                }
             } else {
                 let name = name.unwrap();
                 match cursor.as_deref() {
@@ -1187,6 +1191,29 @@ async fn mcp_skill_inventory_bounds_entries_and_retained_bytes() {
                 < 8 * 1024
         );
     }
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_does_not_request_a_continuation_after_the_entry_cap() {
+    use super::skills::INVENTORY_MAX_ENTRIES;
+
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("full").await;
+    {
+        let mut state = peer.state.lock().await;
+        state.skills.catalog = Some(
+            (0..INVENTORY_MAX_ENTRIES)
+                .map(|i| remote_skill(&format!("entry-{i}")))
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        state.skills.second_page = Some(Vec::<Value>::new().into());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || runtime.skill_inventory_snapshot().truncated).await;
+    assert_eq!(runtime.skill_inventory().len(), INVENTORY_MAX_ENTRIES);
+    assert_eq!(peer.state.lock().await.skills.cursor_requests, [None]);
 }
 
 #[tokio::test]
