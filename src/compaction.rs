@@ -537,29 +537,59 @@ fn render_bounded_fallback(
     head_denominator: usize,
 ) -> String {
     let mut head_sample = String::new();
-    for (index, part) in prepared_parts.iter().enumerate() {
-        if head_sample.len() >= max_bytes {
-            break;
+    if head_numerator > 0 {
+        for (index, part) in prepared_parts.iter().enumerate() {
+            if head_sample.len() >= max_bytes {
+                break;
+            }
+            if index > 0 {
+                head_sample.push_str(" | ");
+            }
+            let budget = max_bytes.saturating_sub(head_sample.len());
+            head_sample.push_str(&render_prepared_part_for_summary(
+                part,
+                Some(budget),
+                marker,
+                head_numerator,
+                head_denominator,
+            ));
         }
-        if index > 0 {
-            head_sample.push_str(" | ");
-        }
-        let budget = max_bytes.saturating_sub(head_sample.len());
-        head_sample.push_str(&render_prepared_part_for_summary(
-            part,
-            Some(budget),
-            marker,
-            head_numerator,
-            head_denominator,
-        ));
     }
+    let mut tail_parts = Vec::new();
+    let mut tail_len = 0usize;
+    if head_numerator < head_denominator {
+        for part in prepared_parts.iter().rev() {
+            if tail_len >= max_bytes {
+                break;
+            }
+            let budget = max_bytes.saturating_sub(tail_len);
+            let rendered = render_prepared_part_for_summary(
+                part,
+                Some(budget),
+                marker,
+                head_numerator,
+                head_denominator,
+            );
+            tail_len = tail_len.saturating_add(rendered.len() + 3);
+            tail_parts.push(rendered);
+        }
+        tail_parts.reverse();
+    }
+    let tail_sample = tail_parts.join(" | ");
+    let sample = if head_numerator == 0 {
+        tail_sample
+    } else if head_numerator >= head_denominator {
+        head_sample
+    } else {
+        format!("{head_sample}{marker}{tail_sample}")
+    };
     let mut lo = 0usize;
-    let mut hi = head_sample.len().min(max_bytes);
+    let mut hi = sample.len().min(max_bytes);
     let mut fallback_best: Option<String> = None;
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
         let fallback_content =
-            truncate_head_tail_bytes(&head_sample, mid, marker, head_numerator, head_denominator);
+            truncate_head_tail_bytes(&sample, mid, marker, head_numerator, head_denominator);
         let candidate = format!("[{kind:?}] {}", quote_for_summary(&fallback_content));
         if candidate.len() <= max_bytes {
             fallback_best = Some(candidate);
@@ -3948,7 +3978,7 @@ mod tests {
         assert!(prompt.contains("final decision"));
         assert!(prompt.len() <= 1_000);
 
-        let many_calls = (0..24)
+        let many_calls: Vec<_> = (0..24)
             .map(|i| {
                 Part::ToolCall(ToolCallPart::new(
                     format!("call-{i}"),
@@ -3957,9 +3987,17 @@ mod tests {
                 ))
             })
             .collect();
-        let item = Item::new(ItemKind::Assistant, many_calls);
+        let item = Item::new(ItemKind::Assistant, many_calls.clone());
         let rendered = render_item_within_budget(&item, 160, "\n[omitted]\n", 1, 2).unwrap();
         assert!(rendered.len() <= 160);
+
+        let mut with_tail_decision = many_calls;
+        with_tail_decision.push(Part::text("final decision"));
+        let tail_item = Item::new(ItemKind::Assistant, with_tail_decision);
+        let tail_rendered =
+            render_item_within_budget(&tail_item, 160, "\n[omitted]\n", 0, 1).unwrap();
+        assert!(tail_rendered.len() <= 160);
+        assert!(tail_rendered.contains("final decision"));
     }
 
     #[test]
