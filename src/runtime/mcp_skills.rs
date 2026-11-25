@@ -231,6 +231,7 @@ impl Tool for InventorySkillTool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::tools::mcp::SkillMetadata;
