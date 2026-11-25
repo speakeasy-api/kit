@@ -288,34 +288,11 @@ enum PreparedSummaryPart {
         fallback_prefix: Option<String>,
         raw: String,
     },
+    Composite {
+        prefix: String,
+        children: Vec<PreparedSummaryPart>,
+    },
     Literal(String),
-}
-
-fn render_tool_output_ref_for_summary(output: &ToolOutput) -> String {
-    match output {
-        ToolOutput::Text(text) => text.clone(),
-        ToolOutput::Parts(parts) => parts
-            .iter()
-            .filter_map(prepare_summary_part)
-            .map(|part| render_prepared_part_for_summary(&part, None, "", 1, 2))
-            .collect::<Vec<_>>()
-            .join(" | "),
-        ToolOutput::Files(files) => files
-            .iter()
-            .map(|file| {
-                quote_for_summary(&format!(
-                    "[file attachment: name={}; mime_type={}; {}]",
-                    file.name.as_deref().unwrap_or("unknown"),
-                    file.mime_type.as_deref().unwrap_or("unknown"),
-                    bounded_reference(&file.data)
-                ))
-            })
-            .collect::<Vec<_>>()
-            .join(" | "),
-        other => {
-            serde_json::to_string(other).unwrap_or_else(|_| "[unserializable tool output]".into())
-        }
-    }
 }
 
 fn custom_data_reference(data: &DataRef) -> Option<String> {
@@ -381,11 +358,54 @@ fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
         Part::ToolResult(result) => {
             let id = quote_for_summary(&result.call_id.to_string());
             let status = if result.is_error { " error=true" } else { "" };
-            let text = render_tool_output_ref_for_summary(&result.output);
-            Some(PreparedSummaryPart::TaggedText {
-                prefix: format!("[ToolResult id={id}{status}] "),
-                text,
-            })
+            let prefix = format!("[ToolResult id={id}{status}] ");
+            match &result.output {
+                ToolOutput::Text(text) => Some(PreparedSummaryPart::TaggedText {
+                    prefix,
+                    text: text.clone(),
+                }),
+                ToolOutput::Parts(parts) => {
+                    let children = parts
+                        .iter()
+                        .filter_map(prepare_summary_part)
+                        .collect::<Vec<_>>();
+                    if children.is_empty() {
+                        Some(PreparedSummaryPart::TaggedText {
+                            prefix,
+                            text: String::new(),
+                        })
+                    } else {
+                        Some(PreparedSummaryPart::Composite { prefix, children })
+                    }
+                }
+                ToolOutput::Files(files) => {
+                    let children = files
+                        .iter()
+                        .map(|file| {
+                            PreparedSummaryPart::Text(format!(
+                                "[file attachment: name={}; mime_type={}; {}]",
+                                file.name.as_deref().unwrap_or("unknown"),
+                                file.mime_type.as_deref().unwrap_or("unknown"),
+                                bounded_reference(&file.data)
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    if children.is_empty() {
+                        Some(PreparedSummaryPart::TaggedText {
+                            prefix,
+                            text: String::new(),
+                        })
+                    } else {
+                        Some(PreparedSummaryPart::Composite { prefix, children })
+                    }
+                }
+                other => Some(PreparedSummaryPart::Json {
+                    prefix,
+                    fallback_prefix: None,
+                    raw: serde_json::to_string(other)
+                        .unwrap_or_else(|_| "[unserializable tool output]".into()),
+                }),
+            }
         }
         Part::Reasoning(reasoning) => reasoning
             .summary
@@ -470,6 +490,15 @@ fn quote_for_summary(value: &str) -> String {
     escape_xml_delimiters(serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()))
 }
 
+fn encode_json_str_body(value: &str) -> String {
+    let quoted = quote_for_summary(value);
+    quoted
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(&quoted)
+        .to_owned()
+}
+
 fn quote_bounded_for_summary_checked(
     value: &str,
     max_encoded_bytes: usize,
@@ -481,6 +510,75 @@ fn quote_bounded_for_summary_checked(
         let full = quote_for_summary(value);
         if full.len() <= max_encoded_bytes {
             return (full, !value.is_empty());
+        }
+    }
+    if head_numerator > 0 && head_numerator < head_denominator {
+        let encoded_marker = encode_json_str_body(marker);
+        if max_encoded_bytes > encoded_marker.len().saturating_add(2) {
+            let content_budget = max_encoded_bytes - encoded_marker.len() - 2;
+            let head_budget = content_budget.saturating_mul(head_numerator) / head_denominator;
+            let tail_budget = content_budget - head_budget;
+
+            let mut lo = 0usize;
+            let mut hi = value.len().min(head_budget);
+            let mut best_head_end = 0usize;
+            let mut best_head_encoded = String::new();
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                let mut end = mid;
+                while !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let encoded = encode_json_str_body(&value[..end]);
+                if encoded.len() <= head_budget {
+                    best_head_end = end;
+                    best_head_encoded = encoded;
+                    lo = mid + 1;
+                } else if mid == 0 {
+                    break;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+
+            let effective_tail_budget =
+                tail_budget.saturating_add(head_budget.saturating_sub(best_head_encoded.len()));
+            let mut lo = 0usize;
+            let mut hi = value
+                .len()
+                .saturating_sub(best_head_end)
+                .min(effective_tail_budget);
+            let mut best_tail_start = value.len();
+            let mut best_tail_encoded = String::new();
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                let mut start = value.len() - mid;
+                while !value.is_char_boundary(start) {
+                    start += 1;
+                }
+                let encoded = encode_json_str_body(&value[start..]);
+                if encoded.len() <= effective_tail_budget {
+                    best_tail_start = start;
+                    best_tail_encoded = encoded;
+                    lo = mid + 1;
+                } else if mid == 0 {
+                    break;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+
+            if best_head_end >= best_tail_start {
+                let full = quote_for_summary(value);
+                if full.len() <= max_encoded_bytes {
+                    return (full, !value.is_empty());
+                }
+            }
+            let has_source = best_head_end > 0 || best_tail_start < value.len();
+            return (
+                format!("\"{best_head_encoded}{encoded_marker}{best_tail_encoded}\""),
+                has_source,
+            );
         }
     }
     let mut lo = 0usize;
@@ -564,6 +662,46 @@ fn render_prepared_part_for_summary_checked(
             let (body, has_source) = encode_json(raw, json_limit);
             (format!("{active_prefix}{body}"), has_source)
         }
+        PreparedSummaryPart::Composite { prefix, children } => {
+            let per_child = max_body_bytes.map(|limit| {
+                let inner = limit.saturating_sub(prefix.len());
+                let sep = children.len().saturating_sub(1).saturating_mul(3);
+                inner.saturating_sub(sep) / children.len().max(1)
+            });
+            let mut out = prefix.clone();
+            let mut first_has_source = false;
+            let mut last_has_source = false;
+            let mut any_source = false;
+            let last_index = children.len().saturating_sub(1);
+            for (index, child) in children.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(" | ");
+                }
+                let (rendered, has_source) = render_prepared_part_for_summary_checked(
+                    child,
+                    per_child,
+                    marker,
+                    head_numerator,
+                    head_denominator,
+                );
+                if index == 0 {
+                    first_has_source = has_source;
+                }
+                if index == last_index {
+                    last_has_source = has_source;
+                }
+                any_source |= has_source;
+                out.push_str(&rendered);
+            }
+            let preserves_source = if head_numerator == 0 {
+                last_has_source
+            } else if head_numerator >= head_denominator {
+                first_has_source
+            } else {
+                any_source
+            };
+            (out, preserves_source)
+        }
         PreparedSummaryPart::Literal(literal) => (literal.clone(), !literal.is_empty()),
     }
 }
@@ -610,6 +748,13 @@ fn prepared_part_min_bytes(part: &PreparedSummaryPart) -> usize {
             prefix.len().saturating_add(text.len()).saturating_add(2)
         }
         PreparedSummaryPart::Json { prefix, raw, .. } => prefix.len().saturating_add(raw.len()),
+        PreparedSummaryPart::Composite { prefix, children } => {
+            let sep = children.len().saturating_sub(1).saturating_mul(3);
+            children
+                .iter()
+                .map(prepared_part_min_bytes)
+                .fold(prefix.len().saturating_add(sep), usize::saturating_add)
+        }
         PreparedSummaryPart::Literal(literal) => literal.len(),
     }
 }
@@ -683,6 +828,26 @@ fn sample_prepared_part_raw(
                 "{active_prefix}{}",
                 truncate_head_tail_bytes(raw, body_limit, marker, head_numerator, head_denominator)
             )
+        }
+        PreparedSummaryPart::Composite { prefix, children } => {
+            let body_limit = limit.saturating_sub(prefix.len());
+            let selected = if head_numerator == 0 {
+                children.last()
+            } else {
+                children.first()
+            };
+            let sampled = selected
+                .map(|child| {
+                    sample_prepared_part_raw(
+                        child,
+                        body_limit,
+                        marker,
+                        head_numerator,
+                        head_denominator,
+                    )
+                })
+                .unwrap_or_default();
+            format!("{prefix}{sampled}")
         }
         PreparedSummaryPart::Literal(literal) => {
             truncate_head_tail_bytes(literal, limit, marker, head_numerator, head_denominator)
@@ -4816,6 +4981,47 @@ mod tests {
         assert!(
             rendered.contains("verified"),
             "expected JSON suffix preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn shared_boundary_record_splits_escape_heavy_head_and_ascii_tail_by_encoded_bytes() {
+        let path = "packages/renderer/src/runtime/transition_state.rs";
+        let mut items = vec![Item::text(ItemKind::Assistant, "a".repeat(13_690)); 4];
+        items.push(Item::text(
+            ItemKind::Assistant,
+            format!("{}{path}{}", "<".repeat(3_000), "b".repeat(400)),
+        ));
+        items.push(Item::text(ItemKind::User, "c".repeat(6_964)));
+        let request = SummaryRequest::new(items, CompactionReason::Manual);
+        let prompt = build_summary_prompt(&request).unwrap();
+        assert!(prompt.len() <= 64_000, "prompt too long: {}", prompt.len());
+        assert!(
+            prompt.contains(path),
+            "expected encoded-byte split to retain suffix path"
+        );
+    }
+
+    #[test]
+    fn nested_tool_result_parts_avoid_double_escaping_and_preserve_custom_uri() {
+        let uri = format!("https://example.com/{}", "x".repeat(300));
+        let custom = agentkit_core::CustomPart::new("report")
+            .with_data(DataRef::Uri(uri.clone()))
+            .with_value(json!({"status": format!("{} verified", "\\".repeat(3_000))}));
+        let mut items = vec![Item::text(ItemKind::Assistant, "a".repeat(13_900)); 4];
+        let result =
+            ToolResultPart::success("call-1", ToolOutput::Parts(vec![Part::Custom(custom)]));
+        items.push(Item::new(ItemKind::Tool, vec![Part::ToolResult(result)]));
+        let prompt =
+            build_summary_prompt(&SummaryRequest::new(items, CompactionReason::Manual)).unwrap();
+        assert!(prompt.len() <= 64_000, "prompt too long: {}", prompt.len());
+        assert!(
+            prompt.contains(uri.as_str()),
+            "expected nested tool result custom URI to be preserved"
+        );
+        assert!(
+            prompt.contains("verified"),
+            "expected nested tool result custom value to be preserved"
         );
     }
 
