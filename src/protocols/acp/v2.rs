@@ -2794,6 +2794,7 @@ fn v2_config_options(
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
                 crate::ProviderKind::Anthropic => "Anthropic",
+                crate::ProviderKind::Gemini => "Gemini",
             };
             let options = group
                 .models
@@ -8420,7 +8421,7 @@ for line in sys.stdin:
             provider != ProviderKind::OpenRouter
         });
         let method_ids = terminal_auth_method_ids(&methods);
-        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic"]);
+        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic", "gemini"]);
         let providers = methods
             .iter()
             .map(|method| match method {
@@ -8435,7 +8436,8 @@ for line in sys.stdin:
             [
                 json!("openai-subscription"),
                 json!("speakeasy"),
-                json!("anthropic")
+                json!("anthropic"),
+                json!("gemini")
             ]
         );
         assert!(
@@ -8443,6 +8445,12 @@ for line in sys.stdin:
                 .iter()
                 .any(|method| method.method_id == "anthropic"
                     && method.provider == ProviderKind::Anthropic)
+        );
+        assert!(
+            terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == "gemini"
+                    && method.provider == ProviderKind::Gemini)
         );
 
         let metadata_only = wire::ClientCapabilities::new().meta(serde_json::Map::from_iter([(

@@ -1,10 +1,14 @@
 mod adapter;
 pub(crate) mod anthropic_auth;
 mod anthropic_catalog;
+pub(crate) mod gemini_auth;
+mod gemini_catalog;
 pub mod inference;
 
 #[doc(hidden)]
 pub use anthropic_auth::{AnthropicAuthCommand, execute_anthropic_auth};
+#[doc(hidden)]
+pub use gemini_auth::{GeminiAuthCommand, execute_gemini_auth};
 pub mod chatgpt;
 pub(crate) mod openai_auth;
 mod openrouter_auth;
@@ -148,6 +152,9 @@ pub fn execute_provider_logout(
     match provider {
         ProviderKind::Anthropic => {
             execute_anthropic_auth(AnthropicAuthCommand::Logout { local_only }, storage)
+        }
+        ProviderKind::Gemini => {
+            execute_gemini_auth(GeminiAuthCommand::Logout { local_only }, storage)
         }
         ProviderKind::OpenAiSubscription => {
             execute_openai_auth(OpenAiAuthCommand::Logout { local_only }, storage)

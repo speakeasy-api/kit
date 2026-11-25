@@ -1262,6 +1262,7 @@ impl Runtime {
             ProviderKind::OpenRouter,
             ProviderKind::Speakeasy,
             ProviderKind::Anthropic,
+            ProviderKind::Gemini,
         ]
         .into_iter()
         .filter_map(|provider| {
