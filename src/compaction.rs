@@ -196,12 +196,29 @@ fn compact_conversation_tool_outputs(items: &mut [Item]) {
     }
 }
 
+fn is_data_url(uri: &str) -> bool {
+    uri.trim_start()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+}
+
+fn is_inline_data_ref(data: &DataRef) -> bool {
+    match data {
+        DataRef::InlineText(_) | DataRef::InlineBytes(_) => true,
+        DataRef::Uri(uri) => is_data_url(uri),
+        DataRef::Handle(_) => false,
+    }
+}
+
 fn bounded_reference(data: &DataRef) -> String {
     match data {
         DataRef::InlineText(value) => {
             format!("inline payload omitted ({} chars)", value.chars().count())
         }
         DataRef::InlineBytes(value) => format!("inline payload omitted ({} bytes)", value.len()),
+        DataRef::Uri(uri) if is_data_url(uri) => {
+            format!("inline data url omitted ({} bytes)", uri.len())
+        }
         DataRef::Uri(uri) => format!(
             "uri {}",
             truncate_chars(uri, 512).unwrap_or_else(|| uri.clone())
@@ -245,17 +262,13 @@ fn summary_part(part: Part) -> Part {
             Part::ToolResult(result)
         }
         Part::Reasoning(mut reasoning) => {
-            if reasoning.data.as_ref().is_some_and(|data| {
-                matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
-            }) {
+            if reasoning.data.as_ref().is_some_and(is_inline_data_ref) {
                 reasoning.data = None;
             }
             Part::Reasoning(reasoning)
         }
         Part::Custom(mut custom) => {
-            if custom.data.as_ref().is_some_and(|data| {
-                matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
-            }) {
+            if custom.data.as_ref().is_some_and(is_inline_data_ref) {
                 custom.data = None;
             }
             Part::Custom(custom)
@@ -266,8 +279,15 @@ fn summary_part(part: Part) -> Part {
 
 enum PreparedSummaryPart {
     Text(String),
-    TaggedText { prefix: String, text: String },
-    Json { prefix: String, raw: String },
+    TaggedText {
+        prefix: String,
+        text: String,
+    },
+    Json {
+        prefix: String,
+        fallback_prefix: Option<String>,
+        raw: String,
+    },
     Literal(String),
 }
 
@@ -299,6 +319,9 @@ fn render_tool_output_ref_for_summary(output: &ToolOutput) -> String {
 }
 
 fn custom_data_reference(data: &DataRef) -> Option<String> {
+    if is_inline_data_ref(data) {
+        return None;
+    }
     match data {
         DataRef::InlineText(_) | DataRef::InlineBytes(_) => None,
         DataRef::Uri(uri) => {
@@ -340,6 +363,7 @@ fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
         ))),
         Part::Structured(structured) => Some(PreparedSummaryPart::Json {
             prefix: "[Structured] ".into(),
+            fallback_prefix: None,
             raw: serde_json::to_string(&structured.value)
                 .unwrap_or_else(|_| "[unserializable structured part]".into()),
         }),
@@ -350,6 +374,7 @@ fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
                 .unwrap_or_else(|_| "[unserializable tool input]".into());
             Some(PreparedSummaryPart::Json {
                 prefix: format!("[ToolCall name={name} id={id}] "),
+                fallback_prefix: None,
                 raw,
             })
         }
@@ -371,12 +396,16 @@ fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
                 text: summary.to_owned(),
             }),
         Part::Custom(custom) => {
+            let kind = quote_for_summary(&custom.kind);
+            let short_header = format!("[Custom kind={kind}]");
             let header = custom_part_header(custom);
             if let Some(value) = &custom.value {
                 let raw = serde_json::to_string(value)
                     .unwrap_or_else(|_| "[unserializable custom value]".into());
+                let fallback_prefix = (header != short_header).then(|| format!("{short_header} "));
                 Some(PreparedSummaryPart::Json {
                     prefix: format!("{header} "),
+                    fallback_prefix,
                     raw,
                 })
             } else {
@@ -491,7 +520,7 @@ fn render_prepared_part_for_summary_checked(
         ),
         None => (quote_for_summary(value), !value.is_empty()),
     };
-    let encode_json = |raw: &str| match max_body_bytes {
+    let encode_json = |raw: &str, max_json_bytes: Option<usize>| match max_json_bytes {
         Some(limit) if raw.len() > limit => {
             quote_bounded_for_summary_checked(raw, limit, marker, head_numerator, head_denominator)
         }
@@ -517,9 +546,20 @@ fn render_prepared_part_for_summary_checked(
             let (body, has_source) = encode_text(text);
             (format!("{prefix}{body}"), has_source)
         }
-        PreparedSummaryPart::Json { prefix, raw } => {
-            let (body, has_source) = encode_json(raw);
-            (format!("{prefix}{body}"), has_source)
+        PreparedSummaryPart::Json {
+            prefix,
+            fallback_prefix,
+            raw,
+        } => {
+            let min_body = raw.len().min(marker.len().saturating_add(24));
+            let (active_prefix, json_limit) = match (max_body_bytes, fallback_prefix.as_deref()) {
+                (Some(limit), Some(short)) if prefix.len().saturating_add(min_body) > limit => {
+                    (short, Some(limit.saturating_sub(short.len())))
+                }
+                (limit, _) => (prefix.as_str(), limit),
+            };
+            let (body, has_source) = encode_json(raw, json_limit);
+            (format!("{active_prefix}{body}"), has_source)
         }
         PreparedSummaryPart::Literal(literal) => (literal.clone(), !literal.is_empty()),
     }
@@ -566,7 +606,7 @@ fn prepared_part_min_bytes(part: &PreparedSummaryPart) -> usize {
         PreparedSummaryPart::TaggedText { prefix, text } => {
             prefix.len().saturating_add(text.len()).saturating_add(2)
         }
-        PreparedSummaryPart::Json { prefix, raw } => prefix.len().saturating_add(raw.len()),
+        PreparedSummaryPart::Json { prefix, raw, .. } => prefix.len().saturating_add(raw.len()),
         PreparedSummaryPart::Literal(literal) => literal.len(),
     }
 }
@@ -625,10 +665,19 @@ fn sample_prepared_part_raw(
                 )
             )
         }
-        PreparedSummaryPart::Json { prefix, raw } => {
-            let body_limit = limit.saturating_sub(prefix.len());
+        PreparedSummaryPart::Json {
+            prefix,
+            fallback_prefix,
+            raw,
+        } => {
+            let min_body = raw.len().min(marker.len().saturating_add(24));
+            let active_prefix = match fallback_prefix.as_deref() {
+                Some(short) if prefix.len().saturating_add(min_body) > limit => short,
+                _ => prefix.as_str(),
+            };
+            let body_limit = limit.saturating_sub(active_prefix.len());
             format!(
-                "{prefix}{}",
+                "{active_prefix}{}",
                 truncate_head_tail_bytes(raw, body_limit, marker, head_numerator, head_denominator)
             )
         }
@@ -1362,11 +1411,11 @@ fn bounded_summary_prompt(
         }
         tail_parts.reverse();
         let mut tail_sliced = false;
+        let min_slice = marker.len() + 17;
         if tail_parts.is_empty()
             && (history_items[head_count..].len() > 1 || !head_parts.is_empty())
             && let Some((last_item, _)) = history_items[head_count..].last()
         {
-            let min_slice = marker.len() + 17;
             let min_useful_slice = quote_for_summary(marker).len() + 36;
             let has_distinct_skipped_head = history_items[head_count..].len() > 1;
             let shared = remaining.saturating_sub(head_used + 2);
@@ -1391,6 +1440,20 @@ fn bounded_summary_prompt(
                 tail_used = truncated.len() + 2;
                 tail_parts.push(truncated);
                 tail_sliced = true;
+            }
+        } else if !tail_parts.is_empty() {
+            let unretained_end = history_items.len().saturating_sub(tail_count);
+            if head_count + 1 < unretained_end
+                && let Some((tail_item, _)) = history_items.get(unretained_end - 1)
+            {
+                let spare_tail_budget = tail_budget.saturating_sub(tail_used + 2);
+                if spare_tail_budget >= min_slice {
+                    let truncated =
+                        render_item_within_budget(tail_item, spare_tail_budget, marker, 0, 1)?;
+                    tail_used += truncated.len() + 2;
+                    tail_parts.insert(0, truncated);
+                    tail_sliced = true;
+                }
             }
         }
         let unretained_end = history_items
@@ -4628,6 +4691,79 @@ mod tests {
         assert!(prompt.contains("https://example.com/artifacts/build-report?tag=\\u003cv1\\u003e"));
         assert!(prompt.contains("art_12345"));
         assert!(!prompt.contains("SENSITIVE_INLINE_BLOB"));
+    }
+
+    #[test]
+    fn spare_tail_budget_excerpts_first_non_fitting_tail_record() {
+        let mut items = vec![Item::text(ItemKind::Assistant, "a".repeat(15_900)); 4];
+        items.push(Item::text(
+            ItemKind::Assistant,
+            format!("{} final decision", "b".repeat(12_000)),
+        ));
+        items.push(Item::text(ItemKind::User, "acknowledged"));
+        let request = SummaryRequest::new(items, CompactionReason::TranscriptTooLong);
+        let prompt = smaller_summary_prompt(&request, 64_000).unwrap();
+        assert!(prompt.len() <= 64_000, "prompt too long: {}", prompt.len());
+        assert!(
+            prompt.contains("final decision"),
+            "expected spare tail budget to retain decision suffix"
+        );
+        assert!(prompt.contains("acknowledged"));
+    }
+
+    #[test]
+    fn custom_parts_omit_data_urls_in_summary_and_follow_up_prompt() {
+        let data_url = "data:text/plain;base64,U0VDUkVUX0lOTElORV9QQVlMT0FE";
+        let external_uri = "https://example.com/artifacts/report";
+        let custom_data_url =
+            agentkit_core::CustomPart::new("inline").with_data(DataRef::Uri(data_url.into()));
+        let custom_external =
+            agentkit_core::CustomPart::new("ext").with_data(DataRef::Uri(external_uri.into()));
+        let follow_up = Item::new(
+            ItemKind::User,
+            vec![
+                Part::text("check the report"),
+                Part::Custom(custom_data_url.clone()),
+                Part::Custom(custom_external.clone()),
+            ],
+        );
+        let follow_up_rendered = render_follow_up_prompt(&follow_up, 0);
+        assert!(!follow_up_rendered.contains("U0VDUkVUX0lOTElORV9QQVlMT0FE"));
+        assert!(!follow_up_rendered.contains("data:text/plain"));
+        assert!(follow_up_rendered.contains(external_uri));
+
+        let mut request = SummaryRequest::new(
+            vec![Item::new(
+                ItemKind::Assistant,
+                vec![Part::Custom(custom_data_url), Part::Custom(custom_external)],
+            )],
+            CompactionReason::Manual,
+        );
+        request.metadata.insert(
+            NEXT_USER_PROMPT_METADATA_KEY.into(),
+            json!(follow_up_rendered),
+        );
+        let prompt = build_summary_prompt(&request).unwrap();
+        assert!(!prompt.contains("U0VDUkVUX0lOTElORV9QQVlMT0FE"));
+        assert!(!prompt.contains("data:text/plain"));
+        assert!(prompt.contains(external_uri));
+    }
+
+    #[test]
+    fn tight_slice_keeps_fitting_custom_value_when_reference_is_too_long() {
+        let custom = agentkit_core::CustomPart::new("report")
+            .with_data(DataRef::Uri(format!(
+                "https://example.com/{}",
+                "x".repeat(300)
+            )))
+            .with_value(json!({"status": "verified"}));
+        let item = Item::new(ItemKind::Assistant, vec![Part::Custom(custom)]);
+        let rendered = render_item_within_budget(&item, 160, "\n[omitted]\n", 0, 1).unwrap();
+        assert!(rendered.len() <= 160, "rendered too long: {rendered:?}");
+        assert!(
+            rendered.contains("verified"),
+            "expected short custom JSON value to be preserved: {rendered:?}"
+        );
     }
 
     #[test]
