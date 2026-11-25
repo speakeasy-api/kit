@@ -528,6 +528,43 @@ fn try_render_full_within_budget(
     Some(out)
 }
 
+fn sample_prepared_part_raw(
+    part: &PreparedSummaryPart,
+    limit: usize,
+    marker: &str,
+    head_numerator: usize,
+    head_denominator: usize,
+) -> String {
+    match part {
+        PreparedSummaryPart::Text(text) => {
+            truncate_head_tail_bytes(text, limit, marker, head_numerator, head_denominator)
+        }
+        PreparedSummaryPart::TaggedText { prefix, text } => {
+            let body_limit = limit.saturating_sub(prefix.len());
+            format!(
+                "{prefix}{}",
+                truncate_head_tail_bytes(
+                    text,
+                    body_limit,
+                    marker,
+                    head_numerator,
+                    head_denominator
+                )
+            )
+        }
+        PreparedSummaryPart::Json { prefix, raw } => {
+            let body_limit = limit.saturating_sub(prefix.len());
+            format!(
+                "{prefix}{}",
+                truncate_head_tail_bytes(raw, body_limit, marker, head_numerator, head_denominator)
+            )
+        }
+        PreparedSummaryPart::Literal(literal) => {
+            truncate_head_tail_bytes(literal, limit, marker, head_numerator, head_denominator)
+        }
+    }
+}
+
 fn render_bounded_fallback(
     kind: ItemKind,
     prepared_parts: &[PreparedSummaryPart],
@@ -546,9 +583,9 @@ fn render_bounded_fallback(
                 head_sample.push_str(" | ");
             }
             let budget = max_bytes.saturating_sub(head_sample.len());
-            head_sample.push_str(&render_prepared_part_for_summary(
+            head_sample.push_str(&sample_prepared_part_raw(
                 part,
-                Some(budget),
+                budget,
                 marker,
                 head_numerator,
                 head_denominator,
@@ -563,13 +600,8 @@ fn render_bounded_fallback(
                 break;
             }
             let budget = max_bytes.saturating_sub(tail_len);
-            let rendered = render_prepared_part_for_summary(
-                part,
-                Some(budget),
-                marker,
-                head_numerator,
-                head_denominator,
-            );
+            let rendered =
+                sample_prepared_part_raw(part, budget, marker, head_numerator, head_denominator);
             tail_len = tail_len.saturating_add(rendered.len() + 3);
             tail_parts.push(rendered);
         }
@@ -3998,6 +4030,17 @@ mod tests {
             render_item_within_budget(&tail_item, 160, "\n[omitted]\n", 0, 1).unwrap();
         assert!(tail_rendered.len() <= 160);
         assert!(tail_rendered.contains("final decision"));
+
+        let win_path = format!(r"C:\{}{}", r"dir\".repeat(14), "a".repeat(57));
+        let mut win_parts = vec![Part::reasoning("checked"); 24];
+        win_parts.push(Part::text(win_path.clone()));
+        let win_item = Item::new(ItemKind::Assistant, win_parts);
+        let win_rendered =
+            render_item_within_budget(&win_item, 160, "\n[omitted]\n", 0, 1).unwrap();
+        let decoded: String =
+            serde_json::from_str(win_rendered.strip_prefix("[Assistant] ").unwrap()).unwrap();
+        assert!(win_rendered.len() <= 160);
+        assert!(decoded.ends_with(&win_path));
     }
 
     #[test]
