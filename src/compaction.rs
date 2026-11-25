@@ -298,6 +298,29 @@ fn render_tool_output_ref_for_summary(output: &ToolOutput) -> String {
     }
 }
 
+fn custom_data_reference(data: &DataRef) -> Option<String> {
+    match data {
+        DataRef::InlineText(_) | DataRef::InlineBytes(_) => None,
+        DataRef::Uri(uri) => {
+            let bounded = truncate_chars(uri, 512).unwrap_or_else(|| uri.clone());
+            Some(format!("uri={}", quote_for_summary(&bounded)))
+        }
+        DataRef::Handle(handle) => {
+            let raw = handle.to_string();
+            let bounded = truncate_chars(&raw, 512).unwrap_or(raw);
+            Some(format!("handle={}", quote_for_summary(&bounded)))
+        }
+    }
+}
+
+fn custom_part_header(custom: &agentkit_core::CustomPart) -> String {
+    let kind = quote_for_summary(&custom.kind);
+    match custom.data.as_ref().and_then(custom_data_reference) {
+        Some(reference) => format!("[Custom kind={kind} {reference}]"),
+        None => format!("[Custom kind={kind}]"),
+    }
+}
+
 fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
     match part {
         Part::Text(text) => {
@@ -348,35 +371,40 @@ fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
                 text: summary.to_owned(),
             }),
         Part::Custom(custom) => {
-            let kind = quote_for_summary(&custom.kind);
+            let header = custom_part_header(custom);
             if let Some(value) = &custom.value {
                 let raw = serde_json::to_string(value)
                     .unwrap_or_else(|_| "[unserializable custom value]".into());
                 Some(PreparedSummaryPart::Json {
-                    prefix: format!("[Custom kind={kind}] "),
+                    prefix: format!("{header} "),
                     raw,
                 })
             } else {
-                Some(PreparedSummaryPart::Literal(format!(
-                    "[Custom kind={kind}]"
-                )))
+                Some(PreparedSummaryPart::Literal(header))
             }
         }
     }
 }
 
-fn truncate_head_tail_bytes(
+fn truncate_head_tail_bytes_checked(
     value: &str,
     limit: usize,
     marker: &str,
     head_numerator: usize,
     head_denominator: usize,
-) -> String {
+) -> (String, bool) {
+    if value.is_empty() {
+        return (String::new(), false);
+    }
     if value.len() <= limit {
-        return value.to_string();
+        return (value.to_string(), true);
     }
     if limit <= marker.len() {
-        return marker[..limit.min(marker.len())].to_string();
+        let mut end = limit.min(marker.len());
+        while !marker.is_char_boundary(end) {
+            end -= 1;
+        }
+        return (marker[..end].to_string(), false);
     }
     let remaining = limit - marker.len();
     let mut head = remaining.saturating_mul(head_numerator) / head_denominator.max(1);
@@ -388,7 +416,21 @@ fn truncate_head_tail_bytes(
     while !value.is_char_boundary(tail) {
         tail += 1;
     }
-    format!("{}{}{}", &value[..head], marker, &value[tail..])
+    let has_source = head > 0 || tail < value.len();
+    (
+        format!("{}{}{}", &value[..head], marker, &value[tail..]),
+        has_source,
+    )
+}
+
+fn truncate_head_tail_bytes(
+    value: &str,
+    limit: usize,
+    marker: &str,
+    head_numerator: usize,
+    head_denominator: usize,
+) -> String {
+    truncate_head_tail_bytes_checked(value, limit, marker, head_numerator, head_denominator).0
 }
 
 fn escape_xml_delimiters(value: String) -> String {
@@ -399,29 +441,29 @@ fn quote_for_summary(value: &str) -> String {
     escape_xml_delimiters(serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()))
 }
 
-fn quote_bounded_for_summary(
+fn quote_bounded_for_summary_checked(
     value: &str,
     max_encoded_bytes: usize,
     marker: &str,
     head_numerator: usize,
     head_denominator: usize,
-) -> String {
+) -> (String, bool) {
     if value.len().saturating_add(2) <= max_encoded_bytes {
         let full = quote_for_summary(value);
         if full.len() <= max_encoded_bytes {
-            return full;
+            return (full, !value.is_empty());
         }
     }
     let mut lo = 0usize;
     let mut hi = value.len().min(max_encoded_bytes);
-    let mut best = String::from("\"\"");
+    let mut best = (String::from("\"\""), false);
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
-        let excerpt =
-            truncate_head_tail_bytes(value, mid, marker, head_numerator, head_denominator);
+        let (excerpt, has_source) =
+            truncate_head_tail_bytes_checked(value, mid, marker, head_numerator, head_denominator);
         let quoted = quote_for_summary(&excerpt);
         if quoted.len() <= max_encoded_bytes {
-            best = quoted;
+            best = (quoted, has_source);
             lo = mid + 1;
         } else if mid == 0 {
             break;
@@ -432,6 +474,57 @@ fn quote_bounded_for_summary(
     best
 }
 
+fn render_prepared_part_for_summary_checked(
+    part: &PreparedSummaryPart,
+    max_body_bytes: Option<usize>,
+    marker: &str,
+    head_numerator: usize,
+    head_denominator: usize,
+) -> (String, bool) {
+    let encode_text = |value: &str| match max_body_bytes {
+        Some(limit) => quote_bounded_for_summary_checked(
+            value,
+            limit,
+            marker,
+            head_numerator,
+            head_denominator,
+        ),
+        None => (quote_for_summary(value), !value.is_empty()),
+    };
+    let encode_json = |raw: &str| match max_body_bytes {
+        Some(limit) if raw.len() > limit => {
+            quote_bounded_for_summary_checked(raw, limit, marker, head_numerator, head_denominator)
+        }
+        Some(limit) => {
+            let escaped = escape_xml_delimiters(raw.to_owned());
+            if escaped.len() > limit {
+                quote_bounded_for_summary_checked(
+                    raw,
+                    limit,
+                    marker,
+                    head_numerator,
+                    head_denominator,
+                )
+            } else {
+                (escaped, !raw.is_empty())
+            }
+        }
+        None => (escape_xml_delimiters(raw.to_owned()), !raw.is_empty()),
+    };
+    match part {
+        PreparedSummaryPart::Text(text) => encode_text(text),
+        PreparedSummaryPart::TaggedText { prefix, text } => {
+            let (body, has_source) = encode_text(text);
+            (format!("{prefix}{body}"), has_source)
+        }
+        PreparedSummaryPart::Json { prefix, raw } => {
+            let (body, has_source) = encode_json(raw);
+            (format!("{prefix}{body}"), has_source)
+        }
+        PreparedSummaryPart::Literal(literal) => (literal.clone(), !literal.is_empty()),
+    }
+}
+
 fn render_prepared_part_for_summary(
     part: &PreparedSummaryPart,
     max_body_bytes: Option<usize>,
@@ -439,34 +532,14 @@ fn render_prepared_part_for_summary(
     head_numerator: usize,
     head_denominator: usize,
 ) -> String {
-    let encode_text = |value: &str| match max_body_bytes {
-        Some(limit) => {
-            quote_bounded_for_summary(value, limit, marker, head_numerator, head_denominator)
-        }
-        None => quote_for_summary(value),
-    };
-    let encode_json = |raw: &str| match max_body_bytes {
-        Some(limit) if raw.len() > limit => {
-            quote_bounded_for_summary(raw, limit, marker, head_numerator, head_denominator)
-        }
-        Some(limit) => {
-            let escaped = escape_xml_delimiters(raw.to_owned());
-            if escaped.len() > limit {
-                quote_bounded_for_summary(raw, limit, marker, head_numerator, head_denominator)
-            } else {
-                escaped
-            }
-        }
-        None => escape_xml_delimiters(raw.to_owned()),
-    };
-    match part {
-        PreparedSummaryPart::Text(text) => encode_text(text),
-        PreparedSummaryPart::TaggedText { prefix, text } => {
-            format!("{prefix}{}", encode_text(text))
-        }
-        PreparedSummaryPart::Json { prefix, raw } => format!("{prefix}{}", encode_json(raw)),
-        PreparedSummaryPart::Literal(literal) => literal.clone(),
-    }
+    render_prepared_part_for_summary_checked(
+        part,
+        max_body_bytes,
+        marker,
+        head_numerator,
+        head_denominator,
+    )
+    .0
 }
 
 #[cfg(test)]
@@ -653,26 +726,46 @@ fn render_item_within_budget(
         return Ok(full);
     }
     let prefix_len = format!("[{:?}] ", item.kind).len();
-    let render_with = |per_part: usize| -> String {
+    let render_with = |per_part: usize| -> (String, bool) {
         let mut out = format!("[{:?}] ", item.kind);
+        let mut first_has_source = false;
+        let mut last_has_source = false;
+        let mut any_source = false;
+        let last_index = prepared_parts.len().saturating_sub(1);
         for (index, part) in prepared_parts.iter().enumerate() {
             if index > 0 {
                 out.push_str(" | ");
             }
-            out.push_str(&render_prepared_part_for_summary(
+            let (rendered, has_source) = render_prepared_part_for_summary_checked(
                 part,
                 Some(per_part),
                 marker,
                 head_numerator,
                 head_denominator,
-            ));
+            );
+            if index == 0 {
+                first_has_source = has_source;
+            }
+            if index == last_index {
+                last_has_source = has_source;
+            }
+            any_source |= has_source;
+            out.push_str(&rendered);
         }
-        out
+        let preserves_source = if head_numerator == 0 {
+            last_has_source
+        } else if head_numerator >= head_denominator {
+            first_has_source
+        } else {
+            any_source
+        };
+        (out, preserves_source)
     };
     if prepared_parts.len() == 1 {
         let single_budget = max_bytes.saturating_sub(prefix_len);
-        let candidate = render_with(single_budget);
+        let (candidate, preserves_source) = render_with(single_budget);
         if candidate.len() <= max_bytes
+            && preserves_source
             && (candidate.len() > prefix_len + 4 || max_bytes <= prefix_len + 4)
         {
             return Ok(candidate);
@@ -680,12 +773,12 @@ fn render_item_within_budget(
     }
     let mut lo = 0usize;
     let mut hi = max_bytes.saturating_sub(prefix_len).max(1);
-    let mut best: Option<String> = None;
+    let mut best: Option<(String, bool)> = None;
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
-        let candidate = render_with(mid);
+        let (candidate, preserves_source) = render_with(mid);
         if candidate.len() <= max_bytes {
-            best = Some(candidate);
+            best = Some((candidate, preserves_source));
             lo = mid + 1;
         } else if mid == 0 {
             break;
@@ -693,7 +786,8 @@ fn render_item_within_budget(
             hi = mid - 1;
         }
     }
-    if let Some(best) = best
+    if let Some((best, preserves_source)) = best
+        && preserves_source
         && (best.len() > prefix_len + 4 || max_bytes <= prefix_len + 4)
     {
         return Ok(best);
@@ -746,15 +840,17 @@ fn render_follow_up_part(part: &Part) -> Option<String> {
             bounded_reference(&file.data)
         )),
         Part::Structured(structured) => serde_json::to_string(&structured.value).ok(),
-        Part::Custom(custom) => Some(match &custom.value {
-            Some(value) => format!(
-                "[Custom kind={}] {}",
-                quote_for_summary(&custom.kind),
-                serde_json::to_string(value)
-                    .unwrap_or_else(|_| "[unserializable custom value]".into())
-            ),
-            None => format!("[Custom kind={}]", quote_for_summary(&custom.kind)),
-        }),
+        Part::Custom(custom) => {
+            let header = custom_part_header(custom);
+            Some(match &custom.value {
+                Some(value) => format!(
+                    "{header} {}",
+                    serde_json::to_string(value)
+                        .unwrap_or_else(|_| "[unserializable custom value]".into())
+                ),
+                None => header,
+            })
+        }
         _ => None,
     }
 }
@@ -4494,6 +4590,44 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn multipart_tail_slice_falls_back_when_per_part_slices_are_marker_only() {
+        let mut parts = vec![Part::text("x".repeat(1_000)); 9];
+        parts.push(Part::text(format!("{} final decision", "y".repeat(1_000))));
+        let item = Item::new(ItemKind::Assistant, parts);
+        let marker = "\n[intermediate history omitted after provider context rejection]\n";
+        let rendered = render_item_within_budget(&item, 160, marker, 0, 1).unwrap();
+        assert!(rendered.len() <= 160, "rendered too long: {rendered:?}");
+        assert!(
+            rendered.contains("final decision"),
+            "expected newest suffix text in fallback: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn custom_parts_preserve_bounded_non_inline_references_and_omit_inline_data() {
+        let uri = "https://example.com/artifacts/build-report?tag=<v1>";
+        let custom_uri =
+            agentkit_core::CustomPart::new("report").with_data(DataRef::Uri(uri.into()));
+        let custom_handle = agentkit_core::CustomPart::new("artifact")
+            .with_data(DataRef::Handle("art_12345".into()));
+        let custom_inline = agentkit_core::CustomPart::new("secret")
+            .with_data(DataRef::InlineText("SENSITIVE_INLINE_BLOB".into()));
+        let item = Item::new(
+            ItemKind::Assistant,
+            vec![
+                Part::Custom(custom_uri),
+                Part::Custom(custom_handle),
+                Part::Custom(custom_inline),
+            ],
+        );
+        let request = SummaryRequest::new(vec![item], CompactionReason::TranscriptTooLong);
+        let prompt = build_summary_prompt(&request).unwrap();
+        assert!(prompt.contains("https://example.com/artifacts/build-report?tag=\\u003cv1\\u003e"));
+        assert!(prompt.contains("art_12345"));
+        assert!(!prompt.contains("SENSITIVE_INLINE_BLOB"));
     }
 
     #[test]
