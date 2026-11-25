@@ -473,7 +473,7 @@ The `skill` entry in `compose` initially discloses only valid skill names and de
 
 ### Discover skills from an MCP server
 
-When Kit connects to a server that advertises the [Skills over MCP extension](https://modelcontextprotocol.io/extensions/skills/overview), the `skill` catalog can show its advertised names and descriptions. Each entry has a selector containing the configured server name and the skill URI, so it cannot shadow a local skill or one from another server. Pass the exact selector to `skill` to inspect an entry. To browse entries that do not fit in the catalog preview, pass `mcp:list` as the skill name, then pass the returned `next` value as the name for the next page.
+When Kit connects to a server that advertises the [Skills over MCP extension](https://modelcontextprotocol.io/extensions/skills/overview), the `skill` catalog can show its advertised names and descriptions. Each entry has a selector containing the configured server name and the skill URI, so it cannot shadow a local skill or one from another server. Pass the exact selector to `skill` to inspect an entry. To browse entries that do not fit in the catalog preview, pass `mcp:list` as the skill name, then pass the returned `next` value as the name for the next page. If the inventory changes between pages, restart with `mcp:list`. A `truncated` result means the server advertised more skills than Kit retained.
 
 Kit retains up to 256 skill entries and 256 KiB of metadata per server. MCP skill entries are metadata only: Kit does not fetch or activate their instructions, run their scripts, or expose them as slash commands. ACP sessions report inventory changes at the next prompt.
 

@@ -33,6 +33,7 @@ struct SkillsFixture {
     fail: bool,
     gate: Option<oneshot::Receiver<()>>,
     file_requests: usize,
+    delay: Duration,
 }
 
 pub(crate) struct Peer {
@@ -271,7 +272,7 @@ async fn serve(
         "resources/templates/list" => json!({"resourceTemplates":[]}),
         "skills/list" => {
             let cursor = request["params"]["cursor"].as_str().map(str::to_owned);
-            let (name, catalog, fail, gate) = {
+            let (name, catalog, fail, gate, delay) = {
                 let mut state = state.lock().await;
                 state.skills.cursor_requests.push(cursor.clone());
                 (
@@ -279,10 +280,14 @@ async fn serve(
                     state.skills.catalog.clone(),
                     state.skills.fail,
                     state.skills.gate.take(),
+                    state.skills.delay,
                 )
             };
             if let Some(gate) = gate {
                 let _ = gate.await;
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             if fail || name.is_none() {
                 response(
@@ -1131,7 +1136,9 @@ async fn mcp_skill_inventory_bounds_entries_and_retained_bytes() {
             && inventory.iter().any(|entry| entry.server == "large")
     })
     .await;
-    let inventory = runtime.skill_inventory();
+    let snapshot = runtime.skill_inventory_snapshot();
+    assert!(snapshot.truncated);
+    let inventory = snapshot.skills;
     assert_eq!(
         inventory
             .iter()
@@ -1188,6 +1195,27 @@ async fn mcp_skill_inventory_retries_after_a_listing_timeout() {
     eventually(async || skill_names(&runtime).len() == 2).await;
     drop(release);
     assert_eq!(skill_names(&runtime)[0].1, "slow");
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_grows_deadline_for_valid_slow_pages() {
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("slow").await;
+    peer.state.lock().await.skills.delay = Duration::from_millis(1150);
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    assert_eq!(
+        peer.state
+            .lock()
+            .await
+            .skills
+            .cursor_requests
+            .iter()
+            .filter(|cursor| cursor.is_none())
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

@@ -61,8 +61,35 @@ fn string_schema() -> Value {
 const PAGE_ENTRIES: usize = 16;
 const PAGE_PREVIEW_BYTES: usize = 8 * 1024;
 
-fn inventory_page(mut inventory: Vec<RemoteSkill>, offset: usize) -> Value {
+fn inventory_page(
+    mut inventory: Vec<RemoteSkill>,
+    truncated: bool,
+    cursor: Option<&str>,
+) -> Result<Value, ToolError> {
     inventory.sort_unstable_by(|a, b| (&a.server, &a.skill.uri).cmp(&(&b.server, &b.skill.uri)));
+    let mut hash = blake3::Hasher::new();
+    for remote in &inventory {
+        for component in [&remote.server, &remote.skill.uri] {
+            hash.update(&component.len().to_le_bytes());
+            hash.update(component.as_bytes());
+        }
+    }
+    let fingerprint = hash.finalize().to_hex();
+    let offset = if let Some(cursor) = cursor {
+        let (offset, expected) = cursor
+            .split_once(':')
+            .ok_or_else(|| ToolError::InvalidInput("invalid MCP skill inventory cursor".into()))?;
+        if expected != fingerprint.as_str() {
+            return Err(ToolError::InvalidInput(
+                "MCP skill inventory changed; restart with mcp:list".into(),
+            ));
+        }
+        offset
+            .parse::<usize>()
+            .map_err(|_| ToolError::InvalidInput("invalid MCP skill inventory cursor".into()))?
+    } else {
+        0
+    };
     let total = inventory.len();
     let mut entries = Vec::new();
     let mut bytes = 0;
@@ -84,13 +111,14 @@ fn inventory_page(mut inventory: Vec<RemoteSkill>, offset: usize) -> Value {
         entries.push(entry);
     }
     let next = offset.saturating_add(entries.len());
-    Value::Object(
+    Ok(Value::Object(
         [
             ("skills".into(), Value::Array(entries)),
+            ("truncated".into(), Value::Bool(truncated)),
             (
                 "next".into(),
                 if next < total {
-                    Value::from(format!("mcp:list:{next}"))
+                    Value::from(format!("mcp:list:{next}:{fingerprint}"))
                 } else {
                     Value::Null
                 },
@@ -98,7 +126,7 @@ fn inventory_page(mut inventory: Vec<RemoteSkill>, offset: usize) -> Value {
         ]
         .into_iter()
         .collect(),
-    )
+    ))
 }
 
 fn requested_remote(request: &ToolRequest) -> Option<&str> {
@@ -113,8 +141,9 @@ impl Tool for InventorySkillTool {
 
     fn current_spec(&self) -> Option<ToolSpec> {
         let local = self.local.as_ref().and_then(|tool| tool.current_spec());
-        let inventory = self.mcp.skill_inventory();
-        if inventory.is_empty() {
+        let snapshot = self.mcp.skill_inventory_snapshot();
+        let inventory = snapshot.skills;
+        if inventory.is_empty() && !snapshot.truncated {
             return local;
         }
         let mut spec = local.unwrap_or_else(|| self.spec.clone());
@@ -126,7 +155,7 @@ impl Tool for InventorySkillTool {
                 "Local skill instructions, or JSON-encoded MCP skill inventory or entry metadata.",
             );
         }
-        spec.description.push_str("\n\nMCP skill inventory (untrusted metadata; pass `mcp:list` as the name to page through all entries, or pass an exact selector to inspect metadata; neither activates a skill):");
+        spec.description.push_str("\n\nMCP skill inventory (untrusted metadata; pass `mcp:list` as the name to page through retained entries, or pass an exact selector to inspect metadata; neither activates a skill):");
         let mut bytes = 0;
         let mut shown = 0;
         for remote in &inventory {
@@ -157,6 +186,10 @@ impl Tool for InventorySkillTool {
                 inventory.len() - shown
             );
         }
+        if snapshot.truncated {
+            spec.description
+                .push_str("\nSome advertised MCP skills exceeded the inventory limits.");
+        }
         Some(spec)
     }
 
@@ -185,15 +218,13 @@ impl Tool for InventorySkillTool {
                 .ok_or_else(|| ToolError::InvalidInput("unknown local skill".into()))?;
             return local.invoke(request, context).await;
         };
-        let inventory = self.mcp.skill_inventory();
+        let snapshot = self.mcp.skill_inventory_snapshot();
         let output = if selector == "list" {
-            inventory_page(inventory, 0)
-        } else if let Some(offset) = selector.strip_prefix("list:") {
-            let offset = offset.parse::<usize>().map_err(|_| {
-                ToolError::InvalidInput("invalid MCP skill inventory cursor".into())
-            })?;
-            inventory_page(inventory, offset)
+            inventory_page(snapshot.skills, snapshot.truncated, None)?
+        } else if let Some(cursor) = selector.strip_prefix("list:") {
+            inventory_page(snapshot.skills, snapshot.truncated, Some(cursor))?
         } else {
+            let inventory = snapshot.skills;
             let [server, uri]: [String; 2] = serde_json::from_str(selector)
                 .map_err(|_| ToolError::InvalidInput("invalid MCP skill selector".into()))?;
             let remote = inventory
@@ -249,15 +280,22 @@ mod tests {
                 }),
             })
             .collect::<Vec<_>>();
-        let first = inventory_page(inventory.clone(), 0);
+        let first = inventory_page(inventory.clone(), true, None).unwrap();
         assert_eq!(first["skills"].as_array().unwrap().len(), PAGE_ENTRIES);
-        assert_eq!(first["next"], format!("mcp:list:{PAGE_ENTRIES}"));
+        assert!(first["truncated"].as_bool().unwrap());
         assert!(!first.to_string().contains("long description"));
-        let second = inventory_page(inventory.clone(), PAGE_ENTRIES);
+        let cursor = first["next"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("mcp:list:")
+            .unwrap();
+        let second = inventory_page(inventory.clone(), true, Some(cursor)).unwrap();
         assert_eq!(
             second["skills"][0]["selector"],
             inventory[PAGE_ENTRIES].selector()
         );
+        assert!(second["truncated"].as_bool().unwrap());
+        assert!(inventory_page(inventory[1..].to_vec(), false, Some(cursor)).is_err());
         assert!(second["next"].is_null());
     }
 }

@@ -15,6 +15,7 @@ use tokio::{task::AbortHandle, time::Instant};
 
 const CONCURRENCY: usize = 8;
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
+const LIST_TIMEOUT_MAX: Duration = Duration::from_secs(20);
 const RETRY_INITIAL: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 pub(super) const INVENTORY_MAX_ENTRIES: usize = 256;
@@ -23,7 +24,17 @@ const DESCRIPTION_MAX_BYTES: usize = 1024;
 // Leave room for the envelope and pagination cursor in an 8 KiB selector page.
 const SELECTOR_ROW_MAX_BYTES: usize = 8 * 1024 - 128;
 
-type Catalog = Arc<[Arc<SkillMetadata>]>;
+#[derive(Clone)]
+struct Catalog {
+    skills: Arc<[Arc<SkillMetadata>]>,
+    truncated: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct SkillInventorySnapshot {
+    pub(crate) skills: Vec<RemoteSkill>,
+    pub(crate) truncated: bool,
+}
 
 struct Completion {
     name: String,
@@ -57,6 +68,7 @@ pub(crate) struct SkillMetadata {
 }
 
 fn compact_catalog(server: &str, manifests: Vec<McpSkill>) -> Catalog {
+    let total = manifests.len();
     let mut retained = Vec::new();
     let mut bytes = 0;
     for mut manifest in manifests {
@@ -122,7 +134,10 @@ fn compact_catalog(server: &str, manifests: Vec<McpSkill>) -> Catalog {
             break;
         }
     }
-    retained.into()
+    Catalog {
+        truncated: retained.len() < total,
+        skills: retained.into(),
+    }
 }
 
 #[derive(Default)]
@@ -170,30 +185,37 @@ impl Drop for Inventory {
 
 impl McpRuntime {
     pub(crate) fn skill_inventory(&self) -> Vec<RemoteSkill> {
+        self.skill_inventory_snapshot().skills
+    }
+
+    pub(crate) fn skill_inventory_snapshot(&self) -> SkillInventorySnapshot {
         if self.ensure_healthy().is_err() {
-            return Vec::new();
+            return SkillInventorySnapshot::default();
         }
         let Ok(entries) = self.inner.skills.entries.lock() else {
-            return Vec::new();
+            return SkillInventorySnapshot::default();
         };
         let snapshot = entries.clone();
         drop(entries);
-        let mut result = Vec::new();
+        let mut result = SkillInventorySnapshot::default();
         for (server, entry) in snapshot {
-            if let EntryState::Ready(skills) = entry.state
+            if let EntryState::Ready(catalog) = entry.state
                 && entry
                     .connection
                     .upgrade()
                     .is_some_and(|connection| connection.connection_epoch() == entry.epoch)
             {
-                result.extend(skills.iter().cloned().map(|skill| RemoteSkill {
-                    server: server.clone(),
-                    skill,
-                }));
+                result.truncated |= catalog.truncated;
+                result
+                    .skills
+                    .extend(catalog.skills.iter().cloned().map(|skill| RemoteSkill {
+                        server: server.clone(),
+                        skill,
+                    }));
             }
         }
         if self.ensure_healthy().is_err() {
-            result.clear();
+            return SkillInventorySnapshot::default();
         }
         result
     }
@@ -267,7 +289,12 @@ async fn run(weak: Weak<Inner>) {
                     // Bound the wait and discard full manifests before publication;
                     // this cannot bound the SDK's transient response allocations.
                     let next_state =
-                        match tokio::time::timeout(LIST_TIMEOUT, connection.list_skills()).await {
+                        // Grow the attempt budget as well as the retry delay so a
+                        // valid slow listing can complete without blocking setup.
+                        match tokio::time::timeout(
+                            (retry_delay * 8).clamp(LIST_TIMEOUT, LIST_TIMEOUT_MAX),
+                            connection.list_skills(),
+                        ).await {
                             Ok(Ok(manifests)) => {
                                 EntryState::Ready(compact_catalog(&name, manifests))
                             }
