@@ -663,27 +663,73 @@ fn render_prepared_part_for_summary_checked(
             (format!("{active_prefix}{body}"), has_source)
         }
         PreparedSummaryPart::Composite { prefix, children } => {
-            let per_child = max_body_bytes.map(|limit| {
+            let mut rendered: Vec<Option<(String, bool)>> = vec![None; children.len()];
+            if let Some(limit) = max_body_bytes {
                 let inner = limit.saturating_sub(prefix.len());
                 let sep = children.len().saturating_sub(1).saturating_mul(3);
-                inner.saturating_sub(sep) / children.len().max(1)
-            });
+                let mut remaining_budget = inner.saturating_sub(sep);
+                let mut remaining_children = children.len();
+                while remaining_children > 0 {
+                    let share = remaining_budget / remaining_children;
+                    let mut settled_any = false;
+                    for (index, child) in children.iter().enumerate() {
+                        if rendered[index].is_some() {
+                            continue;
+                        }
+                        if prepared_part_min_bytes(child) <= share {
+                            let (full, has_source) = render_prepared_part_for_summary_checked(
+                                child,
+                                None,
+                                marker,
+                                head_numerator,
+                                head_denominator,
+                            );
+                            if full.len() <= share {
+                                remaining_budget = remaining_budget.saturating_sub(full.len());
+                                remaining_children -= 1;
+                                rendered[index] = Some((full, has_source));
+                                settled_any = true;
+                            }
+                        }
+                    }
+                    if !settled_any {
+                        break;
+                    }
+                }
+                if let Some(share) = remaining_budget.checked_div(remaining_children) {
+                    for (index, child) in children.iter().enumerate() {
+                        if rendered[index].is_none() {
+                            rendered[index] = Some(render_prepared_part_for_summary_checked(
+                                child,
+                                Some(share),
+                                marker,
+                                head_numerator,
+                                head_denominator,
+                            ));
+                        }
+                    }
+                }
+            } else {
+                for (index, child) in children.iter().enumerate() {
+                    rendered[index] = Some(render_prepared_part_for_summary_checked(
+                        child,
+                        None,
+                        marker,
+                        head_numerator,
+                        head_denominator,
+                    ));
+                }
+            }
             let mut out = prefix.clone();
             let mut first_has_source = false;
             let mut last_has_source = false;
             let mut any_source = false;
             let last_index = children.len().saturating_sub(1);
-            for (index, child) in children.iter().enumerate() {
+            for (index, entry) in rendered.into_iter().enumerate() {
+                let (part_text, has_source) = entry.unwrap_or_default();
                 if index > 0 {
                     out.push_str(" | ");
                 }
-                let (rendered, has_source) = render_prepared_part_for_summary_checked(
-                    child,
-                    per_child,
-                    marker,
-                    head_numerator,
-                    head_denominator,
-                );
                 if index == 0 {
                     first_has_source = has_source;
                 }
@@ -691,7 +737,7 @@ fn render_prepared_part_for_summary_checked(
                     last_has_source = has_source;
                 }
                 any_source |= has_source;
-                out.push_str(&rendered);
+                out.push_str(&part_text);
             }
             let preserves_source = if head_numerator == 0 {
                 last_has_source
@@ -831,22 +877,34 @@ fn sample_prepared_part_raw(
         }
         PreparedSummaryPart::Composite { prefix, children } => {
             let body_limit = limit.saturating_sub(prefix.len());
-            let selected = if head_numerator == 0 {
-                children.last()
+            let sampled = if head_numerator == 0 {
+                let mut tail_parts = Vec::new();
+                let mut tail_len = 0usize;
+                for child in children.iter().rev() {
+                    if tail_len >= body_limit {
+                        break;
+                    }
+                    let budget = body_limit.saturating_sub(tail_len);
+                    let rendered = sample_prepared_part_raw(child, budget, marker, 0, 1);
+                    tail_len = tail_len.saturating_add(rendered.len() + 3);
+                    tail_parts.push(rendered);
+                }
+                tail_parts.reverse();
+                tail_parts.join(" | ")
             } else {
-                children.first()
+                let mut head_sample = String::new();
+                for (index, child) in children.iter().enumerate() {
+                    if head_sample.len() >= body_limit {
+                        break;
+                    }
+                    if index > 0 {
+                        head_sample.push_str(" | ");
+                    }
+                    let budget = body_limit.saturating_sub(head_sample.len());
+                    head_sample.push_str(&sample_prepared_part_raw(child, budget, marker, 1, 1));
+                }
+                head_sample
             };
-            let sampled = selected
-                .map(|child| {
-                    sample_prepared_part_raw(
-                        child,
-                        body_limit,
-                        marker,
-                        head_numerator,
-                        head_denominator,
-                    )
-                })
-                .unwrap_or_default();
             format!("{prefix}{sampled}")
         }
         PreparedSummaryPart::Literal(literal) => {
@@ -873,13 +931,7 @@ fn render_bounded_fallback(
                 head_sample.push_str(" | ");
             }
             let budget = max_bytes.saturating_sub(head_sample.len());
-            head_sample.push_str(&sample_prepared_part_raw(
-                part,
-                budget,
-                marker,
-                head_numerator,
-                head_denominator,
-            ));
+            head_sample.push_str(&sample_prepared_part_raw(part, budget, marker, 1, 1));
         }
     }
     let mut tail_parts = Vec::new();
@@ -890,8 +942,7 @@ fn render_bounded_fallback(
                 break;
             }
             let budget = max_bytes.saturating_sub(tail_len);
-            let rendered =
-                sample_prepared_part_raw(part, budget, marker, head_numerator, head_denominator);
+            let rendered = sample_prepared_part_raw(part, budget, marker, 0, 1);
             tail_len = tail_len.saturating_add(rendered.len() + 3);
             tail_parts.push(rendered);
         }
@@ -5022,6 +5073,49 @@ mod tests {
         assert!(
             prompt.contains("verified"),
             "expected nested tool result custom value to be preserved"
+        );
+    }
+
+    #[test]
+    fn two_sided_tool_result_fallback_keeps_final_child() {
+        let custom = agentkit_core::CustomPart::new("report").with_data(DataRef::Uri(format!(
+            "https://example.com/{}",
+            "x".repeat(300)
+        )));
+        let mut parts = vec![Part::Custom(custom); 64];
+        parts.push(Part::text("verification failed"));
+        let item = Item::new(
+            ItemKind::Tool,
+            vec![Part::ToolResult(ToolResultPart::success(
+                "call-1",
+                ToolOutput::Parts(parts),
+            ))],
+        );
+        let rendered = render_summary_item(&item).unwrap();
+        assert!(rendered.len() <= SUMMARY_ITEM_MAX_BYTES);
+        assert!(
+            rendered.contains("verification failed"),
+            "expected final child in two-sided fallback: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn short_tool_result_part_leaves_budget_for_stderr() {
+        let stderr = format!(
+            "{}verification failed{}",
+            "a".repeat(12_000),
+            "b".repeat(4_500)
+        );
+        let output = ToolOutput::Parts(vec![Part::text("stderr"), Part::text(stderr)]);
+        let item = Item::new(
+            ItemKind::Tool,
+            vec![Part::ToolResult(ToolResultPart::success("call-1", output))],
+        );
+        let rendered = render_summary_item(&item).unwrap();
+        assert!(rendered.len() <= SUMMARY_ITEM_MAX_BYTES);
+        assert!(
+            rendered.contains("verification failed"),
+            "expected unused sibling budget to preserve stderr diagnostic"
         );
     }
 
