@@ -575,19 +575,26 @@ impl ModelAdapter for SelectableAdapter {
 const OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM: &str = concat!(
     "# Additional guidance\n",
     "- Treat action requests (\"can you...\", \"help me...\", \"I want to...\") as instructions to execute, not invitations to propose a plan or confirm capability.\n",
-    "- When the user points out a mistake or unmet requirement, fix it directly rather than only acknowledging or explaining it.\n",
+    "- When the user points out a mistake or unmet requirement in an implementation task, fix it directly rather than only acknowledging or explaining it, unless they ask only for an explanation, review, or diagnosis.\n",
     "- Do not invent unsolicited warnings, disclaimers, approval checklists, or self-imposed rules for hypothetical risks.\n",
     "- Do not narrate what you won't do or use contrastive filler (\"X, not Y\"). Do not claim changes succeeded or tests passed without actually running them.\n"
 );
 
 fn needs_openai_system_prompt_addendum(model: &str) -> bool {
-    let after_vendor = model.rsplit_once('/').map_or(model, |(_, slug)| slug);
+    let (vendor, after_vendor) = match model.rsplit_once('/') {
+        Some((vendor, slug)) => (Some(vendor), slug),
+        None => (None, model),
+    };
+    if vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai")) {
+        return true;
+    }
     let slug = after_vendor
         .split_once(':')
         .map_or(after_vendor, |(base, _)| base)
         .to_ascii_lowercase();
     slug == "gpt"
         || slug.starts_with("gpt-")
+        || slug.starts_with("chatgpt-")
         || slug.starts_with("codex")
         || slug == "o1"
         || slug.starts_with("o1-")
@@ -3506,6 +3513,8 @@ mod tests {
             "gpt-6.2-sol",
             "openai/gpt-5.4",
             "openai/gpt-5.4:nitro",
+            "openai/chatgpt-4o-latest",
+            "chatgpt-4o-latest",
             "openai/o3",
             "openai/o4-mini",
             "o3-pro",
