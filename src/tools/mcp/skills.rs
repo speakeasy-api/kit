@@ -1,7 +1,8 @@
 //! Connection-scoped inventory of untrusted Skills extension metadata.
 use super::{Inner, McpRuntime, McpServerId};
 use agentkit_mcp::{
-    McpConnection, McpSkill, McpSkillResources, McpSkillScanLimits, McpSkillScanOutcome,
+    McpConnection, McpSkill, McpSkillResources, McpSkillScanLimit, McpSkillScanLimits,
+    McpSkillScanOutcome,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -100,13 +101,7 @@ fn compact_skill(
     let description = &manifest.frontmatter.description;
     let description = &description[..description.floor_char_boundary(DESCRIPTION_MAX_BYTES)];
     // Charge for owned fields and the shared record, not discarded files or extra frontmatter.
-    let charge = server.len()
-        + uri.len()
-        + name.len()
-        + description.len()
-        + size_of::<SkillMetadata>()
-        + size_of::<Arc<SkillMetadata>>()
-        + 2 * size_of::<usize>();
+    let charge = minimum_skill_charge(server) + uri.len() + name.len() + description.len();
     if charge > remaining_bytes {
         return None;
     }
@@ -142,21 +137,57 @@ fn scan_limits(retry_delay: Duration) -> McpSkillScanLimits {
     }
 }
 
+fn minimum_skill_charge(server: &str) -> usize {
+    server.len()
+        + size_of::<SkillMetadata>()
+        + size_of::<Arc<SkillMetadata>>()
+        + 2 * size_of::<usize>()
+}
+
 async fn scan_catalog(
     connection: &McpConnection,
     server: &str,
     retry_delay: Duration,
 ) -> Option<Catalog> {
-    // Bound advertised entries as well as retained entries so an unneeded
-    // continuation cannot delay or discard an already full catalog.
     let limits = scan_limits(retry_delay);
+    let deadline = Instant::now() + (limits.page_timeout * 2).min(LIST_TIMEOUT_MAX);
+    let (prefix, full, outcome) = scan_prefix(connection, server, limits, deadline).await?;
+    if full
+        || outcome
+            != Some(McpSkillScanOutcome::Truncated(
+                McpSkillScanLimit::EntryCount,
+            ))
+    {
+        return Some(prefix);
+    }
+    // The SDK visitor cannot stop on a local acceptance condition. Keep the
+    // efficient first pass for compact catalogs; if some rows were rejected,
+    // allow a bounded second pass under the same deadline. A failed second
+    // pass cannot erase the prefix from the successful first pass.
+    let expanded = McpSkillScanLimits {
+        page_timeout: (retry_delay * 8).clamp(PAGE_TIMEOUT, LIST_TIMEOUT_MAX),
+        ..McpSkillScanLimits::default()
+    };
+    Some(
+        scan_prefix(connection, server, expanded, deadline)
+            .await
+            .map_or(prefix, |(catalog, _, _)| catalog),
+    )
+}
+
+async fn scan_prefix(
+    connection: &McpConnection,
+    server: &str,
+    limits: McpSkillScanLimits,
+    deadline: Instant,
+) -> Option<(Catalog, bool, Option<McpSkillScanOutcome>)> {
     let max_row_bytes = crate::runtime::mcp_skills::max_selector_row_bytes();
-    // Give multiple timely pages room to complete, but bound the whole scan too.
+    let minimum_charge = minimum_skill_charge(server);
     let mut retained = Vec::new();
     let mut remaining_bytes = INVENTORY_MAX_BYTES;
     let mut truncated = false;
-    let outcome = tokio::time::timeout(
-        (limits.page_timeout * 2).min(LIST_TIMEOUT_MAX),
+    let outcome = tokio::time::timeout_at(
+        deadline,
         connection.visit_skills(limits, |manifest| {
             if retained.len() < INVENTORY_MAX_ENTRIES
                 && let Some((skill, charge)) =
@@ -170,12 +201,21 @@ async fn scan_catalog(
         }),
     )
     .await
-    .ok()?
-    .ok()?;
-    Some(Catalog {
-        skills: retained.into(),
-        truncated: truncated || matches!(outcome, McpSkillScanOutcome::Truncated(_)),
-    })
+    .ok()
+    .and_then(Result::ok);
+    let full = retained.len() == INVENTORY_MAX_ENTRIES
+        || (remaining_bytes <= minimum_charge && !retained.is_empty());
+    if outcome.is_none() && !full {
+        return None;
+    }
+    Some((
+        Catalog {
+            skills: retained.into(),
+            truncated: truncated || outcome != Some(McpSkillScanOutcome::Complete),
+        },
+        full,
+        outcome,
+    ))
 }
 
 #[derive(Default)]

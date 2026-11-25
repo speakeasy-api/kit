@@ -302,11 +302,18 @@ async fn serve(
                 return;
             }
             if let Some(catalog) = catalog {
-                assert!(cursor.is_none());
-                if second_page.is_some() {
-                    json!({"resultType":"complete","skills":catalog.as_ref(),"nextCursor":"unneeded"})
-                } else {
-                    json!({"resultType":"complete","skills":catalog.as_ref()})
+                match (cursor.as_deref(), second_page) {
+                    (None, Some(_)) => {
+                        json!({"resultType":"complete","skills":catalog.as_ref(),"nextCursor":"second"})
+                    }
+                    (None, None) => json!({"resultType":"complete","skills":catalog.as_ref()}),
+                    (Some("second"), Some(page)) if !page.is_empty() => {
+                        json!({"resultType":"complete","skills":page.as_ref()})
+                    }
+                    _ => {
+                        response(&mut stream, "200 OK", Some(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"continuation failed"}}))).await;
+                        return;
+                    }
                 }
             } else {
                 let name = name.unwrap();
@@ -1214,6 +1221,66 @@ async fn mcp_skill_inventory_does_not_request_a_continuation_after_the_entry_cap
     eventually(async || runtime.skill_inventory_snapshot().truncated).await;
     assert_eq!(runtime.skill_inventory().len(), INVENTORY_MAX_ENTRIES);
     assert_eq!(peer.state.lock().await.skills.cursor_requests, [None]);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_can_fill_rejected_slots_from_a_continuation() {
+    use super::skills::INVENTORY_MAX_ENTRIES;
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("partial").await;
+    let mut first = (0..INVENTORY_MAX_ENTRIES - 1)
+        .map(|i| remote_skill(&format!("entry-{i}")))
+        .collect::<Vec<_>>();
+    first.push(remote_skill(&"x".repeat(9000)));
+    {
+        let mut state = peer.state.lock().await;
+        state.skills.catalog = Some(first.into());
+        state.skills.second_page = Some(vec![remote_skill("last")].into());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || {
+        runtime
+            .skill_inventory()
+            .iter()
+            .any(|entry| entry.skill.name == "last")
+    })
+    .await;
+    let snapshot = runtime.skill_inventory_snapshot();
+    assert_eq!(snapshot.skills.len(), INVENTORY_MAX_ENTRIES);
+    assert!(snapshot.truncated);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_keeps_a_byte_saturated_prefix_after_continuation_error() {
+    use super::skills::{INVENTORY_MAX_BYTES, SkillMetadata};
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("full-bytes").await;
+    let mut first = Vec::new();
+    for i in 0..64 {
+        let mut row = remote_skill(&format!("entry-{i}"));
+        let charge = "peer".len()
+            + row["uri"].as_str().unwrap().len()
+            + row["frontmatter"]["description"].as_str().unwrap().len()
+            + size_of::<SkillMetadata>()
+            + size_of::<Arc<SkillMetadata>>()
+            + 2 * size_of::<usize>();
+        row["frontmatter"]["name"] = json!("n".repeat(INVENTORY_MAX_BYTES / 64 - charge));
+        first.push(row);
+    }
+    {
+        let mut state = peer.state.lock().await;
+        state.skills.catalog = Some(first.into());
+        state.skills.second_page = Some(Vec::<Value>::new().into());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || runtime.skill_inventory_snapshot().truncated).await;
+    assert_eq!(runtime.skill_inventory().len(), 64);
+    assert_eq!(
+        peer.state.lock().await.skills.cursor_requests,
+        [None, Some("second".into())]
+    );
 }
 
 #[tokio::test]

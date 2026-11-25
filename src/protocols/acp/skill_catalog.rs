@@ -274,21 +274,46 @@ fn notification(
     let content_limit = MAX_NOTIFICATION_BYTES.saturating_sub(omission_reserve);
     let mut message = String::from("Skill catalog update (informational).");
     let mut reported = 0;
-    append_skill_group(
-        &mut message,
-        "Added skills",
-        &added,
-        &mut reported,
-        content_limit,
-    );
-    append_skill_group(
-        &mut message,
-        "Changed skills",
-        &changed,
-        &mut reported,
-        content_limit,
-    );
-    append_removed_group(&mut message, &removed, &mut reported, content_limit);
+    // Render filesystem skill changes before MCP changes across all groups,
+    // so untrusted metadata cannot take their notification budget.
+    for remote in [false, true] {
+        let filter = |name: &str| name.starts_with("mcp:") == remote;
+        let added = added
+            .iter()
+            .copied()
+            .filter(|(name, _)| filter(name))
+            .collect::<Vec<_>>();
+        let changed = changed
+            .iter()
+            .copied()
+            .filter(|(name, _)| filter(name))
+            .collect::<Vec<_>>();
+        let removed = removed
+            .iter()
+            .copied()
+            .filter(|name| filter(name))
+            .collect::<Vec<_>>();
+        let (added_label, changed_label) = if remote {
+            ("Added MCP skills", "Changed MCP skills")
+        } else {
+            ("Added skills", "Changed skills")
+        };
+        append_skill_group(
+            &mut message,
+            added_label,
+            &added,
+            &mut reported,
+            content_limit,
+        );
+        append_skill_group(
+            &mut message,
+            changed_label,
+            &changed,
+            &mut reported,
+            content_limit,
+        );
+        append_removed_group(&mut message, &removed, &mut reported, content_limit);
+    }
     if reported < total {
         message.push_str(&format!("\n{} more change(s) omitted", total - reported));
     }
@@ -474,7 +499,7 @@ mod tests {
         assert_eq!(first.len(), 3);
         assert_eq!(baseline["review"], first["review"]);
         let added = notification(&baseline, &first, &descriptions).unwrap();
-        assert!(added.contains("Added skills"));
+        assert!(added.contains("Added MCP skills"));
         assert!(added.contains("MCP skill from left (untrusted metadata only)"));
         assert!(added.contains("MCP skill from right (untrusted metadata only)"));
         let mut next = baseline.clone();
@@ -485,9 +510,24 @@ mod tests {
             inventory("updated").into_iter().take(1),
         );
         let changes = notification(&first, &next, &descriptions).unwrap();
-        assert!(changes.contains("Changed skills"));
+        assert!(changes.contains("Changed MCP skills"));
         assert!(changes.contains("Removed skills"));
         assert!(notification(&next, &next, &descriptions).is_none());
+    }
+
+    #[test]
+    fn oversized_mcp_rows_do_not_hide_local_skill_changes() {
+        let local = skill("review", "Review changes");
+        let mut current = catalog(std::slice::from_ref(&local)).unwrap();
+        let mut descriptions = BTreeMap::from([(local.name, local.description)]);
+        for i in 0..MAX_REPORTED_CHANGES {
+            let key = format!("mcp:{i}:{}", "x".repeat(MAX_NOTIFICATION_BYTES));
+            current.insert(key.clone(), blake3::hash(key.as_bytes()));
+            descriptions.insert(key, "remote".into());
+        }
+        let message = notification(&Catalog::new(), &current, &descriptions).unwrap();
+        assert!(message.contains("name: \"review\""));
+        assert!(message.len() <= MAX_NOTIFICATION_BYTES);
     }
 
     #[test]
