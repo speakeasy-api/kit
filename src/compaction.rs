@@ -556,6 +556,9 @@ fn render_prepared_part_for_summary_checked(
                 (Some(limit), Some(short)) if prefix.len().saturating_add(min_body) > limit => {
                     (short, Some(limit.saturating_sub(short.len())))
                 }
+                (Some(limit), Some(_)) => {
+                    (prefix.as_str(), Some(limit.saturating_sub(prefix.len())))
+                }
                 (limit, _) => (prefix.as_str(), limit),
             };
             let (body, has_source) = encode_json(raw, json_limit);
@@ -1464,8 +1467,21 @@ fn bounded_summary_prompt(
         {
             let slice_budget = remaining.saturating_sub(head_used + tail_used + 2);
             if slice_budget > marker.len() + 16 {
-                let truncated =
-                    render_item_within_budget(skipped_item, slice_budget, marker, 7, 8)?;
+                let (head_num, head_den) =
+                    if head_count + 1 == unretained_end && !tail_parts.is_empty() {
+                        let spare_head = head_budget.saturating_sub(head_used);
+                        let spare_tail = tail_budget.saturating_sub(tail_used);
+                        (spare_head, (spare_head + spare_tail).max(1))
+                    } else {
+                        (7, 8)
+                    };
+                let truncated = render_item_within_budget(
+                    skipped_item,
+                    slice_budget,
+                    marker,
+                    head_num,
+                    head_den,
+                )?;
                 head_parts.push(truncated);
             }
         }
@@ -4763,6 +4779,43 @@ mod tests {
         assert!(
             rendered.contains("verified"),
             "expected short custom JSON value to be preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn shared_boundary_record_weights_excerpt_by_remaining_head_and_tail_allowances() {
+        let path = "packages/renderer/src/runtime/transition_state.rs";
+        let mut items = vec![Item::text(ItemKind::Assistant, "a".repeat(13_939)); 4];
+        items.push(Item::text(
+            ItemKind::Assistant,
+            format!("{}{path}", "b".repeat(4_000 - path.len())),
+        ));
+        items.push(Item::text(ItemKind::User, "c".repeat(7_700)));
+        let request = SummaryRequest::new(items, CompactionReason::Manual);
+        let prompt = build_summary_prompt(&request).unwrap();
+        assert!(prompt.len() <= 64_000, "prompt too long: {}", prompt.len());
+        assert!(
+            prompt.contains(path),
+            "expected shared boundary suffix to retain path"
+        );
+    }
+
+    #[test]
+    fn bounded_custom_part_keeps_reference_and_json_excerpt_when_both_fit() {
+        let uri = format!("https://example.com/{}", "x".repeat(300));
+        let custom = agentkit_core::CustomPart::new("report")
+            .with_data(DataRef::Uri(uri.clone()))
+            .with_value(json!({"status": format!("{} verified", "a".repeat(1_200))}));
+        let item = Item::new(ItemKind::Assistant, vec![Part::Custom(custom)]);
+        let rendered = render_item_within_budget(&item, 600, "\n[omitted]\n", 0, 1).unwrap();
+        assert!(rendered.len() <= 600, "rendered too long: {rendered:?}");
+        assert!(
+            rendered.contains(uri.as_str()),
+            "expected URI preserved: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("verified"),
+            "expected JSON suffix preserved: {rendered:?}"
         );
     }
 
