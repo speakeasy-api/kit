@@ -1090,6 +1090,33 @@ async fn mcp_skill_inventory_filters_out_old_oauth_transport_epochs() {
 }
 
 #[tokio::test]
+async fn mcp_skill_inventory_marks_a_pending_first_scan_incomplete() {
+    let ready = Peer::with_protocol(Vec::new(), true).await;
+    ready.advertise_skills("ready").await;
+    let slow = Peer::with_protocol(Vec::new(), true).await;
+    slow.advertise_skills("slow").await;
+    let (release, gate) = oneshot::channel();
+    slow.state.lock().await.skills.gate = Some(gate);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let runtime = runtime(&path, &[("ready", &ready)]).await;
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    config(&path, &[("ready", &ready), ("slow", &slow)]);
+    runtime.reload_config().await.unwrap();
+    runtime.initialize_uninitialized().await.unwrap();
+    eventually(async || slow.state.lock().await.skills.cursor_requests.len() == 1).await;
+    let snapshot = runtime.skill_inventory_snapshot();
+    assert_eq!(snapshot.skills.len(), 2);
+    assert!(snapshot.truncated);
+    release.send(()).unwrap();
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.skills.len() == 4 && !snapshot.truncated
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn mcp_skill_inventory_retries_without_reconnecting() {
     let peer = Peer::with_protocol(vec![tool("read", "string")], true).await;
     peer.advertise_skills("recovered").await;
@@ -1224,7 +1251,11 @@ async fn mcp_skill_inventory_does_not_request_a_continuation_after_the_entry_cap
     }
     let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
-    eventually(async || runtime.skill_inventory_snapshot().truncated).await;
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.truncated && snapshot.skills.len() == INVENTORY_MAX_ENTRIES
+    })
+    .await;
     assert_eq!(runtime.skill_inventory().len(), INVENTORY_MAX_ENTRIES);
     assert_eq!(peer.state.lock().await.skills.cursor_requests, [None]);
 }
@@ -1331,7 +1362,11 @@ async fn mcp_skill_inventory_keeps_a_byte_saturated_prefix_after_continuation_er
     }
     let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
-    eventually(async || runtime.skill_inventory_snapshot().truncated).await;
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.truncated && snapshot.skills.len() == 64
+    })
+    .await;
     assert_eq!(runtime.skill_inventory().len(), 64);
     assert_eq!(
         peer.state.lock().await.skills.cursor_requests,
@@ -1379,7 +1414,11 @@ async fn mcp_skill_inventory_keeps_prefix_when_the_sdk_caps_a_scan() {
 
     let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
-    eventually(async || runtime.skill_inventory_snapshot().truncated).await;
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.truncated && snapshot.skills.len() == 1
+    })
+    .await;
     assert_eq!(skill_names(&runtime), [("peer".into(), "first".into())]);
     let state = peer.state.lock().await;
     assert_eq!(state.skills.cursor_requests, [None, Some("second".into())]);

@@ -276,6 +276,7 @@ struct Entry {
 
 #[derive(Clone)]
 enum EntryState {
+    Pending,
     Ready(Catalog),
     Retry {
         at: Instant,
@@ -329,6 +330,10 @@ impl McpRuntime {
             }
             let catalog = match entry.state {
                 EntryState::Ready(catalog) => Some(catalog),
+                EntryState::Pending => {
+                    result.truncated = true;
+                    None
+                }
                 EntryState::Retry { catalog, .. } => {
                     result.truncated = true;
                     catalog
@@ -391,7 +396,7 @@ async fn run(weak: Weak<Inner>) {
                 continue;
             }
             let epoch = connection.connection_epoch();
-            let (retry_delay, previous_catalog, expanded) = {
+            let (retry_delay, previous_catalog, expanded, first_scan) = {
                 let Ok(entries) = inner.skills.entries.lock() else {
                     return;
                 };
@@ -399,18 +404,18 @@ async fn run(weak: Weak<Inner>) {
                     entry.epoch == epoch && entry.connection.ptr_eq(&Arc::downgrade(&connection))
                 });
                 match previous.map(|entry| &entry.state) {
-                    Some(EntryState::Ready(_)) => continue,
+                    Some(EntryState::Pending | EntryState::Ready(_)) => continue,
                     Some(EntryState::Retry {
                         at,
                         next_delay,
                         catalog,
                         expanded,
-                    }) if *at <= Instant::now() => (*next_delay, catalog.clone(), *expanded),
+                    }) if *at <= Instant::now() => (*next_delay, catalog.clone(), *expanded, false),
                     Some(EntryState::Retry { at, .. }) => {
                         retry_at = Some(retry_at.map_or(*at, |earliest| earliest.min(*at)));
                         continue;
                     }
-                    None => (RETRY_INITIAL, None, false),
+                    None => (RETRY_INITIAL, None, false, true),
                 }
             };
             if !connection
@@ -418,6 +423,21 @@ async fn run(weak: Weak<Inner>) {
                 .is_some_and(|caps| caps.resources.is_some() && caps.supports_skills())
             {
                 continue;
+            }
+            if first_scan {
+                let Ok(mut entries) = inner.skills.entries.lock() else {
+                    return;
+                };
+                let retired = entries.insert(
+                    name.clone(),
+                    Entry {
+                        connection: Arc::downgrade(&connection),
+                        epoch,
+                        state: EntryState::Pending,
+                    },
+                );
+                drop(entries);
+                drop(retired);
             }
             active.insert(name.clone());
             pending.push(
