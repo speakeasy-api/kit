@@ -148,31 +148,52 @@ async fn scan_catalog(
     connection: &McpConnection,
     server: &str,
     retry_delay: Duration,
-) -> Option<Catalog> {
+) -> ScanResult {
     let limits = scan_limits(retry_delay);
     let deadline = Instant::now() + (limits.page_timeout * 2).min(LIST_TIMEOUT_MAX);
-    let (prefix, full, outcome) = scan_prefix(connection, server, limits, deadline).await?;
-    if full
-        || outcome
-            != Some(McpSkillScanOutcome::Truncated(
-                McpSkillScanLimit::EntryCount,
-            ))
-    {
-        return Some(prefix);
+    let Some((prefix, full, outcome)) = scan_prefix(connection, server, limits, deadline).await
+    else {
+        return ScanResult::Retry(None);
+    };
+    if full {
+        return ScanResult::Ready(prefix);
     }
-    // The SDK visitor cannot stop on a local acceptance condition. Keep the
-    // efficient first pass for compact catalogs; if some rows were rejected,
-    // allow a bounded second pass under the same deadline. A failed second
-    // pass cannot erase the prefix from the successful first pass.
+    match outcome {
+        None => return ScanResult::Retry(Some(prefix)),
+        Some(McpSkillScanOutcome::Truncated(McpSkillScanLimit::EntryCount)) => {}
+        Some(_) => return ScanResult::Ready(prefix),
+    }
+    // If the first pass exhausted the visit limit without filling retention,
+    // allow a bounded expansion. Never publish less because expansion failed
+    // or because it paid a larger SDK deduplication charge and truncated.
     let expanded = McpSkillScanLimits {
-        page_timeout: (retry_delay * 8).clamp(PAGE_TIMEOUT, LIST_TIMEOUT_MAX),
+        page_timeout: limits.page_timeout,
         ..McpSkillScanLimits::default()
     };
-    Some(
-        scan_prefix(connection, server, expanded, deadline)
-            .await
-            .map_or(prefix, |(catalog, _, _)| catalog),
-    )
+    match scan_prefix(connection, server, expanded, deadline).await {
+        Some((catalog, full, outcome)) => {
+            let catalog = prefer_catalog(prefix, catalog);
+            if full || outcome.is_some() {
+                ScanResult::Ready(catalog)
+            } else {
+                ScanResult::Retry(Some(catalog))
+            }
+        }
+        None => ScanResult::Retry(Some(prefix)),
+    }
+}
+
+fn prefer_catalog(previous: Catalog, candidate: Catalog) -> Catalog {
+    if candidate.truncated && candidate.skills.len() < previous.skills.len() {
+        previous
+    } else {
+        candidate
+    }
+}
+
+enum ScanResult {
+    Ready(Catalog),
+    Retry(Option<Catalog>),
 }
 
 async fn scan_prefix(
@@ -200,12 +221,15 @@ async fn scan_prefix(
             }
         }),
     )
-    .await
-    .ok()
-    .and_then(Result::ok);
+    .await;
+    let timed_out = matches!(
+        &outcome,
+        Err(_) | Ok(Err(agentkit_mcp::McpError::Timeout { .. }))
+    );
+    let outcome = outcome.ok().and_then(Result::ok);
     let full = retained.len() == INVENTORY_MAX_ENTRIES
         || (remaining_bytes <= minimum_charge && !retained.is_empty());
-    if outcome.is_none() && !full {
+    if outcome.is_none() && !full && (!timed_out || retained.is_empty()) {
         return None;
     }
     Some((
@@ -237,7 +261,11 @@ struct Entry {
 #[derive(Clone)]
 enum EntryState {
     Ready(Catalog),
-    Retry { at: Instant, next_delay: Duration },
+    Retry {
+        at: Instant,
+        next_delay: Duration,
+        catalog: Option<Catalog>,
+    },
 }
 
 impl Inventory {
@@ -277,7 +305,11 @@ impl McpRuntime {
         drop(entries);
         let mut result = SkillInventorySnapshot::default();
         for (server, entry) in snapshot {
-            if let EntryState::Ready(catalog) = entry.state
+            let catalog = match entry.state {
+                EntryState::Ready(catalog) => Some(catalog),
+                EntryState::Retry { catalog, .. } => catalog,
+            };
+            if let Some(catalog) = catalog
                 && entry.connection.upgrade().is_some_and(|connection| {
                     connection.connection_epoch() == entry.epoch
                         && !connection.is_transport_closed()
@@ -339,7 +371,7 @@ async fn run(weak: Weak<Inner>) {
                 continue;
             }
             let epoch = connection.connection_epoch();
-            let retry_delay = {
+            let (retry_delay, previous_catalog) = {
                 let Ok(entries) = inner.skills.entries.lock() else {
                     return;
                 };
@@ -348,14 +380,16 @@ async fn run(weak: Weak<Inner>) {
                 });
                 match previous.map(|entry| &entry.state) {
                     Some(EntryState::Ready(_)) => continue,
-                    Some(EntryState::Retry { at, next_delay }) if *at <= Instant::now() => {
-                        *next_delay
-                    }
+                    Some(EntryState::Retry {
+                        at,
+                        next_delay,
+                        catalog,
+                    }) if *at <= Instant::now() => (*next_delay, catalog.clone()),
                     Some(EntryState::Retry { at, .. }) => {
                         retry_at = Some(retry_at.map_or(*at, |earliest| earliest.min(*at)));
                         continue;
                     }
-                    None => RETRY_INITIAL,
+                    None => (RETRY_INITIAL, None),
                 }
             };
             if !connection
@@ -368,8 +402,17 @@ async fn run(weak: Weak<Inner>) {
             pending.push(
                 async move {
                     let next_state = match scan_catalog(&connection, &name, retry_delay).await {
-                        Some(catalog) => EntryState::Ready(catalog),
-                        None => EntryState::Retry {
+                        ScanResult::Ready(catalog) => EntryState::Ready(match previous_catalog {
+                            Some(previous) => prefer_catalog(previous, catalog),
+                            None => catalog,
+                        }),
+                        ScanResult::Retry(catalog) => EntryState::Retry {
+                            catalog: match (previous_catalog, catalog) {
+                                (Some(previous), Some(candidate)) => {
+                                    Some(prefer_catalog(previous, candidate))
+                                }
+                                (previous, candidate) => previous.or(candidate),
+                            },
                             at: Instant::now() + retry_delay,
                             next_delay: (retry_delay * 2).min(RETRY_MAX),
                         },
@@ -458,5 +501,25 @@ mod tests {
             super::scan_limits(super::RETRY_MAX).page_timeout,
             super::LIST_TIMEOUT_MAX
         );
+    }
+
+    #[test]
+    fn mcp_skill_inventory_does_not_replace_a_larger_prefix_with_truncation() {
+        use super::{Arc, Catalog, SkillMetadata, prefer_catalog};
+        let skill = Arc::new(SkillMetadata {
+            uri: "skill://one/SKILL.md".into(),
+            name: "one".into(),
+            description: String::new(),
+            fingerprint: blake3::hash(b"one"),
+        });
+        let original = Catalog {
+            skills: vec![skill].into(),
+            truncated: true,
+        };
+        let truncated = Catalog {
+            skills: Vec::new().into(),
+            truncated: true,
+        };
+        assert_eq!(prefer_catalog(original, truncated).skills.len(), 1);
     }
 }

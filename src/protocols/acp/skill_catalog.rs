@@ -312,7 +312,17 @@ fn notification(
             &mut reported,
             content_limit,
         );
-        append_removed_group(&mut message, &removed, &mut reported, content_limit);
+        append_removed_group(
+            &mut message,
+            if remote {
+                "\nRemoved MCP skills:"
+            } else {
+                "\nRemoved skills:"
+            },
+            &removed,
+            &mut reported,
+            content_limit,
+        );
     }
     if reported < total {
         message.push_str(&format!("\n{} more change(s) omitted", total - reported));
@@ -364,6 +374,7 @@ fn append_skill_group(
 
 fn append_removed_group(
     message: &mut String,
+    heading: &str,
     names: &[&str],
     reported: &mut usize,
     content_limit: usize,
@@ -371,12 +382,11 @@ fn append_removed_group(
     if names.is_empty() || *reported >= MAX_REPORTED_CHANGES {
         return;
     }
-    const HEADING: &str = "\nRemoved skills:";
-    if message.len() + HEADING.len() > content_limit {
+    if message.len() + heading.len() > content_limit {
         return;
     }
     let heading_start = message.len();
-    message.push_str(HEADING);
+    message.push_str(heading);
     let mut group_count = 0;
     for name in names
         .iter()
@@ -511,8 +521,19 @@ mod tests {
         );
         let changes = notification(&first, &next, &descriptions).unwrap();
         assert!(changes.contains("Changed MCP skills"));
-        assert!(changes.contains("Removed skills"));
+        assert!(changes.contains("Removed MCP skills"));
         assert!(notification(&next, &next, &descriptions).is_none());
+    }
+
+    #[test]
+    fn mixed_removals_have_origin_specific_headings() {
+        let before = BTreeMap::from([
+            ("local".into(), blake3::hash(b"local")),
+            ("mcp:remote".into(), blake3::hash(b"remote")),
+        ]);
+        let message = notification(&before, &Catalog::new(), &BTreeMap::new()).unwrap();
+        assert_eq!(message.matches("\nRemoved skills:").count(), 1);
+        assert_eq!(message.matches("\nRemoved MCP skills:").count(), 1);
     }
 
     #[test]

@@ -1252,6 +1252,38 @@ async fn mcp_skill_inventory_can_fill_rejected_slots_from_a_continuation() {
 }
 
 #[tokio::test]
+async fn mcp_skill_inventory_publishes_partial_deadline_result_and_retries_expansion() {
+    use super::skills::INVENTORY_MAX_ENTRIES;
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("partial").await;
+    let mut first = (0..INVENTORY_MAX_ENTRIES - 1)
+        .map(|i| remote_skill(&format!("entry-{i}")))
+        .collect::<Vec<_>>();
+    first.push(remote_skill(&"x".repeat(9000)));
+    {
+        let mut state = peer.state.lock().await;
+        state.skills.catalog = Some(first.into());
+        state.skills.second_page = Some(vec![remote_skill("last")].into());
+        state.skills.delay = Duration::from_millis(1450);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.truncated && snapshot.skills.len() == INVENTORY_MAX_ENTRIES - 1
+    })
+    .await;
+    eventually(async || {
+        runtime
+            .skill_inventory()
+            .iter()
+            .any(|entry| entry.skill.name == "last")
+    })
+    .await;
+    assert_eq!(runtime.skill_inventory().len(), INVENTORY_MAX_ENTRIES);
+}
+
+#[tokio::test]
 async fn mcp_skill_inventory_keeps_a_byte_saturated_prefix_after_continuation_error() {
     use super::skills::{INVENTORY_MAX_BYTES, SkillMetadata};
     let peer = Peer::with_protocol(Vec::new(), true).await;
