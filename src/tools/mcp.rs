@@ -14,6 +14,8 @@ pub(crate) mod refresh_tests;
 mod skills;
 mod subscriptions;
 pub(crate) use skills::RemoteSkill;
+#[cfg(test)]
+pub(crate) use skills::SkillMetadata;
 mod workload;
 pub use subscriptions::McpSubscriptionTool;
 mod schema;
@@ -51,6 +53,9 @@ use tokio::sync::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// Keep a finite read budget while allowing existing stdio servers to return
+// replies larger than AgentKit's 16 MiB default.
+const DEFAULT_STDIO_MAX_LINE_LENGTH: usize = 64 * 1024 * 1024;
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const SEARCH_RESULT_LIMIT: usize = 5;
 const SEARCH_MIN_SCORE: u32 = 60;
@@ -122,6 +127,12 @@ struct Stdio {
     #[serde(default)]
     env: BTreeMap<String, String>,
     cwd: Option<PathBuf>,
+    #[serde(default = "default_stdio_max_line_length")]
+    max_line_length: usize,
+}
+
+fn default_stdio_max_line_length() -> usize {
+    DEFAULT_STDIO_MAX_LINE_LENGTH
 }
 
 #[derive(Deserialize)]
@@ -1207,7 +1218,14 @@ fn prepare_server(
             if server.command.trim().is_empty() {
                 return Err(format!("MCP server {id} has an empty command"));
             }
-            let mut transport = StdioTransportConfig::new(server.command);
+            if !(1..usize::MAX).contains(&server.max_line_length) {
+                return Err(format!(
+                    "MCP server {id}: max_line_length must be between 1 and {} bytes",
+                    usize::MAX - 1
+                ));
+            }
+            let mut transport = StdioTransportConfig::new(server.command)
+                .with_max_line_length(server.max_line_length);
             transport.args = server.args;
             transport.env = server.env.into_iter().collect();
             transport.cwd = effective_stdio_cwd.map(Path::to_path_buf);
@@ -1440,7 +1458,8 @@ fn prepare_plugin_server(
             } else {
                 command.clone()
             };
-            let mut transport = StdioTransportConfig::new(command);
+            let mut transport = StdioTransportConfig::new(command)
+                .with_max_line_length(DEFAULT_STDIO_MAX_LINE_LENGTH);
             transport.args = args
                 .iter()
                 .map(|value| expand_plugin_value(value, root, data))
@@ -7260,6 +7279,77 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Config>(config).is_err(), "{config}");
         }
+    }
+
+    #[test]
+    fn stdio_max_line_length_accepts_only_finite_byte_limits() {
+        let path = Path::new("mcp.json");
+        let config = |value: Option<Value>| {
+            let mut config = json!({"mcpServers":{"local":{"command":"server"}}});
+            if let Some(value) = value {
+                config["mcpServers"]["local"]["max_line_length"] = value;
+            }
+            serde_json::to_vec(&config).unwrap()
+        };
+        for (value, expected) in [(None, 64 * 1024 * 1024), (Some(json!(54321)), 54321)] {
+            let (prepared, _) = prepare_config(&config(value), path, None).unwrap();
+            let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
+                panic!("expected stdio transport");
+            };
+            assert_eq!(transport.max_line_length, expected);
+        }
+        for value in [json!(0), json!(usize::MAX)] {
+            assert!(matches!(
+                prepare_config(&config(Some(value)), path, None),
+                Err(error) if error.contains("MCP server local: max_line_length must be between")
+            ));
+        }
+        for value in [json!(null), json!(-1), json!(1.5), json!("1024")] {
+            assert!(prepare_config(&config(Some(value)), path, None).is_err());
+        }
+        assert!(prepare_config(
+            br#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","max_line_length":1024}}}"#,
+            path,
+            None,
+        ).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_max_line_length_reload_allows_previously_rejected_frame() {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    response = {'jsonrpc': '2.0', 'id': request['id']}
+    if request['method'] == 'initialize':
+        response['result'] = {'protocolVersion': '2025-11-25', 'capabilities': {}, 'serverInfo': {'name': 'local', 'version': '1'}}
+        print(json.dumps(response) + ' ' * 4096, flush=True)
+    else:
+        response['error'] = {'code': -32601, 'message': 'Method not found'}
+        print(json.dumps(response), flush=True)
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let write_config = |limit| {
+            let config = json!({"mcpServers":{"local":{
+                "command":"/usr/bin/env", "args":["python3", "-u", "-c", script],
+                "max_line_length":limit,
+            }}});
+            std::fs::write(&path, config.to_string()).unwrap();
+        };
+        write_config(1024);
+        let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let failed = runtime.search("mcp").await.unwrap();
+        let server = &failed["servers"][0];
+        assert_eq!(server["status"], "error");
+        write_config(8192);
+        let recovered = runtime.search("mcp").await.unwrap();
+        assert_eq!(recovered["servers"][0]["status"], "authenticated");
     }
 
     #[test]

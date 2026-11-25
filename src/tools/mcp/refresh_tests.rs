@@ -28,6 +28,7 @@ struct PeerState {
 #[derive(Default)]
 struct SkillsFixture {
     name: Option<&'static str>,
+    catalog: Option<Arc<[Value]>>,
     cursor_requests: Vec<Option<String>>,
     fail: bool,
     gate: Option<oneshot::Receiver<()>>,
@@ -98,7 +99,7 @@ impl Peer {
         }
     }
 
-    async fn advertise_skills(&self, name: &'static str) {
+    pub(crate) async fn advertise_skills(&self, name: &'static str) {
         let mut state = self.state.lock().await;
         state.capabilities["extensions"] = json!({agentkit_mcp::MCP_SKILLS_EXTENSION_ID: {}});
         state.skills.name = Some(name);
@@ -270,11 +271,12 @@ async fn serve(
         "resources/templates/list" => json!({"resourceTemplates":[]}),
         "skills/list" => {
             let cursor = request["params"]["cursor"].as_str().map(str::to_owned);
-            let (name, fail, gate) = {
+            let (name, catalog, fail, gate) = {
                 let mut state = state.lock().await;
                 state.skills.cursor_requests.push(cursor.clone());
                 (
                     state.skills.name,
+                    state.skills.catalog.clone(),
                     state.skills.fail,
                     state.skills.gate.take(),
                 )
@@ -292,15 +294,20 @@ async fn serve(
                 .await;
                 return;
             }
-            let name = name.unwrap();
-            match cursor.as_deref() {
-                None => {
-                    json!({"resultType":"complete","skills":[remote_skill(name)],"nextCursor":"second"})
+            if let Some(catalog) = catalog {
+                assert!(cursor.is_none());
+                json!({"resultType":"complete","skills":catalog.as_ref()})
+            } else {
+                let name = name.unwrap();
+                match cursor.as_deref() {
+                    None => {
+                        json!({"resultType":"complete","skills":[remote_skill(name)],"nextCursor":"second"})
+                    }
+                    Some("second") => {
+                        json!({"resultType":"complete","skills":[remote_skill(&format!("{name}-second"))]})
+                    }
+                    Some(other) => panic!("unexpected skill cursor: {other}"),
                 }
-                Some("second") => {
-                    json!({"resultType":"complete","skills":[remote_skill(&format!("{name}-second"))]})
-                }
-                Some(other) => panic!("unexpected skill cursor: {other}"),
             }
         }
         "resources/read" => {
@@ -952,7 +959,7 @@ fn skill_names(runtime: &McpRuntime) -> Vec<(String, String)> {
     runtime
         .skill_inventory()
         .into_iter()
-        .map(|remote| (remote.server, remote.skill.name().to_owned()))
+        .map(|remote| (remote.server, remote.skill.name.clone()))
         .collect()
 }
 
@@ -1058,4 +1065,167 @@ async fn mcp_skill_inventory_filters_out_old_oauth_transport_epochs() {
     eventually(async || skill_names(&runtime).len() == 2).await;
     assert_eq!(skill_names(&runtime)[0].1, "after-auth");
     assert_eq!(peer.state.lock().await.skills.file_requests, 0);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_retries_without_reconnecting() {
+    let peer = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    peer.advertise_skills("recovered").await;
+    peer.state.lock().await.skills.fail = true;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    let connection = runtime
+        .inner
+        .manager
+        .lock()
+        .await
+        .connected_server(&McpServerId::new("peer"))
+        .unwrap()
+        .connection();
+    let epoch = connection.connection_epoch();
+    eventually(async || !peer.state.lock().await.skills.cursor_requests.is_empty()).await;
+    assert!(skill_names(&runtime).is_empty());
+    peer.state.lock().await.skills.fail = false;
+    // No list-change notification, credentials change, or reconnect wakes discovery.
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    assert_eq!(skill_names(&runtime)[0].1, "recovered");
+    assert_eq!(connection.connection_epoch(), epoch);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_bounds_entries_and_retained_bytes() {
+    use super::skills::{INVENTORY_MAX_BYTES, INVENTORY_MAX_ENTRIES};
+
+    let many = Peer::with_protocol(vec![], true).await;
+    many.advertise_skills("many").await;
+    many.state.lock().await.skills.catalog = Some(
+        (0..INVENTORY_MAX_ENTRIES * 2)
+            .map(|i| remote_skill(&format!("skill-{i}")))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    let large = Peer::with_protocol(vec![], true).await;
+    large.advertise_skills("large").await;
+    let mut escaped = remote_skill("escaped");
+    escaped["uri"] = json!(format!("skill://fixture/{}", "\u{0000}".repeat(1200)));
+    let mut large_catalog = vec![escaped];
+    for i in 0..INVENTORY_MAX_ENTRIES / 2 {
+        let mut skill = remote_skill(&format!("large-{i}-{}", "x".repeat(1024)));
+        skill["frontmatter"]["description"] = json!("🙂".repeat(500));
+        skill["frontmatter"]["metadata"] = json!({"ignored": "x".repeat(2048)});
+        skill["resources"] =
+            json!([{"uri":"skill://fixture/guide.md", "digest":"sha256:fixture", "size":2048}]);
+        large_catalog.push(skill);
+    }
+    large.state.lock().await.skills.catalog = Some(large_catalog.into());
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(
+        &dir.path().join("mcp.json"),
+        &[("many", &many), ("large", &large)],
+    )
+    .await;
+    eventually(async || {
+        let inventory = runtime.skill_inventory();
+        inventory.iter().any(|entry| entry.server == "many")
+            && inventory.iter().any(|entry| entry.server == "large")
+    })
+    .await;
+    let inventory = runtime.skill_inventory();
+    assert_eq!(
+        inventory
+            .iter()
+            .filter(|entry| entry.server == "many")
+            .count(),
+        INVENTORY_MAX_ENTRIES
+    );
+    let large_inventory: Vec<_> = inventory
+        .iter()
+        .filter(|entry| entry.server == "large")
+        .collect();
+    assert!(large_inventory.len() < INVENTORY_MAX_ENTRIES);
+    assert!(
+        large_inventory
+            .iter()
+            .all(|entry| entry.skill.name != "escaped")
+    );
+    let retained_bytes: usize = large_inventory
+        .iter()
+        .map(|entry| {
+            entry.server.len()
+                + entry.skill.uri.len()
+                + entry.skill.name.len()
+                + entry.skill.description.len()
+        })
+        .sum();
+    assert!((INVENTORY_MAX_BYTES / 2..=INVENTORY_MAX_BYTES).contains(&retained_bytes));
+    assert!(
+        large_inventory
+            .iter()
+            .all(|entry| entry.skill.description.len() < 2000)
+    );
+    let snapshot = runtime.skill_inventory();
+    assert!(Arc::ptr_eq(&inventory[0].skill, &snapshot[0].skill));
+    for entry in &inventory {
+        assert!(
+            json!({"selector": entry.selector(), "name": entry.skill.name})
+                .to_string()
+                .len()
+                < 8 * 1024
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_retries_after_a_listing_timeout() {
+    let peer = Peer::with_protocol(vec![tool("read", "string")], true).await;
+    peer.advertise_skills("slow").await;
+    let (release, gate) = oneshot::channel();
+    peer.state.lock().await.skills.gate = Some(gate);
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    // Keep the initial request blocked until another attempt completes.
+    eventually(async || skill_names(&runtime).len() == 2).await;
+    drop(release);
+    assert_eq!(skill_names(&runtime)[0].1, "slow");
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_fingerprints_manifest_content_not_wire_order() {
+    let base = Peer::with_protocol(vec![], true).await;
+    let reordered = Peer::with_protocol(vec![], true).await;
+    let changed = Peer::with_protocol(vec![], true).await;
+    for (peer, digests, marker) in [
+        (&base, [("a", "one"), ("b", "two")], "base"),
+        (&reordered, [("b", "two"), ("a", "one")], "reordered"),
+        (&changed, [("a", "one"), ("b", "new")], "changed"),
+    ] {
+        peer.advertise_skills("shared").await;
+        let mut skill = remote_skill("shared");
+        skill["_meta"] = json!({"fixture/marker": marker});
+        skill["resources"] = json!(digests.map(|(file, digest)| json!({
+            "uri": format!("skill://fixture/{file}.md"), "digest": digest, "size": 2,
+        })));
+        peer.state.lock().await.skills.catalog = Some(vec![skill].into());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(
+        &dir.path().join("mcp.json"),
+        &[
+            ("base", &base),
+            ("changed", &changed),
+            ("reordered", &reordered),
+        ],
+    )
+    .await;
+    eventually(async || runtime.skill_inventory().len() == 3).await;
+    let inventory = runtime.skill_inventory();
+    assert_eq!(
+        inventory[0].skill.fingerprint,
+        inventory[2].skill.fingerprint
+    );
+    assert_ne!(
+        inventory[0].skill.fingerprint,
+        inventory[1].skill.fingerprint
+    );
 }
