@@ -1303,6 +1303,7 @@ impl Server {
             Vec::new()
         };
         let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
+            .map(|monitor| monitor.with_mcp(driver.mcp.clone()))
             .map_err(|error| AcpRuntimeError::Loop(format!("skill catalog error: {error}")))?;
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();

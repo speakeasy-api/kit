@@ -4,7 +4,13 @@ use agentkit_core::{Part, ToolOutput, TurnCancellation};
 use agentkit_tools_core::ToolError;
 use serde_json::{Map, Value};
 
-const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
+
+// Direct Runlet returns of text are delivered as JSON strings. A serialized
+// JSON fragment can be charged separately by subtracting its two outer quotes.
+pub(crate) fn model_json_string_bytes(text: String) -> usize {
+    serde_json::Value::String(text).to_string().len()
+}
 
 /// Resolve only the final Runlet JSON value. Both foreground and detached
 /// completions use this boundary; resolving a reference never reimports its path.

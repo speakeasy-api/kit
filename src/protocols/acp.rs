@@ -1979,6 +1979,7 @@ impl Server {
         let structured_completion = driver.structured_completion;
         let canonical_transcript = driver.canonical_transcript;
         let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
+            .map(|monitor| monitor.with_mcp(driver.mcp.clone()))
             .map_err(|error| record_acp_runtime_failure(&session_id, "skill_catalog", error))?;
         let (tx, rx) = mpsc::channel(8);
         let voice_state = crate::runtime::voice_state::VoiceState::default();

@@ -471,6 +471,12 @@ Review the change and run the smallest relevant checks.
 
 The `skill` entry in `compose` initially discloses only valid skill names and descriptions. When a task matches, the agent loads the skill before proceeding; the result contains the full Markdown body, skill directory, and paths to supporting resources. Project and user skill files are read with the Kit process's normal host permissions. Invalid or unreadable skills are omitted, and the same skill can be loaded repeatedly.
 
+### Discover skills from an MCP server
+
+When Kit connects to a server that advertises the [Skills over MCP extension](https://modelcontextprotocol.io/extensions/skills/overview), the `skill` catalog can show its advertised names and descriptions. Each entry has a selector containing the configured server name and the skill URI, so it cannot shadow a local skill or one from another server. Pass the exact selector to `skill` to inspect an entry. To browse entries that do not fit in the catalog preview, pass `mcp:list` as the skill name, then pass the returned `next` value as the name for the next page. If the inventory changes between pages, restart with `mcp:list`. A `truncated` result means the inventory is incomplete: discovery may still be retrying or may have reached a limit.
+
+Kit retains up to 256 skill entries and 256 KiB of metadata per server. MCP skill entries are metadata only: Kit does not fetch or activate their instructions, run their scripts, or expose them as slash commands. ACP sessions report inventory changes at the next prompt.
+
 ### Invoke a skill with a slash command
 
 In the TUI or an ACP client, enter `/name` to load a skill by name. Append optional task details, for example `/release-notes focus on user-facing fixes`. Kit loads the latest skill instructions when you invoke the command. Skill commands that collide with `/compact` or Kit’s local commands (`/voice`, `/new`, `/clear`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, `/login`, and `/usage`) are hidden; use the `skill` tool to load those skills instead. Unknown or removed skill commands are sent as ordinary prompts; Kit does not reuse their old instructions.

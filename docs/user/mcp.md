@@ -128,7 +128,11 @@ Server names must have unambiguous tool prefixes. Do not configure names where o
 
 ### Local stdio transport
 
-A stdio server requires a non-empty `command`. Optional fields are `args` (an array of strings), `env` (a string-to-string object), `cwd`, and `description`. Kit starts and connects a configured stdio server in the background at startup, or as soon as a reload adds it and the next `tool_search` or `auth` call initializes it. Treat `command`, `args`, `cwd`, and environment values as executable configuration, and review the file before using it.
+A stdio server requires a non-empty `command`. Optional fields are `args` (an array of strings), `env` (a string-to-string object), `cwd`, `description`, and `max_line_length`. Kit starts and connects a configured stdio server in the background at startup, or as soon as a reload adds it and the next `tool_search` or `auth` call initializes it. Treat `command`, `args`, `cwd`, and environment values as executable configuration, and review the file before using it.
+
+Kit limits each incoming stdio JSON-RPC line to **64 MiB**, including its trailing newline. This bounds the read buffer while allowing large replies from existing servers that exceed AgentKit's 16 MiB default. To override the limit, set `max_line_length` on the server's entry in a Kit MCP configuration file, for example `"max_line_length": 134217728` for 128 MiB. Use a positive integer in bytes; there is no unlimited setting. Plugin and ACP client-supplied stdio declarations use the Kit default and do not accept this field.
+
+An oversized line closes the connection and fails pending requests. The resulting error reports `stdio line exceeded the ...-byte limit`. To recover, reduce the size of each reply (for example, request smaller pages) or raise `max_line_length` for that trusted server. A change to the config takes effect on the next `tool_search` or `auth` call.
 
 ### Remote Streamable HTTP transport
 

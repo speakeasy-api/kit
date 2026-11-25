@@ -48,6 +48,8 @@ use crate::{
     },
 };
 
+pub(crate) mod mcp_skills;
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -724,6 +726,7 @@ pub(crate) struct AcpDriver {
         >,
     >,
     pub skills: Vec<Skill>,
+    pub mcp: crate::tools::mcp::McpRuntime,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
     pub structured_completion: bool,
@@ -1885,15 +1888,14 @@ impl Runtime {
             )))
             .register(Observed::new(AuthTool::new(mcp.clone())))
             .register(Observed::new(McpSubscriptionTool::new(mcp.clone())))
-            .register(Observed::new(McpTool::new(mcp)));
-        if let Some(skill_tool) = &self.dynamic_skill_tool {
-            children.register(observe_shared(Arc::clone(skill_tool)));
-        } else {
-            let skill_tools = skills.tool_registry();
-            if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
-                children.register(observe_shared(skill_tool));
-            }
-        }
+            .register(Observed::new(McpTool::new(mcp.clone())));
+        let local = self
+            .dynamic_skill_tool
+            .clone()
+            .or_else(|| skills.tool_registry().get(&ToolName::new("skill")));
+        children.register(observe_shared(Arc::new(
+            mcp_skills::InventorySkillTool::new(local, mcp),
+        )));
         if let Some(hooks) = &self.hooks {
             children = crate::ahp::hooked_tools(children, hooks);
         }
@@ -2514,7 +2516,7 @@ impl Runtime {
                 subagents.clone(),
                 background_jobs.clone(),
                 skills,
-                mcp,
+                mcp.clone(),
             ))
             .task_manager(task_manager);
         if let Some(hooks) = &self.hooks {
@@ -2543,6 +2545,7 @@ impl Runtime {
             subagents,
             driver,
             skills: skill_catalog,
+            mcp,
             tasks,
             background_jobs,
             structured_completion: self.base_depth > 0,

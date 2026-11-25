@@ -436,7 +436,7 @@ mod tests {
                 HashMap::new()
             )),
         );
-        assert!(matches!(first, Ok(StreamableHttpPostResponse::Json(_, _))));
+        assert_bare_post_rejection(first, 401);
         assert!(matches!(second, Ok(StreamableHttpPostResponse::Json(_, _))));
         assert!(rejected.rejected());
         assert!(!successful.rejected());
@@ -505,7 +505,7 @@ mod tests {
                 let first = client
                     .post_message(uri.clone().into(), message(), None, None, HashMap::new())
                     .await;
-                assert_eq!(first.is_ok(), json);
+                assert_bare_post_rejection(first, code);
                 let second = client
                     .post_message(uri.into(), message(), None, None, HashMap::new())
                     .await;
@@ -526,6 +526,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    // rmcp 3.9 preserves bare auth statuses even when the body is a JSON-RPC error.
+    fn assert_bare_post_rejection(result: Result<StreamableHttpPostResponse, Error>, code: u16) {
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::UnexpectedServerResponse(message))
+                if message.starts_with(&format!("HTTP {code} "))
+        ));
     }
 
     #[tokio::test]
@@ -572,14 +581,7 @@ mod tests {
                     ))
                     .await;
                 assert!(status.rejected(), "bare HTTP {code} was lost");
-                if json {
-                    assert!(matches!(result, Ok(StreamableHttpPostResponse::Json(_, _))));
-                } else {
-                    assert!(matches!(
-                        result,
-                        Err(StreamableHttpError::UnexpectedServerResponse(_))
-                    ));
-                }
+                assert_bare_post_rejection(result, code);
                 assert!(
                     server.await.unwrap().0[0]
                         .to_lowercase()
