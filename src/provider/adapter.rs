@@ -574,7 +574,7 @@ impl ModelAdapter for SelectableAdapter {
 
 const OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM: &str = concat!(
     "# Additional guidance\n",
-    "- Match your action to the request: answer, explain, review, or diagnose without making edits unless asked; when asked to change or build something, persist end-to-end through implementation and verification rather than stopping at a plan or partial fix, yielding only when waiting for background work to resume.\n",
+    "- Match your action to the request: answer, explain, review, or diagnose without making edits unless asked; when asked to change or build something, persist end-to-end through implementation and verification rather than stopping at a plan or partial fix, yielding only when waiting for background work to resume or when blocked on a user decision or authorization.\n",
     "- Treat action requests (\"can you...\", \"help me...\", \"I want to...\") as instructions to execute, not invitations to propose a plan or confirm capability.\n",
     "- When the user points out a mistake or unmet requirement in an implementation task, fix it directly rather than only acknowledging or explaining it, unless they ask only for an explanation, review, or diagnosis.\n",
     "- Work through errors and blockers within scope before coming back to the user. Keep code readable; avoid unnecessary abstractions or dense one-liners.\n",
