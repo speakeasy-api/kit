@@ -2822,8 +2822,10 @@ fn system_prompt_is_independent_of_delegation() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let prompt = runtime.system_prompt();
+    assert!(prompt.starts_with(crate::runtime::SYSTEM_PROMPT_PREFIX));
     assert!(prompt.contains("Keep tool output lean"));
     assert!(prompt.contains("Do not dump whole trees"));
+    assert!(!prompt.contains("# Additional guidance"));
     assert!(!prompt.contains("compose"));
     assert!(!prompt.contains("delegat"));
 }
