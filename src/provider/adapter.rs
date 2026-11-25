@@ -574,7 +574,7 @@ impl ModelAdapter for SelectableAdapter {
 
 const OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM: &str = concat!(
     "# Additional guidance\n",
-    "- Match your action to the request: answer, explain, review, or diagnose without making edits unless asked; when asked to change or build something, persist end-to-end through implementation and verification in the current turn rather than stopping at a plan or partial fix.\n",
+    "- Match your action to the request: answer, explain, review, or diagnose without making edits unless asked; when asked to change or build something, persist end-to-end through implementation and verification rather than stopping at a plan or partial fix, yielding only when waiting for background work to resume.\n",
     "- Treat action requests (\"can you...\", \"help me...\", \"I want to...\") as instructions to execute, not invitations to propose a plan or confirm capability.\n",
     "- When the user points out a mistake or unmet requirement in an implementation task, fix it directly rather than only acknowledging or explaining it, unless they ask only for an explanation, review, or diagnosis.\n",
     "- Work through errors and blockers within scope before coming back to the user. Keep code readable; avoid unnecessary abstractions or dense one-liners.\n",
@@ -605,11 +605,12 @@ fn needs_openai_system_prompt_addendum(model: &str) -> bool {
         || slug.starts_with("o4-")
 }
 
-fn apply_model_system_prompt(request: &mut TurnRequest, model: Option<&str>) {
-    let Some(model) = model else {
-        return;
-    };
-    if !needs_openai_system_prompt_addendum(model) {
+fn apply_model_system_prompt(
+    request: &mut TurnRequest,
+    is_native_openai: bool,
+    model: Option<&str>,
+) {
+    if !is_native_openai && !model.is_some_and(needs_openai_system_prompt_addendum) {
         return;
     }
     let Some(system_item) = request
@@ -1518,12 +1519,13 @@ impl ModelSession for KitSession {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        let mut request = if matches!(self, Self::OpenAiSubscription(_)) {
+        let is_native_openai = matches!(self, Self::OpenAiSubscription(_));
+        let mut request = if is_native_openai {
             request
         } else {
             project_tool_output_images(request, matches!(self, Self::Anthropic(_, _)))?
         };
-        apply_model_system_prompt(&mut request, self.model_name());
+        apply_model_system_prompt(&mut request, is_native_openai, self.model_name());
         match self {
             Self::OpenAiSubscription(session) => session
                 .begin_turn(request, cancellation)
@@ -3565,7 +3567,7 @@ mod tests {
 
         // OpenAI model gets the addendum appended to the native system prompt, before AGENTS.md.
         let mut gpt_request = canonical.clone();
-        apply_model_system_prompt(&mut gpt_request, Some("openai/gpt-5.4"));
+        apply_model_system_prompt(&mut gpt_request, false, Some("openai/gpt-5.4"));
         let Part::Text(gpt_system) = &gpt_request.transcript[0].parts[0] else {
             panic!("expected system text");
         };
@@ -3580,9 +3582,21 @@ mod tests {
         };
         assert_eq!(agents_md.text, "Project AGENTS.md guidance");
 
+        // Native OpenAI subscription sessions get the addendum even for custom/unrecognized model IDs.
+        let mut native_custom = canonical.clone();
+        apply_model_system_prompt(&mut native_custom, true, Some("custom-model"));
+        let Part::Text(native_system) = &native_custom.transcript[0].parts[0] else {
+            panic!("expected system text");
+        };
+        assert!(
+            native_system
+                .text
+                .contains(OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM)
+        );
+
         // Idempotent if applied twice.
         let once = gpt_system.text.clone();
-        apply_model_system_prompt(&mut gpt_request, Some("gpt-5.4"));
+        apply_model_system_prompt(&mut gpt_request, true, Some("gpt-5.4"));
         let Part::Text(gpt_system_again) = &gpt_request.transcript[0].parts[0] else {
             panic!("expected system text");
         };
@@ -3590,7 +3604,7 @@ mod tests {
 
         // Switching to a non-OpenAI model uses the clean canonical transcript without the addendum.
         let mut claude_request = canonical.clone();
-        apply_model_system_prompt(&mut claude_request, Some("claude-opus-4-6"));
+        apply_model_system_prompt(&mut claude_request, false, Some("claude-opus-4-6"));
         let Part::Text(claude_system) = &claude_request.transcript[0].parts[0] else {
             panic!("expected system text");
         };
@@ -3605,7 +3619,7 @@ mod tests {
             cache: None,
             metadata: MetadataMap::new(),
         };
-        apply_model_system_prompt(&mut compaction_request, Some("gpt-5.4"));
+        apply_model_system_prompt(&mut compaction_request, true, Some("gpt-5.4"));
         let Part::Text(compaction_system) = &compaction_request.transcript[0].parts[0] else {
             panic!("expected system text");
         };
