@@ -162,7 +162,7 @@ fn compact_tool_output(output: ToolOutput, limit: usize) -> ToolOutput {
             .map(ToolOutput::Text)
             .unwrap_or(ToolOutput::Text(text));
     }
-    let projected = summary_tool_output_ref(&output);
+    let projected = summary_tool_output(output);
     let rendered = match &projected {
         ToolOutput::Text(text) => text.clone(),
         other => {
@@ -210,27 +210,23 @@ fn bounded_reference(data: &DataRef) -> String {
     }
 }
 
-fn summary_tool_output_ref(output: &ToolOutput) -> ToolOutput {
+fn summary_tool_output(output: ToolOutput) -> ToolOutput {
     match output {
-        ToolOutput::Parts(parts) => ToolOutput::Parts(parts.iter().map(summary_part_ref).collect()),
+        ToolOutput::Parts(parts) => {
+            ToolOutput::Parts(parts.into_iter().map(summary_part).collect())
+        }
         ToolOutput::Files(files) => ToolOutput::Parts(
             files
-                .iter()
-                .map(|file| {
-                    Part::text(format!(
-                        "[file attachment: name={}; mime_type={}; {}]",
-                        file.name.as_deref().unwrap_or("unknown"),
-                        file.mime_type.as_deref().unwrap_or("unknown"),
-                        bounded_reference(&file.data)
-                    ))
-                })
+                .into_iter()
+                .map(Part::File)
+                .map(summary_part)
                 .collect(),
         ),
-        other => other.clone(),
+        output => output,
     }
 }
 
-fn summary_part_ref(part: &Part) -> Part {
+fn summary_part(part: Part) -> Part {
     match part {
         Part::Media(media) => Part::text(format!(
             "[{:?} attachment: {}; {}]",
@@ -244,41 +240,128 @@ fn summary_part_ref(part: &Part) -> Part {
             file.mime_type.as_deref().unwrap_or("unknown"),
             bounded_reference(&file.data)
         )),
-        Part::ToolResult(result) => Part::ToolResult(agentkit_core::ToolResultPart {
-            call_id: result.call_id.clone(),
-            output: summary_tool_output_ref(&result.output),
-            is_error: result.is_error,
-            metadata: result.metadata.clone(),
+        Part::ToolResult(mut result) => {
+            result.output = summary_tool_output(result.output);
+            Part::ToolResult(result)
+        }
+        Part::Reasoning(mut reasoning) => {
+            if reasoning.data.as_ref().is_some_and(|data| {
+                matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
+            }) {
+                reasoning.data = None;
+            }
+            Part::Reasoning(reasoning)
+        }
+        Part::Custom(mut custom) => {
+            if custom.data.as_ref().is_some_and(|data| {
+                matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
+            }) {
+                custom.data = None;
+            }
+            Part::Custom(custom)
+        }
+        part => part,
+    }
+}
+
+enum PreparedSummaryPart {
+    Text(String),
+    TaggedText { prefix: String, text: String },
+    Json { prefix: String, raw: String },
+    Literal(String),
+}
+
+fn render_tool_output_ref_for_summary(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Text(text) => text.clone(),
+        ToolOutput::Parts(parts) => parts
+            .iter()
+            .filter_map(prepare_summary_part)
+            .map(|part| render_prepared_part_for_summary(&part, None, "", 1, 2))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        ToolOutput::Files(files) => files
+            .iter()
+            .map(|file| {
+                quote_for_summary(&format!(
+                    "[file attachment: name={}; mime_type={}; {}]",
+                    file.name.as_deref().unwrap_or("unknown"),
+                    file.mime_type.as_deref().unwrap_or("unknown"),
+                    bounded_reference(&file.data)
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(" | "),
+        other => {
+            serde_json::to_string(other).unwrap_or_else(|_| "[unserializable tool output]".into())
+        }
+    }
+}
+
+fn prepare_summary_part(part: &Part) -> Option<PreparedSummaryPart> {
+    match part {
+        Part::Text(text) => {
+            (!text.text.is_empty()).then(|| PreparedSummaryPart::Text(text.text.clone()))
+        }
+        Part::Media(media) => Some(PreparedSummaryPart::Text(format!(
+            "[{:?} attachment: {}; {}]",
+            media.modality,
+            media.mime_type,
+            bounded_reference(&media.data)
+        ))),
+        Part::File(file) => Some(PreparedSummaryPart::Text(format!(
+            "[file attachment: name={}; mime_type={}; {}]",
+            file.name.as_deref().unwrap_or("unknown"),
+            file.mime_type.as_deref().unwrap_or("unknown"),
+            bounded_reference(&file.data)
+        ))),
+        Part::Structured(structured) => Some(PreparedSummaryPart::Json {
+            prefix: "[Structured] ".into(),
+            raw: serde_json::to_string(&structured.value)
+                .unwrap_or_else(|_| "[unserializable structured part]".into()),
         }),
-        Part::Reasoning(reasoning) => {
-            let mut projected = agentkit_core::ReasoningPart {
-                summary: reasoning.summary.clone(),
-                data: None,
-                redacted: reasoning.redacted,
-                metadata: reasoning.metadata.clone(),
-            };
-            if let Some(data) = &reasoning.data
-                && !matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
-            {
-                projected.data = Some(data.clone());
-            }
-            Part::Reasoning(projected)
+        Part::ToolCall(call) => {
+            let name = quote_for_summary(&call.name);
+            let id = quote_for_summary(&call.id.to_string());
+            let raw = serde_json::to_string(&call.input)
+                .unwrap_or_else(|_| "[unserializable tool input]".into());
+            Some(PreparedSummaryPart::Json {
+                prefix: format!("[ToolCall name={name} id={id}] "),
+                raw,
+            })
         }
+        Part::ToolResult(result) => {
+            let id = quote_for_summary(&result.call_id.to_string());
+            let status = if result.is_error { " error=true" } else { "" };
+            let text = render_tool_output_ref_for_summary(&result.output);
+            Some(PreparedSummaryPart::TaggedText {
+                prefix: format!("[ToolResult id={id}{status}] "),
+                text,
+            })
+        }
+        Part::Reasoning(reasoning) => reasoning
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.is_empty())
+            .map(|summary| PreparedSummaryPart::TaggedText {
+                prefix: "[Reasoning] ".into(),
+                text: summary.to_owned(),
+            }),
         Part::Custom(custom) => {
-            let mut projected = agentkit_core::CustomPart {
-                kind: custom.kind.clone(),
-                value: custom.value.clone(),
-                data: None,
-                metadata: custom.metadata.clone(),
-            };
-            if let Some(data) = &custom.data
-                && !matches!(data, DataRef::InlineText(_) | DataRef::InlineBytes(_))
-            {
-                projected.data = Some(data.clone());
+            let kind = quote_for_summary(&custom.kind);
+            if let Some(value) = &custom.value {
+                let raw = serde_json::to_string(value)
+                    .unwrap_or_else(|_| "[unserializable custom value]".into());
+                Some(PreparedSummaryPart::Json {
+                    prefix: format!("[Custom kind={kind}] "),
+                    raw,
+                })
+            } else {
+                Some(PreparedSummaryPart::Literal(format!(
+                    "[Custom kind={kind}]"
+                )))
             }
-            Part::Custom(projected)
         }
-        part => part.clone(),
     }
 }
 
@@ -316,20 +399,6 @@ fn quote_for_summary(value: &str) -> String {
     escape_xml_delimiters(serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()))
 }
 
-fn render_tool_output_for_summary(output: &ToolOutput) -> String {
-    match summary_tool_output_ref(output) {
-        ToolOutput::Text(text) => text,
-        ToolOutput::Parts(parts) => parts
-            .iter()
-            .filter_map(|part| render_projected_part_for_summary(part, None, "", 1, 2))
-            .collect::<Vec<_>>()
-            .join(" | "),
-        other => {
-            serde_json::to_string(&other).unwrap_or_else(|_| "[unserializable tool output]".into())
-        }
-    }
-}
-
 fn quote_bounded_for_summary(
     value: &str,
     max_encoded_bytes: usize,
@@ -363,74 +432,40 @@ fn quote_bounded_for_summary(
     best
 }
 
-fn render_projected_part_for_summary(
-    part: &Part,
+fn render_prepared_part_for_summary(
+    part: &PreparedSummaryPart,
     max_body_bytes: Option<usize>,
     marker: &str,
     head_numerator: usize,
     head_denominator: usize,
-) -> Option<String> {
+) -> String {
     let encode_text = |value: &str| match max_body_bytes {
         Some(limit) => {
             quote_bounded_for_summary(value, limit, marker, head_numerator, head_denominator)
         }
         None => quote_for_summary(value),
     };
-    let encode_json = |rendered: String| {
-        let escaped = escape_xml_delimiters(rendered.clone());
-        match max_body_bytes {
-            Some(limit) if escaped.len() > limit => quote_bounded_for_summary(
-                &rendered,
-                limit,
-                marker,
-                head_numerator,
-                head_denominator,
-            ),
-            _ => escaped,
+    let encode_json = |raw: &str| match max_body_bytes {
+        Some(limit) if raw.len() > limit => {
+            quote_bounded_for_summary(raw, limit, marker, head_numerator, head_denominator)
         }
-    };
-    match part {
-        Part::Text(text) => (!text.text.is_empty()).then(|| encode_text(&text.text)),
-        Part::Structured(structured) => {
-            let rendered = serde_json::to_string(&structured.value)
-                .unwrap_or_else(|_| "[unserializable structured part]".into());
-            Some(format!("[Structured] {}", encode_json(rendered)))
-        }
-        Part::ToolCall(call) => {
-            let name = quote_for_summary(&call.name);
-            let id = quote_for_summary(&call.id.to_string());
-            let input = serde_json::to_string(&call.input)
-                .unwrap_or_else(|_| "[unserializable tool input]".into());
-            Some(format!(
-                "[ToolCall name={name} id={id}] {}",
-                encode_json(input)
-            ))
-        }
-        Part::ToolResult(result) => {
-            let id = quote_for_summary(&result.call_id.to_string());
-            let status = if result.is_error { " error=true" } else { "" };
-            let output = render_tool_output_for_summary(&result.output);
-            Some(format!(
-                "[ToolResult id={id}{status}] {}",
-                encode_text(&output)
-            ))
-        }
-        Part::Reasoning(reasoning) => reasoning
-            .summary
-            .as_deref()
-            .filter(|summary| !summary.is_empty())
-            .map(|summary| format!("[Reasoning] {}", encode_text(summary))),
-        Part::Custom(custom) => {
-            let kind = quote_for_summary(&custom.kind);
-            if let Some(value) = &custom.value {
-                let rendered = serde_json::to_string(value)
-                    .unwrap_or_else(|_| "[unserializable custom value]".into());
-                Some(format!("[Custom kind={kind}] {}", encode_json(rendered)))
+        Some(limit) => {
+            let escaped = escape_xml_delimiters(raw.to_owned());
+            if escaped.len() > limit {
+                quote_bounded_for_summary(raw, limit, marker, head_numerator, head_denominator)
             } else {
-                Some(format!("[Custom kind={kind}]"))
+                escaped
             }
         }
-        Part::Media(_) | Part::File(_) => None,
+        None => escape_xml_delimiters(raw.to_owned()),
+    };
+    match part {
+        PreparedSummaryPart::Text(text) => encode_text(text),
+        PreparedSummaryPart::TaggedText { prefix, text } => {
+            format!("{prefix}{}", encode_text(text))
+        }
+        PreparedSummaryPart::Json { prefix, raw } => format!("{prefix}{}", encode_json(raw)),
+        PreparedSummaryPart::Literal(literal) => literal.clone(),
     }
 }
 
@@ -442,14 +477,14 @@ fn render_part_for_summary(
     head_numerator: usize,
     head_denominator: usize,
 ) -> Option<String> {
-    let projected = summary_part_ref(&part);
-    render_projected_part_for_summary(
-        &projected,
+    let prepared = prepare_summary_part(&part)?;
+    Some(render_prepared_part_for_summary(
+        &prepared,
         max_body_bytes,
         marker,
         head_numerator,
         head_denominator,
-    )
+    ))
 }
 
 fn render_item_within_budget(
@@ -459,10 +494,14 @@ fn render_item_within_budget(
     head_numerator: usize,
     head_denominator: usize,
 ) -> Result<String, CompactionError> {
-    let projected_parts = item.parts.iter().map(summary_part_ref).collect::<Vec<_>>();
-    let full_body = projected_parts
+    let prepared_parts = item
+        .parts
         .iter()
-        .filter_map(|part| render_projected_part_for_summary(part, None, "", 1, 2))
+        .filter_map(prepare_summary_part)
+        .collect::<Vec<_>>();
+    let full_body = prepared_parts
+        .iter()
+        .map(|part| render_prepared_part_for_summary(part, None, "", 1, 2))
         .collect::<Vec<_>>()
         .join(" | ");
     let full = format!("[{:?}] {full_body}", item.kind);
@@ -471,10 +510,10 @@ fn render_item_within_budget(
     }
     let prefix_len = format!("[{:?}] ", item.kind).len();
     let render_with = |per_part: usize| -> String {
-        let body = projected_parts
+        let body = prepared_parts
             .iter()
-            .filter_map(|part| {
-                render_projected_part_for_summary(
+            .map(|part| {
+                render_prepared_part_for_summary(
                     part,
                     Some(per_part),
                     marker,
@@ -486,7 +525,7 @@ fn render_item_within_budget(
             .join(" | ");
         format!("[{:?}] {body}", item.kind)
     };
-    if projected_parts.len() == 1 {
+    if prepared_parts.len() == 1 {
         let single_budget = max_bytes.saturating_sub(prefix_len);
         let candidate = render_with(single_budget);
         if candidate.len() <= max_bytes
@@ -553,22 +592,34 @@ fn render_protected_summary_item(item: &Item) -> Result<String, CompactionError>
     let body = item
         .parts
         .iter()
-        .map(summary_part_ref)
-        .filter_map(|part| render_projected_part_for_summary(&part, None, "", 1, 2))
+        .filter_map(prepare_summary_part)
+        .map(|part| render_prepared_part_for_summary(&part, None, "", 1, 2))
         .collect::<Vec<_>>()
         .join(" | ");
     Ok(format!("[{:?}] {body}", item.kind))
 }
 
 fn render_follow_up_part(part: &Part) -> Option<String> {
-    match summary_part_ref(part) {
-        Part::Text(text) => (!text.text.trim().is_empty()).then_some(text.text),
+    match part {
+        Part::Text(text) => (!text.text.trim().is_empty()).then(|| text.text.clone()),
+        Part::Media(media) => Some(format!(
+            "[{:?} attachment: {}; {}]",
+            media.modality,
+            media.mime_type,
+            bounded_reference(&media.data)
+        )),
+        Part::File(file) => Some(format!(
+            "[file attachment: name={}; mime_type={}; {}]",
+            file.name.as_deref().unwrap_or("unknown"),
+            file.mime_type.as_deref().unwrap_or("unknown"),
+            bounded_reference(&file.data)
+        )),
         Part::Structured(structured) => serde_json::to_string(&structured.value).ok(),
-        Part::Custom(custom) => Some(match custom.value {
+        Part::Custom(custom) => Some(match &custom.value {
             Some(value) => format!(
                 "[Custom kind={}] {}",
                 quote_for_summary(&custom.kind),
-                serde_json::to_string(&value)
+                serde_json::to_string(value)
                     .unwrap_or_else(|_| "[unserializable custom value]".into())
             ),
             None => format!("[Custom kind={}]", quote_for_summary(&custom.kind)),
