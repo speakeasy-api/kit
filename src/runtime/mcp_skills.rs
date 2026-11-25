@@ -10,7 +10,10 @@ use agentkit_tools_core::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::tools::mcp::{McpRuntime, RemoteSkill};
+use crate::{
+    compose_output::MAX_MODEL_OUTPUT_BYTES,
+    tools::mcp::{McpRuntime, RemoteSkill},
+};
 
 pub(super) struct InventorySkillTool {
     local: Option<Arc<dyn Tool>>,
@@ -59,7 +62,6 @@ fn string_schema() -> Value {
 }
 
 const PAGE_ENTRIES: usize = 16;
-const PAGE_PREVIEW_BYTES: usize = 8 * 1024;
 
 fn inventory_page(
     mut inventory: Vec<RemoteSkill>,
@@ -68,8 +70,9 @@ fn inventory_page(
 ) -> Result<Value, ToolError> {
     inventory.sort_unstable_by(|a, b| (&a.server, &a.skill.uri).cmp(&(&b.server, &b.skill.uri)));
     let mut hash = blake3::Hasher::new();
+    hash.update(&[u8::from(truncated)]);
     for remote in &inventory {
-        for component in [&remote.server, &remote.skill.uri] {
+        for component in [&remote.server, &remote.skill.uri, &remote.skill.name] {
             hash.update(&component.len().to_le_bytes());
             hash.update(component.as_bytes());
         }
@@ -92,7 +95,7 @@ fn inventory_page(
     };
     let total = inventory.len();
     let mut entries = Vec::new();
-    let mut bytes = 0;
+    let mut row_bytes = 0;
     for remote in inventory.iter().skip(offset).take(PAGE_ENTRIES) {
         let entry = Value::Object(
             [
@@ -102,31 +105,48 @@ fn inventory_page(
             .into_iter()
             .collect(),
         );
-        bytes += entry.to_string().len();
-        // Always return the first selector: it cannot be truncated without
-        // changing the identity. Discovery limits the size of each entry.
-        if bytes > PAGE_PREVIEW_BYTES && !entries.is_empty() {
+        let next = offset.saturating_add(entries.len() + 1);
+        let cursor = page_cursor(next, total, fingerprint.as_str());
+        let candidate_bytes =
+            row_bytes + entry.to_string().len() + usize::from(!entries.is_empty());
+        let envelope_bytes = page_result(Vec::new(), truncated, cursor).to_string().len();
+        if candidate_bytes + envelope_bytes > MAX_MODEL_OUTPUT_BYTES {
+            if entries.is_empty() {
+                return Err(ToolError::Unavailable(
+                    "MCP skill selector exceeds the page budget".into(),
+                ));
+            }
             break;
         }
+        row_bytes = candidate_bytes;
         entries.push(entry);
     }
     let next = offset.saturating_add(entries.len());
-    Ok(Value::Object(
+    Ok(page_result(
+        entries,
+        truncated,
+        page_cursor(next, total, fingerprint.as_str()),
+    ))
+}
+
+fn page_cursor(next: usize, total: usize, fingerprint: &str) -> Value {
+    if next < total {
+        Value::from(format!("mcp:list:{next}:{fingerprint}"))
+    } else {
+        Value::Null
+    }
+}
+
+fn page_result(entries: Vec<Value>, truncated: bool, cursor: Value) -> Value {
+    Value::Object(
         [
             ("skills".into(), Value::Array(entries)),
             ("truncated".into(), Value::Bool(truncated)),
-            (
-                "next".into(),
-                if next < total {
-                    Value::from(format!("mcp:list:{next}:{fingerprint}"))
-                } else {
-                    Value::Null
-                },
-            ),
+            ("next".into(), cursor),
         ]
         .into_iter()
         .collect(),
-    ))
+    )
 }
 
 fn requested_remote(request: &ToolRequest) -> Option<&str> {
@@ -295,7 +315,41 @@ mod tests {
             inventory[PAGE_ENTRIES].selector()
         );
         assert!(second["truncated"].as_bool().unwrap());
-        assert!(inventory_page(inventory[1..].to_vec(), false, Some(cursor)).is_err());
+        assert!(inventory_page(inventory[1..].to_vec(), true, Some(cursor)).is_err());
+        let mut renamed = inventory;
+        let old = &renamed[0].skill;
+        renamed[0].skill = Arc::new(SkillMetadata {
+            uri: old.uri.clone(),
+            name: "renamed".into(),
+            description: old.description.clone(),
+            fingerprint: old.fingerprint,
+        });
+        assert!(inventory_page(renamed, true, Some(cursor)).is_err());
         assert!(second["next"].is_null());
+    }
+
+    #[test]
+    fn skill_inventory_page_counts_cursor_and_envelope_in_inline_budget() {
+        let inventory = (0..3)
+            .map(|i| RemoteSkill {
+                server: "test".into(),
+                skill: Arc::new(SkillMetadata {
+                    uri: format!("skill://{i}/SKILL.md"),
+                    name: "x".repeat(4030),
+                    description: String::new(),
+                    fingerprint: blake3::hash(&[i]),
+                }),
+            })
+            .collect::<Vec<_>>();
+        let first = inventory_page(inventory.clone(), false, None).unwrap();
+        assert!(first.to_string().len() <= MAX_MODEL_OUTPUT_BYTES);
+        assert_eq!(first["skills"].as_array().unwrap().len(), 1);
+        let cursor = first["next"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("mcp:list:")
+            .unwrap();
+        let second = inventory_page(inventory.clone(), false, Some(cursor)).unwrap();
+        assert_eq!(second["skills"][0]["selector"], inventory[1].selector());
     }
 }

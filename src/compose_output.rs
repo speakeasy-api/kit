@@ -4,7 +4,7 @@ use agentkit_core::{Part, ToolOutput, TurnCancellation};
 use agentkit_tools_core::ToolError;
 use serde_json::{Map, Value};
 
-const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// Resolve only the final Runlet JSON value. Both foreground and detached
 /// completions use this boundary; resolving a reference never reimports its path.
