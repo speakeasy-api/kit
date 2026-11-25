@@ -803,6 +803,8 @@ pub struct Runtime {
     compaction: crate::compaction::policy::CompactionConfig,
 }
 
+pub(crate) const SYSTEM_PROMPT_PREFIX: &str = "You are a coding agent using Kit version ";
+
 impl Runtime {
     pub fn new(root: impl AsRef<Path>, model: impl Into<String>) -> Result<Arc<Self>, String> {
         Self::new_with_provider(root, model, ProviderKind::default())
@@ -2576,6 +2578,8 @@ impl Runtime {
             concat!(
                 "You are a coding agent using Kit version {} as your harness, working in {}. This is your cwd and project context, not a filesystem boundary. ",
                 "Make minimal changes, inspect before editing, and run the smallest useful check. ",
+                "Treat unfamiliar files or edits as user work, and never run destructive commands (such as `git reset --hard` or `git checkout --`) unless explicitly requested. ",
+                "Think in systems and solve problems with comprehensive Runlet programs rather than iterating over many small turns: combine independent reads, searches, edits, and checks into one program, process and filter intermediate results inside the program, and return only the minimal output needed in context. ",
                 "Keep tool output lean: use targeted paths, ranges, filters, and bounded `head`/`tail` output. Do not dump whole trees, generated files, long successful build logs, credential files, or environment contents.\n\n"
             ),
             env!("CARGO_PKG_VERSION"),

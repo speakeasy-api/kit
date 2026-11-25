@@ -572,6 +572,77 @@ impl ModelAdapter for SelectableAdapter {
     }
 }
 
+const OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM: &str = concat!(
+    "# Additional guidance\n",
+    "- Match your action to the request: answer, explain, review, or diagnose without making edits unless asked; when asked to change or build something, persist end-to-end through implementation and verification rather than stopping at a plan or partial fix, yielding only when waiting for background work to resume or when blocked on a user decision or authorization.\n",
+    "- Treat action requests (\"can you...\", \"help me...\", \"I want to...\") as instructions to execute, not invitations to propose a plan or confirm capability.\n",
+    "- When the user points out a mistake or unmet requirement in an implementation task, fix it directly rather than only acknowledging or explaining it, unless they ask only for an explanation, review, or diagnosis.\n",
+    "- Work through errors and blockers within scope before coming back to the user. Keep code readable; avoid unnecessary abstractions or dense one-liners.\n",
+    "- Do not invent unsolicited warnings, disclaimers, approval checklists, or self-imposed rules for hypothetical risks. Do not narrate what you won't do or use contrastive filler (\"X, not Y\"). Do not claim changes succeeded or tests passed without actually running them.\n"
+);
+
+fn needs_openai_system_prompt_addendum(model: &str) -> bool {
+    let (vendor, after_vendor) = match model.rsplit_once('/') {
+        Some((vendor, slug)) => (Some(vendor), slug),
+        None => (None, model),
+    };
+    if vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai")) {
+        return true;
+    }
+    let slug = after_vendor
+        .split_once(':')
+        .map_or(after_vendor, |(base, _)| base)
+        .to_ascii_lowercase();
+    slug == "gpt"
+        || slug.starts_with("gpt-")
+        || slug.starts_with("chatgpt-")
+        || slug.starts_with("codex")
+        || slug == "o1"
+        || slug.starts_with("o1-")
+        || slug == "o3"
+        || slug.starts_with("o3-")
+        || slug == "o4"
+        || slug.starts_with("o4-")
+}
+
+fn apply_model_system_prompt(
+    request: &mut TurnRequest,
+    is_native_openai: bool,
+    model: Option<&str>,
+) {
+    if !is_native_openai && !model.is_some_and(needs_openai_system_prompt_addendum) {
+        return;
+    }
+    let Some(system_item) = request
+        .transcript
+        .iter_mut()
+        .find(|item| item.kind == agentkit_core::ItemKind::System)
+    else {
+        return;
+    };
+    let Some(Part::Text(text)) = system_item
+        .parts
+        .iter_mut()
+        .find(|part| matches!(part, Part::Text(_)))
+    else {
+        return;
+    };
+    if !text.text.starts_with(crate::runtime::SYSTEM_PROMPT_PREFIX)
+        || text.text.contains(OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM)
+    {
+        return;
+    }
+    if !text.text.ends_with("\n\n") {
+        if text.text.ends_with('\n') {
+            text.text.push('\n');
+        } else {
+            text.text.push_str("\n\n");
+        }
+    }
+    text.text.push_str(OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM);
+    text.text.push('\n');
+}
+
 fn expose_background_call_ids(request: &mut TurnRequest) {
     const DETACHED: &str = "is now running in the background";
     for item in &mut request.transcript {
@@ -1448,11 +1519,13 @@ impl ModelSession for KitSession {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        let request = if matches!(self, Self::OpenAiSubscription(_)) {
+        let is_native_openai = matches!(self, Self::OpenAiSubscription(_));
+        let mut request = if is_native_openai {
             request
         } else {
             project_tool_output_images(request, matches!(self, Self::Anthropic(_, _)))?
         };
+        apply_model_system_prompt(&mut request, is_native_openai, self.model_name());
         match self {
             Self::OpenAiSubscription(session) => session
                 .begin_turn(request, cancellation)
@@ -2234,12 +2307,13 @@ mod tests {
     use crate::credentials::CredentialStorage;
 
     use super::{
-        KitAdapter, KitSession, ModelSelection, OPENAI_FALLBACK, OPENROUTER_MODELS_URL,
-        OpenRouterApiKey, OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort,
-        SelectableAdapter, SelectableSession, SessionSelection, SpeakeasyKitAdapter,
-        SpeakeasyProvider, apply_openrouter_reasoning_effort, catalog_models_url,
-        expose_background_call_ids, gram_chat_id, models_url, openai_models,
-        openrouter_config_from_env, parse_context_window, rewrite_openrouter_media,
+        KitAdapter, KitSession, ModelSelection, OPENAI_FALLBACK,
+        OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM, OPENROUTER_MODELS_URL, OpenRouterApiKey,
+        OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter,
+        SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
+        apply_model_system_prompt, apply_openrouter_reasoning_effort, catalog_models_url,
+        expose_background_call_ids, gram_chat_id, models_url, needs_openai_system_prompt_addendum,
+        openai_models, openrouter_config_from_env, parse_context_window, rewrite_openrouter_media,
         stamp_context_window,
     };
 
@@ -3432,6 +3506,124 @@ mod tests {
             assert_eq!(usage.metadata["context_window"], json!(200_000));
             assert_eq!(usage.metadata["openrouter.context_length"], json!(200_000));
         }
+    }
+
+    #[test]
+    fn openai_system_prompt_addendum_matches_expected_models() {
+        for matching in [
+            "gpt-5.4",
+            "gpt-5.2-codex",
+            "gpt-6.2-sol",
+            "openai/gpt-5.4",
+            "openai/gpt-5.4:nitro",
+            "openai/chatgpt-4o-latest",
+            "chatgpt-4o-latest",
+            "openai/o3",
+            "openai/o4-mini",
+            "o3-pro",
+            "o1",
+            "codex-mini-latest",
+            "OPENAI/GPT-5.4",
+        ] {
+            assert!(
+                needs_openai_system_prompt_addendum(matching),
+                "expected {matching} to receive OpenAI addendum"
+            );
+        }
+        for non_matching in [
+            "claude-opus-4-6",
+            "anthropic/claude-sonnet-4-6",
+            "google/gemini-2.5-pro",
+            "google/gemini-3-pro",
+            "moonshotai/kimi-k2",
+            "deepseek/deepseek-r1",
+            "custom/not-gpt",
+        ] {
+            assert!(
+                !needs_openai_system_prompt_addendum(non_matching),
+                "expected {non_matching} not to receive OpenAI addendum"
+            );
+        }
+    }
+
+    #[test]
+    fn model_system_prompt_appends_only_to_kit_prompt_and_is_reversible() {
+        let base_prompt = format!(
+            "{}0.1.0 as your harness, working in /tmp.\n\n",
+            crate::runtime::SYSTEM_PROMPT_PREFIX
+        );
+        let canonical = TurnRequest {
+            session_id: SessionId::new("prompt-test"),
+            turn_id: TurnId::new("turn"),
+            transcript: vec![
+                Item::text(ItemKind::System, base_prompt.clone()),
+                Item::text(ItemKind::System, "Project AGENTS.md guidance"),
+                Item::text(ItemKind::User, "fix the bug"),
+            ],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        };
+
+        // OpenAI model gets the addendum appended to the native system prompt, before AGENTS.md.
+        let mut gpt_request = canonical.clone();
+        apply_model_system_prompt(&mut gpt_request, false, Some("openai/gpt-5.4"));
+        let Part::Text(gpt_system) = &gpt_request.transcript[0].parts[0] else {
+            panic!("expected system text");
+        };
+        assert!(gpt_system.text.starts_with(&base_prompt));
+        assert!(
+            gpt_system
+                .text
+                .contains(OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM)
+        );
+        let Part::Text(agents_md) = &gpt_request.transcript[1].parts[0] else {
+            panic!("expected AGENTS.md text");
+        };
+        assert_eq!(agents_md.text, "Project AGENTS.md guidance");
+
+        // Native OpenAI subscription sessions get the addendum even for custom/unrecognized model IDs.
+        let mut native_custom = canonical.clone();
+        apply_model_system_prompt(&mut native_custom, true, Some("custom-model"));
+        let Part::Text(native_system) = &native_custom.transcript[0].parts[0] else {
+            panic!("expected system text");
+        };
+        assert!(
+            native_system
+                .text
+                .contains(OPENAI_MODEL_SYSTEM_PROMPT_ADDENDUM)
+        );
+
+        // Idempotent if applied twice.
+        let once = gpt_system.text.clone();
+        apply_model_system_prompt(&mut gpt_request, true, Some("gpt-5.4"));
+        let Part::Text(gpt_system_again) = &gpt_request.transcript[0].parts[0] else {
+            panic!("expected system text");
+        };
+        assert_eq!(gpt_system_again.text, once);
+
+        // Switching to a non-OpenAI model uses the clean canonical transcript without the addendum.
+        let mut claude_request = canonical.clone();
+        apply_model_system_prompt(&mut claude_request, false, Some("claude-opus-4-6"));
+        let Part::Text(claude_system) = &claude_request.transcript[0].parts[0] else {
+            panic!("expected system text");
+        };
+        assert_eq!(claude_system.text, base_prompt);
+
+        // Non-Kit system prompts (such as compaction summarization) are left untouched.
+        let mut compaction_request = TurnRequest {
+            session_id: SessionId::new("compaction-test"),
+            turn_id: TurnId::new("turn"),
+            transcript: vec![Item::text(ItemKind::System, "Summarize this conversation.")],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        };
+        apply_model_system_prompt(&mut compaction_request, true, Some("gpt-5.4"));
+        let Part::Text(compaction_system) = &compaction_request.transcript[0].parts[0] else {
+            panic!("expected system text");
+        };
+        assert_eq!(compaction_system.text, "Summarize this conversation.");
     }
 }
 
