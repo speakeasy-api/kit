@@ -148,20 +148,34 @@ async fn scan_catalog(
     connection: &McpConnection,
     server: &str,
     retry_delay: Duration,
+    expanded_retry: bool,
 ) -> ScanResult {
     let limits = scan_limits(retry_delay);
     let deadline = Instant::now() + (limits.page_timeout * 2).min(LIST_TIMEOUT_MAX);
+    if expanded_retry {
+        let expanded = McpSkillScanLimits {
+            page_timeout: limits.page_timeout,
+            ..McpSkillScanLimits::default()
+        };
+        return match scan_prefix(connection, server, expanded, deadline).await {
+            Some((catalog, full, outcome)) if full || outcome.is_some() => {
+                ScanResult::Ready(catalog, outcome)
+            }
+            Some((catalog, _, _)) => ScanResult::Retry(Some(catalog), true),
+            None => ScanResult::Retry(None, true),
+        };
+    }
     let Some((prefix, full, outcome)) = scan_prefix(connection, server, limits, deadline).await
     else {
-        return ScanResult::Retry(None);
+        return ScanResult::Retry(None, false);
     };
     if full {
-        return ScanResult::Ready(prefix);
+        return ScanResult::Ready(prefix, outcome);
     }
     match outcome {
-        None => return ScanResult::Retry(Some(prefix)),
+        None => return ScanResult::Retry(Some(prefix), false),
         Some(McpSkillScanOutcome::Truncated(McpSkillScanLimit::EntryCount)) => {}
-        Some(_) => return ScanResult::Ready(prefix),
+        Some(_) => return ScanResult::Ready(prefix, outcome),
     }
     // If the first pass exhausted the visit limit without filling retention,
     // allow a bounded expansion. Never publish less because expansion failed
@@ -172,19 +186,25 @@ async fn scan_catalog(
     };
     match scan_prefix(connection, server, expanded, deadline).await {
         Some((catalog, full, outcome)) => {
-            let catalog = prefer_catalog(prefix, catalog);
+            let catalog = prefer_catalog(prefix, catalog, outcome);
             if full || outcome.is_some() {
-                ScanResult::Ready(catalog)
+                ScanResult::Ready(catalog, outcome)
             } else {
-                ScanResult::Retry(Some(catalog))
+                ScanResult::Retry(Some(catalog), true)
             }
         }
-        None => ScanResult::Retry(Some(prefix)),
+        None => ScanResult::Retry(Some(prefix), true),
     }
 }
 
-fn prefer_catalog(previous: Catalog, candidate: Catalog) -> Catalog {
-    if candidate.truncated && candidate.skills.len() < previous.skills.len() {
+fn prefer_catalog(
+    previous: Catalog,
+    candidate: Catalog,
+    outcome: Option<McpSkillScanOutcome>,
+) -> Catalog {
+    if outcome != Some(McpSkillScanOutcome::Complete)
+        && candidate.skills.len() < previous.skills.len()
+    {
         previous
     } else {
         candidate
@@ -192,8 +212,8 @@ fn prefer_catalog(previous: Catalog, candidate: Catalog) -> Catalog {
 }
 
 enum ScanResult {
-    Ready(Catalog),
-    Retry(Option<Catalog>),
+    Ready(Catalog, Option<McpSkillScanOutcome>),
+    Retry(Option<Catalog>, bool),
 }
 
 async fn scan_prefix(
@@ -265,6 +285,7 @@ enum EntryState {
         at: Instant,
         next_delay: Duration,
         catalog: Option<Catalog>,
+        expanded: bool,
     },
 }
 
@@ -371,7 +392,7 @@ async fn run(weak: Weak<Inner>) {
                 continue;
             }
             let epoch = connection.connection_epoch();
-            let (retry_delay, previous_catalog) = {
+            let (retry_delay, previous_catalog, expanded) = {
                 let Ok(entries) = inner.skills.entries.lock() else {
                     return;
                 };
@@ -384,12 +405,13 @@ async fn run(weak: Weak<Inner>) {
                         at,
                         next_delay,
                         catalog,
-                    }) if *at <= Instant::now() => (*next_delay, catalog.clone()),
+                        expanded,
+                    }) if *at <= Instant::now() => (*next_delay, catalog.clone(), *expanded),
                     Some(EntryState::Retry { at, .. }) => {
                         retry_at = Some(retry_at.map_or(*at, |earliest| earliest.min(*at)));
                         continue;
                     }
-                    None => (RETRY_INITIAL, None),
+                    None => (RETRY_INITIAL, None, false),
                 }
             };
             if !connection
@@ -401,22 +423,26 @@ async fn run(weak: Weak<Inner>) {
             active.insert(name.clone());
             pending.push(
                 async move {
-                    let next_state = match scan_catalog(&connection, &name, retry_delay).await {
-                        ScanResult::Ready(catalog) => EntryState::Ready(match previous_catalog {
-                            Some(previous) => prefer_catalog(previous, catalog),
-                            None => catalog,
-                        }),
-                        ScanResult::Retry(catalog) => EntryState::Retry {
-                            catalog: match (previous_catalog, catalog) {
-                                (Some(previous), Some(candidate)) => {
-                                    Some(prefer_catalog(previous, candidate))
-                                }
-                                (previous, candidate) => previous.or(candidate),
+                    let next_state =
+                        match scan_catalog(&connection, &name, retry_delay, expanded).await {
+                            ScanResult::Ready(catalog, outcome) => {
+                                EntryState::Ready(match previous_catalog {
+                                    Some(previous) => prefer_catalog(previous, catalog, outcome),
+                                    None => catalog,
+                                })
+                            }
+                            ScanResult::Retry(catalog, expanded) => EntryState::Retry {
+                                expanded,
+                                catalog: match (previous_catalog, catalog) {
+                                    (Some(previous), Some(candidate)) => {
+                                        Some(prefer_catalog(previous, candidate, None))
+                                    }
+                                    (previous, candidate) => previous.or(candidate),
+                                },
+                                at: Instant::now() + retry_delay,
+                                next_delay: (retry_delay * 2).min(RETRY_MAX),
                             },
-                            at: Instant::now() + retry_delay,
-                            next_delay: (retry_delay * 2).min(RETRY_MAX),
-                        },
-                    };
+                        };
                     Completion {
                         name,
                         connection,
@@ -520,6 +546,20 @@ mod tests {
             skills: Vec::new().into(),
             truncated: true,
         };
-        assert_eq!(prefer_catalog(original, truncated).skills.len(), 1);
+        assert_eq!(
+            prefer_catalog(original.clone(), truncated.clone(), None)
+                .skills
+                .len(),
+            1
+        );
+        assert!(
+            prefer_catalog(
+                original,
+                truncated,
+                Some(super::McpSkillScanOutcome::Complete)
+            )
+            .skills
+            .is_empty()
+        );
     }
 }

@@ -388,10 +388,13 @@ fn append_removed_group(
     let heading_start = message.len();
     message.push_str(heading);
     let mut group_count = 0;
-    for name in names
-        .iter()
-        .take(MAX_REPORTED_CHANGES.saturating_sub(*reported))
-    {
+    for name in names {
+        if *reported >= MAX_REPORTED_CHANGES {
+            break;
+        }
+        if message.len() + "\n- name: \"\"".len() + name.len() > content_limit {
+            continue;
+        }
         let row = format!(
             "\n- name: {}",
             serde_json::Value::String((*name).to_owned())
@@ -523,6 +526,20 @@ mod tests {
         assert!(changes.contains("Changed MCP skills"));
         assert!(changes.contains("Removed MCP skills"));
         assert!(notification(&next, &next, &descriptions).is_none());
+    }
+
+    #[test]
+    fn oversized_mcp_removals_do_not_hide_short_removals() {
+        let mut before = Catalog::new();
+        for i in 0..MAX_REPORTED_CHANGES {
+            let selector = format!("mcp:a{i:02}:{}", "x".repeat(MAX_NOTIFICATION_BYTES));
+            before.insert(selector.clone(), blake3::hash(selector.as_bytes()));
+        }
+        let short = "mcp:z";
+        before.insert(short.into(), blake3::hash(short.as_bytes()));
+        let message = notification(&before, &Catalog::new(), &BTreeMap::new()).unwrap();
+        assert!(message.contains(short));
+        assert!(message.len() <= MAX_NOTIFICATION_BYTES);
     }
 
     #[test]

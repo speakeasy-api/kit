@@ -216,7 +216,7 @@ impl Tool for InventorySkillTool {
         }
         if snapshot.truncated {
             spec.description
-                .push_str("\nSome advertised MCP skills exceeded the inventory limits.");
+                .push_str("\nThe MCP skill inventory is incomplete. Discovery may still be retrying or may have reached a limit.");
         }
         Some(spec)
     }
