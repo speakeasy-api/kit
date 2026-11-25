@@ -242,14 +242,10 @@ async fn scan_prefix(
         }),
     )
     .await;
-    let timed_out = matches!(
-        &outcome,
-        Err(_) | Ok(Err(agentkit_mcp::McpError::Timeout { .. }))
-    );
     let outcome = outcome.ok().and_then(Result::ok);
     let full = retained.len() == INVENTORY_MAX_ENTRIES
         || (remaining_bytes <= minimum_charge && !retained.is_empty());
-    if outcome.is_none() && !full && (!timed_out || retained.is_empty()) {
+    if outcome.is_none() && retained.is_empty() {
         return None;
     }
     Some((
@@ -326,16 +322,19 @@ impl McpRuntime {
         drop(entries);
         let mut result = SkillInventorySnapshot::default();
         for (server, entry) in snapshot {
+            if !entry.connection.upgrade().is_some_and(|connection| {
+                connection.connection_epoch() == entry.epoch && !connection.is_transport_closed()
+            }) {
+                continue;
+            }
             let catalog = match entry.state {
                 EntryState::Ready(catalog) => Some(catalog),
-                EntryState::Retry { catalog, .. } => catalog,
+                EntryState::Retry { catalog, .. } => {
+                    result.truncated = true;
+                    catalog
+                }
             };
-            if let Some(catalog) = catalog
-                && entry.connection.upgrade().is_some_and(|connection| {
-                    connection.connection_epoch() == entry.epoch
-                        && !connection.is_transport_closed()
-                })
-            {
+            if let Some(catalog) = catalog {
                 result.truncated |= catalog.truncated;
                 result
                     .skills

@@ -347,10 +347,10 @@ fn append_skill_group(
     let heading_start = message.len();
     message.push_str(&heading);
     let mut group_count = 0;
-    for (name, description) in skills
-        .iter()
-        .take(MAX_REPORTED_CHANGES.saturating_sub(*reported))
-    {
+    for (name, description) in skills {
+        if *reported >= MAX_REPORTED_CHANGES {
+            break;
+        }
         const ROW_OVERHEAD: usize = "\n- name: \"\"\n  description: \"\"".len();
         if message.len() + ROW_OVERHEAD + name.len() + description.len() > content_limit {
             continue;
@@ -526,6 +526,33 @@ mod tests {
         assert!(changes.contains("Changed MCP skills"));
         assert!(changes.contains("Removed MCP skills"));
         assert!(notification(&next, &next, &descriptions).is_none());
+    }
+
+    #[test]
+    fn oversized_mcp_rows_do_not_hide_short_additions_or_changes() {
+        let mut current = Catalog::new();
+        let mut descriptions = BTreeMap::new();
+        for i in 0..MAX_REPORTED_CHANGES {
+            let key = format!("mcp:a{i:02}:{}", "x".repeat(MAX_NOTIFICATION_BYTES));
+            current.insert(key.clone(), blake3::hash(b"new"));
+            descriptions.insert(key, "remote".into());
+        }
+        let short = "mcp:z";
+        current.insert(short.into(), blake3::hash(b"new"));
+        descriptions.insert(short.into(), "visible".into());
+        let old = current
+            .keys()
+            .map(|key| (key.clone(), blake3::hash(b"old")))
+            .collect();
+        for (before, heading) in [
+            (Catalog::new(), "Added MCP skills"),
+            (old, "Changed MCP skills"),
+        ] {
+            let message = notification(&before, &current, &descriptions).unwrap();
+            assert!(message.contains(heading));
+            assert!(message.contains(short));
+            assert!(message.len() <= MAX_NOTIFICATION_BYTES);
+        }
     }
 
     #[test]

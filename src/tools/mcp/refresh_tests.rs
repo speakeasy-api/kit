@@ -1105,11 +1105,17 @@ async fn mcp_skill_inventory_retries_without_reconnecting() {
         .unwrap()
         .connection();
     let epoch = connection.connection_epoch();
-    eventually(async || !peer.state.lock().await.skills.cursor_requests.is_empty()).await;
-    assert!(skill_names(&runtime).is_empty());
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.skills.is_empty() && snapshot.truncated
+    })
+    .await;
     peer.state.lock().await.skills.fail = false;
-    // No list-change notification, credentials change, or reconnect wakes discovery.
-    eventually(async || skill_names(&runtime).len() == 2).await;
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.skills.len() == 2 && !snapshot.truncated
+    })
+    .await;
     assert_eq!(skill_names(&runtime)[0].1, "recovered");
     assert_eq!(connection.connection_epoch(), epoch);
 }
@@ -1281,6 +1287,24 @@ async fn mcp_skill_inventory_publishes_partial_deadline_result_and_retries_expan
     })
     .await;
     assert_eq!(runtime.skill_inventory().len(), INVENTORY_MAX_ENTRIES);
+}
+
+#[tokio::test]
+async fn mcp_skill_inventory_keeps_validated_rows_after_continuation_error() {
+    let peer = Peer::with_protocol(Vec::new(), true).await;
+    peer.advertise_skills("prefix").await;
+    {
+        let mut state = peer.state.lock().await;
+        state.skills.catalog = Some(vec![remote_skill("prefix")].into());
+        state.skills.second_page = Some(Vec::<Value>::new().into());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir.path().join("mcp.json"), &[("peer", &peer)]).await;
+    eventually(async || {
+        let snapshot = runtime.skill_inventory_snapshot();
+        snapshot.truncated && snapshot.skills.iter().any(|row| row.skill.name == "prefix")
+    })
+    .await;
 }
 
 #[tokio::test]
