@@ -2017,18 +2017,32 @@ impl Runtime {
             )?
             .with_inference(self.adapter.inference())
             .with_gemini_non_thinking(self.adapter.gemini_non_thinking())
+            .with_repair_inherited_gemini_effort(opened.reasoning_effort.flatten().is_some())
             .with_session_observer(opened.observer.clone(), !request.resume)?;
-            if request.resume && self.model_override {
+            if request.resume && self.model_override && selection.provider != ProviderKind::Gemini {
                 opened
                     .observer
                     .set_model_and_reasoning_effort(&selection.id(), reasoning_effort)?;
             }
-            let pending_effort_repair = (request.resume
+            let pending_selection_persist = if request.resume
+                && self.model_override
+                && selection.provider == ProviderKind::Gemini
+            {
+                Some((
+                    opened.observer.clone(),
+                    Some(selection.id()),
+                    adapter.clone(),
+                ))
+            } else if request.resume
                 && !self.model_override
                 && restored.fallback.is_none()
                 && opened.reasoning_effort.is_some()
-                && Some(reasoning_effort) != opened.reasoning_effort)
-                .then(|| (opened.observer.clone(), reasoning_effort));
+            {
+                Some((opened.observer.clone(), None, adapter.clone()))
+            } else {
+                None
+            };
+            let saved_reasoning_effort = opened.reasoning_effort;
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
             let compactor = self
@@ -2126,13 +2140,18 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation, pending_effort_repair))
+            Ok::<_, String>((
+                driver,
+                pending_creation,
+                pending_selection_persist,
+                saved_reasoning_effort,
+            ))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation, pending_effort_repair) = {
+        let (mut driver, pending_creation, pending_selection_persist, saved_reasoning_effort) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {
@@ -2143,8 +2162,13 @@ impl Runtime {
         if let Some(observer) = pending_creation {
             observer.commit_creation()?;
         }
-        if let Some((observer, effort)) = pending_effort_repair {
-            observer.set_reasoning_effort(effort)?;
+        if let Some((observer, model_id, adapter)) = pending_selection_persist {
+            let effective_effort = adapter.reasoning_effort()?;
+            if let Some(model_id) = model_id {
+                observer.set_model_and_reasoning_effort(&model_id, effective_effort)?;
+            } else if Some(effective_effort) != saved_reasoning_effort {
+                observer.set_reasoning_effort(effective_effort)?;
+            }
         }
         let result = {
             let cancellation = std::pin::pin!(cancelled.cancelled());
@@ -2491,6 +2515,9 @@ impl Runtime {
             adapter
                 .with_inference(self.adapter.inference())
                 .with_gemini_non_thinking(self.adapter.gemini_non_thinking())
+                .with_repair_inherited_gemini_effort(
+                    !had_selected && opened.reasoning_effort.flatten().is_some(),
+                )
                 .with_session_observer(opened.observer.clone(), is_fork || !request.resume)
         })
         .map_err(AcpRuntimeError::Loop)?;
@@ -2578,18 +2605,19 @@ impl Runtime {
             .start(session_config)
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        let effective_effort = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
         if request.resume && self.model_override && !had_selected {
             override_observer
-                .set_model_and_reasoning_effort(&selection.id(), reasoning_effort)
+                .set_model_and_reasoning_effort(&selection.id(), effective_effort)
                 .map_err(AcpRuntimeError::Loop)?;
         } else if request.resume
             && !had_selected
             && model_fallback.is_none()
             && opened.reasoning_effort.is_some()
-            && Some(reasoning_effort) != opened.reasoning_effort
+            && Some(effective_effort) != opened.reasoning_effort
         {
             override_observer
-                .set_reasoning_effort(reasoning_effort)
+                .set_reasoning_effort(effective_effort)
                 .map_err(AcpRuntimeError::Loop)?;
         }
         let driver = AcpDriver {

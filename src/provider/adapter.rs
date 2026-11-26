@@ -255,6 +255,7 @@ pub struct SelectableAdapter {
     openrouter_api_key: Option<OpenRouterApiKey>,
     openai_model_catalog: SubscriptionModelCatalogCache,
     gemini_non_thinking: Arc<Mutex<std::collections::HashSet<String>>>,
+    repair_inherited_gemini_effort: bool,
     inference: super::inference::Instances,
 }
 
@@ -308,6 +309,7 @@ impl SelectableAdapter {
             openrouter_api_key,
             openai_model_catalog: SubscriptionModelCatalogCache::default(),
             gemini_non_thinking: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            repair_inherited_gemini_effort: false,
             inference: Default::default(),
         })
     }
@@ -325,6 +327,11 @@ impl SelectableAdapter {
         gemini_non_thinking: Arc<Mutex<std::collections::HashSet<String>>>,
     ) -> Self {
         self.gemini_non_thinking = gemini_non_thinking;
+        self
+    }
+
+    pub(crate) fn with_repair_inherited_gemini_effort(mut self, repair: bool) -> Self {
+        self.repair_inherited_gemini_effort = repair;
         self
     }
 
@@ -395,6 +402,7 @@ impl SelectableAdapter {
                 openrouter_api_key: self.openrouter_api_key.clone(),
                 openai_model_catalog: self.openai_model_catalog.clone(),
                 gemini_non_thinking: self.gemini_non_thinking.clone(),
+                repair_inherited_gemini_effort: false,
                 inference: self.inference.clone(),
             },
             revision,
@@ -571,9 +579,7 @@ impl SelectableAdapter {
     }
 
     pub(crate) async fn probe_gemini_thinking_veto(&self, selection: &ModelSelection) {
-        if selection.provider != ProviderKind::Gemini
-            || is_gemini_thinking_vetoed(&self.gemini_non_thinking, &selection.model)
-        {
+        if selection.provider != ProviderKind::Gemini {
             return;
         }
         let Ok(Some(credentials)) = super::gemini_auth::credentials(&self.credential_storage)
@@ -641,7 +647,7 @@ impl SelectableAdapter {
             .map_err(|_| "session selection lock is poisoned")?;
         // Same lock order and failure semantics as `select_reasoning_effort`.
         if let Some(observer) = &self.session_observer {
-            observer.set_model(&selection.id())?;
+            observer.set_model_and_reasoning_effort(&selection.id(), current.reasoning_effort)?;
         }
         current.model = selection;
         current.revision = current.revision.wrapping_add(1);
@@ -707,12 +713,12 @@ impl ModelAdapter for SelectableAdapter {
     type Session = SelectableSession;
 
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
-        let active = self
+        let mut active = self
             .selection
             .lock()
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
-        let inner = KitAdapter::new_with_inference(
+        let inner = match KitAdapter::new_with_inference(
             active.model.provider,
             active.model.model.clone(),
             self.credential_storage.clone(),
@@ -724,7 +730,41 @@ impl ModelAdapter for SelectableAdapter {
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
-        .await?;
+        .await
+        {
+            Ok(inner) => inner,
+            Err(error)
+                if self.repair_inherited_gemini_effort
+                    && active.model.provider == ProviderKind::Gemini
+                    && active.reasoning_effort.is_some()
+                    && is_gemini_thinking_vetoed(
+                        &self.gemini_non_thinking,
+                        &active.model.model,
+                    ) =>
+            {
+                active.reasoning_effort = None;
+                if let Ok(mut guard) = self.selection.lock()
+                    && guard.revision == active.revision
+                {
+                    guard.reasoning_effort = None;
+                }
+                KitAdapter::new_with_inference(
+                    active.model.provider,
+                    active.model.model.clone(),
+                    self.credential_storage.clone(),
+                    None,
+                    self.openrouter_api_key.as_ref(),
+                    self.openai_model_catalog.clone(),
+                    self.gemini_non_thinking.clone(),
+                    &self.inference,
+                )
+                .map_err(LoopError::InvalidState)?
+                .start_session(config.clone())
+                .await
+                .map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(SelectableSession {
             selection: Arc::clone(&self.selection),
             credential_storage: self.credential_storage.clone(),
@@ -1424,12 +1464,7 @@ impl ModelAdapter for KitAdapter {
                 .await
                 .ok();
                 if let Some(model) = resolved.as_ref() {
-                    if model.thinking == Some(false) {
-                        record_gemini_non_thinking(
-                            &adapter.non_thinking,
-                            std::slice::from_ref(model),
-                        );
-                    }
+                    record_gemini_non_thinking(&adapter.non_thinking, std::slice::from_ref(model));
                     if !model.supports_generate_content() {
                         return Err(LoopError::InvalidState(format!(
                             "Gemini model {:?} does not support generateContent",
@@ -2390,8 +2425,14 @@ fn record_gemini_non_thinking(
 ) {
     if let Ok(mut guard) = vetoed.lock() {
         for model in models {
-            if model.thinking == Some(false) {
-                guard.insert(model.id().to_ascii_lowercase());
+            match model.thinking {
+                Some(false) => {
+                    guard.insert(model.id().to_ascii_lowercase());
+                }
+                Some(true) => {
+                    guard.remove(&model.id().to_ascii_lowercase());
+                }
+                None => {}
             }
         }
     }
@@ -2501,7 +2542,12 @@ fn gemini_config(
     let Some(effort) = effort else {
         return Ok(config);
     };
-    if cached_non_thinking || metadata.and_then(|model| model.thinking) == Some(false) {
+    let thinking_vetoed = match metadata.and_then(|model| model.thinking) {
+        Some(false) => true,
+        Some(true) => false,
+        None => cached_non_thinking,
+    };
+    if thinking_vetoed {
         return Err(format!(
             "Cannot configure explicit reasoning effort for Gemini model {:?} because discovered metadata indicates thinking is not supported; select default reasoning effort",
             config.model
@@ -2899,8 +2945,9 @@ mod tests {
             "models/gemini-3.5-flash"
         ));
 
-        // Explicit effort is rejected when metadata or a cached veto reports thinking is unsupported.
-        let mut non_thinking = model;
+        // Explicit effort is rejected when metadata or a cached veto reports thinking is unsupported,
+        // but fresh positive detail supersedes a stale cached veto.
+        let mut non_thinking = model.clone();
         non_thinking.thinking = Some(false);
         assert!(
             gemini_config(
@@ -2913,10 +2960,58 @@ mod tests {
             .contains("default reasoning")
         );
         assert!(
-            gemini_config(base_25, Some(ReasoningEffort::Low), None, true)
+            gemini_config(base_25.clone(), Some(ReasoningEffort::Low), None, true)
                 .unwrap_err()
                 .contains("default reasoning")
         );
+        let mut positive_thinking = model;
+        positive_thinking.thinking = Some(true);
+        assert!(
+            gemini_config(
+                base_25,
+                Some(ReasoningEffort::High),
+                Some(&positive_thinking),
+                true
+            )
+            .is_ok()
+        );
+
+        // Explicit select after a passive fallback persists both the new model and retained effort.
+        let root = tempfile::tempdir().unwrap();
+        let open = |resume| {
+            let initial = if resume {
+                vec![]
+            } else {
+                vec![Item::text(ItemKind::System, "system")]
+            };
+            crate::session::open(root.path(), "fallback-switch", resume, false, initial).unwrap()
+        };
+        let opened = open(false);
+        opened
+            .observer
+            .set_model_and_reasoning_effort("gemini:gemini-2.5-pro", Some(ReasoningEffort::Medium))
+            .unwrap();
+        let fallback_adapter =
+            super::SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+                super::ProviderKind::Gemini,
+                "gemini-3-pro-preview",
+                crate::credentials::CredentialStorage::Memory,
+                None,
+                Some(super::OpenRouterApiKey::new("test-key")),
+            )
+            .unwrap()
+            .with_session_observer(opened.observer, false)
+            .unwrap();
+        fallback_adapter
+            .select(super::ModelSelection::new(
+                super::ProviderKind::OpenRouter,
+                "test/model",
+            ))
+            .unwrap();
+        drop(fallback_adapter);
+        let reopened = open(true);
+        assert_eq!(reopened.model.as_deref(), Some("openrouter:test/model"));
+        assert_eq!(reopened.reasoning_effort, Some(None));
     }
 
     #[test]
