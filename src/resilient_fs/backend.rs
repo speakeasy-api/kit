@@ -274,6 +274,11 @@ mod native {
             "expected a file name",
         ))
     }
+    // POSIX has no share modes to relax; the lease walks ancestors exactly
+    // like any other operation.
+    pub(super) fn parent_leased(path: &Path) -> io::Result<Parent> {
+        parent(path)
+    }
     impl Parent {
         pub(super) fn open(&self, o: &DiskOpenOptions) -> io::Result<File> {
             if !(o.read || o.write || o.append)
@@ -570,11 +575,45 @@ mod native {
         }
         Ok(f)
     }
+    fn directory_leased(path: &Path) -> io::Result<File> {
+        // The lease's ancestor pins live for the whole session, and
+        // `sync_directory` must flush those directories while they are
+        // pinned. FlushFileBuffers needs a write-data handle: measured on
+        // Windows, only GENERIC_WRITE, FILE_WRITE_DATA and FILE_APPEND_DATA
+        // flush (FILE_WRITE_ATTRIBUTES opens but its flush fails with
+        // ERROR_ACCESS_DENIED), and every one of them carries the
+        // write-share bit, which conflicts with share_mode(1). Sharing
+        // cannot tell kit's flush open from any other process's, so the
+        // lease pins share write. Delete sharing stays denied and sharing
+        // is not access, so rename protection and the ACL are unchanged. A
+        // junction conversion, if it ever happened, is still caught
+        // fail-closed by the identity and reparse checks on every later
+        // open. Transient per-operation pins keep share_mode(1): a write
+        // open is all FSCTL_SET_REPARSE_POINT needs to turn an empty pinned
+        // directory into a junction in place, so ordinary mutations never
+        // share write.
+        let f = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .custom_flags(REPARSE | BACKUP)
+            .open(path)?;
+        let m = f.metadata()?;
+        if !m.is_dir() || m.file_attributes() & REPARSE_ATTRIBUTE != 0 {
+            return Err(denied());
+        }
+        Ok(f)
+    }
     pub(super) struct Parent {
         path: PathBuf,
         _ancestors: Vec<File>,
     }
     pub(super) fn parent(path: &Path) -> io::Result<Parent> {
+        ancestor_walk(path, directory)
+    }
+    pub(super) fn parent_leased(path: &Path) -> io::Result<Parent> {
+        ancestor_walk(path, directory_leased)
+    }
+    fn ancestor_walk(path: &Path, open: fn(&Path) -> io::Result<File>) -> io::Result<Parent> {
         let absolute = if path.is_absolute() {
             path.to_owned()
         } else {
@@ -590,7 +629,7 @@ mod native {
                 Component::Prefix(_) => prefix.push(part.as_os_str()),
                 Component::RootDir | Component::Normal(_) => {
                     prefix.push(part.as_os_str());
-                    ancestors.push(directory(&prefix)?);
+                    ancestors.push(open(&prefix)?);
                 }
                 Component::CurDir => {}
                 _ => return Err(denied()),
@@ -669,9 +708,37 @@ mod native {
         file.set_permissions(permissions)
     }
     pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
-        let _p = parent(&path.join(".kit-sync-anchor"))?;
-        // Windows does not support FlushFileBuffers on directory handles.
-        Ok(())
+        // FlushFileBuffers works on a directory handle only when the handle
+        // has write access; a read/listing handle fails with
+        // ERROR_ACCESS_DENIED. BACKUP_SEMANTICS is what opens a directory at
+        // all, and REPARSE keeps the no-reparse-follow stance of every other
+        // open here. The pinned ancestor walk protects the ancestors only;
+        // the target itself is opened for write, so it must not also be
+        // pinned read-only (hence the separate anchor-free open).
+        let absolute: PathBuf = if path.is_absolute() {
+            path.components().collect()
+        } else {
+            std::env::current_dir()?.join(path).components().collect()
+        };
+        // Keep the parent pin alive through the open, metadata checks and
+        // flush. Dropping it before opening would leave the ancestors
+        // replaceable (OPEN_REPARSE_POINT only covers the final component).
+        // A volume root has no ancestors to pin.
+        let pinned = if absolute.file_name().is_some() {
+            Some(parent(&absolute)?)
+        } else {
+            None
+        };
+        let target = pinned.as_ref().map_or(&absolute, |p| &p.path);
+        let dir = OpenOptions::new()
+            .write(true)
+            .custom_flags(REPARSE | BACKUP)
+            .open(target)?;
+        let m = dir.metadata()?;
+        if !m.is_dir() || m.file_attributes() & REPARSE_ATTRIBUTE != 0 {
+            return Err(denied());
+        }
+        dir.sync_all()
     }
     pub(super) fn open_beneath(root: &Path, relative: &Path) -> io::Result<File> {
         if relative.as_os_str().is_empty()
@@ -779,7 +846,7 @@ fn acquire_lease(request: &LeaseRequest) -> io::Result<Box<dyn BackendLease>> {
         token[i * 2] = b"0123456789abcdef"[(byte >> 4) as usize];
         token[i * 2 + 1] = b"0123456789abcdef"[(byte & 15) as usize];
     }
-    let parent = native::parent(&request.path)?;
+    let parent = native::parent_leased(&request.path)?;
     let mut options = DiskOpenOptions {
         read: true,
         write: true,
@@ -1262,5 +1329,100 @@ mod tests {
         assert!(DiskBackend.acquire_lease(&request).is_err());
         assert_eq!(fs::read(&request.path).unwrap(), b"public");
         assert_eq!(fs::metadata(&request.path).unwrap().mode() & 0o777, 0o644);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )]
+    use super::*;
+
+    // These run on a Windows GitHub Actions runner: the flush must work with
+    // a live session lease holding the directory pinned, a transient
+    // per-operation pin must still deny a write open, and the lease pin
+    // must still reject a rename of that pinned directory.
+    #[test]
+    fn sync_directory_succeeds_on_a_real_directory() {
+        let dir = std::env::temp_dir().join(format!("kit-sync-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        DiskBackend.sync_directory(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_directory_propagates_missing_directory() {
+        let missing = std::env::temp_dir().join("kit-sync-no-such-dir");
+        assert!(DiskBackend.sync_directory(&missing).is_err());
+    }
+
+    #[test]
+    fn sync_directory_coexists_with_a_held_session_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = DiskBackend
+            .acquire_lease(&LeaseRequest {
+                path: dir.path().join("session.lock"),
+                scope: dir.path().to_owned(),
+                mode: LeaseMode::CreateNew,
+                remove_on_drop: true,
+            })
+            .unwrap();
+        DiskBackend.sync_directory(dir.path()).unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn pinned_directory_still_resists_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = DiskBackend
+            .acquire_lease(&LeaseRequest {
+                path: dir.path().join("session.lock"),
+                scope: dir.path().to_owned(),
+                mode: LeaseMode::CreateNew,
+                remove_on_drop: true,
+            })
+            .unwrap();
+        let moved = dir.path().with_extension("moved");
+        assert!(fs::rename(dir.path(), &moved).is_err());
+        DiskBackend.sync_directory(dir.path()).unwrap();
+        drop(lease);
+        let _ = fs::remove_dir_all(&moved);
+    }
+
+    #[test]
+    fn transient_pin_denies_write_open() {
+        // A write open is all FSCTL_SET_REPARSE_POINT needs to turn an empty
+        // pinned directory into a junction in place, so a per-operation pin
+        // must keep denying it for the operation's duration.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = native::parent(&dir.path().join("child")).unwrap();
+        let attempted = OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir.path());
+        let error = attempted.expect_err("transient pin must deny a write open");
+        assert_eq!(error.raw_os_error(), Some(32));
+        drop(pinned);
+    }
+
+    #[test]
+    fn sync_directory_rejects_a_reparse_point() {
+        // The write open uses OPEN_REPARSE_POINT and the metadata check
+        // rejects a reparse directory, so a junction conversion is caught
+        // fail-closed instead of being flushed through.
+        use std::os::windows::fs::symlink_dir;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        symlink_dir(&real, &link).unwrap();
+        assert!(DiskBackend.sync_directory(&link).is_err());
     }
 }
