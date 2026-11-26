@@ -38,7 +38,7 @@ Fewer model round trips repeat less context and complete more work in each reque
 - **Reusable subagents.** A subagent is a reusable value. You can continue, fork, inspect, and close a subagent. You can require JSON that matches a schema. You can also use Claude Code, Codex, Cursor, or Kit as the subagent harness over ACP.
 - **Open protocols.** Kit supports ACP v1 and v2 over stdio, HTTP/SSE, and WebSocket. Kit supports A2A v1 in both directions. It also supports MCP, Agent Skills, and Agent Plugin packages.
 - **Long sessions.** Kit synchronizes each append-only JSONL transcript item to disk before it accepts the item. It compacts context automatically at 80% of the context window. You can resume a session from `tui`, `prompt`, or any ACP client. Kit also uses crash-safe locks. It retries eligible `openai-subscription` failures for up to 24 hours.
-- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports the Anthropic API directly and models through OpenRouter and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
+- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports the Anthropic and Gemini APIs directly and models through OpenRouter and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
 - **Small runtime.** Kit has no permissions framework, sandbox, or web UI. The `--root` option sets the working directory. Kit is a runtime, not a security boundary. Run Kit inside a security boundary that you trust. See the [trust model](docs/user/security-limits-and-troubleshooting.md).
 
 ## Install
@@ -169,6 +169,10 @@ For direct Anthropic API usage, run `kit auth login anthropic`, then select
 `--provider anthropic --model claude-sonnet-5-5`. Use a single-workspace Console
 API key; `ANTHROPIC_API_KEY` is also supported. See
 [Anthropic setup](docs/user/getting-started-and-configuration.md#direct-anthropic-api).
+
+For direct Gemini API usage, run `kit auth login gemini`, then select
+`--provider gemini --model gemini-2.5-pro`. `GEMINI_API_KEY` is also supported.
+See [Gemini setup](docs/user/getting-started-and-configuration.md#direct-gemini-api).
 
 ### Coming from Claude Code or Codex
 

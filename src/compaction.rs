@@ -2114,6 +2114,31 @@ pub struct AutomaticCompactor {
     preparation: Option<background::Preparation>,
 }
 
+fn strip_abandoned_switch_markers(
+    transcript: &[Item],
+    keep_trailing_manual: bool,
+) -> std::borrow::Cow<'_, [Item]> {
+    let last_index = transcript.len().checked_sub(1);
+    let has_abandoned = transcript.iter().enumerate().any(|(idx, item)| {
+        crate::protocols::acp::model_switch::is_compact_marker(item)
+            && !(keep_trailing_manual && Some(idx) == last_index)
+    });
+    if !has_abandoned {
+        return std::borrow::Cow::Borrowed(transcript);
+    }
+    std::borrow::Cow::Owned(
+        transcript
+            .iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                !crate::protocols::acp::model_switch::is_compact_marker(item)
+                    || (keep_trailing_manual && Some(*idx) == last_index)
+            })
+            .map(|(_, item)| item.clone())
+            .collect(),
+    )
+}
+
 impl AutomaticCompactor {
     /// Enables single-flight preparation using a fresh immutable model snapshot.
     /// The factory must not attach persistence, session observers, or hooks.
@@ -2266,9 +2291,8 @@ impl AutomaticCompactor {
                 preparation.cancel(false);
                 None
             } else {
-                preparation
-                    .take(cursor.as_slice(), ctx.cancellation.clone())
-                    .await
+                let sanitized = strip_abandoned_switch_markers(cursor.as_slice(), false);
+                preparation.take(&sanitized, ctx.cancellation.clone()).await
             }
         } else {
             None
@@ -2296,8 +2320,12 @@ impl AutomaticCompactor {
         } else if let Some(prepared) = prepared {
             Ok(prepared)
         } else {
+            let sanitized = strip_abandoned_switch_markers(
+                cursor.as_slice(),
+                matches!(reason, CompactionReason::Manual),
+            );
             self.inner
-                .compact(cursor.as_slice(), reason.clone(), ctx.cancellation.clone())
+                .compact(&sanitized, reason.clone(), ctx.cancellation.clone())
                 .await
         };
         if let Some(preparation) = &self.preparation {
@@ -2315,7 +2343,9 @@ impl AutomaticCompactor {
         );
 
         match result {
-            Ok(compacted) => {
+            Ok(mut compacted) => {
+                compacted
+                    .retain(|item| !crate::protocols::acp::model_switch::is_compact_marker(item));
                 if ctx.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
                     metadata.insert("cancelled".into(), true.into());
                     lifecycle.finish(false, metadata);

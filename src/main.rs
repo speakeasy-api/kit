@@ -596,7 +596,7 @@ tables, and quoted strings). Use --string to force literal string input.
 Root settings:
   root                              Working directory and project context
   model                             Default model ID
-  provider                          Model provider: openai-subscription, openrouter, speakeasy, anthropic
+  provider                          Model provider: openai-subscription, openrouter, speakeasy, anthropic, gemini
   reasoning_effort                  Reasoning effort: low, medium, high; unset for provider default
   a2a                               A2A listener bind address (e.g. 127.0.0.1:7331)
   mcp_config                        MCP server configuration path
@@ -1312,6 +1312,7 @@ impl ValueEnum for AuthProvider {
             Self::Speakeasy,
             Self::Typesafe,
             Self::Anthropic,
+            Self::Gemini,
         ]
     }
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -1321,6 +1322,7 @@ impl ValueEnum for AuthProvider {
             Self::Speakeasy => "speakeasy",
             Self::Typesafe => "typesafe",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
         }))
     }
 }
@@ -1711,6 +1713,7 @@ enum AuthProvider {
     Speakeasy,
     Typesafe,
     Anthropic,
+    Gemini,
 }
 
 enum AuthAction {
@@ -1971,6 +1974,7 @@ async fn execute_auth(
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
         TypeSafe(kit::provider::TypeSafeAuthCommand),
         Anthropic(kit::provider::AnthropicAuthCommand),
+        Gemini(kit::provider::GeminiAuthCommand),
         Logout(kit::ProviderKind, bool),
     }
     let command = match action {
@@ -1979,6 +1983,7 @@ async fn execute_auth(
             AuthProvider::Anthropic => {
                 Execution::Anthropic(kit::provider::AnthropicAuthCommand::Login)
             }
+            AuthProvider::Gemini => Execution::Gemini(kit::provider::GeminiAuthCommand::Login),
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Login)
             }
@@ -1994,6 +1999,7 @@ async fn execute_auth(
             AuthProvider::Anthropic => {
                 Execution::Anthropic(kit::provider::AnthropicAuthCommand::Status)
             }
+            AuthProvider::Gemini => Execution::Gemini(kit::provider::GeminiAuthCommand::Status),
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Status)
             }
@@ -2015,6 +2021,7 @@ async fn execute_auth(
                 Execution::Logout(kit::ProviderKind::OpenRouter, *local_only)
             }
             AuthProvider::Anthropic => Execution::Logout(kit::ProviderKind::Anthropic, *local_only),
+            AuthProvider::Gemini => Execution::Logout(kit::ProviderKind::Gemini, *local_only),
             AuthProvider::Speakeasy => Execution::Logout(kit::ProviderKind::Speakeasy, *local_only),
             AuthProvider::Typesafe => {
                 Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Logout {
@@ -2034,6 +2041,7 @@ async fn execute_auth(
         ),
         Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
         Execution::Anthropic(command) => kit::provider::execute_anthropic_auth(command, &storage),
+        Execution::Gemini(command) => kit::provider::execute_gemini_auth(command, &storage),
         Execution::TypeSafe(command) => kit::provider::execute_typesafe_auth(command, &storage),
         Execution::Logout(provider, local_only) => kit::provider::execute_provider_logout(
             provider,
@@ -4391,7 +4399,7 @@ future_option = true
             assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
             for setting in [
                 "Default model ID",
-                "Model provider: openai-subscription, openrouter, speakeasy, anthropic",
+                "Model provider: openai-subscription, openrouter, speakeasy, anthropic, gemini",
                 "Reasoning effort: low, medium, high; unset for provider default",
                 "A2A listener bind address (e.g. 127.0.0.1:7331)",
                 "Credential backend: memory, keychain, file",
@@ -4608,6 +4616,7 @@ future_option = true
         assert!(
             Cli::try_parse_from(["kit", "auth", "logout", "anthropic", "--local-only"]).is_ok()
         );
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "gemini", "--local-only"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "kit",
@@ -4620,11 +4629,26 @@ future_option = true
             .is_ok()
         );
         assert!(
+            Cli::try_parse_from([
+                "kit",
+                "acp",
+                "--provider",
+                "gemini",
+                "--model",
+                "gemini-2.5-pro"
+            ])
+            .is_ok()
+        );
+        assert!(
             Cli::try_parse_from(["kit", "auth", "login", "anthropic", "--api-key", "secret"])
                 .is_err()
         );
+        assert!(
+            Cli::try_parse_from(["kit", "auth", "login", "gemini", "--api-key", "secret"]).is_err()
+        );
         for action in ["login", "status", "logout"] {
             assert!(Cli::try_parse_from(["kit", "auth", action, "anthropic"]).is_ok());
+            assert!(Cli::try_parse_from(["kit", "auth", action, "gemini"]).is_ok());
             assert!(Cli::try_parse_from(["kit", "auth", action, "typesafe"]).is_ok());
         }
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "typesafe", "--local-only"]).is_ok());
@@ -4679,6 +4703,7 @@ future_option = true
             AuthProvider::Speakeasy,
             AuthProvider::Typesafe,
             AuthProvider::Anthropic,
+            AuthProvider::Gemini,
         ] {
             let login = AuthAction::Login { provider };
             assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());

@@ -648,6 +648,7 @@ async fn federation_missing_assertion_fails_without_legacy_credentials() {
         None,
         None,
         Default::default(),
+        Default::default(),
         &instances,
     )
     .unwrap();

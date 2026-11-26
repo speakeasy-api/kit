@@ -40,16 +40,17 @@ agenthooksprotocol = { version = "=0.10.1", default-features = false, features =
 agent-client-protocol = { package = "agentkit-acp-sdk", version = "=5.4.0", features = ["stdio", "unstable_session_fork", "unstable_prompt_delivery", "unstable_subagents"] }
 agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.19.0", features = ["unstable_end_turn_token_usage"] }
 agent-client-protocol-http = { package = "agentkit-acp-http", version = "=5.4.0", default-features = false, features = ["server", "client"] }
-agentkit-acp = { version = "=0.13.0", features = ["unstable-prompt-delivery"] }
+agentkit-acp = { version = "=0.13.1", features = ["unstable-prompt-delivery"] }
 agentkit-adapter-completions = "=0.11.0"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.11.0"
-agentkit-loop = { version = "=0.11.1", features = ["otel"] }
+agentkit-loop = { version = "=0.11.3", features = ["otel"] }
 agentkit-mcp = "=0.13.0"
 agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
 agentkit-provider-anthropic = "=0.11.0"
+agentkit-provider-gemini = "=0.11.0"
 agentkit-provider-openai = "=0.11.0"
 agentkit-provider-openrouter = "=0.11.0"
 agentkit-task-manager = "=0.10.7"

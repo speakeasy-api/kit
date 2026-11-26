@@ -150,8 +150,8 @@ pub(super) fn restored_context(
             .find_map(|item| item.usage.as_ref())?
             .metadata
             .get(crate::provider::USAGE_MODEL_METADATA_KEY);
-        let applies = match producer {
-            Some(producer) => producer.as_str() == Some(selection.id().as_str()),
+        let applies = match producer.and_then(serde_json::Value::as_str) {
+            Some(producer) => same_model_identity(producer, selection),
             None => unattributed_usage_applies,
         };
         applies
@@ -159,6 +159,25 @@ pub(super) fn restored_context(
             .flatten()
     };
     Some((used, advertised.or_else(recorded)?))
+}
+
+fn same_model_identity(producer: &str, selection: &crate::provider::ModelSelection) -> bool {
+    if producer == selection.id() {
+        return true;
+    }
+    if selection.provider == crate::provider::ProviderKind::Gemini
+        && let Some(recorded_model) = producer.strip_prefix("gemini:")
+    {
+        let recorded_norm = recorded_model
+            .strip_prefix("models/")
+            .unwrap_or(recorded_model);
+        let selected_norm = selection
+            .model
+            .strip_prefix("models/")
+            .unwrap_or(&selection.model);
+        return recorded_norm == selected_norm;
+    }
+    false
 }
 
 #[derive(Clone)]
@@ -904,6 +923,28 @@ mod tests {
         assert_eq!(
             activity.completed_usage().unwrap(),
             Some(TokenUsage::new(7, 1))
+        );
+    }
+
+    #[test]
+    fn restored_context_matches_equivalent_gemini_resource_ids() {
+        let mut usage = Usage::new(TokenUsage::new(100, 0));
+        usage
+            .metadata
+            .insert("context_window".into(), 1000u64.into());
+        usage.metadata.insert(
+            crate::provider::USAGE_MODEL_METADATA_KEY.into(),
+            "gemini:gemini-2.5-pro".into(),
+        );
+        let item =
+            agentkit_core::Item::text(agentkit_core::ItemKind::Assistant, "ok").with_usage(usage);
+        let selection = crate::provider::ModelSelection::new(
+            crate::provider::ProviderKind::Gemini,
+            "models/gemini-2.5-pro",
+        );
+        assert_eq!(
+            restored_context(&[item], &[], &selection, false),
+            Some((100, 1000)),
         );
     }
 }

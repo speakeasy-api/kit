@@ -1177,6 +1177,18 @@ impl SessionObserver {
             .set_model(model)
     }
 
+    /// Atomically records the session's model id and reasoning effort in one record.
+    pub(crate) fn set_model_and_reasoning_effort(
+        &self,
+        model: &str,
+        effort: Option<crate::ReasoningEffort>,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?
+            .set_model_and_reasoning_effort(model, effort)
+    }
+
     /// Appends parent-owned child state under the transcript lease and generation lock.
     /// Unlike ordinary transcript output, child lifecycle writes require disk.
     /// No registry callback runs while this writer guard is held; poison is isolation.
@@ -1218,13 +1230,18 @@ impl SessionObserver {
     /// Existing append records remain intact, while readers treat this record as
     /// a new canonical snapshot.
     pub fn replace(&self, transcript: &[Item]) -> Result<(), String> {
-        if transcript.is_empty() {
+        let filtered: Vec<_> = transcript
+            .iter()
+            .filter(|item| !crate::protocols::acp::model_switch::is_compact_marker(item))
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
             return Err("cannot persist an empty transcript replacement".into());
         }
         self.0
             .lock()
             .map_err(|_| "session transcript writer poisoned".to_string())?
-            .replace(transcript)
+            .replace(&filtered)
     }
 }
 
@@ -1274,12 +1291,21 @@ impl TranscriptObserver for SessionObserver {
         // As with appends, storage is best-effort and cannot roll back that
         // commit. Keep the existing loss-domain semantics; report rejected
         // writes rather than claiming that the replacement reached disk.
-        if let Err(error) = self.replace(items) {
+        let filtered: Vec<_> = items
+            .iter()
+            .filter(|item| !crate::protocols::acp::model_switch::is_compact_marker(item))
+            .cloned()
+            .collect();
+        if let Err(error) = self.replace(&filtered) {
             tracing::warn!(%session_id, %error, "could not persist committed transcript replacement");
         }
     }
 
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        // Synthetic switch-compaction markers are internal triggers, never durable user history.
+        if crate::protocols::acp::model_switch::is_compact_marker(event.item) {
+            return;
+        }
         // Persistence must not prevent the loop from committing its in-memory
         // transcript. Poison still isolates the writer: never recover a guard
         // whose file or lease transition may have been interrupted.
@@ -1347,6 +1373,48 @@ impl Writer {
         };
         self.write_record(record, generation)?;
         self.model = Some(model.into());
+        Ok(())
+    }
+
+    fn set_model_and_reasoning_effort(
+        &mut self,
+        model: &str,
+        effort: Option<crate::ReasoningEffort>,
+    ) -> Result<(), String> {
+        let model_changed = self.model.as_deref() != Some(model);
+        let effort_changed = self.reasoning_effort != Some(effort);
+        if !model_changed && !effort_changed {
+            return Ok(());
+        }
+        self.ensure_lock()?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?;
+        let record = Record {
+            schema_version: MODEL_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            generation,
+            workspace_root: Some(self.workspace_root.clone()),
+            item: None,
+            replacement: None,
+            redirect: None,
+            child: None,
+            snapshot: None,
+            reasoning_effort: effort_changed.then(|| {
+                effort
+                    .map_or("default", crate::ReasoningEffort::as_str)
+                    .into()
+            }),
+            model: model_changed.then(|| model.into()),
+        };
+        self.write_record(record, generation)?;
+        if model_changed {
+            self.model = Some(model.into());
+        }
+        if effort_changed {
+            self.reasoning_effort = Some(effort);
+        }
         Ok(())
     }
 

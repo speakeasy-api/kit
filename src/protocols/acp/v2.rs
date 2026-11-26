@@ -1286,7 +1286,7 @@ impl Server {
             .reasoning_effort()
             .map_err(AcpRuntimeError::Loop)?;
         let catalog = driver.adapter.model_catalog(&current).await;
-        let config_options = v2_config_options(&current, reasoning, &catalog);
+        let config_options = v2_config_options_for(&driver.adapter, &current, reasoning, &catalog);
         let model_fallback = driver.model_fallback.clone();
         let restored_context = super::usage::restored_context(
             &driver.canonical_transcript,
@@ -1996,6 +1996,26 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                             let target = request.value.as_id().ok_or_else(|| {
                                 model_switch::error("selection requires an id value")
                             })?;
+                            let target_selection =
+                                crate::provider::ModelSelection::from_id(&target.to_string())
+                                    .map_err(|error| model_switch::error(&error))?;
+                            {
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
+                                let preflight = std::pin::pin!(
+                                    adapter.preflight_model_switch(&target_selection)
+                                );
+                                match futures_util::future::select(cancelled, preflight).await {
+                                    futures_util::future::Either::Left(((), _)) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    futures_util::future::Either::Right((result, _)) => {
+                                        result.map_err(|error| model_switch::error(&error))?;
+                                    }
+                                }
+                            }
+                            if cancellation.is_cancelled() {
+                                return Err(model_switch::error("model change cancelled"));
+                            }
                             let decision = model_switch.check(
                                 (
                                     &adapter
@@ -2003,8 +2023,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                         .map_err(|error| model_switch::error(&error))?,
                                     cancellation.generation(),
                                 ),
-                                crate::provider::ModelSelection::from_id(&target.to_string())
-                                    .map_err(|error| model_switch::error(&error))?,
+                                target_selection,
                                 &catalog,
                                 driver.snapshot().transcript,
                                 request
@@ -2013,6 +2032,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                     .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
+                                if cancellation.is_cancelled() {
+                                    return Err(model_switch::error("model change cancelled"));
+                                }
                                 busy.store(true, Ordering::Release);
                                 let compacted = compact_for_switch(
                                     &session_id,
@@ -2026,6 +2048,30 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                 .await;
                                 busy.store(false, Ordering::Release);
                                 compacted?;
+                            }
+                        } else if request.config_id.to_string() == super::REASONING_EFFORT_CONFIG_ID
+                        {
+                            let value = request
+                                .value
+                                .as_id()
+                                .ok_or_else(|| {
+                                    model_switch::error("selection requires an id value")
+                                })?
+                                .to_string();
+                            let effort = crate::provider::ReasoningEffort::from_id(&value)
+                                .map_err(|error| model_switch::error(&error))?;
+                            if effort.is_some() {
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
+                                let preflight =
+                                    std::pin::pin!(adapter.preflight_reasoning_effort(effort));
+                                match futures_util::future::select(cancelled, preflight).await {
+                                    futures_util::future::Either::Left(((), _)) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    futures_util::future::Either::Right((result, _)) => {
+                                        result.map_err(|error| model_switch::error(&error))?;
+                                    }
+                                }
                             }
                         }
                         if cancellation.is_cancelled() {
@@ -2087,7 +2133,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                 "session must be settled before snapshot".into(),
                             ));
                         }
-                        let transcript = driver.snapshot().transcript;
+                        let mut transcript = driver.snapshot().transcript;
+                        transcript.retain(|item| !model_switch::is_compact_marker(item));
                         let children_after = subagents
                             .as_ref()
                             .map(|s| s.active_count())
@@ -2781,10 +2828,33 @@ fn error_stop_reason() -> wire::StopReason {
     wire::StopReason::Error(wire::ErrorStopReason::new())
 }
 
+fn v2_config_options_for(
+    adapter: &SelectableAdapter,
+    current: &crate::provider::ModelSelection,
+    reasoning: Option<crate::provider::ReasoningEffort>,
+    catalog: &[crate::provider::ModelGroup],
+) -> Vec<wire::SessionConfigOption> {
+    v2_config_options_with_filter(current, reasoning, catalog, |effort| {
+        adapter.supports_reasoning_effort(effort)
+    })
+}
+
+#[cfg(test)]
 fn v2_config_options(
     current: &crate::provider::ModelSelection,
     reasoning: Option<crate::provider::ReasoningEffort>,
     catalog: &[crate::provider::ModelGroup],
+) -> Vec<wire::SessionConfigOption> {
+    v2_config_options_with_filter(current, reasoning, catalog, |effort| {
+        current.supports_reasoning_effort(effort)
+    })
+}
+
+fn v2_config_options_with_filter(
+    current: &crate::provider::ModelSelection,
+    reasoning: Option<crate::provider::ReasoningEffort>,
+    catalog: &[crate::provider::ModelGroup],
+    supports_effort: impl Fn(crate::provider::ReasoningEffort) -> bool,
 ) -> Vec<wire::SessionConfigOption> {
     let groups = catalog
         .iter()
@@ -2794,6 +2864,7 @@ fn v2_config_options(
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
                 crate::ProviderKind::Anthropic => "Anthropic",
+                crate::ProviderKind::Gemini => "Gemini",
             };
             let options = group
                 .models
@@ -2810,13 +2881,20 @@ fn v2_config_options(
         })
         .collect::<Vec<_>>();
     let effort_options = [
-        ("default", "Default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
+        (None, "default", "Default"),
+        (Some(crate::provider::ReasoningEffort::Low), "low", "Low"),
+        (
+            Some(crate::provider::ReasoningEffort::Medium),
+            "medium",
+            "Medium",
+        ),
+        (Some(crate::provider::ReasoningEffort::High), "high", "High"),
     ]
     .into_iter()
-    .map(|(value, name)| wire::SessionConfigSelectOption::new(value, name))
+    .filter(|(effort, _, _)| {
+        effort.is_none_or(|effort| supports_effort(effort) || reasoning == Some(effort))
+    })
+    .map(|(_, value, name)| wire::SessionConfigSelectOption::new(value, name))
     .collect();
     vec![
         wire::SessionConfigOption::select(super::MODEL_CONFIG_ID, "Model", current.id(), groups)
@@ -2886,7 +2964,7 @@ fn set_v2_config(
     let current = adapter.selection().map_err(AcpRuntimeError::Loop)?;
     let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
     Ok(wire::SetSessionConfigOptionResponse::new(
-        v2_config_options(&current, reasoning, catalog),
+        v2_config_options_for(adapter, &current, reasoning, catalog),
     ))
 }
 
@@ -2981,6 +3059,9 @@ fn transcript_replay(
     let mut replay = Vec::new();
     let mut presentation_order: HashMap<wire::MessageId, (String, usize)> = HashMap::new();
     for (item_index, item) in transcript.iter().enumerate() {
+        if model_switch::is_compact_marker(item) {
+            continue;
+        }
         let message_id =
             |kind: &str| wire::MessageId::new(format!("{session_id}-replay-{item_index}-{kind}"));
         if crate::compaction::is_compaction_summary(item)
@@ -8386,7 +8467,7 @@ for line in sys.stdin:
             assert_eq!(server.form_elicitation.load(Ordering::Acquire), expected);
         }
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
-        assert_eq!(response.auth_methods.len(), 4);
+        assert_eq!(response.auth_methods.len(), 5);
         assert!(matches!(
             &response.auth_methods[0],
             wire::AuthMethod::Terminal(method)
@@ -8405,6 +8486,18 @@ for line in sys.stdin:
                 if method.method_id.0.as_ref() == "speakeasy"
                     && method.args == ["--terminal-auth-login", "speakeasy"]
         ));
+        assert!(matches!(
+            &response.auth_methods[3],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "anthropic"
+                    && method.args == ["--terminal-auth-login", "anthropic"]
+        ));
+        assert!(matches!(
+            &response.auth_methods[4],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "gemini"
+                    && method.args == ["--terminal-auth-login", "gemini"]
+        ));
         let unsupported = server
             .initialize(wire::InitializeRequest::new(
                 wire::ProtocolVersion::V2,
@@ -8420,7 +8513,7 @@ for line in sys.stdin:
             provider != ProviderKind::OpenRouter
         });
         let method_ids = terminal_auth_method_ids(&methods);
-        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic"]);
+        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic", "gemini"]);
         let providers = methods
             .iter()
             .map(|method| match method {
@@ -8435,7 +8528,8 @@ for line in sys.stdin:
             [
                 json!("openai-subscription"),
                 json!("speakeasy"),
-                json!("anthropic")
+                json!("anthropic"),
+                json!("gemini")
             ]
         );
         assert!(
@@ -8443,6 +8537,12 @@ for line in sys.stdin:
                 .iter()
                 .any(|method| method.method_id == "anthropic"
                     && method.provider == ProviderKind::Anthropic)
+        );
+        assert!(
+            terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == "gemini"
+                    && method.provider == ProviderKind::Gemini)
         );
 
         let metadata_only = wire::ClientCapabilities::new().meta(serde_json::Map::from_iter([(

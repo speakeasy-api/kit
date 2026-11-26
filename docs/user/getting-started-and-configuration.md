@@ -40,7 +40,7 @@ tarball with the full feature set, not a static musl tarball.
 
 ## Choose a provider and authenticate
 
-Kit supports `openai-subscription`, `anthropic`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
+Kit supports `openai-subscription`, `anthropic`, `gemini`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
 
 ### ChatGPT subscription with native OpenAI login
 
@@ -99,6 +99,34 @@ have an output limit of at most 16,384 tokens, capped by the model's advertised
 maximum when available. Leave `reasoning_effort` unset for the provider default,
 or select `low`, `medium`, or `high` when discovery confirms support. Logout deletes the locally
 saved key; revoke it in Claude Console to disable it remotely. An environment key remains active after logout.
+
+### Direct Gemini API
+
+Use an API key from [Google AI Studio](https://aistudio.google.com/apikey):
+
+```sh
+kit auth login gemini --credential-store keychain
+kit auth status gemini --credential-store keychain
+kit prompt --provider gemini --model gemini-2.5-pro \
+  --credential-store keychain "Summarize this project"
+kit auth logout gemini --credential-store keychain
+```
+
+Login reads the key at a hidden prompt, validates it with the non-inference Models
+API using the `x-goog-api-key` header, and saves it only on success. Use the same
+persistent credential store for login and runtime commands. File storage is also
+supported with `--credential-store file --credential-dir /path/to/private-directory`.
+Alternatively, set `GEMINI_API_KEY`; a nonempty environment key overrides the
+saved key. Do not put API keys in command-line arguments or `config.toml`.
+
+Use direct Gemini model IDs with `--model` (for example, `gemini-2.5-pro`), not
+OpenRouter's `google/…` IDs. Kit discovers available `generateContent` models
+and context limits from the authenticated Gemini Models API. Leave
+`reasoning_effort` unset for the provider default when a model's supported
+levels are unknown; explicit `low`, `medium`, and `high` settings are validated
+by model support (for example, `gemini-3-pro-preview` accepts `low` and `high`,
+not `medium`). Logout deletes the locally saved key; revoke it in Google AI
+Studio to disable it remotely. An environment key remains active after logout.
 
 ### OpenRouter API key and model
 
@@ -491,7 +519,7 @@ The value must be a non-negative integer number of seconds. Set it to `0` to dis
 
 ## Troubleshoot startup and configuration
 
-- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `anthropic`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
+- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `anthropic`, `gemini`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
 - **`could not read config ...`**: check permissions and that `$HOME/.kit/config.toml` is a readable regular file. Deleting an unwanted config is valid because a missing file falls back to defaults.
 - **`credential_dir is required when credential_store is file`**: add the directory or choose another store.
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.

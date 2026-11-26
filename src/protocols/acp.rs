@@ -147,6 +147,12 @@ const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
         description: "Authenticate Kit with an Anthropic API key",
         provider: ProviderKind::Anthropic,
     },
+    TerminalAuthMethodSpec {
+        method_id: "gemini",
+        name: "Sign in with Gemini",
+        description: "Authenticate Kit with a Gemini API key",
+        provider: ProviderKind::Gemini,
+    },
 ];
 
 pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] {
@@ -266,6 +272,9 @@ fn transcript_replay(
                     .summary(summary),
                 ),
             ));
+            continue;
+        }
+        if model_switch::is_compact_marker(item) {
             continue;
         }
         for part in &item.parts {
@@ -617,7 +626,7 @@ enum Command {
     Cancel,
     SetConfig {
         request: SetSessionConfigOptionRequest,
-        cancellation_generation: u64,
+        cancellation: agentkit_core::TurnCancellation,
         reply:
             oneshot::Sender<Result<SetSessionConfigOptionResponse, agent_client_protocol::Error>>,
     },
@@ -1979,7 +1988,8 @@ impl Server {
             .reasoning_effort()
             .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
         let catalog = driver.adapter.model_catalog(&current).await;
-        let config_options = config_options(&current, reasoning_effort, &catalog);
+        let config_options =
+            config_options_for(&driver.adapter, &current, reasoning_effort, &catalog);
         let model_fallback = driver.model_fallback.clone();
         let restored_context = usage::restored_context(
             &driver.canonical_transcript,
@@ -2151,17 +2161,17 @@ impl Server {
         request: SetSessionConfigOptionRequest,
     ) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
         let sender = self.sender(&request.session_id).await.map_err(sdk_error)?;
-        let cancellation_generation = self
+        let cancellation = self
             .integration
             .cancellation_handle(&request.session_id)
             .map_err(sdk_error)?
-            .generation();
+            .checkpoint();
         let (tx, rx) = oneshot::channel();
         sender
             .send(Command::SetConfig {
                 request,
                 reply: tx,
-                cancellation_generation,
+                cancellation,
             })
             .await
             .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
@@ -2465,30 +2475,45 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 Some(Command::SetConfig {
                     request,
                     reply,
-                    cancellation_generation,
+                    cancellation,
                 }) => {
                     let span = crate::telemetry::incoming::operation(request.meta.as_ref());
                     let model_change = request.config_id.to_string() == MODEL_CONFIG_ID;
                     let result = async {
-                        let cancellation = integration
-                            .cancellation_handle(&session_id)
-                            .map_err(sdk_error)?;
-                        if cancellation.is_cancelled_since(cancellation_generation) {
+                        if cancellation.is_cancelled() {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         if model_change {
                             let target = request.value.as_value_id().ok_or_else(|| {
                                 model_switch::error("selection requires an id value")
                             })?;
+                            let target_selection = ModelSelection::from_id(&target.to_string())
+                                .map_err(|error| model_switch::error(&error))?;
+                            {
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
+                                let preflight = std::pin::pin!(
+                                    adapter.preflight_model_switch(&target_selection)
+                                );
+                                match futures_util::future::select(cancelled, preflight).await {
+                                    futures_util::future::Either::Left(((), _)) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    futures_util::future::Either::Right((result, _)) => {
+                                        result.map_err(|error| model_switch::error(&error))?;
+                                    }
+                                }
+                            }
+                            if cancellation.is_cancelled() {
+                                return Err(model_switch::error("model change cancelled"));
+                            }
                             let decision = model_switch.check(
                                 (
                                     &adapter
                                         .selection()
                                         .map_err(|error| model_switch::error(&error))?,
-                                    cancellation_generation,
+                                    cancellation.generation(),
                                 ),
-                                ModelSelection::from_id(&target.to_string())
-                                    .map_err(|error| model_switch::error(&error))?,
+                                target_selection,
                                 &catalog,
                                 driver.snapshot().transcript,
                                 request
@@ -2497,22 +2522,35 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
+                                if cancellation.is_cancelled() {
+                                    return Err(model_switch::error("model change cancelled"));
+                                }
                                 let before = driver.snapshot().transcript;
                                 let marker = model_switch::compact_marker();
                                 let marker_id = marker.id.clone();
-                                driver.submit_input(vec![marker]).map_err(|error| {
-                                    sdk_error(record_acp_loop_failure(&session_id, &error))
-                                })?;
+                                match driver.commit_input(vec![marker], cancellation.clone()) {
+                                    Ok(()) => {}
+                                    Err(LoopError::Cancelled) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    Err(error) => {
+                                        return Err(sdk_error(record_acp_loop_failure(
+                                            &session_id,
+                                            &error,
+                                        )));
+                                    }
+                                }
                                 let reason = activity
                                     .execute(
                                         activity::ExecutionOrigin::Prompt,
-                                        drive_finalized(
+                                        drive_finalized_with_cancellation(
                                             &session_id,
                                             &integration,
                                             &mut driver,
                                             false,
                                             None,
                                             &activity,
+                                            cancellation.clone(),
                                         ),
                                         |reason| Some(reason.clone()),
                                     )
@@ -2527,15 +2565,38 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     &marker_id,
                                     &before,
                                     &driver.snapshot().transcript,
-                                    cancellation.is_cancelled_since(cancellation_generation),
+                                    cancellation.is_cancelled(),
                                 ) {
                                     return Err(model_switch::error(
                                         "compaction did not complete; model unchanged",
                                     ));
                                 }
                             }
+                        } else if request.config_id.to_string() == REASONING_EFFORT_CONFIG_ID {
+                            let value = request
+                                .value
+                                .as_value_id()
+                                .ok_or_else(|| {
+                                    model_switch::error("selection requires an id value")
+                                })?
+                                .to_string();
+                            let effort = ReasoningEffort::from_id(&value)
+                                .map_err(|error| model_switch::error(&error))?;
+                            if effort.is_some() {
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
+                                let preflight =
+                                    std::pin::pin!(adapter.preflight_reasoning_effort(effort));
+                                match futures_util::future::select(cancelled, preflight).await {
+                                    futures_util::future::Either::Left(((), _)) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    futures_util::future::Either::Right((result, _)) => {
+                                        result.map_err(|error| model_switch::error(&error))?;
+                                    }
+                                }
+                            }
                         }
-                        if cancellation.is_cancelled_since(cancellation_generation) {
+                        if cancellation.is_cancelled() {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         set_config(&adapter, &catalog, request).map_err(sdk_error)
@@ -2596,7 +2657,8 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 "session must be settled before snapshot".into(),
                             ));
                         }
-                        let transcript = driver.snapshot().transcript;
+                        let mut transcript = driver.snapshot().transcript;
+                        transcript.retain(|item| !model_switch::is_compact_marker(item));
                         let children_after = subagents
                             .as_ref()
                             .map(|s| s.active_count())
@@ -2702,11 +2764,13 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     }
 }
 
-pub(super) fn config_options(
+fn config_options_for(
+    adapter: &SelectableAdapter,
     current: &ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
     catalog: &[ModelGroup],
 ) -> Vec<SessionConfigOption> {
+    let supports_effort = |effort: ReasoningEffort| adapter.supports_reasoning_effort(effort);
     let groups = catalog
         .iter()
         .map(|group| {
@@ -2716,6 +2780,7 @@ pub(super) fn config_options(
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
                 crate::ProviderKind::Anthropic => "Anthropic",
+                crate::ProviderKind::Gemini => "Gemini",
             };
             let options = group
                 .models
@@ -2732,13 +2797,16 @@ pub(super) fn config_options(
         })
         .collect::<Vec<_>>();
     let effort_options = [
-        ("default", "Default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
+        (None, "default", "Default"),
+        (Some(ReasoningEffort::Low), "low", "Low"),
+        (Some(ReasoningEffort::Medium), "medium", "Medium"),
+        (Some(ReasoningEffort::High), "high", "High"),
     ]
     .into_iter()
-    .map(|(value, name)| SessionConfigSelectOption::new(value, name))
+    .filter(|(effort, _, _)| {
+        effort.is_none_or(|effort| supports_effort(effort) || reasoning_effort == Some(effort))
+    })
+    .map(|(_, value, name)| SessionConfigSelectOption::new(value, name))
     .collect();
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.id(), groups)
@@ -2795,7 +2863,8 @@ pub(super) fn set_config(
     }
     let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
     let reasoning_effort = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
-    Ok(SetSessionConfigOptionResponse::new(config_options(
+    Ok(SetSessionConfigOptionResponse::new(config_options_for(
+        adapter,
         &selection,
         reasoning_effort,
         catalog,
@@ -3041,12 +3110,39 @@ async fn drive_finalized<S: ModelSession>(
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
     activity: &activity::SessionActivity,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    let cancellation = integration.cancellation_handle(session_id)?;
-    let generation = cancellation.generation();
-    let result =
-        drive_domain_until_pause(session_id, integration, driver, answer_prompt, structured).await;
+    let cancellation = integration.cancellation_handle(session_id)?.checkpoint();
+    drive_finalized_with_cancellation(
+        session_id,
+        integration,
+        driver,
+        answer_prompt,
+        structured,
+        activity,
+        cancellation,
+    )
+    .await
+}
+
+async fn drive_finalized_with_cancellation<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    integration: &AcpIntegration,
+    driver: &mut LoopDriver<S>,
+    answer_prompt: bool,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    activity: &activity::SessionActivity,
+    cancellation: agentkit_core::TurnCancellation,
+) -> Result<FinishReason, AcpRuntimeError> {
+    let result = drive_domain_until_pause_with_cancellation(
+        session_id,
+        integration,
+        driver,
+        answer_prompt,
+        structured,
+        cancellation.clone(),
+    )
+    .await;
     activity::finalize(
-        activity::ExecutionOutcome::new(result, cancellation.is_cancelled_since(generation)),
+        activity::ExecutionOutcome::new(result, cancellation.is_cancelled()),
         structured,
         async {
             let projected = activity.drain_tool_projection().await;
@@ -3058,24 +3154,27 @@ async fn drive_finalized<S: ModelSession>(
     .await
 }
 
-async fn drive_domain_until_pause<S: ModelSession>(
+async fn drive_domain_until_pause_with_cancellation<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    cancellation: agentkit_core::TurnCancellation,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    let cancellation = integration.cancellation_handle(session_id)?;
-    let generation = cancellation.generation();
     loop {
-        let step = match driver.next().await {
+        let step = match driver.next_with_cancellation(cancellation.clone()).await {
             Ok(step) => step,
             Err(LoopError::Cancelled) => {
+                driver
+                    .retire_interrupted_turn()
+                    .await
+                    .map_err(|error| record_acp_loop_failure(session_id, &error))?;
                 return Ok(FinishReason::Cancelled);
             }
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
-        if cancellation.is_cancelled_since(generation) {
+        if cancellation.is_cancelled() {
             driver
                 .retire_interrupted_turn()
                 .await
@@ -3950,7 +4049,7 @@ pub(super) mod tests {
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
         assert!(terminal_auth_methods(&capabilities, |_| false).is_empty());
         let methods = terminal_auth_methods(&capabilities, |_| true);
-        assert_eq!(methods.len(), 4);
+        assert_eq!(methods.len(), 5);
         assert!(matches!(
             &methods[0],
             AuthMethod::Terminal(method)
@@ -3980,12 +4079,18 @@ pub(super) mod tests {
                 _ => unreachable!("only terminal methods are advertised"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic"]);
+        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic", "gemini"]);
         assert!(
             terminal_auth_method_specs()
                 .iter()
                 .any(|method| method.method_id == "anthropic"
                     && method.provider == ProviderKind::Anthropic)
+        );
+        assert!(
+            terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == "gemini"
+                    && method.provider == ProviderKind::Gemini)
         );
     }
 
@@ -4619,7 +4724,7 @@ pub(super) mod tests {
         meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
         let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
 
-        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 4);
+        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 5);
     }
 
     struct CompletionOnDrop(watch::Sender<bool>);

@@ -594,6 +594,11 @@ pub(crate) struct SessionClaim {
     // This private staged snapshot is written only in the publication commit;
     // no actor can run before activation and no guard is held during preparation.
     pending_workspace: Option<(crate::session::SessionObserver, Vec<Item>)>,
+    pending_selection: Option<(
+        crate::session::SessionObserver,
+        Option<String>,
+        Option<crate::ReasoningEffort>,
+    )>,
     committed: bool,
 }
 
@@ -674,6 +679,17 @@ impl SessionClaim {
                 .replace(transcript)
                 .map_err(AcpRuntimeError::Loop)?;
         }
+        if let Some((observer, model_id, effort)) = &self.pending_selection {
+            if let Some(model_id) = model_id {
+                observer
+                    .set_model_and_reasoning_effort(model_id, *effort)
+                    .map_err(AcpRuntimeError::Loop)?;
+            } else {
+                observer
+                    .set_reasoning_effort(*effort)
+                    .map_err(AcpRuntimeError::Loop)?;
+            }
+        }
         // Fork claims returned above; the remaining claims either create or load.
         if let SessionClaimKind::New {
             configured,
@@ -695,6 +711,7 @@ impl Drop for SessionClaim {
         let opened_uncommitted = self.uncommitted_observer.is_some();
         drop(self.uncommitted_observer.take());
         drop(self.pending_workspace.take());
+        drop(self.pending_selection.take());
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
@@ -1086,7 +1103,6 @@ impl Runtime {
     async fn restored_model(
         &self,
         opened: &crate::session::OpenSession,
-        resume: bool,
     ) -> Result<RestoredModel, String> {
         let configured = ModelSelection::new(self.provider, self.model.clone());
         let recorded = opened.model.as_deref();
@@ -1108,9 +1124,6 @@ impl Runtime {
             }
             _ => (configured, None),
         };
-        if resume && self.model_override {
-            opened.observer.set_model(&selection.id())?;
-        }
         Ok(RestoredModel {
             selection,
             fallback,
@@ -1262,6 +1275,7 @@ impl Runtime {
             ProviderKind::OpenRouter,
             ProviderKind::Speakeasy,
             ProviderKind::Anthropic,
+            ProviderKind::Gemini,
         ]
         .into_iter()
         .filter_map(|provider| {
@@ -1998,26 +2012,52 @@ impl Runtime {
                     error,
                 )
             })?;
-            let selection = self
-                .restored_model(&opened, request.resume)
-                .await?
-                .selection;
+            let restored = self.restored_model(&opened).await?;
+            let selection = restored.selection;
+            let reasoning_effort = selection.compatible_reasoning_effort(
+                opened.reasoning_effort,
+                self.adapter.reasoning_effort()?,
+            );
             let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
                 selection.provider,
-                selection.model,
+                selection.model.clone(),
                 self.credential_storage.clone(),
-                opened
-                    .reasoning_effort
-                    .unwrap_or(self.adapter.reasoning_effort()?),
+                reasoning_effort,
                 self.openrouter_api_key.clone(),
             )?
             .with_inference(self.adapter.inference())
+            .with_gemini_non_thinking(self.adapter.gemini_non_thinking())
+            .with_repair_inherited_gemini_effort(opened.reasoning_effort.flatten().is_some())
             .with_session_observer(opened.observer.clone(), !request.resume)?;
+            if request.resume && self.model_override && selection.provider != ProviderKind::Gemini {
+                opened
+                    .observer
+                    .set_model_and_reasoning_effort(&selection.id(), reasoning_effort)?;
+            }
+            let pending_selection_persist = if request.resume
+                && self.model_override
+                && selection.provider == ProviderKind::Gemini
+            {
+                Some((
+                    opened.observer.clone(),
+                    Some(selection.id()),
+                    adapter.clone(),
+                ))
+            } else if request.resume
+                && !self.model_override
+                && restored.fallback.is_none()
+                && opened.reasoning_effort.is_some()
+            {
+                Some((opened.observer.clone(), None, adapter.clone()))
+            } else {
+                None
+            };
+            let saved_reasoning_effort = opened.reasoning_effort;
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
             let compactor = self
                 .compactor(
-                    adapter.clone(),
+                    adapter.clone().with_repair_inherited_gemini_effort(false),
                     Some(opened.observer.clone()),
                     session_id.clone(),
                     None,
@@ -2110,13 +2150,18 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation))
+            Ok::<_, String>((
+                driver,
+                pending_creation,
+                pending_selection_persist,
+                saved_reasoning_effort,
+            ))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation) = {
+        let (mut driver, pending_creation, pending_selection_persist, saved_reasoning_effort) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {
@@ -2126,6 +2171,14 @@ impl Runtime {
         };
         if let Some(observer) = pending_creation {
             observer.commit_creation()?;
+        }
+        if let Some((observer, model_id, adapter)) = pending_selection_persist {
+            let effective_effort = adapter.reasoning_effort()?;
+            if let Some(model_id) = model_id {
+                observer.set_model_and_reasoning_effort(&model_id, effective_effort)?;
+            } else if Some(effective_effort) != saved_reasoning_effort {
+                observer.set_reasoning_effort(effective_effort)?;
+            }
         }
         let result = {
             let cancellation = std::pin::pin!(cancelled.cancelled());
@@ -2303,6 +2356,7 @@ impl Runtime {
             },
             uncommitted_observer: None,
             pending_workspace: None,
+            pending_selection: None,
             committed: false,
         })
     }
@@ -2318,6 +2372,7 @@ impl Runtime {
             kind: SessionClaimKind::Fork,
             uncommitted_observer: None,
             pending_workspace: None,
+            pending_selection: None,
             committed: false,
         })
     }
@@ -2337,6 +2392,7 @@ impl Runtime {
             kind: SessionClaimKind::Load { configured },
             uncommitted_observer: None,
             pending_workspace: None,
+            pending_selection: None,
             committed: false,
         })
     }
@@ -2394,6 +2450,7 @@ impl Runtime {
                 ));
             }
             crate::transcript::rebind_forked_transcript(&mut transcript, &request.id);
+            transcript.retain(|item| !crate::protocols::acp::model_switch::is_compact_marker(item));
             transcript
         } else if request.resume {
             vec![Item::text(ItemKind::System, self.system_prompt())]
@@ -2431,17 +2488,22 @@ impl Runtime {
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
+        let had_selected = selected.is_some();
         let (selection, reasoning_effort, model_fallback, unattributed_usage_applies) =
             match selected {
                 Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, false),
                 None => {
                     let restored = self
-                        .restored_model(&opened, request.resume)
+                        .restored_model(&opened)
                         .await
                         .map_err(AcpRuntimeError::Loop)?;
+                    let effort = restored.selection.compatible_reasoning_effort(
+                        opened.reasoning_effort,
+                        self.reasoning_effort,
+                    );
                     (
                         restored.selection,
-                        opened.reasoning_effort.unwrap_or(self.reasoning_effort),
+                        effort,
                         restored.fallback,
                         restored.unattributed_usage_applies,
                     )
@@ -2449,7 +2511,7 @@ impl Runtime {
             };
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             selection.provider,
-            selection.model,
+            selection.model.clone(),
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.clone(),
@@ -2457,15 +2519,20 @@ impl Runtime {
         .and_then(|adapter| {
             adapter
                 .with_inference(self.adapter.inference())
+                .with_gemini_non_thinking(self.adapter.gemini_non_thinking())
+                .with_repair_inherited_gemini_effort(
+                    !had_selected && opened.reasoning_effort.flatten().is_some(),
+                )
                 .with_session_observer(opened.observer.clone(), is_fork || !request.resume)
         })
         .map_err(AcpRuntimeError::Loop)?;
+        let override_observer = opened.observer.clone();
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
         let skill_catalog = current_skills.skills;
         let compactor = self
             .compactor(
-                adapter.clone(),
+                adapter.clone().with_repair_inherited_gemini_effort(false),
                 Some(opened.observer.clone()),
                 session_id.clone(),
                 Some(context.activity.clone()),
@@ -2543,6 +2610,18 @@ impl Runtime {
             .start(session_config)
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        let effective_effort = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+        if request.resume && self.model_override && !had_selected {
+            claim.pending_selection =
+                Some((override_observer, Some(selection.id()), effective_effort));
+        } else if request.resume
+            && !had_selected
+            && model_fallback.is_none()
+            && opened.reasoning_effort.is_some()
+            && Some(effective_effort) != opened.reasoning_effort
+        {
+            claim.pending_selection = Some((override_observer, None, effective_effort));
+        }
         let driver = AcpDriver {
             subagents,
             driver,
