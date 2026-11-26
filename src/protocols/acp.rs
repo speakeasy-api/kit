@@ -623,7 +623,7 @@ enum Command {
     Cancel,
     SetConfig {
         request: SetSessionConfigOptionRequest,
-        cancellation_generation: u64,
+        cancellation: agentkit_core::TurnCancellation,
         reply:
             oneshot::Sender<Result<SetSessionConfigOptionResponse, agent_client_protocol::Error>>,
     },
@@ -2158,17 +2158,17 @@ impl Server {
         request: SetSessionConfigOptionRequest,
     ) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
         let sender = self.sender(&request.session_id).await.map_err(sdk_error)?;
-        let cancellation_generation = self
+        let cancellation = self
             .integration
             .cancellation_handle(&request.session_id)
             .map_err(sdk_error)?
-            .generation();
+            .checkpoint();
         let (tx, rx) = oneshot::channel();
         sender
             .send(Command::SetConfig {
                 request,
                 reply: tx,
-                cancellation_generation,
+                cancellation,
             })
             .await
             .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
@@ -2472,15 +2472,12 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 Some(Command::SetConfig {
                     request,
                     reply,
-                    cancellation_generation,
+                    cancellation,
                 }) => {
                     let span = crate::telemetry::incoming::operation(request.meta.as_ref());
                     let model_change = request.config_id.to_string() == MODEL_CONFIG_ID;
                     let result = async {
-                        let cancellation = integration
-                            .cancellation_handle(&session_id)
-                            .map_err(sdk_error)?;
-                        if cancellation.is_cancelled_since(cancellation_generation) {
+                        if cancellation.is_cancelled() {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         if model_change {
@@ -2490,9 +2487,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             let target_selection = ModelSelection::from_id(&target.to_string())
                                 .map_err(|error| model_switch::error(&error))?;
                             {
-                                let cancelled = std::pin::pin!(
-                                    cancellation.cancelled_since(cancellation_generation)
-                                );
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
                                 let preflight = std::pin::pin!(
                                     adapter.preflight_model_switch(&target_selection)
                                 );
@@ -2505,7 +2500,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     }
                                 }
                             }
-                            if cancellation.is_cancelled_since(cancellation_generation) {
+                            if cancellation.is_cancelled() {
                                 return Err(model_switch::error("model change cancelled"));
                             }
                             let decision = model_switch.check(
@@ -2513,7 +2508,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     &adapter
                                         .selection()
                                         .map_err(|error| model_switch::error(&error))?,
-                                    cancellation_generation,
+                                    cancellation.generation(),
                                 ),
                                 target_selection,
                                 &catalog,
@@ -2524,7 +2519,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
-                                if cancellation.is_cancelled_since(cancellation_generation) {
+                                if cancellation.is_cancelled() {
                                     return Err(model_switch::error("model change cancelled"));
                                 }
                                 let before = driver.snapshot().transcript;
@@ -2536,14 +2531,14 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 let reason = activity
                                     .execute(
                                         activity::ExecutionOrigin::Prompt,
-                                        drive_finalized_since(
+                                        drive_finalized_with_cancellation(
                                             &session_id,
                                             &integration,
                                             &mut driver,
                                             false,
                                             None,
                                             &activity,
-                                            cancellation_generation,
+                                            cancellation.clone(),
                                         ),
                                         |reason| Some(reason.clone()),
                                     )
@@ -2558,7 +2553,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                     &marker_id,
                                     &before,
                                     &driver.snapshot().transcript,
-                                    cancellation.is_cancelled_since(cancellation_generation),
+                                    cancellation.is_cancelled(),
                                 ) {
                                     return Err(model_switch::error(
                                         "compaction did not complete; model unchanged",
@@ -2576,9 +2571,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             let effort = ReasoningEffort::from_id(&value)
                                 .map_err(|error| model_switch::error(&error))?;
                             if effort.is_some() {
-                                let cancelled = std::pin::pin!(
-                                    cancellation.cancelled_since(cancellation_generation)
-                                );
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
                                 let preflight =
                                     std::pin::pin!(adapter.preflight_reasoning_effort(effort));
                                 match futures_util::future::select(cancelled, preflight).await {
@@ -2591,7 +2584,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 }
                             }
                         }
-                        if cancellation.is_cancelled_since(cancellation_generation) {
+                        if cancellation.is_cancelled() {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         set_config(&adapter, &catalog, request).map_err(sdk_error)
@@ -3104,40 +3097,39 @@ async fn drive_finalized<S: ModelSession>(
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
     activity: &activity::SessionActivity,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    let generation = integration.cancellation_handle(session_id)?.generation();
-    drive_finalized_since(
+    let cancellation = integration.cancellation_handle(session_id)?.checkpoint();
+    drive_finalized_with_cancellation(
         session_id,
         integration,
         driver,
         answer_prompt,
         structured,
         activity,
-        generation,
+        cancellation,
     )
     .await
 }
 
-async fn drive_finalized_since<S: ModelSession>(
+async fn drive_finalized_with_cancellation<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
     activity: &activity::SessionActivity,
-    generation: u64,
+    cancellation: agentkit_core::TurnCancellation,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    let cancellation = integration.cancellation_handle(session_id)?;
-    let result = drive_domain_until_pause_since(
+    let result = drive_domain_until_pause_with_cancellation(
         session_id,
         integration,
         driver,
         answer_prompt,
         structured,
-        generation,
+        cancellation.clone(),
     )
     .await;
     activity::finalize(
-        activity::ExecutionOutcome::new(result, cancellation.is_cancelled_since(generation)),
+        activity::ExecutionOutcome::new(result, cancellation.is_cancelled()),
         structured,
         async {
             let projected = activity.drain_tool_projection().await;
@@ -3149,24 +3141,23 @@ async fn drive_finalized_since<S: ModelSession>(
     .await
 }
 
-async fn drive_domain_until_pause_since<S: ModelSession>(
+async fn drive_domain_until_pause_with_cancellation<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-    generation: u64,
+    cancellation: agentkit_core::TurnCancellation,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    let cancellation = integration.cancellation_handle(session_id)?;
     loop {
-        let step = match driver.next().await {
+        let step = match driver.next_with_cancellation(cancellation.clone()).await {
             Ok(step) => step,
             Err(LoopError::Cancelled) => {
                 return Ok(FinishReason::Cancelled);
             }
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
-        if cancellation.is_cancelled_since(generation) {
+        if cancellation.is_cancelled() {
             driver
                 .retire_interrupted_turn()
                 .await

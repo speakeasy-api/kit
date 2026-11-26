@@ -234,13 +234,13 @@ struct SessionSelection {
     revision: u64,
 }
 
-/// A per-session adapter whose selection is read only when a new model turn begins.
 #[derive(Default)]
 pub(crate) struct GeminiThinkingCache {
     detail: std::collections::HashMap<String, bool>,
     list: std::collections::HashMap<String, bool>,
 }
 
+/// A per-session adapter whose selection is read only when a new model turn begins.
 #[derive(Clone)]
 pub struct SelectableAdapter {
     session_observer: Option<crate::session::SessionObserver>,
@@ -564,20 +564,26 @@ impl SelectableAdapter {
         else {
             return Ok(());
         };
-        if let Ok(model) = super::gemini_catalog::retrieve(
+        match super::gemini_catalog::retrieve(
             super::gemini_catalog::MODELS_URL,
             credentials.api_key(),
             &selection.model,
         )
         .await
         {
-            record_gemini_thinking_detail(&self.gemini_non_thinking, &model);
-            if !model.supports_generate_content() {
-                return Err(format!(
-                    "Gemini model {:?} does not support generateContent",
-                    selection.model
-                ));
+            Ok(model) => {
+                record_gemini_thinking_detail(&self.gemini_non_thinking, &model);
+                if !model.supports_generate_content() {
+                    return Err(format!(
+                        "Gemini model {:?} does not support generateContent",
+                        selection.model
+                    ));
+                }
             }
+            Err(error) if error.contains("HTTP 404") => {
+                return Err(format!("Gemini model {:?} was not found", selection.model));
+            }
+            Err(_) => {}
         }
         Ok(())
     }
