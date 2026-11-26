@@ -594,6 +594,11 @@ pub(crate) struct SessionClaim {
     // This private staged snapshot is written only in the publication commit;
     // no actor can run before activation and no guard is held during preparation.
     pending_workspace: Option<(crate::session::SessionObserver, Vec<Item>)>,
+    pending_selection: Option<(
+        crate::session::SessionObserver,
+        Option<String>,
+        Option<crate::ReasoningEffort>,
+    )>,
     committed: bool,
 }
 
@@ -674,6 +679,17 @@ impl SessionClaim {
                 .replace(transcript)
                 .map_err(AcpRuntimeError::Loop)?;
         }
+        if let Some((observer, model_id, effort)) = &self.pending_selection {
+            if let Some(model_id) = model_id {
+                observer
+                    .set_model_and_reasoning_effort(model_id, *effort)
+                    .map_err(AcpRuntimeError::Loop)?;
+            } else {
+                observer
+                    .set_reasoning_effort(*effort)
+                    .map_err(AcpRuntimeError::Loop)?;
+            }
+        }
         // Fork claims returned above; the remaining claims either create or load.
         if let SessionClaimKind::New {
             configured,
@@ -695,6 +711,7 @@ impl Drop for SessionClaim {
         let opened_uncommitted = self.uncommitted_observer.is_some();
         drop(self.uncommitted_observer.take());
         drop(self.pending_workspace.take());
+        drop(self.pending_selection.take());
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
@@ -1997,16 +2014,9 @@ impl Runtime {
             })?;
             let restored = self.restored_model(&opened).await?;
             let selection = restored.selection;
-            if opened.reasoning_effort.flatten().is_some() {
-                self.adapter.probe_gemini_thinking_veto(&selection).await;
-            }
-            let reasoning_effort = selection.compatible_reasoning_effort_with(
+            let reasoning_effort = selection.compatible_reasoning_effort(
                 opened.reasoning_effort,
                 self.adapter.reasoning_effort()?,
-                |effort| {
-                    self.adapter
-                        .supports_reasoning_effort_for(&selection, effort)
-                },
             );
             let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
                 selection.provider,
@@ -2047,7 +2057,7 @@ impl Runtime {
             let skills = self.fresh_skills();
             let compactor = self
                 .compactor(
-                    adapter.clone(),
+                    adapter.clone().with_repair_inherited_gemini_effort(false),
                     Some(opened.observer.clone()),
                     session_id.clone(),
                     None,
@@ -2346,6 +2356,7 @@ impl Runtime {
             },
             uncommitted_observer: None,
             pending_workspace: None,
+            pending_selection: None,
             committed: false,
         })
     }
@@ -2361,6 +2372,7 @@ impl Runtime {
             kind: SessionClaimKind::Fork,
             uncommitted_observer: None,
             pending_workspace: None,
+            pending_selection: None,
             committed: false,
         })
     }
@@ -2380,6 +2392,7 @@ impl Runtime {
             kind: SessionClaimKind::Load { configured },
             uncommitted_observer: None,
             pending_workspace: None,
+            pending_selection: None,
             committed: false,
         })
     }
@@ -2483,18 +2496,9 @@ impl Runtime {
                         .restored_model(&opened)
                         .await
                         .map_err(AcpRuntimeError::Loop)?;
-                    if opened.reasoning_effort.flatten().is_some() {
-                        self.adapter
-                            .probe_gemini_thinking_veto(&restored.selection)
-                            .await;
-                    }
-                    let effort = restored.selection.compatible_reasoning_effort_with(
+                    let effort = restored.selection.compatible_reasoning_effort(
                         opened.reasoning_effort,
                         self.reasoning_effort,
-                        |effort| {
-                            self.adapter
-                                .supports_reasoning_effort_for(&restored.selection, effort)
-                        },
                     );
                     (
                         restored.selection,
@@ -2527,7 +2531,7 @@ impl Runtime {
         let skill_catalog = current_skills.skills;
         let compactor = self
             .compactor(
-                adapter.clone(),
+                adapter.clone().with_repair_inherited_gemini_effort(false),
                 Some(opened.observer.clone()),
                 session_id.clone(),
                 Some(context.activity.clone()),
@@ -2607,18 +2611,15 @@ impl Runtime {
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let effective_effort = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
         if request.resume && self.model_override && !had_selected {
-            override_observer
-                .set_model_and_reasoning_effort(&selection.id(), effective_effort)
-                .map_err(AcpRuntimeError::Loop)?;
+            claim.pending_selection =
+                Some((override_observer, Some(selection.id()), effective_effort));
         } else if request.resume
             && !had_selected
             && model_fallback.is_none()
             && opened.reasoning_effort.is_some()
             && Some(effective_effort) != opened.reasoning_effort
         {
-            override_observer
-                .set_reasoning_effort(effective_effort)
-                .map_err(AcpRuntimeError::Loop)?;
+            claim.pending_selection = Some((override_observer, None, effective_effort));
         }
         let driver = AcpDriver {
             subagents,

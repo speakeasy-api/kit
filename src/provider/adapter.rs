@@ -150,31 +150,19 @@ impl ModelSelection {
         }
     }
 
-    pub(crate) fn compatible_reasoning_effort_with(
-        &self,
-        saved: Option<Option<ReasoningEffort>>,
-        configured: Option<ReasoningEffort>,
-        supports: impl Fn(ReasoningEffort) -> bool,
-    ) -> Option<ReasoningEffort> {
-        let Some(saved_effort) = saved else {
-            return configured;
-        };
-        match saved_effort {
-            Some(effort) if supports(effort) => Some(effort),
-            Some(_) => configured.filter(|effort| supports(*effort)),
-            None => None,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn compatible_reasoning_effort(
         &self,
         saved: Option<Option<ReasoningEffort>>,
         configured: Option<ReasoningEffort>,
     ) -> Option<ReasoningEffort> {
-        self.compatible_reasoning_effort_with(saved, configured, |effort| {
-            self.supports_reasoning_effort(effort)
-        })
+        let Some(saved_effort) = saved else {
+            return configured;
+        };
+        match saved_effort {
+            Some(effort) if self.supports_reasoning_effort(effort) => Some(effort),
+            Some(_) => configured.filter(|effort| self.supports_reasoning_effort(*effort)),
+            None => None,
+        }
     }
 }
 
@@ -255,7 +243,7 @@ pub struct SelectableAdapter {
     openrouter_api_key: Option<OpenRouterApiKey>,
     openai_model_catalog: SubscriptionModelCatalogCache,
     gemini_non_thinking: Arc<Mutex<std::collections::HashSet<String>>>,
-    repair_inherited_gemini_effort: bool,
+    repair_inherited_gemini_effort: Arc<std::sync::atomic::AtomicBool>,
     inference: super::inference::Instances,
 }
 
@@ -309,7 +297,7 @@ impl SelectableAdapter {
             openrouter_api_key,
             openai_model_catalog: SubscriptionModelCatalogCache::default(),
             gemini_non_thinking: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            repair_inherited_gemini_effort: false,
+            repair_inherited_gemini_effort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inference: Default::default(),
         })
     }
@@ -331,25 +319,12 @@ impl SelectableAdapter {
     }
 
     pub(crate) fn with_repair_inherited_gemini_effort(mut self, repair: bool) -> Self {
-        self.repair_inherited_gemini_effort = repair;
+        self.repair_inherited_gemini_effort = Arc::new(std::sync::atomic::AtomicBool::new(repair));
         self
     }
 
     pub(crate) fn gemini_non_thinking(&self) -> Arc<Mutex<std::collections::HashSet<String>>> {
         Arc::clone(&self.gemini_non_thinking)
-    }
-
-    pub(crate) fn supports_reasoning_effort_for(
-        &self,
-        selection: &ModelSelection,
-        effort: ReasoningEffort,
-    ) -> bool {
-        if selection.provider == ProviderKind::Gemini
-            && is_gemini_thinking_vetoed(&self.gemini_non_thinking, &selection.model)
-        {
-            return false;
-        }
-        selection.supports_reasoning_effort(effort)
     }
 
     /// Attach persistence before publishing any clones of this session adapter.
@@ -402,7 +377,7 @@ impl SelectableAdapter {
                 openrouter_api_key: self.openrouter_api_key.clone(),
                 openai_model_catalog: self.openai_model_catalog.clone(),
                 gemini_non_thinking: self.gemini_non_thinking.clone(),
-                repair_inherited_gemini_effort: false,
+                repair_inherited_gemini_effort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 inference: self.inference.clone(),
             },
             revision,
@@ -612,6 +587,16 @@ impl SelectableAdapter {
         true
     }
 
+    pub(crate) async fn preflight_model_switch(
+        &self,
+        selection: &ModelSelection,
+    ) -> Result<(), String> {
+        if selection.provider == ProviderKind::Gemini && self.reasoning_effort()?.is_some() {
+            self.probe_gemini_thinking_veto(selection).await;
+        }
+        self.validate_model_switch(selection)
+    }
+
     pub(crate) fn validate_model_switch(&self, selection: &ModelSelection) -> Result<(), String> {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
@@ -713,6 +698,9 @@ impl ModelAdapter for SelectableAdapter {
     type Session = SelectableSession;
 
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
+        let repair_inherited = self
+            .repair_inherited_gemini_effort
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         let mut active = self
             .selection
             .lock()
@@ -734,7 +722,7 @@ impl ModelAdapter for SelectableAdapter {
         {
             Ok(inner) => inner,
             Err(error)
-                if self.repair_inherited_gemini_effort
+                if repair_inherited
                     && active.model.provider == ProviderKind::Gemini
                     && active.reasoning_effort.is_some()
                     && is_gemini_thinking_vetoed(
@@ -4384,12 +4372,6 @@ mod tests {
             Some(ReasoningEffort::High),
         );
         assert_eq!(model.compatible_reasoning_effort(Some(medium), None), None);
-        assert_eq!(
-            model.compatible_reasoning_effort_with(Some(Some(ReasoningEffort::High)), None, |_| {
-                false
-            }),
-            None,
-        );
     }
 }
 

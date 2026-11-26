@@ -2000,7 +2000,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                 crate::provider::ModelSelection::from_id(&target.to_string())
                                     .map_err(|error| model_switch::error(&error))?;
                             adapter
-                                .validate_model_switch(&target_selection)
+                                .preflight_model_switch(&target_selection)
+                                .await
                                 .map_err(|error| model_switch::error(&error))?;
                             let decision = model_switch.check(
                                 (
