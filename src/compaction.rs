@@ -2114,17 +2114,29 @@ pub struct AutomaticCompactor {
     preparation: Option<background::Preparation>,
 }
 
-fn strip_abandoned_switch_markers(transcript: &[Item], keep_trailing_manual: bool) -> Vec<Item> {
+fn strip_abandoned_switch_markers(
+    transcript: &[Item],
+    keep_trailing_manual: bool,
+) -> std::borrow::Cow<'_, [Item]> {
     let last_index = transcript.len().checked_sub(1);
-    transcript
-        .iter()
-        .enumerate()
-        .filter(|(idx, item)| {
-            !crate::protocols::acp::model_switch::is_compact_marker(item)
-                || (keep_trailing_manual && Some(*idx) == last_index)
-        })
-        .map(|(_, item)| item.clone())
-        .collect()
+    let has_abandoned = transcript.iter().enumerate().any(|(idx, item)| {
+        crate::protocols::acp::model_switch::is_compact_marker(item)
+            && !(keep_trailing_manual && Some(idx) == last_index)
+    });
+    if !has_abandoned {
+        return std::borrow::Cow::Borrowed(transcript);
+    }
+    std::borrow::Cow::Owned(
+        transcript
+            .iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                !crate::protocols::acp::model_switch::is_compact_marker(item)
+                    || (keep_trailing_manual && Some(*idx) == last_index)
+            })
+            .map(|(_, item)| item.clone())
+            .collect(),
+    )
 }
 
 impl AutomaticCompactor {
@@ -2238,8 +2250,7 @@ impl AutomaticCompactor {
             .or_else(|| self.inner.should_compact(cursor.as_slice(), ctx.point));
         let Some(reason) = reason else {
             if let Some(preparation) = &self.preparation {
-                let sanitized = strip_abandoned_switch_markers(cursor.as_slice(), false);
-                preparation.arm(&sanitized, &self.policy, ctx.cancellation.clone());
+                preparation.arm(cursor.as_slice(), &self.policy, ctx.cancellation.clone());
             }
             return Ok(());
         };

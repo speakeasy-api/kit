@@ -170,7 +170,11 @@ impl Preparation {
         if frozen_revision != revision {
             return;
         }
-        let snapshot = live.to_vec();
+        let snapshot: Vec<Item> = live
+            .iter()
+            .filter(|item| !crate::protocols::acp::model_switch::is_compact_marker(item))
+            .cloned()
+            .collect();
         let input = snapshot.clone();
         let arm_cancellation = cancellation.clone();
         let succeeded = Arc::new(AtomicBool::new(false));
