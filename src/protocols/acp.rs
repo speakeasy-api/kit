@@ -2525,9 +2525,18 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 let before = driver.snapshot().transcript;
                                 let marker = model_switch::compact_marker();
                                 let marker_id = marker.id.clone();
-                                driver.submit_input(vec![marker]).map_err(|error| {
-                                    sdk_error(record_acp_loop_failure(&session_id, &error))
-                                })?;
+                                match driver.commit_input(vec![marker], cancellation.clone()) {
+                                    Ok(()) => {}
+                                    Err(LoopError::Cancelled) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    Err(error) => {
+                                        return Err(sdk_error(record_acp_loop_failure(
+                                            &session_id,
+                                            &error,
+                                        )));
+                                    }
+                                }
                                 let reason = activity
                                     .execute(
                                         activity::ExecutionOrigin::Prompt,
@@ -3153,6 +3162,10 @@ async fn drive_domain_until_pause_with_cancellation<S: ModelSession>(
         let step = match driver.next_with_cancellation(cancellation.clone()).await {
             Ok(step) => step,
             Err(LoopError::Cancelled) => {
+                driver
+                    .retire_interrupted_turn()
+                    .await
+                    .map_err(|error| record_acp_loop_failure(session_id, &error))?;
                 return Ok(FinishReason::Cancelled);
             }
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
