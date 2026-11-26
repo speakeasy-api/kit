@@ -2739,13 +2739,18 @@ pub(super) fn config_options(
         })
         .collect::<Vec<_>>();
     let effort_options = [
-        ("default", "Default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
+        (None, "default", "Default"),
+        (Some(ReasoningEffort::Low), "low", "Low"),
+        (Some(ReasoningEffort::Medium), "medium", "Medium"),
+        (Some(ReasoningEffort::High), "high", "High"),
     ]
     .into_iter()
-    .map(|(value, name)| SessionConfigSelectOption::new(value, name))
+    .filter(|(effort, _, _)| {
+        effort.is_none_or(|effort| {
+            current.supports_reasoning_effort(effort) || reasoning_effort == Some(effort)
+        })
+    })
+    .map(|(_, value, name)| SessionConfigSelectOption::new(value, name))
     .collect();
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.id(), groups)

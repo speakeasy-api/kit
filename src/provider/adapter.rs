@@ -142,6 +142,13 @@ impl ModelSelection {
         }
         Ok(Self::new(provider.parse()?, model))
     }
+
+    pub(crate) fn supports_reasoning_effort(&self, effort: ReasoningEffort) -> bool {
+        match self.provider {
+            ProviderKind::Gemini => gemini_thinking_for_model(&self.model, effort).is_ok(),
+            _ => true,
+        }
+    }
 }
 
 pub(super) fn valid_model_id(value: &str) -> bool {
@@ -473,8 +480,8 @@ impl SelectableAdapter {
                     .model
                     .strip_prefix("models/")
                     .unwrap_or(&selection.model);
-                if models.iter().any(|model| model.id() == normalized) {
-                    return true;
+                if let Some(found) = models.iter().find(|model| model.id() == normalized) {
+                    return found.supports_generate_content();
                 }
                 let Ok(Some(credentials)) =
                     super::gemini_auth::credentials(&self.credential_storage)
@@ -2257,6 +2264,15 @@ fn gemini_thinking_for_model(
         .strip_prefix("models/")
         .unwrap_or(model.trim())
         .to_ascii_lowercase();
+    if normalized == "gemini-3.1-flash-image" || normalized.starts_with("gemini-3.1-flash-image-") {
+        return match effort {
+            ReasoningEffort::High => Ok(GeminiThinkingConfig::level(GeminiThinkingLevel::High)),
+            ReasoningEffort::Low | ReasoningEffort::Medium => Err(format!(
+                "Cannot configure {} reasoning effort for Gemini model {model:?}; select high or default reasoning effort",
+                effort.as_str()
+            )),
+        };
+    }
     if gemini_is_non_thinking_modality(&normalized) {
         return Err(format!(
             "Cannot configure explicit reasoning effort for Gemini model {model:?}; select default reasoning effort"
@@ -2313,7 +2329,11 @@ fn gemini_model_group(
     current: &ModelSelection,
     discovered: Vec<super::gemini_catalog::Model>,
 ) -> ModelGroup {
-    let context_windows = discovered
+    let generative: Vec<_> = discovered
+        .into_iter()
+        .filter(super::gemini_catalog::Model::supports_generate_content)
+        .collect();
+    let mut context_windows: std::collections::HashMap<String, u64> = generative
         .iter()
         .filter_map(|model| {
             model
@@ -2321,7 +2341,7 @@ fn gemini_model_group(
                 .map(|limit| (model.id().to_owned(), limit))
         })
         .collect();
-    let mut models: Vec<_> = discovered
+    let mut models: Vec<_> = generative
         .into_iter()
         .map(|model| model.id().to_owned())
         .collect();
@@ -2331,6 +2351,13 @@ fn gemini_model_group(
         && valid_model_id(&current.model)
         && !models.contains(&current.model)
     {
+        let normalized = current
+            .model
+            .strip_prefix("models/")
+            .unwrap_or(&current.model);
+        if let Some(&limit) = context_windows.get(normalized) {
+            context_windows.insert(current.model.clone(), limit);
+        }
         models.push(current.model.clone());
     }
     ModelGroup {
@@ -2564,6 +2591,32 @@ mod tests {
         let group = super::gemini_model_group(&custom, vec![model.clone()]);
         assert!(group.models.contains(&custom.model));
         assert!(!group.context_windows.contains_key(&custom.model));
+
+        // Prefixed Gemini selections retain the normalized model's discovered context window.
+        let prefixed =
+            super::ModelSelection::new(super::ProviderKind::Gemini, "models/gemini-2.5-pro");
+        let group = super::gemini_model_group(&prefixed, vec![model.clone()]);
+        assert_eq!(group.context_windows.get(&prefixed.model), Some(&1048576));
+
+        // Non-generative models are excluded from the picker group.
+        let embedding: super::super::gemini_catalog::Model =
+            serde_json::from_value(serde_json::json!({
+                "name": "models/text-embedding-004",
+                "inputTokenLimit": 2048,
+                "supportedGenerationMethods": ["embedContent"]
+            }))
+            .unwrap();
+        let group = super::gemini_model_group(&selection, vec![model.clone(), embedding]);
+        assert_eq!(group.models, vec!["gemini-2.5-pro"]);
+
+        // Gemini 3.1 Flash Image accepts High reasoning while rejecting Low/Medium.
+        let flash_image = "gemini-3.1-flash-image";
+        assert_eq!(
+            super::gemini_thinking_for_model(flash_image, ReasoningEffort::High).unwrap(),
+            GeminiThinkingConfig::level(GeminiThinkingLevel::High)
+        );
+        assert!(super::gemini_thinking_for_model(flash_image, ReasoningEffort::Medium).is_err());
+        assert!(super::gemini_thinking_for_model(flash_image, ReasoningEffort::Low).is_err());
 
         // Default effort leaves thinking unset.
         let base_25 = GeminiConfig::new("test", "gemini-2.5-pro").unwrap();

@@ -143,9 +143,11 @@ async fn fetch(url: &str, key: &str) -> Result<Vec<Model>, String> {
         if model_count > MAX_MODELS {
             return Err("Gemini catalog exceeds model limit".into());
         }
-        models.extend(page.models.into_iter().filter(|model| {
-            model.supports_generate_content() && super::adapter::valid_model_id(model.id())
-        }));
+        models.extend(
+            page.models
+                .into_iter()
+                .filter(|model| super::adapter::valid_model_id(model.id())),
+        );
         let Some(next) = page.next_page_token.filter(|token| !token.is_empty()) else {
             return Ok(models);
         };
@@ -327,11 +329,15 @@ mod tests {
             ),
         ]);
         let models = discover(&url, "secret-one").await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].id(), "gemini-2.5-pro");
+        assert!(models[0].supports_generate_content());
         assert_eq!(models[0].context_window(), Some(1048576));
-        assert_eq!(models[1].id(), "gemini-2.5-flash");
-        assert_eq!(models[1].context_window(), None);
+        assert_eq!(models[1].id(), "text-embedding-004");
+        assert!(!models[1].supports_generate_content());
+        assert_eq!(models[2].id(), "gemini-2.5-flash");
+        assert!(models[2].supports_generate_content());
+        assert_eq!(models[2].context_window(), None);
         let requests = handle.join().unwrap();
         for request in &requests {
             let lower = request.to_ascii_lowercase();

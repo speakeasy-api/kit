@@ -2811,13 +2811,22 @@ fn v2_config_options(
         })
         .collect::<Vec<_>>();
     let effort_options = [
-        ("default", "Default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
+        (None, "default", "Default"),
+        (Some(crate::provider::ReasoningEffort::Low), "low", "Low"),
+        (
+            Some(crate::provider::ReasoningEffort::Medium),
+            "medium",
+            "Medium",
+        ),
+        (Some(crate::provider::ReasoningEffort::High), "high", "High"),
     ]
     .into_iter()
-    .map(|(value, name)| wire::SessionConfigSelectOption::new(value, name))
+    .filter(|(effort, _, _)| {
+        effort.is_none_or(|effort| {
+            current.supports_reasoning_effort(effort) || reasoning == Some(effort)
+        })
+    })
+    .map(|(_, value, name)| wire::SessionConfigSelectOption::new(value, name))
     .collect();
     vec![
         wire::SessionConfigOption::select(super::MODEL_CONFIG_ID, "Model", current.id(), groups)
