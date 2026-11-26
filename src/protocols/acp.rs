@@ -1985,7 +1985,8 @@ impl Server {
             .reasoning_effort()
             .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
         let catalog = driver.adapter.model_catalog(&current).await;
-        let config_options = config_options(&current, reasoning_effort, &catalog);
+        let config_options =
+            config_options_for(&driver.adapter, &current, reasoning_effort, &catalog);
         let model_fallback = driver.model_fallback.clone();
         let restored_context = usage::restored_context(
             &driver.canonical_transcript,
@@ -2486,6 +2487,11 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             let target = request.value.as_value_id().ok_or_else(|| {
                                 model_switch::error("selection requires an id value")
                             })?;
+                            let target_selection = ModelSelection::from_id(&target.to_string())
+                                .map_err(|error| model_switch::error(&error))?;
+                            adapter
+                                .validate_model_switch(&target_selection)
+                                .map_err(|error| model_switch::error(&error))?;
                             let decision = model_switch.check(
                                 (
                                     &adapter
@@ -2493,8 +2499,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                         .map_err(|error| model_switch::error(&error))?,
                                     cancellation_generation,
                                 ),
-                                ModelSelection::from_id(&target.to_string())
-                                    .map_err(|error| model_switch::error(&error))?,
+                                target_selection,
                                 &catalog,
                                 driver.snapshot().transcript,
                                 request
@@ -2708,11 +2713,13 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     }
 }
 
-pub(super) fn config_options(
+fn config_options_for(
+    adapter: &SelectableAdapter,
     current: &ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
     catalog: &[ModelGroup],
 ) -> Vec<SessionConfigOption> {
+    let supports_effort = |effort: ReasoningEffort| adapter.supports_reasoning_effort(effort);
     let groups = catalog
         .iter()
         .map(|group| {
@@ -2746,9 +2753,7 @@ pub(super) fn config_options(
     ]
     .into_iter()
     .filter(|(effort, _, _)| {
-        effort.is_none_or(|effort| {
-            current.supports_reasoning_effort(effort) || reasoning_effort == Some(effort)
-        })
+        effort.is_none_or(|effort| supports_effort(effort) || reasoning_effort == Some(effort))
     })
     .map(|(_, value, name)| SessionConfigSelectOption::new(value, name))
     .collect();
@@ -2807,7 +2812,8 @@ pub(super) fn set_config(
     }
     let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
     let reasoning_effort = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
-    Ok(SetSessionConfigOptionResponse::new(config_options(
+    Ok(SetSessionConfigOptionResponse::new(config_options_for(
+        adapter,
         &selection,
         reasoning_effort,
         catalog,

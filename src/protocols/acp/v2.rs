@@ -1286,7 +1286,7 @@ impl Server {
             .reasoning_effort()
             .map_err(AcpRuntimeError::Loop)?;
         let catalog = driver.adapter.model_catalog(&current).await;
-        let config_options = v2_config_options(&current, reasoning, &catalog);
+        let config_options = v2_config_options_for(&driver.adapter, &current, reasoning, &catalog);
         let model_fallback = driver.model_fallback.clone();
         let restored_context = super::usage::restored_context(
             &driver.canonical_transcript,
@@ -1996,6 +1996,12 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                             let target = request.value.as_id().ok_or_else(|| {
                                 model_switch::error("selection requires an id value")
                             })?;
+                            let target_selection =
+                                crate::provider::ModelSelection::from_id(&target.to_string())
+                                    .map_err(|error| model_switch::error(&error))?;
+                            adapter
+                                .validate_model_switch(&target_selection)
+                                .map_err(|error| model_switch::error(&error))?;
                             let decision = model_switch.check(
                                 (
                                     &adapter
@@ -2003,8 +2009,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                         .map_err(|error| model_switch::error(&error))?,
                                     cancellation.generation(),
                                 ),
-                                crate::provider::ModelSelection::from_id(&target.to_string())
-                                    .map_err(|error| model_switch::error(&error))?,
+                                target_selection,
                                 &catalog,
                                 driver.snapshot().transcript,
                                 request
@@ -2781,10 +2786,33 @@ fn error_stop_reason() -> wire::StopReason {
     wire::StopReason::Error(wire::ErrorStopReason::new())
 }
 
+fn v2_config_options_for(
+    adapter: &SelectableAdapter,
+    current: &crate::provider::ModelSelection,
+    reasoning: Option<crate::provider::ReasoningEffort>,
+    catalog: &[crate::provider::ModelGroup],
+) -> Vec<wire::SessionConfigOption> {
+    v2_config_options_with_filter(current, reasoning, catalog, |effort| {
+        adapter.supports_reasoning_effort(effort)
+    })
+}
+
+#[cfg(test)]
 fn v2_config_options(
     current: &crate::provider::ModelSelection,
     reasoning: Option<crate::provider::ReasoningEffort>,
     catalog: &[crate::provider::ModelGroup],
+) -> Vec<wire::SessionConfigOption> {
+    v2_config_options_with_filter(current, reasoning, catalog, |effort| {
+        current.supports_reasoning_effort(effort)
+    })
+}
+
+fn v2_config_options_with_filter(
+    current: &crate::provider::ModelSelection,
+    reasoning: Option<crate::provider::ReasoningEffort>,
+    catalog: &[crate::provider::ModelGroup],
+    supports_effort: impl Fn(crate::provider::ReasoningEffort) -> bool,
 ) -> Vec<wire::SessionConfigOption> {
     let groups = catalog
         .iter()
@@ -2822,9 +2850,7 @@ fn v2_config_options(
     ]
     .into_iter()
     .filter(|(effort, _, _)| {
-        effort.is_none_or(|effort| {
-            current.supports_reasoning_effort(effort) || reasoning == Some(effort)
-        })
+        effort.is_none_or(|effort| supports_effort(effort) || reasoning == Some(effort))
     })
     .map(|(_, value, name)| wire::SessionConfigSelectOption::new(value, name))
     .collect();
@@ -2896,7 +2922,7 @@ fn set_v2_config(
     let current = adapter.selection().map_err(AcpRuntimeError::Loop)?;
     let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
     Ok(wire::SetSessionConfigOptionResponse::new(
-        v2_config_options(&current, reasoning, catalog),
+        v2_config_options_for(adapter, &current, reasoning, catalog),
     ))
 }
 

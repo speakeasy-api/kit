@@ -1086,7 +1086,6 @@ impl Runtime {
     async fn restored_model(
         &self,
         opened: &crate::session::OpenSession,
-        resume: bool,
     ) -> Result<RestoredModel, String> {
         let configured = ModelSelection::new(self.provider, self.model.clone());
         let recorded = opened.model.as_deref();
@@ -1108,9 +1107,6 @@ impl Runtime {
             }
             _ => (configured, None),
         };
-        if resume && self.model_override {
-            opened.observer.set_model(&selection.id())?;
-        }
         Ok(RestoredModel {
             selection,
             fallback,
@@ -1999,21 +1995,26 @@ impl Runtime {
                     error,
                 )
             })?;
-            let selection = self
-                .restored_model(&opened, request.resume)
-                .await?
-                .selection;
+            let selection = self.restored_model(&opened).await?.selection;
+            let reasoning_effort = selection.compatible_reasoning_effort(
+                opened.reasoning_effort,
+                self.adapter.reasoning_effort()?,
+            );
             let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
                 selection.provider,
-                selection.model,
+                selection.model.clone(),
                 self.credential_storage.clone(),
-                opened
-                    .reasoning_effort
-                    .unwrap_or(self.adapter.reasoning_effort()?),
+                reasoning_effort,
                 self.openrouter_api_key.clone(),
             )?
             .with_inference(self.adapter.inference())
             .with_session_observer(opened.observer.clone(), !request.resume)?;
+            if request.resume && self.model_override {
+                opened.observer.set_model(&selection.id())?;
+                if Some(reasoning_effort) != opened.reasoning_effort {
+                    opened.observer.set_reasoning_effort(reasoning_effort)?;
+                }
+            }
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
             let compactor = self
@@ -2432,17 +2433,22 @@ impl Runtime {
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
+        let had_selected = selected.is_some();
         let (selection, reasoning_effort, model_fallback, unattributed_usage_applies) =
             match selected {
                 Some((selection, reasoning_effort)) => (selection, reasoning_effort, None, false),
                 None => {
                     let restored = self
-                        .restored_model(&opened, request.resume)
+                        .restored_model(&opened)
                         .await
                         .map_err(AcpRuntimeError::Loop)?;
+                    let effort = restored.selection.compatible_reasoning_effort(
+                        opened.reasoning_effort,
+                        self.reasoning_effort,
+                    );
                     (
                         restored.selection,
-                        opened.reasoning_effort.unwrap_or(self.reasoning_effort),
+                        effort,
                         restored.fallback,
                         restored.unattributed_usage_applies,
                     )
@@ -2450,7 +2456,7 @@ impl Runtime {
             };
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             selection.provider,
-            selection.model,
+            selection.model.clone(),
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.clone(),
@@ -2461,6 +2467,18 @@ impl Runtime {
                 .with_session_observer(opened.observer.clone(), is_fork || !request.resume)
         })
         .map_err(AcpRuntimeError::Loop)?;
+        if request.resume && self.model_override && !had_selected {
+            opened
+                .observer
+                .set_model(&selection.id())
+                .map_err(AcpRuntimeError::Loop)?;
+            if Some(reasoning_effort) != opened.reasoning_effort {
+                opened
+                    .observer
+                    .set_reasoning_effort(reasoning_effort)
+                    .map_err(AcpRuntimeError::Loop)?;
+            }
+        }
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
         let skill_catalog = current_skills.skills;
