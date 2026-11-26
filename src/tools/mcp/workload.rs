@@ -93,7 +93,12 @@ impl Client {
                 "workload MCP transport destination or authorization override rejected",
             ));
         }
-        let subject = self.delegation.as_ref().and_then(DelegationSlot::current);
+        let subject = match &self.delegation {
+            None => None,
+            Some(slot) => slot.current().ok_or_else(|| {
+                Self::error("workload delegation has not been established for this session")
+            })?,
+        };
         self.session
             .acquisition_for(subject.as_ref())
             .await
@@ -696,29 +701,40 @@ mod tests {
     #[test]
     fn session_delegation_binds_only_opted_in_clients_to_the_runtime_slot() {
         let slot = DelegationSlot::default();
+        let other = DelegationSlot::default();
         let plain = Client::new("https://mcp.example/mcp", config(), &slot).unwrap();
         assert!(plain.delegation.is_none());
         let mut delegated_config = config();
         delegated_config.delegation = Delegation::Session;
-        let delegated = Client::new("https://mcp.example/mcp", delegated_config, &slot).unwrap();
-        let subject = crate::workload_auth::Subject::new("user.delegation.token".into()).unwrap();
-        slot.set(Some(subject));
-        assert!(
-            delegated
-                .delegation
-                .as_ref()
-                .and_then(DelegationSlot::current)
-                .is_some()
-        );
-        // Another runtime's slot is never observed.
-        DelegationSlot::default().set(None);
-        assert!(
-            delegated
-                .delegation
-                .as_ref()
-                .and_then(DelegationSlot::current)
-                .is_some()
-        );
+        let delegated =
+            Client::new("https://mcp.example/mcp", delegated_config.clone(), &slot).unwrap();
+        let neighbour = Client::new("https://mcp.example/mcp", delegated_config, &other).unwrap();
+        let current =
+            |client: &Client| client.delegation.as_ref().and_then(DelegationSlot::current);
+        slot.set(Some(
+            crate::workload_auth::Subject::new("user.delegation.token".into()).unwrap(),
+        ));
+        assert!(matches!(current(&delegated), Some(Some(_))));
+        // A runtime never observes another runtime's subject.
+        assert!(current(&neighbour).is_none());
+        other.set(None);
+        assert!(matches!(current(&delegated), Some(Some(_))));
+        assert!(matches!(current(&neighbour), Some(None)));
+    }
+
+    #[tokio::test]
+    async fn delegated_client_fails_closed_until_the_subject_is_established() {
+        let mut delegated_config = config();
+        delegated_config.delegation = Delegation::Session;
+        let destination = "https://mcp.example/mcp";
+        let client =
+            Client::new(destination, delegated_config, &DelegationSlot::default()).unwrap();
+        let error = client
+            .authorization(destination, &HashMap::new())
+            .await
+            .err()
+            .expect("an unestablished delegation must not fall back to the workload grant");
+        assert!(error.to_string().contains("has not been established"));
     }
 
     #[tokio::test]

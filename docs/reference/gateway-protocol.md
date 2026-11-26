@@ -77,7 +77,7 @@ Initialize POST body (send `Authorization: Bearer TOKEN` and `Content-Type: appl
 The response is HTTP 200 JSON with `Acp-Connection-Id`. Its `result` contains `protocolVersion: 2`, `info.name: "kit-gateway"`, the running Kit version, and these capabilities:
 
 ```json
-{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true},"kit/delegation":{"method":"_kit/session/update_delegation"}}}}}
+{"_meta":{"kit/session/status":{},"kit/disabledTools":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true},"kit/delegation":{"method":"_kit/session/update_delegation"}}}}}
 ```
 
 Its `result._meta` explicitly identifies the experimental limits:

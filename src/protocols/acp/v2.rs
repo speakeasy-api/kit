@@ -73,12 +73,22 @@ struct UpdateMcpResponse {}
 #[derive(Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcRequest)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[request(method = "_kit/session/update_delegation", response = UpdateDelegationResponse)]
-struct UpdateDelegationRequest {
+pub(crate) struct UpdateDelegationRequest {
     session_id: wire::SessionId,
     #[serde(deserialize_with = "required_nullable")]
     subject_token: Option<String>,
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     meta: Option<serde_json::Map<String, Value>>,
+}
+
+impl UpdateDelegationRequest {
+    pub(crate) fn new(session_id: String, subject_token: Option<String>) -> Self {
+        Self {
+            session_id: wire::SessionId::new(session_id),
+            subject_token,
+            meta: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for UpdateDelegationRequest {
@@ -103,7 +113,7 @@ fn required_nullable<'de, D: serde::Deserializer<'de>>(
 #[derive(
     Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcResponse,
 )]
-struct UpdateDelegationResponse {}
+pub(crate) struct UpdateDelegationResponse {}
 
 fn client_mcp_servers(
     mcp_servers: Vec<wire::McpServer>,
@@ -846,7 +856,7 @@ struct SessionSetup {
     disabled_tools: Vec<String>,
 }
 
-const DISABLED_TOOLS_META: &str = "kit/disabledTools";
+pub(crate) const DISABLED_TOOLS_META: &str = "kit/disabledTools";
 
 /// Reads the built-in tools a client removes for one session. Unknown names are
 /// rejected when the driver starts, so a typo never leaves a tool enabled.
@@ -1049,6 +1059,10 @@ impl Server {
             .meta
             .get_or_insert_with(Map::new)
             .insert("kit/session/status".into(), serde_json::json!({}));
+        capabilities
+            .meta
+            .get_or_insert_with(Map::new)
+            .insert(DISABLED_TOOLS_META.into(), serde_json::json!({}));
         capabilities
             .meta
             .get_or_insert_with(Map::new)
@@ -1317,6 +1331,22 @@ impl Server {
         let session_id = wire::SessionId::new(claim.id());
         let servers = client_mcp_servers(mcp_servers)?;
         let mcp = runtime.isolated_session_mcp(servers, &cwd).await?;
+        // A fork acts for the same person as its source. Without a source in
+        // this process the fork stays unestablished and fails closed until the
+        // client sends `_kit/session/update_delegation`.
+        if let Some(fork) = &forked {
+            let parent = self
+                .sessions
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?
+                .get(&wire::SessionId::new(fork.source_session_id.clone()))
+                .map(|session| session.mcp.delegation());
+            if let Some(Some(subject)) = parent {
+                mcp.set_delegation(subject)
+                    .await
+                    .map_err(AcpRuntimeError::Loop)?;
+            }
+        }
         let mcp_events = mcp
             .subscribe(session_id.to_string())
             .map_err(AcpRuntimeError::Loop)?;
@@ -1628,7 +1658,7 @@ impl Server {
         Ok(UpdateMcpResponse {})
     }
 
-    fn update_delegation(
+    async fn update_delegation(
         &self,
         request: UpdateDelegationRequest,
     ) -> Result<UpdateDelegationResponse, AcpRuntimeError> {
@@ -1637,14 +1667,21 @@ impl Server {
             .map(crate::workload_auth::Subject::new)
             .transpose()
             .map_err(AcpRuntimeError::Unsupported)?;
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        let session = sessions
-            .get(&request.session_id)
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        session.mcp.set_delegation(subject);
+        // Reconnecting delegated servers waits for in-flight operations, so
+        // never hold the session registry lock across it.
+        let mcp = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+            let session = sessions
+                .get(&request.session_id)
+                .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+            session.mcp.clone()
+        };
+        mcp.set_delegation(subject)
+            .await
+            .map_err(AcpRuntimeError::Loop)?;
         Ok(UpdateDelegationResponse {})
     }
 
@@ -3698,8 +3735,9 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: UpdateDelegationRequest, responder, _cx| {
-                    responder
-                        .respond_with_result(state.update_delegation(request).map_err(sdk_error))
+                    responder.respond_with_result(
+                        state.update_delegation(request).await.map_err(sdk_error),
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -8713,6 +8751,7 @@ for line in sys.stdin:
             response.capabilities.meta.as_ref().unwrap()["kit/session/status"],
             json!({})
         );
+        assert!(response.capabilities.meta.as_ref().unwrap()[DISABLED_TOOLS_META].is_object());
         let session = response.capabilities.session.expect("session capabilities");
         let mcp = session.mcp.expect("session MCP capabilities");
         assert!(mcp.stdio.is_some());

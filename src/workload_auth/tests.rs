@@ -210,13 +210,24 @@ fn delegation_subjects_and_config() {
     assert!(Subject::new("a".repeat(MAX_BYTES + 1)).is_err());
     assert!(Subject::new("a.b.c".into()).is_ok());
 
+    // Unestablished until a client states the subject, even as `None`.
     let slot = DelegationSlot::default();
     assert!(slot.current().is_none());
+    let start = slot.epoch();
     let subject = Subject::new("a.b.c".into()).unwrap();
-    slot.set(Some(subject.clone()));
-    assert!(Subject::same(slot.current().as_ref(), Some(&subject)));
-    slot.set(None);
-    assert!(slot.current().is_none());
+    assert!(slot.set(Some(subject.clone())));
+    assert!(Subject::same(
+        slot.current().flatten().as_ref(),
+        Some(&subject)
+    ));
+    // Restating the same token is not a change of principal.
+    assert!(!slot.set(Some(Subject::new("a.b.c".into()).unwrap())));
+    assert_eq!(slot.epoch(), start.wrapping_add(1));
+    // Clearing establishes the workload alone, and is a change.
+    assert!(slot.set(None));
+    assert!(matches!(slot.current(), Some(None)));
+    assert!(!slot.set(None));
+    assert_eq!(slot.epoch(), start.wrapping_add(2));
 
     let config: Config = serde_json::from_value(serde_json::json!({
         "tokenFile": "/var/run/token",

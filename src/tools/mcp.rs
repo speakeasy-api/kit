@@ -1186,6 +1186,20 @@ fn prepare_config(
             fingerprint.push(0);
             fingerprint.extend_from_slice(cwd.as_os_str().as_encoded_bytes());
         }
+        // A change of delegated principal must reconnect the server, so its
+        // MCP session and tool catalog are never reused for another subject.
+        if let Server::Http(server) = &server
+            && server
+                .auth
+                .as_ref()
+                .and_then(auth::Config::workload)
+                .is_some_and(|config| {
+                    config.delegation == crate::workload_auth::Delegation::Session
+                })
+        {
+            fingerprint.push(0);
+            fingerprint.extend_from_slice(&delegation.epoch().to_be_bytes());
+        }
         entries.insert(id.clone(), fingerprint.clone());
         let (binding, record) = prepare_server(
             &id,
@@ -2336,11 +2350,28 @@ impl McpRuntime {
         self.reload_config_with_session(Some(source)).await
     }
 
-    /// Replace this runtime's delegated subject. Workload servers configured
-    /// with session delegation exchange it on their next request; `None`
-    /// returns them to workload-only authentication.
-    pub(crate) fn set_delegation(&self, subject: Option<crate::workload_auth::Subject>) {
-        self.inner.delegation.set(subject);
+    /// Establish this runtime's delegated subject; `None` means the workload
+    /// acts alone. When the principal changes, workload servers configured
+    /// with session delegation reconnect, after in-flight operations finish,
+    /// so no MCP session or tool catalog carries over between subjects.
+    pub(crate) async fn set_delegation(
+        &self,
+        subject: Option<crate::workload_auth::Subject>,
+    ) -> Result<(), String> {
+        if self.inner.delegation.set(subject) {
+            self.reload_config_with_policy(None, false).await?;
+        }
+        Ok(())
+    }
+
+    /// This runtime's delegation, shared with the session's child runs.
+    pub(crate) fn delegation_slot(&self) -> DelegationSlot {
+        self.inner.delegation.clone()
+    }
+
+    /// The established delegated subject, if a client has stated one.
+    pub(crate) fn delegation(&self) -> Option<Option<crate::workload_auth::Subject>> {
+        self.inner.delegation.current()
     }
 
     async fn reload_config(&self) -> Result<(), String> {
@@ -7321,6 +7352,46 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Config>(config).is_err(), "{config}");
         }
+    }
+
+    #[test]
+    fn delegated_workload_servers_reconnect_when_the_principal_changes() {
+        let path = Path::new("mcp.json");
+        let server = |delegation: &str| {
+            json!({
+                "type": "http",
+                "url": "https://mcp.example/mcp",
+                "auth": {
+                    "type": "workload_identity",
+                    "tokenFile": "/nonexistent/kit-workload-test-token",
+                    "expectedIssuer": "https://issuer.example",
+                    "tokenEndpoint": "https://issuer.example/token",
+                    "resource": "https://mcp.example/mcp",
+                    "delegation": delegation
+                }
+            })
+        };
+        let config = serde_json::to_vec(&json!({"mcpServers": {
+            "delegated": server("session"),
+            "workload": server("none"),
+        }}))
+        .unwrap();
+        let slot = crate::workload_auth::DelegationSlot::default();
+        let fingerprints = || prepare_config(&config, path, None, &slot).unwrap().1;
+        let before = fingerprints();
+        // Restating the same principal keeps the connection.
+        slot.set(None);
+        let established = fingerprints();
+        slot.set(None);
+        assert_eq!(fingerprints(), established);
+        slot.set(Some(
+            crate::workload_auth::Subject::new("user.delegation.token".into()).unwrap(),
+        ));
+        let delegated = fingerprints();
+        assert_ne!(before["delegated"], established["delegated"]);
+        assert_ne!(established["delegated"], delegated["delegated"]);
+        // Servers without session delegation never reconnect for it.
+        assert_eq!(before["workload"], delegated["workload"]);
     }
 
     #[test]

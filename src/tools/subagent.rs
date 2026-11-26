@@ -458,6 +458,17 @@ impl Subagents {
         self
     }
 
+    /// Child runs inherit the owning session's restrictions and delegation.
+    pub(crate) fn with_session_authority(
+        mut self,
+        disabled_tools: Vec<String>,
+        delegation: crate::workload_auth::DelegationSlot,
+    ) -> Self {
+        self.config.disabled_tools = disabled_tools;
+        self.config.delegation = Some(delegation);
+        self
+    }
+
     pub(crate) fn child_config(&self) -> ChildConfig {
         self.config.clone()
     }
@@ -2875,6 +2886,8 @@ mod steer_tests {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         });
         let state = Arc::new(AsyncMutex::new(State {
             name: "Scout".into(),

@@ -69,14 +69,28 @@ server configuration, then send the subject token with
 [ACP session delegation](#acp-session-delegation)).
 
 While a session has a subject token, Kit sends an RFC 8693 token exchange with the
-client's token as `subject_token`, the mounted workload JWT as `actor_token`
-(both typed as JWTs), and `requested_token_type` for an access token. The
-authorization server decides what the actor may do for that subject. Without a
-subject token, the configured `grant` authenticates the workload alone.
+client's token as `subject_token`, the mounted workload JWT as `actor_token`,
+and `requested_token_type` for an access token. Both tokens are typed as JWTs;
+Kit does not support an opaque subject token. The authorization server decides
+what the actor may do for that subject. After the client clears the subject
+with `null`, the configured `grant` authenticates the workload alone.
+
+A delegated server fails closed until the client states the session's subject,
+even as `null`. A new session, a session resumed in a new process, and a fork
+with no source session in the same process cannot reach the server until the
+client sends `_kit/session/update_delegation`. A fork of a session in the same
+process starts with its source's subject.
 
 Each session runtime owns its subject. Acquired tokens are cached per subject and
-never reused for a different subject or session. Inference workload
-authentication does not support delegation.
+never reused for a different subject or session. When the subject changes, Kit
+waits for in-flight operations, then reconnects each delegated server, so an MCP
+session or tool catalog is never carried over to another subject. Restating the
+same token does not reconnect. Inference workload authentication does not
+support delegation.
+
+Kit subagents and prompts to Kit children receive their owner's subject before
+each prompt, so a child never acts with more authority than its owner. A child
+whose owner has no established subject stays unestablished and fails closed.
 
 Do not add static authorization or Host headers. Reusing an unchanged assertion
 requires the issuer's explicit replay-policy support. After a process-memory
@@ -465,7 +479,14 @@ Set `_meta["kit/disabledTools"]` on `session/new`, `session/resume`, or
 `["shell", "edit", "subagent"]`. Kit removes them before the model sees the tool
 list. An unknown name fails the request, so a typo never leaves a tool enabled.
 The setting lasts for the attached session; send it again when restoring a
-stopped session.
+stopped session. Check `capabilities._meta["kit/disabledTools"]` before sending
+it. ACP v1 rejects the field rather than ignore it.
+
+Kit subagents and forks inherit the list. A subagent on a harness other than
+Kit cannot enforce it, so Kit refuses to start one while any tool is disabled;
+disable `subagent`, `fork`, and `prompt` as well to avoid that error. Reattaching
+to a resident gateway session with a different list fails with a conflict
+instead of changing the live session.
 
 ### Use MCP servers that require exclusive resources
 

@@ -215,6 +215,20 @@ impl Subject {
         Ok(Self(Arc::new(token)))
     }
 
+    /// Whether two subjects carry the same token bytes.
+    fn same_token(left: Option<&Self>, right: Option<&Self>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.0.as_str() == right.0.as_str(),
+            _ => false,
+        }
+    }
+
+    /// The token this subject wraps, for sending to a child runtime.
+    pub(crate) fn token(&self) -> &str {
+        self.0.as_str()
+    }
+
     fn same(left: Option<&Self>, right: Option<&Self>) -> bool {
         match (left, right) {
             (None, None) => true,
@@ -224,24 +238,58 @@ impl Subject {
     }
 }
 
+#[derive(Default)]
+struct SlotState {
+    /// `false` until a client states the session's subject, even as `None`.
+    established: bool,
+    subject: Option<Subject>,
+    /// Advances whenever the effective principal changes.
+    epoch: u64,
+}
+
 /// The current session's delegated subject, shared by that session's workload
-/// clients only. Replacing it invalidates their cached exchanges.
+/// clients only. A delegated client refuses to authenticate until the slot is
+/// established, so a session that never received a delegation (a fork, a
+/// child run, a fresh session) cannot fall back to the workload's own grant.
 #[derive(Clone, Default)]
-pub struct DelegationSlot(Arc<std::sync::RwLock<Option<Subject>>>);
+pub struct DelegationSlot(Arc<std::sync::RwLock<SlotState>>);
 
 impl DelegationSlot {
-    pub fn set(&self, subject: Option<Subject>) {
-        match self.0.write() {
-            Ok(mut current) => *current = subject,
-            Err(poisoned) => *poisoned.into_inner() = subject,
-        }
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, SlotState> {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub fn current(&self) -> Option<Subject> {
-        match self.0.read() {
-            Ok(current) => current.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, SlotState> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Establish the subject, `None` meaning the workload acts alone. Returns
+    /// whether the effective principal changed.
+    pub fn set(&self, subject: Option<Subject>) -> bool {
+        let mut state = self.write();
+        let changed =
+            !state.established || !Subject::same_token(state.subject.as_ref(), subject.as_ref());
+        state.established = true;
+        state.subject = subject;
+        if changed {
+            state.epoch = state.epoch.wrapping_add(1);
         }
+        changed
+    }
+
+    /// The established subject, or `None` when no client has stated one.
+    pub fn current(&self) -> Option<Option<Subject>> {
+        let state = self.read();
+        state.established.then(|| state.subject.clone())
+    }
+
+    /// Changes whenever the effective principal changes.
+    pub fn epoch(&self) -> u64 {
+        self.read().epoch
     }
 }
 

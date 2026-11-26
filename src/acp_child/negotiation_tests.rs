@@ -76,6 +76,8 @@ fn config(root: &std::path::Path, mode: &str) -> ChildConfig {
         tree_slots: None,
         prompt_cache_key: None,
         ahp_parent_event: None,
+        disabled_tools: Vec::new(),
+        delegation: None,
     }
 }
 

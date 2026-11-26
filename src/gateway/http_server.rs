@@ -148,7 +148,10 @@ impl Connection {
                 .delivery = Some(wire::PromptDeliveryCapabilities::new(true, true));
             let mut capabilities = serde_json::to_value(capabilities)
                 .map_err(|e| Failure::unavailable(e.to_string()))?;
-            capabilities["_meta"] = object([("kit/session/status", object([]))]);
+            capabilities["_meta"] = object([
+                ("kit/session/status", object([])),
+                ("kit/disabledTools", object([])),
+            ]);
             if let Some(session) = capabilities["session"].as_object_mut() {
                 for name in ["delete", "fork"] {
                     session.remove(name);

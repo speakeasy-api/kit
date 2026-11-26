@@ -941,6 +941,8 @@ impl Runtime {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         });
         Ok(Arc::new(Self {
             ask_user_enabled: true,
@@ -1608,6 +1610,8 @@ impl Runtime {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         });
         Ok(Arc::new(runtime))
     }
@@ -2591,6 +2595,7 @@ impl Runtime {
             .subagents
             .fresh_for_workspace(additional_directories, parent_context)
             .with_prompt_cache_key(prompt_cache_key.clone())
+            .with_session_authority(context.disabled_tools.clone(), mcp.delegation_slot())
             .with_observer(opened.observer.clone(), opened.children)
             .map_err(AcpRuntimeError::Loop)?;
         let task_manager = background_task_manager();
