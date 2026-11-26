@@ -140,9 +140,11 @@ fn execute_with_env(
             let removed = entry
                 .delete()
                 .map_err(|_| "Could not remove your Gemini key. Try again.".to_string())?;
-            entry
-                .require_disk()
-                .map_err(|_| "Could not remove your Gemini key. Try again.".to_string())?;
+            if matches!(storage, CredentialStorage::Filesystem(_)) {
+                entry
+                    .require_disk()
+                    .map_err(|_| "Could not remove your Gemini key. Try again.".to_string())?;
+            }
             let mut output = if removed {
                 "Gemini key removed.\n".to_string()
             } else {
@@ -247,9 +249,12 @@ fn save(storage: &CredentialStorage, record: &Credentials) -> Result<(), String>
     entry
         .save(&bytes)
         .map_err(|_| "Could not save your Gemini key. Try again.".to_string())?;
-    entry
-        .require_disk()
-        .map_err(|_| "Could not save your Gemini key. Try again.".to_string())
+    if matches!(storage, CredentialStorage::Filesystem(_)) {
+        entry
+            .require_disk()
+            .map_err(|_| "Could not save your Gemini key. Try again.".to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -570,5 +575,17 @@ mod tests {
             assert_eq!(load(&storage).unwrap().unwrap().api_key, "original");
         }
         assert!(execute(GeminiAuthCommand::Login, &CredentialStorage::Memory, false).is_err());
+    }
+
+    #[test]
+    fn memory_logout_reports_no_saved_key_and_warns_about_env() {
+        let output = execute(
+            GeminiAuthCommand::Logout { local_only: true },
+            &CredentialStorage::Memory,
+            true,
+        )
+        .unwrap();
+        assert!(output.contains("Gemini: no saved key."));
+        assert!(output.contains("GEMINI_API_KEY remains active after logout."));
     }
 }

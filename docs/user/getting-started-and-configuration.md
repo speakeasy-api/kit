@@ -122,9 +122,11 @@ saved key. Do not put API keys in command-line arguments or `config.toml`.
 Use direct Gemini model IDs with `--model` (for example, `gemini-2.5-pro`), not
 OpenRouter's `google/…` IDs. Kit discovers available `generateContent` models
 and context limits from the authenticated Gemini Models API. Leave
-`reasoning_effort` unset for the provider default, or select `low`, `medium`, or
-`high`. Logout deletes the locally saved key; revoke it in Google AI Studio to
-disable it remotely. An environment key remains active after logout.
+`reasoning_effort` unset for the provider default when a model's supported
+levels are unknown; explicit `low`, `medium`, and `high` settings are validated
+by model support (for example, `gemini-3-pro-preview` accepts `low` and `high`,
+not `medium`). Logout deletes the locally saved key; revoke it in Google AI
+Studio to disable it remotely. An environment key remains active after logout.
 
 ### OpenRouter API key and model
 

@@ -473,7 +473,7 @@ impl SelectableAdapter {
                     .model
                     .strip_prefix("models/")
                     .unwrap_or(&selection.model);
-                if models.is_empty() || models.iter().any(|model| model.id() == normalized) {
+                if models.iter().any(|model| model.id() == normalized) {
                     return true;
                 }
                 let Ok(Some(credentials)) =
@@ -1060,6 +1060,9 @@ impl KitAdapter {
             ProviderKind::Gemini => {
                 let credentials = super::gemini_auth::credentials(&credential_storage)?
                     .ok_or_else(|| "gemini_auth_required: set GEMINI_API_KEY or run `kit auth login gemini` before using Gemini".to_string())?;
+                if let Some(effort) = reasoning_effort {
+                    let _ = gemini_thinking_for_model(&model, effort)?;
+                }
                 let config = GeminiConfig::new(credentials.api_key(), model)
                     .map_err(|error| error.to_string())?;
                 Ok(Self::Gemini(GeminiKitAdapter {
@@ -2225,8 +2228,67 @@ fn gemini_major_version(model: &str) -> Option<u32> {
     major.parse::<u32>().ok()
 }
 
+fn gemini_is_non_thinking_modality(normalized: &str) -> bool {
+    normalized.contains("-image")
+        || normalized.contains("-tts")
+        || normalized.contains("-audio")
+        || normalized.contains("embedding")
+        || normalized.contains("imagen")
+        || normalized.contains("veo")
+        || normalized.contains("lyria")
+}
+
 fn gemini_supports_native_tool_images(model: &str) -> bool {
-    gemini_major_version(model).is_some_and(|major| major >= 3)
+    let normalized = model
+        .trim()
+        .strip_prefix("models/")
+        .unwrap_or(model.trim())
+        .to_ascii_lowercase();
+    !gemini_is_non_thinking_modality(&normalized)
+        && gemini_major_version(&normalized).is_some_and(|major| major >= 3)
+}
+
+fn gemini_thinking_for_model(
+    model: &str,
+    effort: ReasoningEffort,
+) -> Result<GeminiThinkingConfig, String> {
+    let normalized = model
+        .trim()
+        .strip_prefix("models/")
+        .unwrap_or(model.trim())
+        .to_ascii_lowercase();
+    if gemini_is_non_thinking_modality(&normalized) {
+        return Err(format!(
+            "Cannot configure explicit reasoning effort for Gemini model {model:?}; select default reasoning effort"
+        ));
+    }
+    if normalized.starts_with("gemini-2.5-") {
+        let budget = match effort {
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 8192,
+        };
+        return Ok(GeminiThinkingConfig::budget(budget));
+    }
+    if gemini_major_version(&normalized).is_some_and(|major| major >= 3) {
+        let is_gemini_3_pro = normalized == "gemini-3-pro"
+            || normalized.starts_with("gemini-3-pro-")
+            || normalized.starts_with("gemini-3.0-pro");
+        if is_gemini_3_pro && effort == ReasoningEffort::Medium {
+            return Err(format!(
+                "Cannot configure medium reasoning effort for Gemini model {model:?}; select low, high, or default reasoning effort"
+            ));
+        }
+        let level = match effort {
+            ReasoningEffort::Low => GeminiThinkingLevel::Low,
+            ReasoningEffort::Medium => GeminiThinkingLevel::Medium,
+            ReasoningEffort::High => GeminiThinkingLevel::High,
+        };
+        return Ok(GeminiThinkingConfig::level(level));
+    }
+    Err(format!(
+        "Cannot configure explicit reasoning effort for Gemini model {model:?}; select default reasoning effort"
+    ))
 }
 
 fn gemini_config(
@@ -2243,41 +2305,7 @@ fn gemini_config(
             config.model
         ));
     }
-    let normalized = config
-        .model
-        .trim()
-        .strip_prefix("models/")
-        .unwrap_or(config.model.trim())
-        .to_ascii_lowercase();
-    let thinking = if normalized.starts_with("gemini-2.5") {
-        let budget = match effort {
-            ReasoningEffort::Low => 1024,
-            ReasoningEffort::Medium => 4096,
-            ReasoningEffort::High => 8192,
-        };
-        GeminiThinkingConfig::budget(budget)
-    } else if gemini_major_version(&normalized).is_some_and(|major| major >= 3) {
-        let is_gemini_3_pro = normalized == "gemini-3-pro"
-            || normalized.starts_with("gemini-3-pro-")
-            || normalized.starts_with("gemini-3.0-pro");
-        if is_gemini_3_pro && effort == ReasoningEffort::Medium {
-            return Err(format!(
-                "Cannot configure medium reasoning effort for Gemini model {:?}; select low, high, or default reasoning effort",
-                config.model
-            ));
-        }
-        let level = match effort {
-            ReasoningEffort::Low => GeminiThinkingLevel::Low,
-            ReasoningEffort::Medium => GeminiThinkingLevel::Medium,
-            ReasoningEffort::High => GeminiThinkingLevel::High,
-        };
-        GeminiThinkingConfig::level(level)
-    } else {
-        return Err(format!(
-            "Cannot configure explicit reasoning effort for Gemini model {:?}; select default reasoning effort",
-            config.model
-        ));
-    };
+    let thinking = gemini_thinking_for_model(&config.model, effort)?;
     Ok(config.with_thinking(thinking))
 }
 
@@ -2572,13 +2600,43 @@ mod tests {
             Some(GeminiThinkingConfig::level(GeminiThinkingLevel::Medium))
         );
 
-        // Legacy or unrecognized Gemini models reject explicit effort without guessing.
-        let legacy = GeminiConfig::new("test", "gemini-2.0-flash").unwrap();
+        // Legacy, image/tts/audio, or unrecognized Gemini models reject explicit effort.
+        for unsupported in [
+            "gemini-2.0-flash",
+            "gemini-2.5-flash-image",
+            "gemini-2.5-flash-preview-tts",
+            "gemini-3-pro-image-preview",
+        ] {
+            let cfg = GeminiConfig::new("test", unsupported).unwrap();
+            assert!(
+                gemini_config(cfg, Some(ReasoningEffort::High), None)
+                    .unwrap_err()
+                    .contains("default reasoning"),
+                "expected {unsupported} to reject explicit reasoning effort"
+            );
+        }
+
+        // Constructor rejects incompatible model/effort before SelectableAdapter persists it.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::credentials::CredentialStorage::Filesystem(dir.path().into());
+        storage
+            .entry("gemini", "default")
+            .save(br#"{"api_key":"test-gemini-key"}"#)
+            .unwrap();
+        let selectable = super::SelectableAdapter::new_with_credentials(
+            super::ProviderKind::Gemini,
+            "gemini-3-pro-preview",
+            storage,
+        )
+        .unwrap();
+        let initial_rev = selectable.selection_revision().unwrap();
         assert!(
-            gemini_config(legacy, Some(ReasoningEffort::High), None)
-                .unwrap_err()
-                .contains("default reasoning")
+            selectable
+                .select_reasoning_effort(Some(ReasoningEffort::Medium))
+                .is_err()
         );
+        assert_eq!(selectable.reasoning_effort().unwrap(), None);
+        assert_eq!(selectable.selection_revision().unwrap(), initial_rev);
 
         // Native multimodal tool-result images require Gemini 3 or later.
         assert!(!super::gemini_supports_native_tool_images("gemini-2.5-pro"));
