@@ -550,13 +550,44 @@ impl SelectableAdapter {
                 else {
                     return true;
                 };
-                !super::gemini_catalog::confirmed_unsupported(
+                match super::gemini_catalog::retrieve(
                     super::gemini_catalog::MODELS_URL,
                     credentials.api_key(),
                     &selection.model,
                 )
                 .await
+                {
+                    Ok(model) => {
+                        record_gemini_non_thinking(
+                            &self.gemini_non_thinking,
+                            std::slice::from_ref(&model),
+                        );
+                        model.supports_generate_content()
+                    }
+                    Err(error) => !error.contains("HTTP 404"),
+                }
             }
+        }
+    }
+
+    pub(crate) async fn probe_gemini_thinking_veto(&self, selection: &ModelSelection) {
+        if selection.provider != ProviderKind::Gemini
+            || is_gemini_thinking_vetoed(&self.gemini_non_thinking, &selection.model)
+        {
+            return;
+        }
+        let Ok(Some(credentials)) = super::gemini_auth::credentials(&self.credential_storage)
+        else {
+            return;
+        };
+        if let Ok(model) = super::gemini_catalog::retrieve(
+            super::gemini_catalog::MODELS_URL,
+            credentials.api_key(),
+            &selection.model,
+        )
+        .await
+        {
+            record_gemini_non_thinking(&self.gemini_non_thinking, std::slice::from_ref(&model));
         }
     }
 
@@ -1409,9 +1440,15 @@ impl ModelAdapter for KitAdapter {
                 let metadata = resolved.as_ref();
                 let context_window =
                     metadata.and_then(super::gemini_catalog::Model::context_window);
-                let provider_config =
-                    gemini_config((*adapter.config).clone(), adapter.effort, metadata)
-                        .map_err(LoopError::InvalidState)?;
+                let cached_non_thinking =
+                    is_gemini_thinking_vetoed(&adapter.non_thinking, &adapter.config.model);
+                let provider_config = gemini_config(
+                    (*adapter.config).clone(),
+                    adapter.effort,
+                    metadata,
+                    cached_non_thinking,
+                )
+                .map_err(LoopError::InvalidState)?;
                 let inner = GeminiAdapter::new(provider_config)
                     .map_err(|error| LoopError::InvalidState(error.to_string()))?
                     .with_resilience(crate::request_budget::RequestBudget::current().resilience());
@@ -2459,11 +2496,12 @@ fn gemini_config(
     config: GeminiConfig,
     effort: Option<ReasoningEffort>,
     metadata: Option<&super::gemini_catalog::Model>,
+    cached_non_thinking: bool,
 ) -> Result<GeminiConfig, String> {
     let Some(effort) = effort else {
         return Ok(config);
     };
-    if metadata.and_then(|model| model.thinking) == Some(false) {
+    if cached_non_thinking || metadata.and_then(|model| model.thinking) == Some(false) {
         return Err(format!(
             "Cannot configure explicit reasoning effort for Gemini model {:?} because discovered metadata indicates thinking is not supported; select default reasoning effort",
             config.model
@@ -2769,33 +2807,43 @@ mod tests {
         // Default effort leaves thinking unset.
         let base_25 = GeminiConfig::new("test", "gemini-2.5-pro").unwrap();
         assert!(
-            gemini_config(base_25.clone(), None, Some(&model))
+            gemini_config(base_25.clone(), None, Some(&model), false)
                 .unwrap()
                 .thinking
                 .is_none()
         );
 
         // Gemini 2.5 maps explicit effort to token budgets.
-        let high_25 =
-            gemini_config(base_25.clone(), Some(ReasoningEffort::High), Some(&model)).unwrap();
+        let high_25 = gemini_config(
+            base_25.clone(),
+            Some(ReasoningEffort::High),
+            Some(&model),
+            false,
+        )
+        .unwrap();
         assert_eq!(high_25.thinking, Some(GeminiThinkingConfig::budget(8192)));
 
         // Gemini 3+ maps explicit effort to thinking levels, rejecting medium on gemini-3-pro.
         let base_3_pro = GeminiConfig::new("test", "gemini-3-pro-preview").unwrap();
         assert!(
-            gemini_config(base_3_pro.clone(), Some(ReasoningEffort::Medium), None)
-                .unwrap_err()
-                .contains("low, high, or default")
+            gemini_config(
+                base_3_pro.clone(),
+                Some(ReasoningEffort::Medium),
+                None,
+                false
+            )
+            .unwrap_err()
+            .contains("low, high, or default")
         );
         assert_eq!(
-            gemini_config(base_3_pro, Some(ReasoningEffort::High), None)
+            gemini_config(base_3_pro, Some(ReasoningEffort::High), None, false)
                 .unwrap()
                 .thinking,
             Some(GeminiThinkingConfig::level(GeminiThinkingLevel::High))
         );
         let base_3_flash = GeminiConfig::new("test", "gemini-3-flash").unwrap();
         assert_eq!(
-            gemini_config(base_3_flash, Some(ReasoningEffort::Medium), None)
+            gemini_config(base_3_flash, Some(ReasoningEffort::Medium), None, false)
                 .unwrap()
                 .thinking,
             Some(GeminiThinkingConfig::level(GeminiThinkingLevel::Medium))
@@ -2810,7 +2858,7 @@ mod tests {
         ] {
             let cfg = GeminiConfig::new("test", unsupported).unwrap();
             assert!(
-                gemini_config(cfg, Some(ReasoningEffort::High), None)
+                gemini_config(cfg, Some(ReasoningEffort::High), None, false)
                     .unwrap_err()
                     .contains("default reasoning"),
                 "expected {unsupported} to reject explicit reasoning effort"
@@ -2851,11 +2899,21 @@ mod tests {
             "models/gemini-3.5-flash"
         ));
 
-        // Explicit effort is rejected when metadata reports thinking is unsupported.
+        // Explicit effort is rejected when metadata or a cached veto reports thinking is unsupported.
         let mut non_thinking = model;
         non_thinking.thinking = Some(false);
         assert!(
-            gemini_config(base_25, Some(ReasoningEffort::Low), Some(&non_thinking))
+            gemini_config(
+                base_25.clone(),
+                Some(ReasoningEffort::Low),
+                Some(&non_thinking),
+                false
+            )
+            .unwrap_err()
+            .contains("default reasoning")
+        );
+        assert!(
+            gemini_config(base_25, Some(ReasoningEffort::Low), None, true)
                 .unwrap_err()
                 .contains("default reasoning")
         );

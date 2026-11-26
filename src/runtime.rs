@@ -1995,7 +1995,11 @@ impl Runtime {
                     error,
                 )
             })?;
-            let selection = self.restored_model(&opened).await?.selection;
+            let restored = self.restored_model(&opened).await?;
+            let selection = restored.selection;
+            if opened.reasoning_effort.flatten().is_some() {
+                self.adapter.probe_gemini_thinking_veto(&selection).await;
+            }
             let reasoning_effort = selection.compatible_reasoning_effort_with(
                 opened.reasoning_effort,
                 self.adapter.reasoning_effort()?,
@@ -2015,16 +2019,16 @@ impl Runtime {
             .with_gemini_non_thinking(self.adapter.gemini_non_thinking())
             .with_session_observer(opened.observer.clone(), !request.resume)?;
             if request.resume && self.model_override {
-                opened.observer.set_model(&selection.id())?;
-                if Some(reasoning_effort) != opened.reasoning_effort {
-                    opened.observer.set_reasoning_effort(reasoning_effort)?;
-                }
-            } else if request.resume
-                && opened.reasoning_effort.is_some()
-                && Some(reasoning_effort) != opened.reasoning_effort
-            {
-                opened.observer.set_reasoning_effort(reasoning_effort)?;
+                opened
+                    .observer
+                    .set_model_and_reasoning_effort(&selection.id(), reasoning_effort)?;
             }
+            let pending_effort_repair = (request.resume
+                && !self.model_override
+                && restored.fallback.is_none()
+                && opened.reasoning_effort.is_some()
+                && Some(reasoning_effort) != opened.reasoning_effort)
+                .then(|| (opened.observer.clone(), reasoning_effort));
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
             let compactor = self
@@ -2122,13 +2126,13 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation))
+            Ok::<_, String>((driver, pending_creation, pending_effort_repair))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation) = {
+        let (mut driver, pending_creation, pending_effort_repair) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {
@@ -2138,6 +2142,9 @@ impl Runtime {
         };
         if let Some(observer) = pending_creation {
             observer.commit_creation()?;
+        }
+        if let Some((observer, effort)) = pending_effort_repair {
+            observer.set_reasoning_effort(effort)?;
         }
         let result = {
             let cancellation = std::pin::pin!(cancelled.cancelled());
@@ -2452,6 +2459,11 @@ impl Runtime {
                         .restored_model(&opened)
                         .await
                         .map_err(AcpRuntimeError::Loop)?;
+                    if opened.reasoning_effort.flatten().is_some() {
+                        self.adapter
+                            .probe_gemini_thinking_veto(&restored.selection)
+                            .await;
+                    }
                     let effort = restored.selection.compatible_reasoning_effort_with(
                         opened.reasoning_effort,
                         self.reasoning_effort,
@@ -2568,15 +2580,11 @@ impl Runtime {
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         if request.resume && self.model_override && !had_selected {
             override_observer
-                .set_model(&selection.id())
+                .set_model_and_reasoning_effort(&selection.id(), reasoning_effort)
                 .map_err(AcpRuntimeError::Loop)?;
-            if Some(reasoning_effort) != opened.reasoning_effort {
-                override_observer
-                    .set_reasoning_effort(reasoning_effort)
-                    .map_err(AcpRuntimeError::Loop)?;
-            }
         } else if request.resume
             && !had_selected
+            && model_fallback.is_none()
             && opened.reasoning_effort.is_some()
             && Some(reasoning_effort) != opened.reasoning_effort
         {

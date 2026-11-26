@@ -79,6 +79,7 @@ pub(super) async fn retrieve(url: &str, key: &str, model: &str) -> Result<Model,
 
 /// Only a 404 or an explicit method list omitting `generateContent` proves a
 /// model cannot be used; any other failure is inconclusive.
+#[cfg(test)]
 pub(super) async fn confirmed_unsupported(url: &str, key: &str, model: &str) -> bool {
     match retrieve(url, key, model).await {
         Ok(model) => !model.supports_generate_content(),
