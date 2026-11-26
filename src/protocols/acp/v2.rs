@@ -1999,10 +1999,23 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                             let target_selection =
                                 crate::provider::ModelSelection::from_id(&target.to_string())
                                     .map_err(|error| model_switch::error(&error))?;
-                            adapter
-                                .preflight_model_switch(&target_selection)
-                                .await
-                                .map_err(|error| model_switch::error(&error))?;
+                            {
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
+                                let preflight = std::pin::pin!(
+                                    adapter.preflight_model_switch(&target_selection)
+                                );
+                                match futures_util::future::select(cancelled, preflight).await {
+                                    futures_util::future::Either::Left(((), _)) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    futures_util::future::Either::Right((result, _)) => {
+                                        result.map_err(|error| model_switch::error(&error))?;
+                                    }
+                                }
+                            }
+                            if cancellation.is_cancelled() {
+                                return Err(model_switch::error("model change cancelled"));
+                            }
                             let decision = model_switch.check(
                                 (
                                     &adapter
@@ -2019,6 +2032,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                     .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
+                                if cancellation.is_cancelled() {
+                                    return Err(model_switch::error("model change cancelled"));
+                                }
                                 busy.store(true, Ordering::Release);
                                 let compacted = compact_for_switch(
                                     &session_id,
@@ -2032,6 +2048,30 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                 .await;
                                 busy.store(false, Ordering::Release);
                                 compacted?;
+                            }
+                        } else if request.config_id.to_string() == super::REASONING_EFFORT_CONFIG_ID
+                        {
+                            let value = request
+                                .value
+                                .as_id()
+                                .ok_or_else(|| {
+                                    model_switch::error("selection requires an id value")
+                                })?
+                                .to_string();
+                            let effort = crate::provider::ReasoningEffort::from_id(&value)
+                                .map_err(|error| model_switch::error(&error))?;
+                            if effort.is_some() {
+                                let cancelled = std::pin::pin!(cancellation.cancelled());
+                                let preflight =
+                                    std::pin::pin!(adapter.preflight_reasoning_effort(effort));
+                                match futures_util::future::select(cancelled, preflight).await {
+                                    futures_util::future::Either::Left(((), _)) => {
+                                        return Err(model_switch::error("model change cancelled"));
+                                    }
+                                    futures_util::future::Either::Right((result, _)) => {
+                                        result.map_err(|error| model_switch::error(&error))?;
+                                    }
+                                }
                             }
                         }
                         if cancellation.is_cancelled() {
