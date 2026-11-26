@@ -150,17 +150,31 @@ impl ModelSelection {
         }
     }
 
+    pub(crate) fn compatible_reasoning_effort_with(
+        &self,
+        saved: Option<Option<ReasoningEffort>>,
+        configured: Option<ReasoningEffort>,
+        supports: impl Fn(ReasoningEffort) -> bool,
+    ) -> Option<ReasoningEffort> {
+        let Some(saved_effort) = saved else {
+            return configured;
+        };
+        match saved_effort {
+            Some(effort) if supports(effort) => Some(effort),
+            Some(_) => configured.filter(|effort| supports(*effort)),
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn compatible_reasoning_effort(
         &self,
         saved: Option<Option<ReasoningEffort>>,
         configured: Option<ReasoningEffort>,
     ) -> Option<ReasoningEffort> {
-        let candidate = saved.unwrap_or(configured);
-        match candidate {
-            Some(effort) if self.supports_reasoning_effort(effort) => Some(effort),
-            Some(_) => configured.filter(|effort| self.supports_reasoning_effort(*effort)),
-            None => None,
-        }
+        self.compatible_reasoning_effort_with(saved, configured, |effort| {
+            self.supports_reasoning_effort(effort)
+        })
     }
 }
 
@@ -304,6 +318,31 @@ impl SelectableAdapter {
     }
     pub(crate) fn inference(&self) -> super::inference::Instances {
         self.inference.clone()
+    }
+
+    pub(crate) fn with_gemini_non_thinking(
+        mut self,
+        gemini_non_thinking: Arc<Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.gemini_non_thinking = gemini_non_thinking;
+        self
+    }
+
+    pub(crate) fn gemini_non_thinking(&self) -> Arc<Mutex<std::collections::HashSet<String>>> {
+        Arc::clone(&self.gemini_non_thinking)
+    }
+
+    pub(crate) fn supports_reasoning_effort_for(
+        &self,
+        selection: &ModelSelection,
+        effort: ReasoningEffort,
+    ) -> bool {
+        if selection.provider == ProviderKind::Gemini
+            && is_gemini_thinking_vetoed(&self.gemini_non_thinking, &selection.model)
+        {
+            return false;
+        }
+        selection.supports_reasoning_effort(effort)
     }
 
     /// Attach persistence before publishing any clones of this session adapter.
@@ -4180,6 +4219,24 @@ mod tests {
             panic!("expected system text");
         };
         assert_eq!(compaction_system.text, "Summarize this conversation.");
+    }
+
+    #[test]
+    fn gemini_configured_effort_reaches_validation_without_a_saved_value() {
+        let model = ModelSelection::new(ProviderKind::Gemini, "gemini-3-pro-preview");
+        let medium = Some(ReasoningEffort::Medium);
+        assert_eq!(model.compatible_reasoning_effort(None, medium), medium);
+        assert_eq!(
+            model.compatible_reasoning_effort(Some(medium), Some(ReasoningEffort::High)),
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(model.compatible_reasoning_effort(Some(medium), None), None);
+        assert_eq!(
+            model.compatible_reasoning_effort_with(Some(Some(ReasoningEffort::High)), None, |_| {
+                false
+            }),
+            None,
+        );
     }
 }
 
