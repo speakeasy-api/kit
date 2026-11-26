@@ -33,31 +33,50 @@ impl Credentials {
     }
 }
 
-/// Resolve the active key without making a network request.
-pub(crate) fn credentials(storage: &CredentialStorage) -> Result<Option<Credentials>, String> {
-    let environment = match std::env::var("GEMINI_API_KEY") {
-        Ok(value) => Some(Zeroizing::new(value)),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("Invalid GEMINI_API_KEY. Check the key and try again.".into());
-        }
-    };
-    resolve_key(storage, environment.as_deref().map(String::as_str))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialSource {
+    Environment,
+    Stored,
 }
 
-fn resolve_key(
+fn read_environment_key() -> Result<Option<Zeroizing<String>>, String> {
+    match std::env::var("GEMINI_API_KEY") {
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("Invalid GEMINI_API_KEY. Check the key and try again.".into())
+        }
+    }
+}
+
+/// Resolve the active key without making a network request.
+pub(crate) fn credentials(storage: &CredentialStorage) -> Result<Option<Credentials>, String> {
+    let environment = read_environment_key()?;
+    resolve_with_source(storage, environment.as_deref().map(String::as_str))
+        .map(|resolved| resolved.map(|(record, _)| record))
+}
+
+fn resolve_with_source(
     storage: &CredentialStorage,
     environment: Option<&str>,
-) -> Result<Option<Credentials>, String> {
+) -> Result<Option<(Credentials, CredentialSource)>, String> {
     if let Some(key) = environment.filter(|key| !key.is_empty()) {
         let record = Credentials {
             api_key: key.into(),
         };
         validate(&record)?;
-        Ok(Some(record))
+        Ok(Some((record, CredentialSource::Environment)))
     } else {
-        load(storage)
+        Ok(load(storage)?.map(|record| (record, CredentialSource::Stored)))
     }
+}
+
+#[cfg(test)]
+fn resolve_key(
+    storage: &CredentialStorage,
+    environment: Option<&str>,
+) -> Result<Option<Credentials>, String> {
+    resolve_with_source(storage, environment).map(|resolved| resolved.map(|(record, _)| record))
 }
 
 impl std::fmt::Debug for Credentials {
@@ -71,16 +90,26 @@ pub fn execute_gemini_auth(
     command: GeminiAuthCommand,
     storage: &CredentialStorage,
 ) -> Result<String, String> {
-    let environment_active =
-        std::env::var_os("GEMINI_API_KEY").is_some_and(|value| !value.is_empty());
-    execute(command, storage, environment_active)
+    match command {
+        GeminiAuthCommand::Status => {
+            let environment = read_environment_key()?;
+            execute_with_env(command, storage, environment.as_deref().map(String::as_str))
+        }
+        GeminiAuthCommand::Login | GeminiAuthCommand::Logout { .. } => {
+            let environment = std::env::var_os("GEMINI_API_KEY")
+                .is_some_and(|value| !value.is_empty())
+                .then_some("present");
+            execute_with_env(command, storage, environment)
+        }
+    }
 }
 
-fn execute(
+fn execute_with_env(
     command: GeminiAuthCommand,
     storage: &CredentialStorage,
-    environment_active: bool,
+    environment: Option<&str>,
 ) -> Result<String, String> {
+    let environment_active = environment.is_some_and(|value| !value.is_empty());
     match command {
         GeminiAuthCommand::Login => {
             if !storage.is_persistent() {
@@ -99,19 +128,20 @@ fn execute(
                 LOGIN_TIMEOUT,
             )
         }
-        GeminiAuthCommand::Status => {
-            if environment_active {
+        GeminiAuthCommand::Status => match resolve_with_source(storage, environment)? {
+            Some((_, CredentialSource::Environment)) => {
                 Ok("Gemini: configured via GEMINI_API_KEY.\n".into())
-            } else if load(storage)?.is_some() {
-                Ok("Gemini: configured.\n".into())
-            } else {
-                Ok("Gemini: not configured.\n".into())
             }
-        }
+            Some((_, CredentialSource::Stored)) => Ok("Gemini: configured.\n".into()),
+            None => Ok("Gemini: not configured.\n".into()),
+        },
         GeminiAuthCommand::Logout { local_only } => {
-            let removed = storage
-                .entry(NAMESPACE, IDENTITY)
+            let entry = storage.entry(NAMESPACE, IDENTITY);
+            let removed = entry
                 .delete()
+                .map_err(|_| "Could not remove your Gemini key. Try again.".to_string())?;
+            entry
+                .require_disk()
                 .map_err(|_| "Could not remove your Gemini key. Try again.".to_string())?;
             let mut output = if removed {
                 "Gemini key removed.\n".to_string()
@@ -213,9 +243,12 @@ fn save(storage: &CredentialStorage, record: &Credentials) -> Result<(), String>
     if bytes.len() > MAX_RECORD_BYTES {
         return Err("Invalid Gemini API key. Copy the key and try again.".into());
     }
-    storage
-        .entry(NAMESPACE, IDENTITY)
+    let entry = storage.entry(NAMESPACE, IDENTITY);
+    entry
         .save(&bytes)
+        .map_err(|_| "Could not save your Gemini key. Try again.".to_string())?;
+    entry
+        .require_disk()
         .map_err(|_| "Could not save your Gemini key. Try again.".to_string())
 }
 
@@ -230,6 +263,15 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    fn execute(
+        command: GeminiAuthCommand,
+        storage: &CredentialStorage,
+        environment_active: bool,
+    ) -> Result<String, String> {
+        let environment = environment_active.then_some("env-test-key");
+        execute_with_env(command, storage, environment)
+    }
 
     // A real HTTP boundary: capture the request and return an upstream response.
     fn serve(response: String, delay: Duration) -> (String, std::thread::JoinHandle<String>) {
@@ -496,6 +538,14 @@ mod tests {
             .save(&vec![b'x'; MAX_RECORD_BYTES + 1])
             .unwrap();
         assert!(load(&storage).unwrap_err().contains("Log in again"));
+        assert!(
+            execute_with_env(
+                GeminiAuthCommand::Status,
+                &storage,
+                Some("invalid key with spaces")
+            )
+            .is_err()
+        );
     }
 
     #[test]

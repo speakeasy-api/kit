@@ -77,11 +77,13 @@ pub(super) async fn retrieve(url: &str, key: &str, model: &str) -> Result<Model,
     .map_err(|_| "Gemini model discovery timed out".to_owned())?
 }
 
-/// Only a 404 proves a model is gone; any other failure is inconclusive.
-pub(super) async fn confirmed_missing(url: &str, key: &str, model: &str) -> bool {
-    retrieve(url, key, model)
-        .await
-        .is_err_and(|error| error.contains("HTTP 404"))
+/// Only a 404 or an explicit method list omitting `generateContent` proves a
+/// model cannot be used; any other failure is inconclusive.
+pub(super) async fn confirmed_unsupported(url: &str, key: &str, model: &str) -> bool {
+    match retrieve(url, key, model).await {
+        Ok(model) => !model.supports_generate_content(),
+        Err(error) => error.contains("HTTP 404"),
+    }
 }
 
 async fn read_model_response(
@@ -248,11 +250,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_not_found_response_confirms_a_model_is_missing() {
-        for (status, body, missing) in [
+    async fn only_not_found_or_non_generative_confirms_model_is_unsupported() {
+        for (status, body, unsupported) in [
             (404, "{}".to_owned(), true),
+            (
+                200,
+                json!({
+                    "name": "models/text-embedding-004",
+                    "supportedGenerationMethods": ["embedContent"]
+                })
+                .to_string(),
+                true,
+            ),
             (401, "{}".to_owned(), false),
             (500, "{}".to_owned(), false),
+            (
+                200,
+                json!({
+                    "name": "models/gemini-2.5-pro",
+                    "supportedGenerationMethods": ["generateContent"]
+                })
+                .to_string(),
+                false,
+            ),
             (
                 200,
                 json!({"name": "models/gemini-2.5-pro"}).to_string(),
@@ -261,8 +281,8 @@ mod tests {
         ] {
             let (url, handle) = server(vec![(status, body)]);
             assert_eq!(
-                confirmed_missing(&url, "test", "gemini-2.5-pro").await,
-                missing
+                confirmed_unsupported(&url, "test", "gemini-2.5-pro").await,
+                unsupported
             );
             let _ = handle.join();
         }

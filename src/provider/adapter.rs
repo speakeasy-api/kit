@@ -481,7 +481,7 @@ impl SelectableAdapter {
                 else {
                     return true;
                 };
-                !super::gemini_catalog::confirmed_missing(
+                !super::gemini_catalog::confirmed_unsupported(
                     super::gemini_catalog::MODELS_URL,
                     credentials.api_key(),
                     &selection.model,
@@ -1270,6 +1270,14 @@ impl ModelAdapter for KitAdapter {
                 )
                 .await
                 .ok();
+                if let Some(model) = resolved.as_ref()
+                    && !model.supports_generate_content()
+                {
+                    return Err(LoopError::InvalidState(format!(
+                        "Gemini model {:?} does not support generateContent",
+                        adapter.config.model
+                    )));
+                }
                 let metadata = resolved.as_ref();
                 let context_window =
                     metadata.and_then(super::gemini_catalog::Model::context_window);
@@ -1601,10 +1609,14 @@ impl ModelSession for KitSession {
         let mut request = if is_native_openai {
             request
         } else {
-            project_tool_output_images(
-                request,
-                matches!(self, Self::Anthropic(_, _) | Self::Gemini(_, _)),
-            )?
+            let native_tool_images = match self {
+                Self::Anthropic(_, _) => true,
+                Self::Gemini(session, _) => session
+                    .model_name()
+                    .is_some_and(gemini_supports_native_tool_images),
+                _ => false,
+            };
+            project_tool_output_images(request, native_tool_images)?
         };
         apply_model_system_prompt(&mut request, is_native_openai, self.model_name());
         match self {
@@ -2202,6 +2214,21 @@ async fn discover_anthropic(
     }
 }
 
+fn gemini_major_version(model: &str) -> Option<u32> {
+    let normalized = model
+        .trim()
+        .strip_prefix("models/")
+        .unwrap_or(model.trim())
+        .to_ascii_lowercase();
+    let rest = normalized.strip_prefix("gemini-")?;
+    let major = rest.split(['.', '-']).next()?;
+    major.parse::<u32>().ok()
+}
+
+fn gemini_supports_native_tool_images(model: &str) -> bool {
+    gemini_major_version(model).is_some_and(|major| major >= 3)
+}
+
 fn gemini_config(
     config: GeminiConfig,
     effort: Option<ReasoningEffort>,
@@ -2220,7 +2247,8 @@ fn gemini_config(
         .model
         .trim()
         .strip_prefix("models/")
-        .unwrap_or(config.model.trim());
+        .unwrap_or(config.model.trim())
+        .to_ascii_lowercase();
     let thinking = if normalized.starts_with("gemini-2.5") {
         let budget = match effort {
             ReasoningEffort::Low => 1024,
@@ -2228,13 +2256,27 @@ fn gemini_config(
             ReasoningEffort::High => 8192,
         };
         GeminiThinkingConfig::budget(budget)
-    } else {
+    } else if gemini_major_version(&normalized).is_some_and(|major| major >= 3) {
+        let is_gemini_3_pro = normalized == "gemini-3-pro"
+            || normalized.starts_with("gemini-3-pro-")
+            || normalized.starts_with("gemini-3.0-pro");
+        if is_gemini_3_pro && effort == ReasoningEffort::Medium {
+            return Err(format!(
+                "Cannot configure medium reasoning effort for Gemini model {:?}; select low, high, or default reasoning effort",
+                config.model
+            ));
+        }
         let level = match effort {
             ReasoningEffort::Low => GeminiThinkingLevel::Low,
             ReasoningEffort::Medium => GeminiThinkingLevel::Medium,
             ReasoningEffort::High => GeminiThinkingLevel::High,
         };
         GeminiThinkingConfig::level(level)
+    } else {
+        return Err(format!(
+            "Cannot configure explicit reasoning effort for Gemini model {:?}; select default reasoning effort",
+            config.model
+        ));
     };
     Ok(config.with_thinking(thinking))
 }
@@ -2509,13 +2551,46 @@ mod tests {
             gemini_config(base_25.clone(), Some(ReasoningEffort::High), Some(&model)).unwrap();
         assert_eq!(high_25.thinking, Some(GeminiThinkingConfig::budget(8192)));
 
-        // Gemini 3+ maps explicit effort to thinking levels.
-        let base_3 = GeminiConfig::new("test", "gemini-3-pro").unwrap();
-        let medium_3 = gemini_config(base_3, Some(ReasoningEffort::Medium), None).unwrap();
+        // Gemini 3+ maps explicit effort to thinking levels, rejecting medium on gemini-3-pro.
+        let base_3_pro = GeminiConfig::new("test", "gemini-3-pro-preview").unwrap();
+        assert!(
+            gemini_config(base_3_pro.clone(), Some(ReasoningEffort::Medium), None)
+                .unwrap_err()
+                .contains("low, high, or default")
+        );
         assert_eq!(
-            medium_3.thinking,
+            gemini_config(base_3_pro, Some(ReasoningEffort::High), None)
+                .unwrap()
+                .thinking,
+            Some(GeminiThinkingConfig::level(GeminiThinkingLevel::High))
+        );
+        let base_3_flash = GeminiConfig::new("test", "gemini-3-flash").unwrap();
+        assert_eq!(
+            gemini_config(base_3_flash, Some(ReasoningEffort::Medium), None)
+                .unwrap()
+                .thinking,
             Some(GeminiThinkingConfig::level(GeminiThinkingLevel::Medium))
         );
+
+        // Legacy or unrecognized Gemini models reject explicit effort without guessing.
+        let legacy = GeminiConfig::new("test", "gemini-2.0-flash").unwrap();
+        assert!(
+            gemini_config(legacy, Some(ReasoningEffort::High), None)
+                .unwrap_err()
+                .contains("default reasoning")
+        );
+
+        // Native multimodal tool-result images require Gemini 3 or later.
+        assert!(!super::gemini_supports_native_tool_images("gemini-2.5-pro"));
+        assert!(!super::gemini_supports_native_tool_images(
+            "gemini-2.0-flash"
+        ));
+        assert!(super::gemini_supports_native_tool_images(
+            "gemini-3-pro-preview"
+        ));
+        assert!(super::gemini_supports_native_tool_images(
+            "models/gemini-3.5-flash"
+        ));
 
         // Explicit effort is rejected when metadata reports thinking is unsupported.
         let mut non_thinking = model;

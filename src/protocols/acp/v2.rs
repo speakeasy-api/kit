@@ -8387,7 +8387,7 @@ for line in sys.stdin:
             assert_eq!(server.form_elicitation.load(Ordering::Acquire), expected);
         }
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
-        assert_eq!(response.auth_methods.len(), 4);
+        assert_eq!(response.auth_methods.len(), 5);
         assert!(matches!(
             &response.auth_methods[0],
             wire::AuthMethod::Terminal(method)
@@ -8405,6 +8405,18 @@ for line in sys.stdin:
             wire::AuthMethod::Terminal(method)
                 if method.method_id.0.as_ref() == "speakeasy"
                     && method.args == ["--terminal-auth-login", "speakeasy"]
+        ));
+        assert!(matches!(
+            &response.auth_methods[3],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "anthropic"
+                    && method.args == ["--terminal-auth-login", "anthropic"]
+        ));
+        assert!(matches!(
+            &response.auth_methods[4],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "gemini"
+                    && method.args == ["--terminal-auth-login", "gemini"]
         ));
         let unsupported = server
             .initialize(wire::InitializeRequest::new(
