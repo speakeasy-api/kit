@@ -180,7 +180,7 @@ impl SdkClient {
         assert_eq!(response["result"]["protocolVersion"], 2, "{response}");
         assert_eq!(
             response["result"]["capabilities"]["session"]["mcp"],
-            json!({"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}})
+            json!({"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true},"kit/delegation":{"method":"_kit/session/update_delegation"}}})
         );
         assert_eq!(
             response["result"]["_meta"]["kit/gateway"]["transport"],
@@ -553,6 +553,24 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
             .as_str()
             .unwrap()
             .contains("_kit/session/update_mcp")
+    );
+    sdk.detach().await;
+
+    // A reattachment cannot silently change the resident disabled tools.
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root,"_meta":{"kit/disabledTools":["shell"]}}),
+        )
+        .await;
+    assert!(
+        resumed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("disabled tools"),
+        "{resumed}"
     );
     sdk.detach().await;
     let mut sdk = SdkClient::connect(&url).await;
@@ -2096,7 +2114,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         initialized,
         json!({"jsonrpc":"2.0","id":1,"result":{
             "protocolVersion":2,"info":{"name":"kit-gateway","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}},
+            "capabilities":{"_meta":{"kit/session/status":{},"kit/disabledTools":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true},"kit/delegation":{"method":"_kit/session/update_delegation"}}}}},
             "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4093}}
         }})
     );

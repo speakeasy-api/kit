@@ -44,6 +44,7 @@ that controller's pending requests with errors without detaching its other sessi
 | `session/resume` | Acquire or replace control of a session; optional replay from `start` only. |
 | `session/prompt` | Submit work to the resident child. Use a `delivery` mode advertised under `capabilities.session.prompt.delivery` to steer or queue explicitly. The response acknowledges insertion, not receipt. |
 | `_kit/session/update_mcp` | Add or update the current controller's client-owned MCP servers; see [session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). |
+| `_kit/session/update_delegation` | Set or clear the subject token delegated to the session's workload MCP servers; see [ACP session delegation](../user/mcp.md#acp-session-delegation). |
 | `$/cancel_request` | Withdraw a held prompt on this connection by its JSON-RPC request ID. A successful withdrawal returns `-32800` on the original request. |
 | `kit/session/status` | Read current outstanding work; see [Read session settlement](#read-session-settlement). |
 | `session/close` | Close the resident session and its outstanding work; retain the transcript for explicit resume. The close response follows child cleanup. A cleanup error is reported, but does not reopen a partially closed child; resume is an explicit new restoration. |
@@ -76,7 +77,7 @@ Initialize POST body (send `Authorization: Bearer TOKEN` and `Content-Type: appl
 The response is HTTP 200 JSON with `Acp-Connection-Id`. Its `result` contains `protocolVersion: 2`, `info.name: "kit-gateway"`, the running Kit version, and these capabilities:
 
 ```json
-{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}}
+{"_meta":{"kit/session/status":{},"kit/disabledTools":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{},"delivery":{"steer":{},"queue":{}}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true},"kit/delegation":{"method":"_kit/session/update_delegation"}}}}}
 ```
 
 Its `result._meta` explicitly identifies the experimental limits:

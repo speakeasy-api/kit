@@ -107,6 +107,7 @@ async fn expiry_and_clock_rollback_reacquire_without_stale_fallback() {
         let mut session = Session::new(config()).unwrap();
         let now = SystemTime::now();
         *session.cached.lock().await = Some(Cached {
+            subject: None,
             value: Acquisition(Arc::new(Zeroizing::new("must-not-escape".into()))),
             acquired: if expired {
                 now - Duration::from_secs(60)
@@ -135,6 +136,7 @@ async fn caches_are_resource_local_and_invalidatable() {
     let second = Session::new(second_config).unwrap();
     let now = SystemTime::now();
     *first.cached.lock().await = Some(Cached {
+        subject: None,
         value: Acquisition(Arc::new(Zeroizing::new("first-resource-token".into()))),
         acquired: now,
         refresh_at: now + Duration::from_secs(60),
@@ -198,4 +200,42 @@ fn explicit_configuration_and_extensions_are_strict() {
         .extensions
         .insert("custom".into(), "x".repeat(1025));
     assert!(candidate.validate().is_err());
+}
+
+#[test]
+fn delegation_subjects_and_config() {
+    for token in ["", "has space", "line\nbreak"] {
+        assert!(Subject::new(token.into()).is_err());
+    }
+    assert!(Subject::new("a".repeat(MAX_BYTES + 1)).is_err());
+    assert!(Subject::new("a.b.c".into()).is_ok());
+
+    // Unestablished until a client states the subject, even as `None`.
+    let slot = DelegationSlot::default();
+    assert!(slot.current().is_none());
+    let start = slot.epoch();
+    let subject = Subject::new("a.b.c".into()).unwrap();
+    assert!(slot.set(Some(subject.clone())));
+    assert!(Subject::same(
+        slot.current().flatten().as_ref(),
+        Some(&subject)
+    ));
+    // Restating the same token is not a change of principal.
+    assert!(!slot.set(Some(Subject::new("a.b.c".into()).unwrap())));
+    assert_eq!(slot.epoch(), start.wrapping_add(1));
+    // Clearing establishes the workload alone, and is a change.
+    assert!(slot.set(None));
+    assert!(matches!(slot.current(), Some(None)));
+    assert!(!slot.set(None));
+    assert_eq!(slot.epoch(), start.wrapping_add(2));
+
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "tokenFile": "/var/run/token",
+        "tokenEndpoint": "https://issuer.example/token",
+        "endpointMode": "explicit",
+        "delegation": "session"
+    }))
+    .unwrap();
+    assert!(config.delegation == Delegation::Session);
+    config.validate().unwrap();
 }

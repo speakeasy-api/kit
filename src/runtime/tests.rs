@@ -265,6 +265,7 @@ mod model_persistence {
                     integration: Arc::new(Observer),
                     cancellation: CancellationController::new().handle(),
                     response_attempt_replacement: false,
+                    disabled_tools: Vec::new(),
                 },
                 &mut claim,
                 None,
@@ -472,6 +473,7 @@ mod reasoning_effort_persistence {
                     integration: Arc::new(Observer),
                     cancellation: CancellationController::new().handle(),
                     response_attempt_replacement: false,
+                    disabled_tools: Vec::new(),
                 },
                 &mut claim,
                 forked,
@@ -2828,4 +2830,22 @@ fn system_prompt_is_independent_of_delegation() {
     assert!(!prompt.contains("# Additional guidance"));
     assert!(!prompt.contains("compose"));
     assert!(!prompt.contains("delegat"));
+}
+
+#[test]
+fn disabled_builtins_are_removed_and_unknown_names_fail_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = || {
+        agentkit_tools_core::ToolRegistry::new()
+            .with(super::DocsTool::new())
+            .with(super::ShellTool::new(root.path().to_path_buf()))
+    };
+    let kept = super::without_tools(registry(), &["shell".into()]).unwrap();
+    assert!(kept.get(&ToolName::new("shell")).is_none());
+    assert!(kept.get(&ToolName::new("docs")).is_some());
+    assert_eq!(
+        super::without_tools(registry(), &[]).unwrap().tools().len(),
+        2
+    );
+    assert!(super::without_tools(registry(), &["shel".into()]).is_err());
 }

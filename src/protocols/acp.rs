@@ -1717,6 +1717,7 @@ impl Server {
         request: NewSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<(NewSessionResponse, oneshot::Sender<()>), AcpRuntimeError> {
+        reject_disabled_tools(request.meta.as_ref())?;
         // session/new retains the configured-or-generated selection semantics.
         Runtime::workspace_root(&request.cwd)?;
         let claim = self.runtime.claim_session()?;
@@ -1805,6 +1806,7 @@ impl Server {
         request: LoadSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<PreparedLoad, AcpRuntimeError> {
+        reject_disabled_tools(request.meta.as_ref())?;
         let claim = self
             .runtime
             .claim_session_load(&request.session_id.to_string())?;
@@ -1839,6 +1841,7 @@ impl Server {
         request: ForkSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<PreparedFork, AcpRuntimeError> {
+        reject_disabled_tools(request.meta.as_ref())?;
         let parent_context = fork_parent_context(request.meta.as_ref());
         let sender = self.sender(&request.session_id).await?;
         let (tx, rx) = oneshot::channel();
@@ -1965,6 +1968,7 @@ impl Server {
             integration: Arc::new(observer),
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
+            disabled_tools: Vec::new(),
         };
         let driver = match runtime
             .start_acp_driver_with_mcp(context, &mut claim, forked, mcp)
@@ -3670,6 +3674,35 @@ fn component(
             },
             agent_client_protocol::on_receive_request!(),
         ))
+}
+
+/// Disabling built-in tools is an ACP v2 feature. Refuse it on v1 rather than
+/// start a session with the tools still enabled.
+fn reject_disabled_tools(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), AcpRuntimeError> {
+    if meta.is_some_and(|meta| meta.contains_key(v2::DISABLED_TOOLS_META)) {
+        return Err(AcpRuntimeError::Unsupported(format!(
+            "{} requires ACP v2",
+            v2::DISABLED_TOOLS_META
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+mod disabled_tools_tests {
+    #[test]
+    fn v1_refuses_disabled_tools_instead_of_ignoring_them() {
+        let meta = serde_json::Map::from_iter([(
+            super::v2::DISABLED_TOOLS_META.to_owned(),
+            serde_json::json!(["shell"]),
+        )]);
+        assert!(super::reject_disabled_tools(Some(&meta)).is_err());
+        assert!(super::reject_disabled_tools(Some(&serde_json::Map::new())).is_ok());
+        assert!(super::reject_disabled_tools(None).is_ok());
+    }
 }
 
 fn fork_parent_context(

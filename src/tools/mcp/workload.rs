@@ -14,19 +14,27 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
 };
 
-use crate::workload_auth::{Acquisition, Config, Session};
+use crate::workload_auth::{Acquisition, Config, Delegation, DelegationSlot, Session};
 
 type Error = StreamableHttpError<reqwest::Error>;
 
 pub(super) struct Client {
     destination: String,
     session: Session,
+    delegation: Option<DelegationSlot>,
     http: reqwest::Client,
 }
 
 impl Client {
-    pub(super) fn new(destination: &str, config: Config) -> Result<Self, String> {
+    /// `delegation` is the owning runtime's slot. It is consulted only when the
+    /// trusted configuration enables session delegation.
+    pub(super) fn new(
+        destination: &str,
+        config: Config,
+        delegation: &DelegationSlot,
+    ) -> Result<Self, String> {
         config.validate()?;
+        let delegation = (config.delegation == Delegation::Session).then(|| delegation.clone());
         let url = url::Url::parse(destination).map_err(|_| "invalid workload MCP URL")?;
         let resource =
             url::Url::parse(&config.resource).map_err(|_| "invalid workload MCP resource")?;
@@ -45,6 +53,7 @@ impl Client {
         Ok(Self {
             destination: destination.to_owned(),
             session: Session::new(config)?,
+            delegation,
             http,
         })
     }
@@ -84,7 +93,16 @@ impl Client {
                 "workload MCP transport destination or authorization override rejected",
             ));
         }
-        self.session.acquisition().await.map_err(Self::error)
+        let subject = match &self.delegation {
+            None => None,
+            Some(slot) => slot.current().ok_or_else(|| {
+                Self::error("workload delegation has not been established for this session")
+            })?,
+        };
+        self.session
+            .acquisition_for(subject.as_ref())
+            .await
+            .map_err(Self::error)
     }
 
     fn error(message: impl Into<String>) -> Error {
@@ -377,6 +395,7 @@ mod tests {
         )
         .unwrap();
         let client = Client {
+            delegation: None,
             destination: uri.clone(),
             session,
             http: PostStatus::client(tls_client()).unwrap(),
@@ -492,6 +511,7 @@ mod tests {
                 )
                 .unwrap();
                 let client = Client {
+                    delegation: None,
                     destination: uri.clone(),
                     session,
                     http: PostStatus::client(tls_client()).unwrap(),
@@ -666,14 +686,65 @@ mod tests {
             "https://user@mcp.example/mcp",
             "https://mcp.example/mcp#fragment",
         ] {
-            assert!(Client::new(destination, config()).is_err());
+            assert!(Client::new(destination, config(), &DelegationSlot::default()).is_err());
         }
-        assert!(Client::new("https://mcp.example/mcp", config()).is_ok());
+        assert!(
+            Client::new(
+                "https://mcp.example/mcp",
+                config(),
+                &DelegationSlot::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn session_delegation_binds_only_opted_in_clients_to_the_runtime_slot() {
+        let slot = DelegationSlot::default();
+        let other = DelegationSlot::default();
+        let plain = Client::new("https://mcp.example/mcp", config(), &slot).unwrap();
+        assert!(plain.delegation.is_none());
+        let mut delegated_config = config();
+        delegated_config.delegation = Delegation::Session;
+        let delegated =
+            Client::new("https://mcp.example/mcp", delegated_config.clone(), &slot).unwrap();
+        let neighbour = Client::new("https://mcp.example/mcp", delegated_config, &other).unwrap();
+        let current =
+            |client: &Client| client.delegation.as_ref().and_then(DelegationSlot::current);
+        slot.set(Some(
+            crate::workload_auth::Subject::new("user.delegation.token".into()).unwrap(),
+        ));
+        assert!(matches!(current(&delegated), Some(Some(_))));
+        // A runtime never observes another runtime's subject.
+        assert!(current(&neighbour).is_none());
+        other.set(None);
+        assert!(matches!(current(&delegated), Some(Some(_))));
+        assert!(matches!(current(&neighbour), Some(None)));
+    }
+
+    #[tokio::test]
+    async fn delegated_client_fails_closed_until_the_subject_is_established() {
+        let mut delegated_config = config();
+        delegated_config.delegation = Delegation::Session;
+        let destination = "https://mcp.example/mcp";
+        let client =
+            Client::new(destination, delegated_config, &DelegationSlot::default()).unwrap();
+        let error = client
+            .authorization(destination, &HashMap::new())
+            .await
+            .err()
+            .expect("an unestablished delegation must not fall back to the workload grant");
+        assert!(error.to_string().contains("has not been established"));
     }
 
     #[tokio::test]
     async fn workload_transport_rejects_overrides_before_acquisition() {
-        let client = Client::new("https://mcp.example/mcp", config()).unwrap();
+        let client = Client::new(
+            "https://mcp.example/mcp",
+            config(),
+            &DelegationSlot::default(),
+        )
+        .unwrap();
         let error = client
             .authorization("https://other.example/mcp", &HashMap::new())
             .await
@@ -713,8 +784,14 @@ mod tests {
             }
         });
         let server = serde_json::from_value(value.clone()).unwrap();
-        let (binding, _) =
-            super::super::prepare_server("workload", server, Vec::new(), None).unwrap();
+        let (binding, _) = super::super::prepare_server(
+            "workload",
+            server,
+            Vec::new(),
+            None,
+            &DelegationSlot::default(),
+        )
+        .unwrap();
         let super::super::McpTransportBinding::StreamableHttp(transport) = binding else {
             panic!("expected workload authentication configuration")
         };
@@ -739,7 +816,16 @@ mod tests {
                 serde_json::json!("static")
             };
             let server = serde_json::from_value(conflict).unwrap();
-            assert!(super::super::prepare_server("workload", server, Vec::new(), None).is_err());
+            assert!(
+                super::super::prepare_server(
+                    "workload",
+                    server,
+                    Vec::new(),
+                    None,
+                    &DelegationSlot::default(),
+                )
+                .is_err()
+            );
         }
     }
 

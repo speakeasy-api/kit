@@ -14,7 +14,7 @@ use futures_util::future::{Either, select};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -33,6 +33,19 @@ const LEASE: Duration = Duration::from_secs(15);
 const MAX_REPLAY: usize = 8 * 1024 * 1024;
 const MAX_HTTP_FRAME: usize = 1024 * 1024;
 const MAX_QUEUE: usize = 4096;
+
+/// `_meta["kit/disabledTools"]` as a set; absent or `null` is empty. `None`
+/// when malformed.
+fn disabled_tools(params: &Value) -> Option<BTreeSet<String>> {
+    match &params["_meta"]["kit/disabledTools"] {
+        Value::Null => Some(BTreeSet::new()),
+        Value::Array(names) => names
+            .iter()
+            .map(|name| name.as_str().map(str::to_owned))
+            .collect(),
+        _ => None,
+    }
+}
 
 fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
     Value::Object(
@@ -738,6 +751,8 @@ struct Actor {
     pending: HashMap<u64, Pending>,
     initialized: Option<Value>,
     session_result: Option<Value>,
+    // The resident session's disabled built-in tools, from its first startup.
+    disabled_tools: BTreeSet<String>,
     // Native child sessions start idle; only lifecycle notifications change this.
     // Independent of bounded transcript retention, never inferred from text.
     state: Value,
@@ -774,6 +789,7 @@ fn spawn(root: &Path, id: &str, restore: bool, force: bool) -> io::Result<Entry>
         pending: HashMap::new(),
         initialized: None,
         session_result: None,
+        disabled_tools: BTreeSet::new(),
         state: object([
             ("sessionUpdate", "state_update".into()),
             ("state", "idle".into()),
@@ -1227,12 +1243,25 @@ impl Actor {
             ..
         } = request
         {
-            // A live runtime owns its MCP configuration. Do not replace the
-            // controller and then silently ignore a new configuration.
-            if (self.session_result.is_some()
+            let resident = self.session_result.is_some()
                 || self.pending.values().any(|pending| {
                     matches!(pending.method.as_str(), "session/new" | "session/resume")
-                }))
+                });
+            // A live runtime owns its disabled tools; never report success
+            // for a reattachment that asks for a different list.
+            if resident && let Some(message) = &startup {
+                let Some(tools) = disabled_tools(&message["params"]) else {
+                    return Err(Failure::bad("kit/disabledTools must be an array of names"));
+                };
+                if tools != self.disabled_tools {
+                    return Err(Failure::conflict(
+                        "resident session retains its disabled tools; send the same kit/disabledTools",
+                    ));
+                }
+            }
+            // A live runtime owns its MCP configuration. Do not replace the
+            // controller and then silently ignore a new configuration.
+            if resident
                 && startup.as_ref().is_some_and(|message| {
                     message["params"].get("mcpServers").is_some_and(|servers| {
                         !servers.is_null() && servers != &Value::Array(Vec::new())
@@ -1442,7 +1471,10 @@ impl Actor {
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
-                if method == "_kit/session/update_mcp" && message["params"]["sessionId"] != self.id
+                if matches!(
+                    method.as_str(),
+                    "_kit/session/update_mcp" | "_kit/session/update_delegation"
+                ) && message["params"]["sessionId"] != self.id
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
@@ -1499,6 +1531,7 @@ impl Actor {
                         | "kit/session/status"
                         | "session/set_config_option"
                         | "_kit/session/update_mcp"
+                        | "_kit/session/update_delegation"
                 ) {
                     return Err(Failure::bad(
                         "ACP method is not supported by the gateway; disconnect to detach",
@@ -1535,6 +1568,19 @@ impl Actor {
                 if startup && replay && !self.replay_complete {
                     return Err(Failure::replay("full live replay is unavailable"));
                 }
+                // The child parses and enforces the list; the gateway only
+                // refuses a reattachment that would silently change it.
+                let disabled_tools = if startup {
+                    let Some(tools) = disabled_tools(&message["params"]) else {
+                        return Err(Failure::bad("kit/disabledTools must be an array of names"));
+                    };
+                    if self.session_result.is_none() {
+                        self.disabled_tools = tools.clone();
+                    }
+                    tools
+                } else {
+                    BTreeSet::new()
+                };
                 let cached = match method.as_str() {
                     "initialize" => self.initialized.clone(),
                     "session/new" | "session/resume" => self.session_result.clone(),
@@ -1548,6 +1594,11 @@ impl Actor {
                         }) {
                             return Err(Failure::conflict(
                                 "resident session retains its MCP servers; omit mcpServers or send an empty array; use _kit/session/update_mcp to add or update client servers",
+                            ));
+                        }
+                        if disabled_tools != self.disabled_tools {
+                            return Err(Failure::conflict(
+                                "resident session retains its disabled tools; send the same kit/disabledTools",
                             ));
                         }
                         let Some(id) = original else {

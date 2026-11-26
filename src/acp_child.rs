@@ -443,6 +443,12 @@ pub(crate) struct ChildConfig {
     /// The parent's `tool.before` event that started this child, passed to a
     /// Kit child so its `session.start` can name it as `parentEventId`.
     pub ahp_parent_event: Option<String>,
+    /// Built-in tools the owning session disabled. A Kit child disables them
+    /// too; a harness that cannot enforce them is refused.
+    pub disabled_tools: Vec<String>,
+    /// The owning session's delegated subject, restated to a Kit child before
+    /// each prompt so the child never acts with more authority than its parent.
+    pub delegation: Option<crate::workload_auth::DelegationSlot>,
 }
 
 impl ChildConfig {
@@ -1547,6 +1553,39 @@ impl ChildSession {
     }
 }
 
+fn disabled_tools_meta(tools: &[String]) -> Option<serde_json::Map<String, Value>> {
+    (!tools.is_empty()).then(|| {
+        serde_json::Map::from_iter([(
+            crate::protocols::acp::v2::DISABLED_TOOLS_META.into(),
+            Value::from(tools.to_vec()),
+        )])
+    })
+}
+
+/// Gives a Kit child its owner's delegated subject before work starts. An
+/// unestablished owner leaves the child unestablished, so its delegated
+/// workload servers fail closed rather than act as the workload alone.
+async fn restate_delegation(
+    connection: &agent_client_protocol::ConnectionTo<protocol::Agent>,
+    version: protocol::Version,
+    session_id: &SessionId,
+    slot: &crate::workload_auth::DelegationSlot,
+) -> Result<(), agent_client_protocol::Error> {
+    let Some(subject) = slot.current() else {
+        return Ok(());
+    };
+    if version != protocol::Version::V2 {
+        return Err(agent_client_protocol::Error::invalid_request()
+            .data("session delegation requires an ACP v2 Kit child"));
+    }
+    let request = crate::protocols::acp::v2::UpdateDelegationRequest::new(
+        session_id.to_string(),
+        subject.as_ref().map(|subject| subject.token().to_owned()),
+    );
+    connection.send_request(request).block_task().await?;
+    Ok(())
+}
+
 struct RunConfig {
     config: ChildConfig,
     harness: String,
@@ -1831,6 +1870,15 @@ async fn run(
             // Startup privately owns this route. Notifications are its only output
             // writers; response completion removes the route before publishing replay.
             // Failure/cancellation drops the entire startup connection and its route.
+            let kit_child = config.harnesses.is_kit(&harness);
+            // Only a Kit child over ACP v2 can enforce the owning session's
+            // disabled built-in tools. Refuse rather than widen them.
+            if !config.disabled_tools.is_empty()
+                && (!kit_child || version != protocol::Version::V2)
+            {
+                let _ = ready.send(Err(format!("ACP harness {harness:?} cannot enforce the session's disabled tools")));
+                return std::future::pending().await;
+            }
             let replay_capture = Arc::new(Mutex::new(capture::Capture::new(false)));
             let session_result = if let Some((id, true)) = &persisted
                 && !config.harnesses.is_kit(&harness)
@@ -1848,7 +1896,9 @@ async fn run(
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
                 result
             } else {
-                protocol::request(connection.clone(), version, agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone())).await
+                let mut request = agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone());
+                request.meta = disabled_tools_meta(&config.disabled_tools);
+                protocol::request(connection.clone(), version, request).await
             };
             let session = match session_result {
                 Ok(session) => session,
@@ -1983,6 +2033,7 @@ async fn run(
                         let root = root.clone();
                         let additional_directories = additional_directories.clone();
                         let session_snapshots = Arc::clone(&session_snapshots);
+                        let disabled_tools = config.disabled_tools.clone();
                         tasks.spawn(async move {
                             let serial = fork.serial;
                             let source_id = fork.session_id.clone();
@@ -1993,6 +2044,9 @@ async fn run(
                                     (FORK_PARENT_ID_META.into(), Value::String(id)),
                                     (FORK_PARENT_NAME_META.into(), Value::String(name)),
                                 ]));
+                            }
+                            if let Some(meta) = disabled_tools_meta(&disabled_tools) {
+                                request.meta.get_or_insert_with(serde_json::Map::new).extend(meta);
                             }
                             let (request_id, request) = match protocol::fork(&connection, version, request) {
                                 Ok(request) => request,
@@ -2180,6 +2234,7 @@ async fn run(
                     Request::Prompt(prompt) => {
                         let stream_routes = Arc::clone(&stream_routes);
                         let auth_methods = auth_methods.clone();
+                        let delegation = config.delegation.clone().filter(|_| kit_child);
                         let connection = connection.clone();
                         let routes = Arc::clone(&routes);
                         let fatal = fatal_tx.clone();
@@ -2206,6 +2261,9 @@ async fn run(
                             }
                             let request = async {
                                 let request_error = |error| ChildError::Failed(child_request_error(error, &auth_methods));
+                                if let Some(slot) = &delegation {
+                                    restate_delegation(&connection, version, &session_id, slot).await.map_err(request_error)?;
+                                }
                                 let receipt = match protocol::prompt(&connection, version, session_id.clone(), prompt.content).await.map_err(request_error)? {
                                     protocol::PromptAcceptance::V1(response) => return Ok(*response),
                                     protocol::PromptAcceptance::V2(receipt) => receipt,
@@ -3054,6 +3112,8 @@ mod tests {
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         for resume in [false, true] {
             let command = harnesses
@@ -3187,6 +3247,8 @@ mod tests {
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -3507,6 +3569,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_tools_refuse_a_harness_that_cannot_enforce_them() {
+        let root = tempfile::tempdir().unwrap();
+        let script = r#"
+import json,sys
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request:
+        continue
+    response={'jsonrpc':'2.0','id':request['id']}
+    if request['method'] == 'initialize':
+        response['result']={'protocolVersion':1,'agentCapabilities':{}}
+    elif request['method'] == 'session/new':
+        response['result']={'sessionId':'test-session'}
+    else:
+        response['result']={}
+    print(json.dumps(response),flush=True)
+"#;
+        let profiles = BTreeMap::from([(
+            "external".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec!["-c".into(), script.into()],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        )]);
+        let config = ChildConfig {
+            root: root.path().into(),
+            additional_directories: Vec::new(),
+            model: "unused".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses: AcpHarnesses::new(profiles).unwrap(),
+            default_harness: "acp.external".into(),
+            parent_id: None,
+            parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
+            ahp_parent_event: None,
+            disabled_tools: vec!["shell".into()],
+            delegation: None,
+        };
+        let error = ChildSession::start(
+            config,
+            "acp.external".into(),
+            None,
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        .err()
+        .expect("an external harness cannot enforce Kit's disabled tools");
+        assert!(error.to_string().contains("cannot enforce"), "{error}");
+    }
+
+    #[test]
+    fn disabled_tools_meta_is_sent_only_when_tools_are_disabled() {
+        assert!(disabled_tools_meta(&[]).is_none());
+        let meta = disabled_tools_meta(&["shell".into()]).unwrap();
+        assert_eq!(meta["kit/disabledTools"], serde_json::json!(["shell"]));
+    }
+
+    #[tokio::test]
     async fn child_auth_required_at_initialize_new_session_and_prompt() {
         for (stage, exit_after_error) in [
             ("initialize", false),
@@ -3568,6 +3700,8 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             };
             let result = ChildSession::start(
                 config,
@@ -3657,6 +3791,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let result = ChildSession::start(
             config,
@@ -3724,6 +3860,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
 
         let error = match ChildSession::start(
@@ -3786,6 +3924,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -3843,6 +3983,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -3980,6 +4122,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let starts = (0..64)
             .map(|_| {
@@ -4051,6 +4195,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let base = ChildSession::start(
             config,
@@ -4133,6 +4279,8 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             };
             let base = ChildSession::start(
                 config,
@@ -4300,6 +4448,8 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             };
             ChildSession::start(
                 config,
@@ -5164,6 +5314,8 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             };
             let (child, _) = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -5266,6 +5418,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let base = ChildSession::start(
             config.clone(),
@@ -5537,6 +5691,8 @@ for line in sys.stdin:
             tree_slots: None,
             prompt_cache_key: None,
             ahp_parent_event: None,
+            disabled_tools: Vec::new(),
+            delegation: None,
         };
         let base = ChildSession::start(
             config,
@@ -5670,6 +5826,8 @@ for line in sys.stdin:
                     tree_slots: None,
                     prompt_cache_key: None,
                     ahp_parent_event: None,
+                    disabled_tools: Vec::new(),
+                    delegation: None,
                 },
                 "acp.mock".into(),
                 None,
@@ -5814,6 +5972,8 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             };
             let base = ChildSession::start(
                 config,
@@ -6278,6 +6438,8 @@ for line in sys.stdin:
                 tree_slots: None,
                 prompt_cache_key: None,
                 ahp_parent_event: None,
+                disabled_tools: Vec::new(),
+                delegation: None,
             }
         }
 
