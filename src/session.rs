@@ -1230,13 +1230,18 @@ impl SessionObserver {
     /// Existing append records remain intact, while readers treat this record as
     /// a new canonical snapshot.
     pub fn replace(&self, transcript: &[Item]) -> Result<(), String> {
-        if transcript.is_empty() {
+        let filtered: Vec<_> = transcript
+            .iter()
+            .filter(|item| !crate::protocols::acp::model_switch::is_compact_marker(item))
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
             return Err("cannot persist an empty transcript replacement".into());
         }
         self.0
             .lock()
             .map_err(|_| "session transcript writer poisoned".to_string())?
-            .replace(transcript)
+            .replace(&filtered)
     }
 }
 
