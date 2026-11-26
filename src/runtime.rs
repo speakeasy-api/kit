@@ -2014,20 +2014,17 @@ impl Runtime {
             .with_inference(self.adapter.inference())
             .with_gemini_non_thinking(self.adapter.gemini_non_thinking())
             .with_session_observer(opened.observer.clone(), !request.resume)?;
-            let pending_override = if request.resume && self.model_override {
-                Some((
-                    opened.observer.clone(),
-                    Some(selection.id()),
-                    (Some(reasoning_effort) != opened.reasoning_effort).then_some(reasoning_effort),
-                ))
+            if request.resume && self.model_override {
+                opened.observer.set_model(&selection.id())?;
+                if Some(reasoning_effort) != opened.reasoning_effort {
+                    opened.observer.set_reasoning_effort(reasoning_effort)?;
+                }
             } else if request.resume
                 && opened.reasoning_effort.is_some()
                 && Some(reasoning_effort) != opened.reasoning_effort
             {
-                Some((opened.observer.clone(), None, Some(reasoning_effort)))
-            } else {
-                None
-            };
+                opened.observer.set_reasoning_effort(reasoning_effort)?;
+            }
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
             let compactor = self
@@ -2125,13 +2122,13 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation, pending_override))
+            Ok::<_, String>((driver, pending_creation))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation, pending_override) = {
+        let (mut driver, pending_creation) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {
@@ -2141,14 +2138,6 @@ impl Runtime {
         };
         if let Some(observer) = pending_creation {
             observer.commit_creation()?;
-        }
-        if let Some((observer, model_id, effort)) = pending_override {
-            if let Some(model_id) = model_id {
-                observer.set_model(&model_id)?;
-            }
-            if let Some(effort) = effort {
-                observer.set_reasoning_effort(effort)?;
-            }
         }
         let result = {
             let cancellation = std::pin::pin!(cancelled.cancelled());
