@@ -2657,7 +2657,8 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 "session must be settled before snapshot".into(),
                             ));
                         }
-                        let transcript = driver.snapshot().transcript;
+                        let mut transcript = driver.snapshot().transcript;
+                        transcript.retain(|item| !model_switch::is_compact_marker(item));
                         let children_after = subagents
                             .as_ref()
                             .map(|s| s.active_count())

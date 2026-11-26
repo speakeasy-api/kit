@@ -2450,6 +2450,7 @@ impl Runtime {
                 ));
             }
             crate::transcript::rebind_forked_transcript(&mut transcript, &request.id);
+            transcript.retain(|item| !crate::protocols::acp::model_switch::is_compact_marker(item));
             transcript
         } else if request.resume {
             vec![Item::text(ItemKind::System, self.system_prompt())]

@@ -2133,7 +2133,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(
                                 "session must be settled before snapshot".into(),
                             ));
                         }
-                        let transcript = driver.snapshot().transcript;
+                        let mut transcript = driver.snapshot().transcript;
+                        transcript.retain(|item| !model_switch::is_compact_marker(item));
                         let children_after = subagents
                             .as_ref()
                             .map(|s| s.active_count())
@@ -3058,6 +3059,9 @@ fn transcript_replay(
     let mut replay = Vec::new();
     let mut presentation_order: HashMap<wire::MessageId, (String, usize)> = HashMap::new();
     for (item_index, item) in transcript.iter().enumerate() {
+        if model_switch::is_compact_marker(item) {
+            continue;
+        }
         let message_id =
             |kind: &str| wire::MessageId::new(format!("{session_id}-replay-{item_index}-{kind}"));
         if crate::compaction::is_compaction_summary(item)

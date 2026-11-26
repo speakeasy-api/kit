@@ -934,6 +934,9 @@ impl ModelSession for SelectableSession {
             .await;
             self.replace_active(selected, replacement)?;
         }
+        request
+            .transcript
+            .retain(|item| !crate::protocols::acp::model_switch::is_compact_marker(item));
         expose_background_call_ids(&mut request);
         let inner = self.inner.begin_turn(request, cancellation).await?;
         Ok(SelectableTurn {
