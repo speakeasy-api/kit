@@ -1442,7 +1442,10 @@ impl Actor {
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
-                if method == "_kit/session/update_mcp" && message["params"]["sessionId"] != self.id
+                if matches!(
+                    method.as_str(),
+                    "_kit/session/update_mcp" | "_kit/session/update_delegation"
+                ) && message["params"]["sessionId"] != self.id
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
@@ -1499,6 +1502,7 @@ impl Actor {
                         | "kit/session/status"
                         | "session/set_config_option"
                         | "_kit/session/update_mcp"
+                        | "_kit/session/update_delegation"
                 ) {
                     return Err(Failure::bad(
                         "ACP method is not supported by the gateway; disconnect to detach",

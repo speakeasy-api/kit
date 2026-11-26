@@ -43,6 +43,9 @@ impl Instances {
                         .into(),
                 );
             }
+            if config.workload.delegation != crate::workload_auth::Delegation::None {
+                return Err("inference workload authentication does not support delegation".into());
+            }
             let session = Arc::new(crate::workload_auth::Session::new(config.workload)?);
             instances.insert(
                 name,

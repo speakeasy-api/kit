@@ -161,13 +161,19 @@ impl Connection {
                         ("http", object([])),
                         (
                             "_meta",
-                            object([(
-                                "kit/updateMcp",
-                                object([
-                                    ("method", "_kit/session/update_mcp".into()),
-                                    ("upsert", true.into()),
-                                ]),
-                            )]),
+                            object([
+                                (
+                                    "kit/updateMcp",
+                                    object([
+                                        ("method", "_kit/session/update_mcp".into()),
+                                        ("upsert", true.into()),
+                                    ]),
+                                ),
+                                (
+                                    "kit/delegation",
+                                    object([("method", "_kit/session/update_delegation".into())]),
+                                ),
+                            ]),
                         ),
                     ]),
                 );

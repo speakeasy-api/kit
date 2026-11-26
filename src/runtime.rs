@@ -568,6 +568,31 @@ pub(crate) struct AcpForkState {
     pub parent_context: Option<(String, String)>,
 }
 
+/// Removes named built-ins. Every name must exist, so a typo fails closed.
+fn without_tools(
+    tools: agentkit_tools_core::ToolRegistry,
+    disabled: &[String],
+) -> Result<agentkit_tools_core::ToolRegistry, AcpRuntimeError> {
+    if disabled.is_empty() {
+        return Ok(tools);
+    }
+    if let Some(name) = disabled
+        .iter()
+        .find(|name| tools.get(&ToolName::new(name.as_str())).is_none())
+    {
+        return Err(AcpRuntimeError::Unsupported(format!(
+            "unknown built-in tool {name:?}"
+        )));
+    }
+    let mut kept = agentkit_tools_core::ToolRegistry::new();
+    for tool in tools.tools() {
+        if !disabled.iter().any(|name| name == &tool.spec().name.0) {
+            kept.register_arc(tool);
+        }
+    }
+    Ok(kept)
+}
+
 pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub activity: crate::protocols::acp::activity::SessionActivity,
     pub ask_user: Option<crate::tools::ask_user::AskUserTool>,
@@ -576,6 +601,8 @@ pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub integration: Arc<I>,
     pub cancellation: CancellationHandle,
     pub response_attempt_replacement: bool,
+    /// Built-in tool names the client removed for this session.
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1863,6 +1890,18 @@ impl Runtime {
         skills: Arc<SkillRegistry>,
         mcp: crate::tools::mcp::McpRuntime,
     ) -> ComposeOnly {
+        let children = self.builtin_tools(depth, subagents, background_jobs.clone(), skills, mcp);
+        self.compose_from(children, background_jobs)
+    }
+
+    fn builtin_tools(
+        &self,
+        depth: usize,
+        subagents: Subagents,
+        background_jobs: BackgroundJobs,
+        skills: Arc<SkillRegistry>,
+        mcp: crate::tools::mcp::McpRuntime,
+    ) -> agentkit_tools_core::ToolRegistry {
         let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
                 &self.root,
@@ -1912,6 +1951,14 @@ impl Runtime {
         children.register(observe_shared(Arc::new(
             mcp_skills::InventorySkillTool::new(local, mcp),
         )));
+        children
+    }
+
+    fn compose_from(
+        &self,
+        mut children: agentkit_tools_core::ToolRegistry,
+        background_jobs: BackgroundJobs,
+    ) -> ComposeOnly {
         if let Some(hooks) = &self.hooks {
             children = crate::ahp::hooked_tools(children, hooks);
         }
@@ -2562,6 +2609,17 @@ impl Runtime {
         } else {
             SessionStartInputTrigger::Startup
         };
+        // Client-disabled built-ins are removed before compose lists them.
+        let children = without_tools(
+            self.builtin_tools(
+                self.base_depth,
+                subagents.clone(),
+                background_jobs.clone(),
+                skills,
+                mcp.clone(),
+            ),
+            &context.disabled_tools,
+        )?;
         let mut builder = Agent::builder()
             .context_recovery(ContextRecoveryPolicy {
                 max_attempts: 3,
@@ -2580,13 +2638,7 @@ impl Runtime {
                 },
             })
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs_and_mcp(
-                self.base_depth,
-                subagents.clone(),
-                background_jobs.clone(),
-                skills,
-                mcp.clone(),
-            ))
+            .add_tool_source(self.compose_from(children, background_jobs.clone()))
             .task_manager(task_manager);
         if let Some(hooks) = &self.hooks {
             builder = builder.observer(crate::ahp::TurnHook(Arc::clone(hooks)));
@@ -3957,6 +4009,7 @@ mod additional_directory_tests {
                         integration: Arc::new(Observer),
                         cancellation: CancellationController::new().handle(),
                         response_attempt_replacement: false,
+                        disabled_tools: Vec::new(),
                     },
                     &mut claim,
                     None,

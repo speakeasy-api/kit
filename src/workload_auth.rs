@@ -48,6 +48,19 @@ pub enum Grant {
     TokenExchange,
 }
 
+/// Whether an ACP client may delegate a user's authority for the session.
+///
+/// `session` exchanges the client-supplied subject token, with the workload
+/// assertion as the RFC 8693 actor token. Without a subject token, the
+/// configured `grant` authenticates the workload alone.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Delegation {
+    #[default]
+    None,
+    Session,
+}
+
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum EndpointMode {
@@ -76,6 +89,8 @@ pub struct Config {
     pub scope: Option<String>,
     #[serde(default)]
     pub extensions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub delegation: Delegation,
 }
 
 impl Config {
@@ -182,6 +197,54 @@ fn https_url(value: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
+const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+
+/// A client-supplied RFC 8693 subject token. Never logged or persisted.
+#[derive(Clone)]
+pub struct Subject(Arc<Zeroizing<String>>);
+
+impl Subject {
+    pub fn new(token: String) -> Result<Self, String> {
+        let token = Zeroizing::new(token);
+        if token.is_empty()
+            || token.len() > MAX_BYTES
+            || !token.bytes().all(|c| c.is_ascii_graphic())
+        {
+            return Err("invalid delegation subject token".into());
+        }
+        Ok(Self(Arc::new(token)))
+    }
+
+    fn same(left: Option<&Self>, right: Option<&Self>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(&left.0, &right.0),
+            _ => false,
+        }
+    }
+}
+
+/// The current session's delegated subject, shared by that session's workload
+/// clients only. Replacing it invalidates their cached exchanges.
+#[derive(Clone, Default)]
+pub struct DelegationSlot(Arc<std::sync::RwLock<Option<Subject>>>);
+
+impl DelegationSlot {
+    pub fn set(&self, subject: Option<Subject>) {
+        match self.0.write() {
+            Ok(mut current) => *current = subject,
+            Err(poisoned) => *poisoned.into_inner() = subject,
+        }
+    }
+
+    pub fn current(&self) -> Option<Subject> {
+        match self.0.read() {
+            Ok(current) => current.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Acquisition(Arc<Zeroizing<String>>);
 
@@ -192,6 +255,7 @@ impl Acquisition {
 }
 
 struct Cached {
+    subject: Option<Subject>,
     value: Acquisition,
     acquired: SystemTime,
     refresh_at: SystemTime,
@@ -232,17 +296,27 @@ impl Session {
     }
 
     pub async fn acquisition(&self) -> Result<Acquisition, String> {
+        self.acquisition_for(None).await
+    }
+
+    /// Acquire for a delegated subject, or for the workload alone. A cached
+    /// token is reused only for the same subject.
+    pub async fn acquisition_for(&self, subject: Option<&Subject>) -> Result<Acquisition, String> {
+        if subject.is_some() && self.config.delegation != Delegation::Session {
+            return Err("workload delegation is not enabled".into());
+        }
         // Serialize acquisition, not merely publication, to avoid consuming a
         // single-use assertion concurrently. Waiting and all I/O are bounded.
-        tokio::time::timeout(TIMEOUT, self.acquire())
+        tokio::time::timeout(TIMEOUT, self.acquire(subject))
             .await
             .map_err(|_| "workload authentication timed out".to_string())?
     }
 
-    async fn acquire(&self) -> Result<Acquisition, String> {
+    async fn acquire(&self, subject: Option<&Subject>) -> Result<Acquisition, String> {
         let mut cached = self.cached.lock().await;
         let now = SystemTime::now();
         if let Some(token) = cached.as_ref()
+            && Subject::same(token.subject.as_ref(), subject)
             && now >= token.acquired
             && now < token.refresh_at
         {
@@ -260,18 +334,30 @@ impl Session {
         };
         let assertion = read_assertion_bounded(&self.config.token_file, limit).await?;
         let mut form = Vec::new();
-        match self.config.grant {
-            Grant::JwtBearer => {
+        let exchange = subject.is_some() || self.config.grant == Grant::TokenExchange;
+        match (subject, self.config.grant) {
+            (Some(subject), _) => {
+                form.push((
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ));
+                form.push(("subject_token", subject.0.as_str()));
+                form.push(("subject_token_type", JWT));
+                form.push(("actor_token", assertion.as_str()));
+                form.push(("actor_token_type", JWT));
+                form.push(("requested_token_type", ACCESS_TOKEN));
+            }
+            (None, Grant::JwtBearer) => {
                 form.push(("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"));
                 form.push(("assertion", assertion.as_str()));
             }
-            Grant::TokenExchange => {
+            (None, Grant::TokenExchange) => {
                 form.push((
                     "grant_type",
                     "urn:ietf:params:oauth:grant-type:token-exchange",
                 ));
                 form.push(("subject_token", assertion.as_str()));
-                form.push(("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"));
+                form.push(("subject_token_type", JWT));
                 form.push(("requested_token_type", ACCESS_TOKEN));
             }
         }
@@ -308,9 +394,8 @@ impl Session {
             serde_json::from_slice(&bytes).map_err(|_| "invalid workload token response")?;
         if !token.token_type.eq_ignore_ascii_case("bearer")
             || token.expires_in == Some(0)
-            || (self.config.grant == Grant::JwtBearer && token.expires_in.is_none())
-            || (self.config.grant == Grant::TokenExchange
-                && token.issued_token_type.as_deref() != Some(ACCESS_TOKEN))
+            || (!exchange && token.expires_in.is_none())
+            || (exchange && token.issued_token_type.as_deref() != Some(ACCESS_TOKEN))
             || token.access_token.is_empty()
             || token.access_token.len() > MAX_BYTES
             || !token.access_token.bytes().all(|c| c.is_ascii_graphic())
@@ -336,6 +421,7 @@ impl Session {
         let value = Acquisition(Arc::new(Zeroizing::new(token.access_token)));
         let result = value.clone();
         *cached = Some(Cached {
+            subject: subject.cloned(),
             value,
             acquired: started,
             refresh_at,

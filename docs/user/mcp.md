@@ -60,6 +60,24 @@ Redirects, token-POST retries, browser fallback, and saved-credential fallback
 are disabled. Rejected MCP calls are not replayed. Tokens remain in process
 memory and each configured server has its own acquisition cache.
 
+### Delegate a user's authority for one session
+
+An ACP client that acts for a person can let a workload server exchange that
+person's delegation for each session. Set `delegation: "session"` on the trusted
+server configuration, then send the subject token with
+`_kit/session/update_delegation` (see
+[ACP session delegation](#acp-session-delegation)).
+
+While a session has a subject token, Kit sends an RFC 8693 token exchange with the
+client's token as `subject_token`, the mounted workload JWT as `actor_token`
+(both typed as JWTs), and `requested_token_type` for an access token. The
+authorization server decides what the actor may do for that subject. Without a
+subject token, the configured `grant` authenticates the workload alone.
+
+Each session runtime owns its subject. Acquired tokens are cached per subject and
+never reused for a different subject or session. Inference workload
+authentication does not support delegation.
+
 Do not add static authorization or Host headers. Reusing an unchanged assertion
 requires the issuer's explicit replay-policy support. After a process-memory
 restore, restart Kit and resume the transcript rather than reuse resident tokens.
@@ -429,6 +447,25 @@ For gateway host execution and reattachment rules, see [the gateway guide](gatew
 When reconnecting to a resident gateway session, omit `mcpServers` or send `[]`
 to retain its current overlay. A nonempty list is rejected with guidance to use
 `_kit/session/update_mcp`; reconnect does not replace or clear the overlay.
+
+### ACP session delegation
+
+When `capabilities.session.mcp._meta["kit/delegation"]` is present, send
+`_kit/session/update_delegation` with `params` containing `sessionId` and
+`subjectToken`. Both fields are required; `subjectToken: null` clears the
+subject. The response is `{}`. The token is held in memory only and applies to
+the next request made by each workload server configured with
+`delegation: "session"`; in-flight requests keep the token they started with.
+Send it again after restoring a stopped session.
+
+### Disable built-in tools for a session
+
+Set `_meta["kit/disabledTools"]` on `session/new`, `session/resume`, or
+`session/fork` to an array of built-in tool names, for example
+`["shell", "edit", "subagent"]`. Kit removes them before the model sees the tool
+list. An unknown name fails the request, so a typo never leaves a tool enabled.
+The setting lasts for the attached session; send it again when restoring a
+stopped session.
 
 ### Use MCP servers that require exclusive resources
 

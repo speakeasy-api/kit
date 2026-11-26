@@ -1965,6 +1965,7 @@ impl Server {
             integration: Arc::new(observer),
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
+            disabled_tools: Vec::new(),
         };
         let driver = match runtime
             .start_acp_driver_with_mcp(context, &mut claim, forked, mcp)

@@ -46,6 +46,8 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
+
+use crate::workload_auth::DelegationSlot;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use tokio::sync::{
@@ -181,6 +183,7 @@ struct Inner {
     event_routes: EventRoutes,
     next_event_route: AtomicU64,
     interactive_oauth_enabled: bool,
+    delegation: DelegationSlot,
 }
 
 #[derive(Clone)]
@@ -203,6 +206,8 @@ struct ReloadState {
     plugins: BTreeMap<String, PreparedServer>,
     plugin_entries: BTreeMap<String, Vec<u8>>,
     plugin_source: Option<crate::plugins::PluginRuntime>,
+    // The runtime's own slot; reloaded workload clients share it.
+    delegation: DelegationSlot,
 }
 
 #[derive(Clone)]
@@ -1139,6 +1144,7 @@ fn prepare_config(
     bytes: &[u8],
     path: &Path,
     default_stdio_cwd: Option<&Path>,
+    delegation: &DelegationSlot,
 ) -> Result<PreparedConfiguration, String> {
     let config: Config = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
@@ -1181,7 +1187,13 @@ fn prepare_config(
             fingerprint.extend_from_slice(cwd.as_os_str().as_encoded_bytes());
         }
         entries.insert(id.clone(), fingerprint.clone());
-        let (binding, record) = prepare_server(&id, server, fingerprint, effective_cwd.as_deref())?;
+        let (binding, record) = prepare_server(
+            &id,
+            server,
+            fingerprint,
+            effective_cwd.as_deref(),
+            delegation,
+        )?;
         prepared.insert(
             id.clone(),
             PreparedServer {
@@ -1212,6 +1224,7 @@ fn prepare_server(
     server: Server,
     fingerprint: Vec<u8>,
     effective_stdio_cwd: Option<&Path>,
+    delegation: &DelegationSlot,
 ) -> Result<(McpTransportBinding, ServerRecord), String> {
     match server {
         Server::Stdio(server) => {
@@ -1276,6 +1289,7 @@ fn prepare_server(
                 transport = transport.with_http_client(Arc::new(workload::Client::new(
                     &server.url,
                     config.clone(),
+                    delegation,
                 )?));
             }
             Ok((
@@ -1603,6 +1617,7 @@ fn prepare_sources(
     sources: &[SourceState],
     plugin_prepared: &PreparedServers,
     plugin_entries: &ServerFingerprints,
+    delegation: &DelegationSlot,
 ) -> Result<PreparedConfiguration, String> {
     let mut prepared = plugin_prepared.clone();
     let mut entries = plugin_entries.clone();
@@ -1615,6 +1630,7 @@ fn prepare_sources(
             bytes,
             &state.source.path,
             state.source.default_stdio_cwd.as_deref(),
+            delegation,
         )?;
         for name in source_prepared.keys() {
             if session_names.contains(name)
@@ -1743,7 +1759,14 @@ fn build_runtime(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
-    let (prepared, entries) = prepare_sources(&source_states, &plugin_prepared, &plugin_entries)?;
+    // Each runtime owns its slot: sessions never share a delegated subject.
+    let delegation = DelegationSlot::default();
+    let (prepared, entries) = prepare_sources(
+        &source_states,
+        &plugin_prepared,
+        &plugin_entries,
+        &delegation,
+    )?;
     validate_server_names(prepared.keys())?;
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let mut manager = McpServerManager::new();
@@ -1784,6 +1807,7 @@ fn build_runtime(
             plugins: plugin_prepared,
             plugin_entries,
             plugin_source,
+            delegation,
         },
         interactive_oauth_enabled,
     );
@@ -2013,6 +2037,7 @@ impl McpRuntime {
         interactive_oauth_enabled: bool,
     ) -> Self {
         let catalog = manager.source();
+        let delegation = reload.delegation.clone();
         let (oauth_sessions, active_replays, healthy) = oauth;
         let plugin_source = reload.plugin_source.clone();
         Self {
@@ -2039,6 +2064,7 @@ impl McpRuntime {
                 event_routes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
                 next_event_route: AtomicU64::new(0),
                 interactive_oauth_enabled,
+                delegation,
             }),
         }
     }
@@ -2310,6 +2336,13 @@ impl McpRuntime {
         self.reload_config_with_session(Some(source)).await
     }
 
+    /// Replace this runtime's delegated subject. Workload servers configured
+    /// with session delegation exchange it on their next request; `None`
+    /// returns them to workload-only authentication.
+    pub(crate) fn set_delegation(&self, subject: Option<crate::workload_auth::Subject>) {
+        self.inner.delegation.set(subject);
+    }
+
     async fn reload_config(&self) -> Result<(), String> {
         self.reload_config_with_session(None).await
     }
@@ -2412,8 +2445,12 @@ impl McpRuntime {
                     let raw = read_source(source)
                         .await?
                         .ok_or("missing session MCP config")?;
-                    let (prepared, _) =
-                        prepare_config(&raw, &source.path, source.default_stdio_cwd.as_deref())?;
+                    let (prepared, _) = prepare_config(
+                        &raw,
+                        &source.path,
+                        source.default_stdio_cwd.as_deref(),
+                        &self.inner.delegation,
+                    )?;
                     validate_server_names(prepared.keys())?;
                     prepared.keys().cloned().collect::<BTreeSet<_>>()
                 }
@@ -2451,8 +2488,12 @@ impl McpRuntime {
 
             // Configured, project, and explicit files retain their declared
             // precedence over the newly staged plugin baseline.
-            let (mut prepared, entries) =
-                prepare_sources(&next_sources, &plugin_prepared, &plugin_entries)?;
+            let (mut prepared, entries) = prepare_sources(
+                &next_sources,
+                &plugin_prepared,
+                &plugin_entries,
+                &self.inner.delegation,
+            )?;
             validate_server_names(prepared.keys())?;
             let changed = current_entries
                 .keys()
@@ -4164,6 +4205,7 @@ pub fn empty() -> McpRuntime {
             plugins: BTreeMap::new(),
             plugin_entries: BTreeMap::new(),
             plugin_source: None,
+            delegation: DelegationSlot::default(),
         },
         true,
     )
@@ -7292,7 +7334,13 @@ mod tests {
             serde_json::to_vec(&config).unwrap()
         };
         for (value, expected) in [(None, 64 * 1024 * 1024), (Some(json!(54321)), 54321)] {
-            let (prepared, _) = prepare_config(&config(value), path, None).unwrap();
+            let (prepared, _) = prepare_config(
+                &config(value),
+                path,
+                None,
+                &crate::workload_auth::DelegationSlot::default(),
+            )
+            .unwrap();
             let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
                 panic!("expected stdio transport");
             };
@@ -7300,17 +7348,26 @@ mod tests {
         }
         for value in [json!(0), json!(usize::MAX)] {
             assert!(matches!(
-                prepare_config(&config(Some(value)), path, None),
+                prepare_config(&config(Some(value)), path, None, &crate::workload_auth::DelegationSlot::default()),
                 Err(error) if error.contains("MCP server local: max_line_length must be between")
             ));
         }
         for value in [json!(null), json!(-1), json!(1.5), json!("1024")] {
-            assert!(prepare_config(&config(Some(value)), path, None).is_err());
+            assert!(
+                prepare_config(
+                    &config(Some(value)),
+                    path,
+                    None,
+                    &crate::workload_auth::DelegationSlot::default()
+                )
+                .is_err()
+            );
         }
         assert!(prepare_config(
             br#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","max_line_length":1024}}}"#,
             path,
             None,
+            &crate::workload_auth::DelegationSlot::default(),
         ).is_err());
     }
 
@@ -7365,15 +7422,26 @@ for line in sys.stdin:
         let path = first.path().join(".mcp.json");
 
         let missing = br#"{"mcpServers":{"local":{"command":"server"}}}"#;
-        let (prepared, _) = prepare_config(missing, &path, Some(first.path())).unwrap();
+        let (prepared, _) = prepare_config(
+            missing,
+            &path,
+            Some(first.path()),
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
             panic!("expected stdio transport");
         };
         assert_eq!(transport.cwd.as_deref(), Some(first.path()));
 
         let relative = br#"{"mcpServers":{"local":{"command":"server","cwd":"tools"}}}"#;
-        let (prepared, first_entries) =
-            prepare_config(relative, &path, Some(first.path())).unwrap();
+        let (prepared, first_entries) = prepare_config(
+            relative,
+            &path,
+            Some(first.path()),
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
             panic!("expected stdio transport");
         };
@@ -7381,7 +7449,13 @@ for line in sys.stdin:
             transport.cwd.as_deref(),
             Some(first.path().join("tools").as_path())
         );
-        let (_, second_entries) = prepare_config(relative, &path, Some(second.path())).unwrap();
+        let (_, second_entries) = prepare_config(
+            relative,
+            &path,
+            Some(second.path()),
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         assert_ne!(first_entries["local"], second_entries["local"]);
 
         let absolute = first.path().join("absolute");
@@ -7391,14 +7465,24 @@ for line in sys.stdin:
             }
         }))
         .unwrap();
-        let (prepared, first_entries) =
-            prepare_config(&absolute_config, &path, Some(first.path())).unwrap();
+        let (prepared, first_entries) = prepare_config(
+            &absolute_config,
+            &path,
+            Some(first.path()),
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
             panic!("expected stdio transport");
         };
         assert_eq!(transport.cwd.as_deref(), Some(absolute.as_path()));
-        let (_, second_entries) =
-            prepare_config(&absolute_config, &path, Some(second.path())).unwrap();
+        let (_, second_entries) = prepare_config(
+            &absolute_config,
+            &path,
+            Some(second.path()),
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         assert_eq!(first_entries["local"], second_entries["local"]);
     }
 
@@ -7837,8 +7921,13 @@ for line in sys.stdin:
         assert!(!empty.inner.servers.read().await.contains_key("local"));
         first.reload_config().await.unwrap();
         let state = first.inner.reload.lock().await;
-        let (prepared, _) =
-            super::prepare_sources(&state.sources, &state.plugins, &state.plugin_entries).unwrap();
+        let (prepared, _) = super::prepare_sources(
+            &state.sources,
+            &state.plugins,
+            &state.plugin_entries,
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         assert!(prepared.contains_key("configured"));
         let McpTransportBinding::Stdio(stdio) = &prepared["local"].config.transport else {
             panic!("expected stdio");
@@ -7988,8 +8077,13 @@ for line in sys.stdin:
         );
         runtime.reload_config().await.unwrap();
         let sources = runtime.inner.reload.lock().await.sources.clone();
-        let (prepared, _) =
-            super::prepare_sources(&sources, &Default::default(), &Default::default()).unwrap();
+        let (prepared, _) = super::prepare_sources(
+            &sources,
+            &Default::default(),
+            &Default::default(),
+            &crate::workload_auth::DelegationSlot::default(),
+        )
+        .unwrap();
         let McpTransportBinding::StreamableHttp(http) = &prepared["remote"].config.transport else {
             panic!("expected native HTTP transport");
         };
@@ -9827,6 +9921,7 @@ for line in sys.stdin:
             br#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","headers":{"AUTHORIZATION":"Bearer static"},"auth":{"type":"oauth"}}}}"#,
             path,
             None,
+            &crate::workload_auth::DelegationSlot::default(),
         ) {
             Ok(_) => panic!("OAuth and static authorization were accepted together"),
             Err(error) => error,

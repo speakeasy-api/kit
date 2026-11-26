@@ -638,3 +638,76 @@ async fn https_explicit_rejection_never_retries_or_retains_stale_token() {
         assert_eq!(server.drain().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn https_delegated_exchange_sends_subject_and_actor_and_caches_per_subject() {
+    let mut server = Server::start().await;
+    let (_dir, path) = source();
+    let mut session = server.session(path, "https://api.example/mcp");
+    session.config.endpoint_mode = EndpointMode::Explicit;
+    session.config.expected_issuer.clear();
+    session.config.delegation = Delegation::Session;
+    session.config.validate().unwrap();
+
+    let alice = Subject::new("alice.delegation.token".into()).unwrap();
+    server.enqueue(exchange_reply(Some(3600)));
+    let first = session.acquisition_for(Some(&alice)).await.unwrap();
+    assert_eq!(first.token(), "exchange-access");
+    let requests = server.drain();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].form(),
+        BTreeMap::from([
+            (
+                "grant_type".into(),
+                "urn:ietf:params:oauth:grant-type:token-exchange".into()
+            ),
+            ("subject_token".into(), "alice.delegation.token".into()),
+            ("subject_token_type".into(), JWT.into()),
+            ("actor_token".into(), ASSERTION.into()),
+            ("actor_token_type".into(), JWT.into()),
+            ("requested_token_type".into(), ACCESS_TOKEN.into()),
+            ("resource".into(), "https://api.example/mcp".into()),
+        ])
+    );
+
+    // The same subject reuses its exchange.
+    assert!(Arc::ptr_eq(
+        &first.0,
+        &session.acquisition_for(Some(&alice)).await.unwrap().0
+    ));
+    assert!(server.drain().is_empty());
+
+    // A different subject, even with identical bytes, never reuses another's token.
+    let replacement = Subject::new("alice.delegation.token".into()).unwrap();
+    server.enqueue(exchange_reply(Some(3600)));
+    session.acquisition_for(Some(&replacement)).await.unwrap();
+    assert_eq!(server.drain().len(), 1);
+
+    // Clearing the subject falls back to the workload-only grant.
+    server.enqueue(Reply::token("workload-access", 3600));
+    let workload = session.acquisition_for(None).await.unwrap();
+    assert_eq!(workload.token(), "workload-access");
+    let form = server.drain()[0].form();
+    assert_eq!(
+        form["grant_type"],
+        "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    );
+    assert!(!form.contains_key("actor_token"));
+}
+
+#[tokio::test]
+async fn https_delegation_requires_opt_in() {
+    let server = Server::start().await;
+    let (_dir, path) = source();
+    let session = server.session(path, "https://api.example/mcp");
+    let subject = Subject::new("subject".into()).unwrap();
+    assert_eq!(
+        session
+            .acquisition_for(Some(&subject))
+            .await
+            .err()
+            .as_deref(),
+        Some("workload delegation is not enabled")
+    );
+}
