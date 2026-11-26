@@ -274,6 +274,9 @@ fn transcript_replay(
             ));
             continue;
         }
+        if model_switch::is_compact_marker(item) {
+            continue;
+        }
         for part in &item.parts {
             let update = match item.kind {
                 ItemKind::User | ItemKind::Developer

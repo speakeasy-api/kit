@@ -1286,12 +1286,21 @@ impl TranscriptObserver for SessionObserver {
         // As with appends, storage is best-effort and cannot roll back that
         // commit. Keep the existing loss-domain semantics; report rejected
         // writes rather than claiming that the replacement reached disk.
-        if let Err(error) = self.replace(items) {
+        let filtered: Vec<_> = items
+            .iter()
+            .filter(|item| !crate::protocols::acp::model_switch::is_compact_marker(item))
+            .cloned()
+            .collect();
+        if let Err(error) = self.replace(&filtered) {
             tracing::warn!(%session_id, %error, "could not persist committed transcript replacement");
         }
     }
 
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        // Synthetic switch-compaction markers are internal triggers, never durable user history.
+        if crate::protocols::acp::model_switch::is_compact_marker(event.item) {
+            return;
+        }
         // Persistence must not prevent the loop from committing its in-memory
         // transcript. Poison still isolates the writer: never recover a guard
         // whose file or lease transition may have been interrupted.

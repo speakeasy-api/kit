@@ -146,6 +146,16 @@ pub(super) fn compact_marker() -> Item {
     )))
 }
 
+pub(crate) fn is_compact_marker(item: &Item) -> bool {
+    item.kind == ItemKind::User
+        && item
+            .id
+            .as_ref()
+            .is_some_and(|id| id.0.as_str().starts_with("kit-model-switch-"))
+        && item.parts.len() == 1
+        && matches!(&item.parts[0], agentkit_core::Part::Text(text) if text.text == "/compact")
+}
+
 pub(super) fn compaction_completed(
     reason: &FinishReason,
     marker: &Option<MessageId>,
@@ -423,5 +433,38 @@ mod tests {
             &[summary],
             false
         ));
+    }
+
+    #[test]
+    fn cancelled_switch_marker_is_not_persisted_or_replayed_as_user_message() {
+        use agentkit_core::SessionId;
+        use agentkit_loop::{TranscriptEvent, TranscriptObserver};
+
+        let root = tempfile::tempdir().unwrap();
+        let initial = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::User, "hello"),
+        ];
+        let opened =
+            crate::session::open(root.path(), "switch-cancel", false, false, initial).unwrap();
+        let marker = compact_marker();
+        assert!(is_compact_marker(&marker));
+        assert!(!is_compact_marker(&Item::text(ItemKind::User, "/compact")));
+        let sid = SessionId::new("switch-cancel");
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &sid,
+            item: &marker,
+        });
+        drop(opened);
+
+        let reopened =
+            crate::session::open(root.path(), "switch-cancel", true, false, vec![]).unwrap();
+        assert!(!reopened.transcript.iter().any(is_compact_marker));
+        let updates = super::super::transcript_replay(
+            &agentkit_acp::SessionId::new("switch-cancel"),
+            &[Item::text(ItemKind::User, "hello"), marker],
+            false,
+        );
+        assert_eq!(updates.len(), 1);
     }
 }
